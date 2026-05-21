@@ -1,0 +1,15 @@
+{
+  "name": "ihow-memory-core",
+  "version": "0.0.0-w1",
+  "description": "Open implementation scaffold for iHow Memory protocol conformance.",
+  "type": "module",
+  "bin": {
+    "ihow-memory": "./bin/ihow-memory"
+  },
+  "scripts": {
+    "smoke:init": "node ./bin/ihow-memory init ./.tmp/init-smoke --force",
+    "test:conformance": "node ./conformance/runners/ihow-memory/run.mjs",
+    "test": "npm run smoke:init && npm run test:conformance"
+  },
+  "license": "Apache-2.0"
+}

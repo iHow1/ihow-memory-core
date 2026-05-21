@@ -1,0 +1,48 @@
+name: ihow-memory-yuntian-pilot
+
+services:
+  console:
+    image: nginx:1.27-alpine
+    pull_policy: if_not_present
+    container_name: ihow-memory-yuntian-console
+    restart: unless-stopped
+    ports:
+      # Localhost-only by default. Set IHOW_CONSOLE_BIND=0.0.0.0 only after the
+      # customer network owner explicitly approves LAN exposure.
+      - "${IHOW_CONSOLE_BIND:-127.0.0.1}:${IHOW_CONSOLE_PORT:-8787}:80"
+    volumes:
+      # Static Console UI: open-source core only, no commercial module mount.
+      - type: bind
+        source: ./console
+        target: /usr/share/nginx/html
+        read_only: true
+      # Local file truth source. Customer data stays in this host directory.
+      - type: bind
+        source: ./memory
+        target: /data/ihow-memory
+        read_only: false
+      - type: bind
+        source: ./nginx/default.conf
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+    networks:
+      - ihow-local
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  ihow-local:
+    name: ihow-memory-yuntian-local
+    # Keep an explicit auditable network name. This is not marked internal because
+    # Docker Desktop does not publish localhost ports from internal networks.

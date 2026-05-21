@@ -1,0 +1,335 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import crypto from "node:crypto";
+
+const HELP = `Usage: ihow-memory init [dir] [--force]
+
+Commands:
+  init [dir]    Create a local iHow Memory protocol sample workspace.
+
+Options:
+  --force       Allow writing into an existing directory.
+  -h, --help    Show this help.
+`;
+
+function die(message, code = 1) {
+  console.error(message);
+  process.exit(code);
+}
+
+function today() {
+  const now = new Date();
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 10);
+}
+
+function timestamp() {
+  return new Date().toISOString();
+}
+
+function sha256(text) {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+async function ensureDir(dir) {
+  await fsp.mkdir(dir, { recursive: true });
+}
+
+async function writeFileIfAbsent(filePath, content, force) {
+  if (!force && fs.existsSync(filePath)) {
+    return false;
+  }
+  await ensureDir(path.dirname(filePath));
+  await fsp.writeFile(filePath, content, "utf-8");
+  return true;
+}
+
+function rel(...parts) {
+  return parts.join("/").replace(/\\/g, "/");
+}
+
+function protocolNamespace(projectName) {
+  return {
+    tenant_id: "local",
+    customer_id: "local",
+    project_id: projectName,
+    user_id: "operator",
+  };
+}
+
+function protocolEvent({ eventId, projectName, now, summary, sourceUri, eventType = "handoff" }) {
+  return {
+    event_id: eventId,
+    namespace: protocolNamespace(projectName),
+    event_type: eventType,
+    actor: {
+      type: "system",
+      name: "ihow-memory-cli",
+    },
+    occurred_at: now,
+    summary,
+    source: {
+      kind: "file",
+      uri: sourceUri,
+      reference: sourceUri,
+    },
+    sensitivity: "normal",
+    metadata: {
+      anchor: sourceUri,
+      scenario: "cross-tool-handoff",
+      protocol_version: "v0.1",
+    },
+  };
+}
+
+function renderLatest(projectName, now) {
+  return `---
+type: handoff_checkpoint
+schema_version: ihow.protocol-sample.v0.1
+status: active
+priority: normal
+updated_at: ${now}
+source: ihow-memory:init
+project: ${projectName}
+session_key: local:init
+valid_until: ${now}
+---
+
+# Handoff Checkpoint
+
+## Objective
+- Initialize a local iHow Memory protocol sample workspace
+
+## Completed
+- Created file-based memory directories
+- Created one protocol-shaped event log
+- Created a Console placeholder
+
+## Preserved Constraints
+- Keep project memory local-first
+- Do not rely on hidden chat history
+- Use synthetic sample data only
+
+## Open Items
+- Replace sample notes with real project handoff notes
+- Run conformance checks for the five public scenarios
+
+## Next Action
+- Review memory/_events/${today()}.ndjson and conformance-samples/protocol-event.json
+
+## Key Artifacts
+- memory/recent/latest.md
+- memory/_events/${today()}.ndjson
+- memory/scopes/project/sample.md
+- conformance-samples/protocol-event.json
+`;
+}
+
+function renderProjectScope(projectName, now) {
+  return `---
+scope: project
+kind: protocol_sample
+status: active
+updated_at: ${now}
+project: ${projectName}
+---
+
+# ${projectName} Current Scope
+
+## Positioning
+
+This workspace is a local sample for the iHow Memory protocol draft and handoff conformance scenarios.
+
+## Scenario Focus
+
+- Scenario 1: Cross-tool handoff
+- Scenario 4: Human team handoff
+- Scenario 5: Model migration
+
+## Next Steps
+
+- Capture handoff notes in memory/inbox/
+- Keep durable project state in memory/recent/ and memory/scopes/
+- Append protocol-shaped events to memory/_events/
+`;
+}
+
+function renderConsole() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iHow Memory Console</title>
+  <style>
+    body { margin: 0; padding: 32px; font: 14px/1.5 system-ui, sans-serif; color: #1f2937; background: #f6f7f9; }
+    main { max-width: 840px; margin: 0 auto; background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 24px; }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    p { color: #667085; }
+    code { background: #f2f4f7; padding: 2px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>iHow Memory Console v0 Stub</h1>
+    <p>This placeholder is created by <code>ihow-memory init</code>. The implementation repo will grow this into a local conformance console.</p>
+    <p>Truth source: <code>memory/</code>. Protocol events: <code>memory/_events/</code>.</p>
+  </main>
+</body>
+</html>
+`;
+}
+
+function renderSampleReadme(projectName) {
+  return `# Conformance Samples
+
+Synthetic sample files generated for ${projectName}.
+
+- \`protocol-event.json\`: one protocol v0.1 Event Object.
+- \`handoff-package.md\`: a short human-readable package for handoff scenarios.
+
+These are debug/conformance samples, not customer data and not a launch artifact.
+`;
+}
+
+function renderHandoffPackage(projectName) {
+  return `# ${projectName} Handoff Package
+
+## Goal
+
+Validate that a receiving tool can continue from durable project state.
+
+## Completed
+
+- Workspace initialized.
+- Handoff checkpoint written.
+- Protocol event recorded.
+
+## Constraints
+
+- Use synthetic data only.
+- Keep project state bounded and source-linked.
+
+## Next Step
+
+Run the local conformance runner against this workspace.
+`;
+}
+
+async function initWorkspace(targetDir, force) {
+  const root = path.resolve(targetDir);
+  if (fs.existsSync(root) && !force) {
+    const entries = await fsp.readdir(root);
+    if (entries.length > 0) {
+      die(`Target directory is not empty: ${root}\nUse --force to add the skeleton anyway.`);
+    }
+  }
+
+  const now = timestamp();
+  const date = today();
+  const projectName = path.basename(root) || "ihow-memory-workspace";
+  const latest = renderLatest(projectName, now);
+  const latestHash = sha256(latest);
+  const initEvent = protocolEvent({
+    eventId: crypto.randomUUID(),
+    projectName,
+    now,
+    summary: "Initialized a local iHow Memory protocol sample workspace.",
+    sourceUri: "memory/recent/latest.md",
+    eventType: "handoff",
+  });
+  initEvent.metadata.hash_after = latestHash;
+
+  const dirs = [
+    "memory/recent",
+    "memory/_events",
+    "memory/scopes/project",
+    "memory/inbox",
+    "console",
+    "conformance-samples",
+  ];
+  for (const dir of dirs) {
+    await ensureDir(path.join(root, dir));
+  }
+
+  await writeFileIfAbsent(
+    path.join(root, "README.md"),
+    `# ${projectName}
+
+This directory was initialized by \`ihow-memory init\`.
+
+## Start Here
+
+- Handoff checkpoint: \`memory/recent/latest.md\`
+- Protocol event log: \`memory/_events/${date}.ndjson\`
+- Project scope: \`memory/scopes/project/sample.md\`
+- Console stub: \`console/index.html\`
+- Conformance samples: \`conformance-samples/\`
+
+No network service is required for this skeleton.
+`,
+    force,
+  );
+  await writeFileIfAbsent(path.join(root, "memory/recent/latest.md"), latest, force);
+  await writeFileIfAbsent(
+    path.join(root, "memory/scopes/project/sample.md"),
+    renderProjectScope(projectName, now),
+    force,
+  );
+  await writeFileIfAbsent(
+    path.join(root, "memory/inbox/README.md"),
+    "# Inbox\n\nDrop local handoff notes here.\n",
+    force,
+  );
+  await writeFileIfAbsent(path.join(root, "console/index.html"), renderConsole(), force);
+  await writeFileIfAbsent(
+    path.join(root, "conformance-samples/README.md"),
+    renderSampleReadme(projectName),
+    force,
+  );
+  await writeFileIfAbsent(
+    path.join(root, "conformance-samples/protocol-event.json"),
+    JSON.stringify(initEvent, null, 2) + "\n",
+    force,
+  );
+  await writeFileIfAbsent(
+    path.join(root, "conformance-samples/handoff-package.md"),
+    renderHandoffPackage(projectName),
+    force,
+  );
+  await fsp.appendFile(
+    path.join(root, "memory/_events", `${date}.ndjson`),
+    JSON.stringify(initEvent) + "\n",
+    "utf-8",
+  );
+
+  console.log(`Initialized iHow Memory workspace at ${root}`);
+  console.log(`Open ${rel(root, "README.md")}`);
+}
+
+const args = process.argv.slice(2);
+if (args.includes("-h") || args.includes("--help") || args.length === 0) {
+  console.log(HELP);
+  process.exit(args.length === 0 ? 1 : 0);
+}
+
+const command = args.shift();
+if (command !== "init") {
+  die(`Unknown command: ${command}\n\n${HELP}`, 2);
+}
+
+let force = false;
+let target = ".";
+for (const arg of args) {
+  if (arg === "--force") {
+    force = true;
+  } else if (target === ".") {
+    target = arg;
+  } else {
+    die(`Unexpected argument: ${arg}`, 2);
+  }
+}
+
+await initWorkspace(target, force);
