@@ -1,10 +1,10 @@
-name: ihow-memory-yuntian-pilot
+name: ihow-memory-local-pilot
 
 services:
   console:
     image: nginx:1.27-alpine
     pull_policy: if_not_present
-    container_name: ihow-memory-yuntian-console
+    container_name: ihow-memory-local-console
     restart: unless-stopped
     ports:
       # Localhost-only by default. Set IHOW_CONSOLE_BIND=0.0.0.0 only after the
@@ -43,6 +43,6 @@ services:
 
 networks:
   ihow-local:
-    name: ihow-memory-yuntian-local
+    name: ihow-memory-local
     # Keep an explicit auditable network name. This is not marked internal because
     # Docker Desktop does not publish localhost ports from internal networks.

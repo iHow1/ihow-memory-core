@@ -1,6 +1,6 @@
-# Yuntian Pilot Deploy Shell
+# Local Pilot Deploy Shell
 
-This directory is a secure local deploy shell for a Yuntian pilot. It runs a localhost-only static Console and mounts a local `memory/` directory as the file truth source.
+This directory is a secure local deploy shell for a local pilot deployment. It runs a localhost-only static Console and mounts a local `memory/` directory as the file truth source.
 
 It does not expose the iHow Memory protocol API. It is not the sidecar service.
 
@@ -23,18 +23,12 @@ It does not expose the iHow Memory protocol API. It is not the sidecar service.
 
 ## Protocol API Candidate
 
-The protocol sidecar candidate remains in the locked Yuntian meeting package:
-
-```text
-~/Desktop/iHowMemory-耘田会面工具包/04-技术接入/sidecar-service-skeleton/
-```
-
-That sidecar skeleton contains REST endpoint candidates and tenant API-key isolation experiments. Keep it separate from this deploy shell until Commander explicitly asks to productize or relocate it.
+The protocol sidecar candidate is maintained separately in private deployment material outside this public repo. This directory only hosts the localhost-only static Console deploy shell.
 
 ## Local Run
 
 ```bash
-cd deploy/yuntian-pilot
+cd deploy/local-pilot
 docker compose up -d
 open http://127.0.0.1:8787
 ```

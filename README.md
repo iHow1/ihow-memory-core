@@ -19,7 +19,7 @@ The spec source of truth is [`iHow1/ihow-memory-standard`](https://github.com/iH
 
 - `bin/ihow-memory`: local CLI scaffold.
 - `tools/ihow-memory/event-log.sh`: append-only local audit log with protocol v0.1 event mapping.
-- `deploy/yuntian-pilot/`: secure local deploy shell for a static pilot Console.
+- `deploy/local-pilot/`: secure local deploy shell for a static pilot Console.
 - `conformance/runners/ihow-memory/`: self-runner for the five public reliability scenarios.
 
 ## Quick Start
@@ -66,10 +66,10 @@ The scenario set defines five acceptance-style tests:
 
 ## Local Deploy Shell
 
-The Yuntian pilot compose file is a deploy shell, not the protocol sidecar API:
+The local pilot compose file is a deploy shell, not the protocol sidecar API:
 
 ```bash
-cd deploy/yuntian-pilot
+cd deploy/local-pilot
 docker compose up -d
 open http://127.0.0.1:8787
 ```
