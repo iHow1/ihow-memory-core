@@ -1,87 +1,66 @@
-<div align="center">
-
 # iHow Memory Core
 
-### Reference implementation scaffold for testing whether agent memory survives handoff
+**Reference implementation for the [iHow Memory spec](https://github.com/iHow1/ihow-memory-standard).**
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
-[![Spec: iHow Memory Standard](https://img.shields.io/badge/spec-ihow--memory--standard-brightgreen.svg)](https://github.com/iHow1/ihow-memory-standard)
+Apache-2.0 · Local-first · File-protocol · Passes spec v0.1 conformance
 
-[中文](./README.zh-CN.md) · [Spec](https://github.com/iHow1/ihow-memory-standard) · [Protocol](https://github.com/iHow1/ihow-memory-standard/blob/main/spec/protocol-draft-v0.1.md) · [Scenarios](https://github.com/iHow1/ihow-memory-standard/blob/main/scenarios/reliability-scenarios-v0.1.md)
+[![Conformance](https://img.shields.io/badge/LongMemEval_S-retrieval_recall_all@10%3D1.0-brightgreen)](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md)
+[![Self-Conformance](https://img.shields.io/badge/scenarios_v0.1-5%2F5_PASS-brightgreen)](https://github.com/iHow1/ihow-memory-standard/tree/main/conformance)
+[![License](https://img.shields.io/badge/code-Apache--2.0-blue)](./LICENSE)
 
-</div>
+## What it is
 
-iHow Memory Core is an implementation repo for the public iHow Memory Standard. It provides local-first tools that produce protocol-shaped events, handoff samples, and self-conformance checks.
+The reference implementation behind the iHow Memory spec. Use it as:
 
-The spec source of truth is [`iHow1/ihow-memory-standard`](https://github.com/iHow1/ihow-memory-standard). This repo is code: CLI, local adapter audit logging, deploy shell, and conformance runners.
+- A working memory layer for your AI agent (file-protocol, no SaaS, no API keys)
+- A baseline to compare your own memory system against
+- The implementation behind the public LongMemEval_S 470/470 retrieval-stage benchmark
 
-## What This Repo Includes
+## Quickstart
 
-- `bin/ihow-memory`: local CLI scaffold.
-- `tools/ihow-memory/event-log.sh`: append-only local audit log with protocol v0.1 event mapping.
-- `deploy/local-pilot/`: secure local deploy shell for a static pilot Console.
-- `conformance/runners/ihow-memory/`: self-runner for the five public reliability scenarios.
-
-## Quick Start
+To try it from a clone today:
 
 ```bash
-npm exec --package . -- ihow-memory init /tmp/ihow-memory-demo --force
+git clone https://github.com/iHow1/ihow-memory-core.git
+cd ihow-memory-core
+npm install
+npm exec --package . -- ihow-memory init my-project
+cd my-project
+# Read README.md to see the generated workspace layout
 ```
 
-The generated workspace includes:
+A polished published-package quickstart is on the v0.2 roadmap. Meanwhile the repo-local invocation works.
 
-- `memory/recent/latest.md`
-- `memory/_events/<today>.ndjson`
-- `memory/scopes/project/sample.md`
-- `memory/inbox/`
-- `console/index.html`
-- `conformance-samples/`
+## Architecture
 
-Run self-conformance:
+- Local file workspace as source of truth
+- Append-only audit log (`memory/_events/*.ndjson`)
+- Scoped memory per agent runtime (Claude Code / Codex / OpenClaw / your own)
+- Retrieval via local vector + lexical hybrid with cluster-aware rerank
 
-```bash
-npm run test:conformance
-```
+For full spec, see [iHow Memory standard](https://github.com/iHow1/ihow-memory-standard).
 
-Expected result: `5/5 PASS`.
+## Performance — retrieval layer
 
-## Relationship to the Standard Repo
+| Benchmark | Result |
+|---|---|
+| LongMemEval_S (470 effective samples) | `recall_all@10 = 1.0` |
+| 5 spec scenarios v0.1 (self-conformance) | 5/5 PASS |
 
-`ihow-memory-standard` defines the protocol draft and reliability scenarios. This repo implements a local scaffold that can be tested against those scenarios.
+**Important**: this is retrieval recall, not end-to-end answer accuracy. For per-layer comparison context and methodology, see the [spec repo](https://github.com/iHow1/ihow-memory-standard) and its [evidence manifest](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md).
 
-The protocol draft defines four interface semantics:
+## Boundary between benchmark and production
 
-- `events`: workflow event ingestion
-- `context`: bounded context package retrieval
-- `writeback`: proposed durable memory and review
-- `audit`: traceability and lifecycle control
+Some techniques used in our benchmark harness port directly to production retrieval (original-query anchor preservation, cluster-aware rerank, bounded sibling expansion). Others are LongMemEval-shaped heuristics that remain benchmark-only.
 
-The scenario set defines five acceptance-style tests:
-
-1. Cross-Tool Handoff
-2. Feedback Pattern Capture
-3. Constraint Preservation
-4. Human Team Handoff
-5. Model Migration
-
-## Local Deploy Shell
-
-The local pilot compose file is a deploy shell, not the protocol sidecar API:
-
-```bash
-cd deploy/local-pilot
-docker compose up -d
-open http://127.0.0.1:8787
-```
-
-It serves a localhost-only static Console and mounts local files. It does not expose `/memory/events`, `/memory/context`, `/memory/writeback`, `/memory/pending`, or `/memory/audit`.
-
-## Security Boundary
-
-- Use synthetic data for public fixtures and conformance samples.
-- Do not commit non-public project memory, customer material, tokens, keys, credentials, or account data.
-- Keep customer deployment material outside this public repo unless Commander explicitly classifies it as public-safe.
+The public evidence manifest summarizes this boundary. Benchmark-only heuristics are not packaged as general retrieval improvements.
 
 ## License
 
-Apache-2.0. See [LICENSE](./LICENSE).
+Apache-2.0. Spec (CC-BY) lives in the [standard repo](https://github.com/iHow1/ihow-memory-standard).
+
+## Contribute
+
+- Bug reports: [issues](../../issues)
+- Discussion: [GitHub Discussions](../../discussions)
+- Spec proposals: [standard repo](https://github.com/iHow1/ihow-memory-standard/discussions)
