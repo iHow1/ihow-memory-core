@@ -31,6 +31,16 @@ cd my-project
 
 A polished published-package quickstart is on the v0.2 roadmap. Meanwhile the repo-local invocation works.
 
+## Use it with your AI tool (vendor-neutral)
+
+`init` drops the same read-first / write-back router as one front-door per AI tool, so a fresh workspace can be picked up without re-briefing:
+
+- **Claude Code** reads `CLAUDE.md`; **Codex / AGENTS.md-convention tools** read `AGENTS.md`.
+- **Cursor / Gemini CLI / Windsurf** → copy `memory/MEMORY-PROTOCOL.md` into the tool's rules file.
+- **Any other tool** → paste `memory/MEMORY-PROTOCOL.md` into its system prompt.
+
+Each router says the same thing: read `memory/recent/latest.md` first, then write progress back. Switch the tool, the session, or the person — the project memory doesn't drop. A fresh workspace also gets a `GETTING_STARTED.md`.
+
 ## Architecture
 
 - Local file workspace as source of truth
