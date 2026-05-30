@@ -218,6 +218,52 @@ Run the local conformance runner against this workspace.
 `;
 }
 
+function renderRouter(projectName) {
+  return `# Project memory router (iHow Memory)
+
+This project uses **iHow Memory** for durable, cross-tool, cross-session project memory.
+Memory lives locally in \`memory/\` — file-protocol, no SaaS, no API keys.
+
+## Before you start (especially when resuming or picking up prior work)
+1. Read \`memory/recent/latest.md\` — the handoff checkpoint. Start here.
+2. Open deeper files only as needed: \`memory/scopes/\`, \`memory/inbox/\`, \`memory/_events/\`.
+
+## After meaningful progress (a decision, a fix, a milestone, a blocker)
+1. Update \`memory/recent/latest.md\`: objective / completed / open items / preserved constraints / next action.
+2. Append a protocol event to \`memory/_events/<date>.ndjson\` (e.g. via \`tools/ihow-memory/event-log.sh\`).
+
+## Safety (hard rules)
+- Never write secrets into memory: API keys, tokens, passwords, cookies, credentials.
+- Keep memory local-first and source-linked; use synthetic data for public fixtures.
+
+> Handing off to another AI tool or teammate? They read \`memory/recent/latest.md\` and continue — no re-briefing.
+`;
+}
+
+function renderGettingStarted(projectName) {
+  return `# Getting started — ${projectName}
+
+\`ihow-memory init\` created a local, file-protocol memory workspace. Data stays in \`memory/\` — no SaaS, no API keys, model-agnostic.
+
+## Layout
+- \`memory/recent/latest.md\` — handoff checkpoint: **start here**
+- \`memory/scopes/project/sample.md\` — project scope
+- \`memory/_events/<date>.ndjson\` — append-only protocol event log
+- \`memory/inbox/\` — drop handoff notes here
+- \`conformance-samples/\` — synthetic protocol samples
+- \`console/index.html\` — local console stub
+
+## Works with any AI tool that reads a file or pasted protocol (vendor-neutral)
+- **Claude Code** → reads \`CLAUDE.md\`
+- **Codex / tools using the AGENTS.md convention** → read \`AGENTS.md\`
+- **Cursor / Gemini CLI / Windsurf** → copy \`memory/MEMORY-PROTOCOL.md\` into \`.cursorrules\` / \`GEMINI.md\` / \`.windsurfrules\`
+- **Any other tool (web chat, etc.)** → paste \`memory/MEMORY-PROTOCOL.md\` into its system prompt
+
+Every router says the same thing: read \`memory/recent/latest.md\` first, then write progress back.
+**Switch the tool, the session, or the person — the project memory doesn't drop.**
+`;
+}
+
 async function initWorkspace(targetDir, force) {
   const root = path.resolve(targetDir);
   if (fs.existsSync(root) && !force) {
@@ -305,8 +351,16 @@ No network service is required for this skeleton.
     "utf-8",
   );
 
+  // vendor-neutral routers: same instructions, one front-door per AI tool
+  const router = renderRouter(projectName);
+  await writeFileIfAbsent(path.join(root, "CLAUDE.md"), router, force);
+  await writeFileIfAbsent(path.join(root, "AGENTS.md"), router, force);
+  await writeFileIfAbsent(path.join(root, "memory/MEMORY-PROTOCOL.md"), router, force);
+  await writeFileIfAbsent(path.join(root, "GETTING_STARTED.md"), renderGettingStarted(projectName), force);
+
   console.log(`Initialized iHow Memory workspace at ${root}`);
-  console.log(`Open ${rel(root, "README.md")}`);
+  console.log(`Routers: CLAUDE.md, AGENTS.md, memory/MEMORY-PROTOCOL.md  (read memory/recent/latest.md first, then write back)`);
+  console.log(`Open GETTING_STARTED.md`);
 }
 
 const args = process.argv.slice(2);
