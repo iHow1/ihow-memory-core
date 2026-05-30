@@ -45,6 +45,16 @@ npm run test:conformance
 
 期望结果：`5/5 PASS`。
 
+## 用你的 AI 工具（厂商中立）
+
+`init` 会顺带生成一份「先读后写」路由的多个入口，让任何 AI 工具都能接上这个工作区、无需重新交底：
+
+- **Claude Code** 读 `CLAUDE.md`；**Codex / 走 AGENTS.md 约定的工具** 读 `AGENTS.md`。
+- **Cursor / Gemini CLI / Windsurf** → 把 `memory/MEMORY-PROTOCOL.md` 复制进工具的规则文件。
+- **其他任意工具** → 把 `memory/MEMORY-PROTOCOL.md` 贴进它的 system prompt。
+
+每个入口说的是同一件事：先读 `memory/recent/latest.md`，再把进展写回。换工具、换会话、换人，项目记忆都不断片。新工作区还会生成 `GETTING_STARTED.md`。
+
 ## 与规范仓库的关系
 
 `ihow-memory-standard` 定义协议草案和可靠性场景。本仓提供可被这些场景验收的本地实现脚手架。
