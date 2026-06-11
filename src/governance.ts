@@ -219,7 +219,7 @@ export async function writeCandidate(
     const title = safeFileSlug(payload.title || candidateId, candidateId);
     const sourceAgent = payload.sourceAgent || payload.source || 'unknown';
     const filePath = path.join(candidateDirForAgent(workspace, sourceAgent), `${nowCompact()}-${title}.md`);
-    await atomicWriteFile(filePath, markdownCandidate(candidateId, payload));
+    await atomicWriteFile(filePath, markdownCandidate(candidateId, payload), workspace.memoryDir);
     const relativePath = relativeToSpace(workspace, filePath);
     await appendEvent(workspace, {
       type: 'candidate.created',
@@ -260,7 +260,7 @@ export async function promoteCandidate(
       .replace(/^status:\s*"candidate"\s*$/m, 'status: "promoted"')
       .replace(/^type:\s*"memory_candidate"\s*$/m, 'type: "memory"')
       .replace(/^---\n/, `---\npromoted_at: "${new Date().toISOString()}"\n`);
-    await atomicWriteFile(targetPath, body);
+    await atomicWriteFile(targetPath, body, workspace.memoryDir);
 
     if (workspace.mode === 'existing-memory-root') {
       if (!isMcpSandboxPath(workspace, targetPath)) throw new Error('target_outside_mcp_sandbox');
@@ -387,7 +387,10 @@ export async function durablePromoteCandidate(
       };
     }
 
-    await atomicWriteFile(targetPath, await durableTargetContent(targetPath, appendContent));
+    // Durable targets are whitelisted to memoryDir or the workspace root's projects/ tree, so the
+    // containment root is the workspace root (it contains memoryDir in both workspace modes).
+    const containmentRoot = workspace.mode === 'existing-memory-root' ? path.dirname(workspace.memoryDir) : workspace.spaceDir;
+    await atomicWriteFile(targetPath, await durableTargetContent(targetPath, appendContent), containmentRoot);
     const archiveAbsolute = path.join(workspace.historyDir, 'promoted-candidates', path.basename(candidate.path));
     await fs.mkdir(path.dirname(archiveAbsolute), { recursive: true });
     await fs.rename(candidateAbsolute, archiveAbsolute);

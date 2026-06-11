@@ -1,250 +1,193 @@
 # iHow Memory
 
-Local-first shared memory for AI agents. The alpha core stores Markdown locally, indexes it with Node's built-in SQLite FTS5, returns citations, and exposes the same governed memory flow through CLI and stdio MCP.
+> Local-first shared memory for AI agents — zero-dependency FTS5 search, citations, governance, stdio MCP.
 
-- No account
-- No telemetry
-- No required network calls
-- No embedding model or API key required
-- Cloud and sync are disabled by default
+[![npm version](https://img.shields.io/npm/v/ihow-memory.svg)](https://www.npmjs.com/package/ihow-memory)
+[![CI](https://github.com/iHow1/ihow-memory-core/actions/workflows/ci.yml/badge.svg)](https://github.com/iHow1/ihow-memory-core/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
 
-> Alpha software. Back up runtime configuration before editing it, and use a demo space until you have reviewed the local file layout.
+[简体中文](./README.zh-CN.md)
 
-## 2-Minute Quickstart
+**Requires Node.js >= 22.12 · macOS / Linux (alpha).** No account, no API key, no third-party runtime dependencies.
 
-Requirements:
+iHow Memory gives your AI agents one durable memory on your own machine. Memory is plain Markdown on disk. Retrieval is Node's built-in SQLite FTS5, and every result carries a citation. Writes go through an explicit governance flow instead of silent self-writes. Agents talk to it over a stdio MCP server; you use the same flow from the CLI.
 
-- Node.js `>=22.12`
-- macOS or Linux for the current alpha validation lane
-- A writable local directory
+## Why it is different
 
-### 1. Inspect and initialize
+1. **Local-first.** Runs entirely on your machine: no account, no telemetry by default, no required network calls. Your memory is human-readable Markdown you can edit, diff and roll back.
+2. **Governed writes.** Agents only propose candidates. Promotion to durable memory is an explicit, audited step, and reads come back with citations — no agent silently rewrites shared memory.
+3. **One memory, many runtimes.** Claude Code, Codex and Cursor connect to the same local memory, one command each.
 
-During repository development:
+## Quickstart
 
-```bash
-git clone https://github.com/iHow1/ihow-memory-core.git
-cd ihow-memory-core
-npm run cli -- doctor
-npm run cli -- init --space demo --runtime codex
-```
-
-After the npm package is published:
+### 1. Connect a runtime
 
 ```bash
-npx ihow-memory init --space demo --runtime codex
+npx ihow-memory connect --runtime claude-code   # or: codex | cursor
 ```
 
-Use one of:
+`connect` provisions a managed workspace under `~/.ihow-memory` (space name derived from the current directory unless you pass `--space`) and registers the `ihow-memory` MCP server with the selected runtime:
+
+- Claude Code and Codex are configured through their official CLIs (`claude mcp add-json`, `codex mcp add`).
+- Cursor is configured by merging `~/.cursor/mcp.json`, with a timestamped backup of the existing file first; an unparseable config is never overwritten.
+- To preview without changing anything, append `--dry-run`:
 
 ```bash
-ihow-memory init --space demo --runtime claude-code
-ihow-memory init --space demo --runtime codex
-ihow-memory init --space demo --runtime cursor
+npx ihow-memory connect --runtime claude-code --dry-run
 ```
 
-`init` creates a local managed workspace and prints the matching MCP configuration snippet. It does not edit runtime configuration automatically.
-It also copies the small zero-dependency JavaScript runtime into `<state-root>/<space>/.runtime/`, so the MCP configuration does not depend on an `npx` cache directory.
+If you prefer to edit runtime config by hand, `npx ihow-memory init --runtime <runtime>` prints the exact MCP snippet instead of applying it.
 
-Before pasting the snippet:
-
-1. Back up the existing runtime configuration file.
-2. Paste the generated snippet.
-3. Restart or reload the runtime.
-4. Run `ihow-memory doctor --runtime <runtime>` again.
-
-### 2. Run the local proof
+### 2. Verify
 
 ```bash
-ihow-memory proof --space demo-proof
+npx ihow-memory doctor --runtime claude-code
 ```
 
-Expected flow:
+`doctor` checks the Node version, `node:sqlite` availability, memory-root writability, runtime setup, retrieval-engine readiness and the index manifest, and confirms cloud/sync are disabled.
+
+### 3. The governed loop in 60 seconds
+
+This is the same flow agents use over MCP, run from your shell. The block is copy-pasteable as a whole:
+
+```bash
+npx ihow-memory init --space demo
+CAND=$(npx ihow-memory write-candidate "Decision: ship weekly release notes." --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
+PROMOTED=$(npx ihow-memory promote "$CAND" --scope team --title "Release notes cadence" --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
+npx ihow-memory search "release notes" --space demo
+npx ihow-memory read "$PROMOTED" --space demo
+```
+
+What you should see:
+
+- `write-candidate` returns a candidate path under `memory/candidate/inbox/` — proposed, not yet durable;
+- `promote` returns the promoted path under `memory/scopes/team/` plus an `eventId` — the audit event;
+- `search` and `read` return JSON whose `citation` field points at the exact Markdown file behind the answer.
+
+Clean up the demo space when done:
+
+```bash
+npx ihow-memory reset --space demo
+```
+
+One-command version of the same proof, in a throwaway space:
+
+```bash
+npx ihow-memory proof
+```
+
+## Retrieval engine
+
+The default retrieval engine is zero-dependency local full-text search — Node built-ins plus `node:sqlite` FTS5 only: no third-party runtime deps, no embedding downloads, no model or API key, with citation-bearing results. An optional local vector provider (separate process) adds semantic retrieval; if unconfigured or unhealthy, retrieval falls back visibly to FTS. Governance, write guards and audit behavior never change with the retrieval backend. The memory itself stays human-readable, editable, rollback-able Markdown.
+
+## Benchmark
+
+We publish one LongMemEval_S retrieval-stage result: recall_all@10 = 1.0 across all 470 effective samples (500 raw; ndcg_any@10 0.946). Three boundaries: (1) this is retrieval-layer recall, not end-to-end LLM-judged answer accuracy — not directly comparable to the 90%+ figures reported by other vendors, which measure a different layer; (2) the score was produced on our experimental vector + lexical hybrid lane, while this published package defaults to zero-dependency FTS5 lexical search (with an optional local vector provider); (3) a one-command reproduction harness is WIP — until it lands, the public evidence manifest (metric definitions, run artifacts, full @5 disclosure incl. structural ceilings) is the auditable reference.
+
+Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md).
+
+## MCP tools
+
+The stdio MCP server (registered by `connect`, or manually via the `init` snippet) exposes six tools:
+
+| Tool | What it does |
+| --- | --- |
+| `memory.search` | Search local memory with FTS. Returns citation path and snippet. |
+| `memory.read` | Read a memory Markdown file by path. Returns exact content plus citation. |
+| `memory.write_candidate` | Write a candidate into the sandbox inbox. Does not write durable memory. |
+| `memory.promote` | Promote a candidate into governed staging, with an audit event. |
+| `memory.durable_promote` | Governed durable promote. Requires explicit `dryRun: true` or `realWrite: true`. |
+| `memory.status` | Report workspace, retrieval provider, index and sync status. |
+
+## CLI reference
 
 ```text
-agent A write candidate
--> governed promote
--> agent B search/read
--> citation
--> audit event
--> cloud disabled / local only
+ihow-memory init             create a managed workspace, print the MCP config snippet
+ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor) [--dry-run]
+ihow-memory doctor           environment + setup checks [--share-diagnostics for a redacted report]
+ihow-memory status           workspace, engine, index and sync state [--json]
+ihow-memory search <query>   citation-bearing local search [--limit n]
+ihow-memory read <path>      read one memory file with citation
+ihow-memory write-candidate  propose a memory candidate (sandbox inbox)
+ihow-memory promote          promote a candidate (explicit, audited)
+ihow-memory durable-promote  durable write — requires --dry-run or --real-write
+ihow-memory reindex          rebuild the SQLite index from Markdown
+ihow-memory proof            one-command governed-loop proof in a throwaway space
+ihow-memory feedback         print a prefilled GitHub issue + redacted diagnostics
+ihow-memory reset            remove a managed demo space (requires --space)
+ihow-memory console          read-only local web UI [--port 8788]
+ihow-memory telemetry        on | off | status — anonymous counters, OFF by default
 ```
 
-### 3. Connect an AI runtime
+Defaults: root `~/.ihow-memory`; space derived from the current directory unless `--space` is given. Run `npx ihow-memory --help` for full flags.
 
-The generated snippet starts:
+## Memory layout and write boundaries
+
+A managed space is plain files:
 
 ```text
-node mcp/server.js
-```
-
-with `cwd` set to:
-
-```text
-<state-root>/<space>/.runtime
-```
-
-Available MCP tools:
-
-- `memory.search`
-- `memory.read`
-- `memory.write_candidate`
-- `memory.promote`
-- `memory.durable_promote`
-- `memory.status`
-
-### 4. Verify the result
-
-Ask runtime A to write a non-sensitive candidate. Ask runtime B to search for the marker and read the cited file. Confirm:
-
-- the search result contains a citation path and snippet;
-- the read result contains the original marker;
-- an audit event exists;
-- status reports `cloud=false` and `sync.enabled=false`.
-
-## Doctor and Diagnostics
-
-Run:
-
-```bash
-ihow-memory doctor --runtime codex
-```
-
-`doctor` checks:
-
-- Node version;
-- `node:sqlite` availability;
-- memory root writability;
-- selected runtime setup guidance;
-- retrieval engine readiness;
-- index manifest;
-- local-only cloud/sync state.
-
-For a redacted report:
-
-```bash
-ihow-memory doctor --runtime codex --share-diagnostics
-```
-
-The report omits memory content, replaces local paths with placeholders, and redacts secret-like values. It is printed locally and is not uploaded.
-
-## Feedback
-
-```bash
-ihow-memory feedback --runtime codex
-```
-
-This prints:
-
-- a prefilled GitHub issue URL;
-- a Markdown issue template;
-- a redacted doctor summary.
-
-No issue is submitted automatically.
-
-## Reset and Uninstall
-
-Remove a managed demo space:
-
-```bash
-ihow-memory reset --space demo
-```
-
-Use the same `--root <dir>` value if the demo was initialized under a custom root:
-
-```bash
-ihow-memory reset --root <state-root> --space demo
-```
-
-Safety boundary:
-
-- `reset` requires an explicit `--space`;
-- `reset` only removes managed spaces;
-- `reset` refuses `--memory-root`, so it cannot delete an existing shared memory root.
-
-Uninstall steps:
-
-1. Remove the `ihow-memory` entry from the AI runtime's MCP configuration.
-2. Restore the configuration backup if needed.
-3. Delete demo spaces with `ihow-memory reset`.
-4. Remove a global npm install with `npm uninstall -g ihow-memory`.
-5. Delete any remaining custom state root only after reviewing its contents.
-
-## Workspace Modes
-
-### Managed Space
-
-Default layout:
-
-```text
-<state-root>/<space>/
+~/.ihow-memory/<space>/
   memory/
-    candidate/inbox/
-    scopes/
-    _events/
-  history/
-  index.sqlite
+    candidate/inbox/     # agent proposals land here, never durable by themselves
+    scopes/<scope>/      # promoted, durable Markdown
+    _events/             # append-only audit log (ndjson)
+  history/               # archived candidates after durable promote
+  index.sqlite           # FTS index (rebuildable via reindex)
   index-manifest.json
 ```
 
-### Existing Memory Root
-
-Use an existing Markdown memory directory without moving it:
+You can also point iHow Memory at an existing Markdown directory without moving it:
 
 ```bash
-ihow-memory doctor \
-  --memory-root <memory-root> \
-  --state-root <state-root>
+npx ihow-memory doctor --memory-root <memory-root> --state-root <state-root>
 ```
 
-Write boundary:
+In that mode the write boundary is strict: existing durable Markdown is read-only by default; candidates go under `memory/_mcp/candidates/`, staged promotes under `memory/_mcp/promoted/`, audit events under `memory/_mcp/_events/`; SQLite state stays under `<state-root>`, outside the memory root. Durable writes into the existing tree happen only through `durable-promote`, which refuses to run without an explicit `--dry-run` (prints the full plan) or `--real-write`.
 
-- existing durable Markdown is read-only by default;
-- candidates are written under `memory/_mcp/candidates/`;
-- normal promote writes staging files under `memory/_mcp/promoted/`;
-- audit events stay under `memory/_mcp/_events/`;
-- SQLite state stays under `<state-root>`, outside the memory root.
+## Diagnostics, feedback, reset, uninstall
 
-## Retrieval Engine
+**Doctor report you can share.** `npx ihow-memory doctor --runtime <runtime> --share-diagnostics` prints a redacted report: local paths replaced with placeholders, secret-like values removed, memory content omitted. It is printed locally and never uploaded.
 
-The default `fts` provider uses only Node built-in modules and `node:sqlite` FTS5:
+**Feedback.** `npx ihow-memory feedback --runtime <runtime>` prints a prefilled GitHub issue URL, a Markdown template and a redacted doctor summary. Nothing is submitted automatically.
 
-- zero third-party runtime dependencies;
-- zero embedding downloads;
-- zero model/API requirements;
-- citation-bearing lexical search.
+**Reset.** `npx ihow-memory reset --space <name>` removes a managed space. It requires an explicit `--space`, only removes managed spaces, and refuses `--memory-root` — it cannot delete an existing shared memory root.
 
-The optional `vector-gguf` provider runs as a separate local process. If it is unconfigured, missing, slow, or unhealthy, retrieval falls back visibly to FTS. Governance, write guards, and audit behavior do not change with the retrieval provider.
+**Uninstall.**
 
-## Development Proofs
+1. Remove the `ihow-memory` entry from the runtime: `claude mcp remove ihow-memory --scope user`, `codex mcp remove ihow-memory`, or edit `~/.cursor/mcp.json` (a `*.ihow-bak-*` backup sits next to it if `connect` wrote it).
+2. Delete demo spaces with `npx ihow-memory reset --space <name>`.
+3. If installed globally: `npm uninstall -g ihow-memory`.
+4. Delete any custom state root only after reviewing its contents.
 
-From a clone of the source repository (these scripts are not part of the npm package):
+## Examples
 
-```bash
-npm run proof
-npm run dogfood
-```
-
-`dogfood` requires explicit local paths:
-
-```bash
-MEMORY_ROOT=<memory-root> \
-IHOW_MEMORY_STATE_ROOT=<state-root> \
-npm run dogfood
-```
-
-## Hosted Runtime
-
-A single-tenant HTTP runtime exists for development and controlled deployment. It is **not** part of the published npm package and is not the self-serve alpha path: no accounts, billing, hosted sync, or web console.
-
-## Package Status
-
-Alpha prerelease (`0.1.0-alpha.0`). The npm tarball ships only the local CLI, the stdio MCP server, and the read-only local console (`ihow-memory console`). The single-tenant hosted runtime, TypeScript sources, and internal proof scripts are intentionally not part of the published package.
+Runnable, self-contained walkthroughs live in [`examples/`](./examples/) (numbered 01–03). All examples use synthetic data only.
 
 ## Privacy
 
-The open-source core runs locally with no telemetry and no required network calls. Memory content is not included in diagnostics. `feedback` only prints a template; the user decides whether to submit it.
+- The open-source core runs locally: no account, no required network calls, cloud and sync are disabled and report as such in `status` and `doctor`.
+- Telemetry is **off by default** and opt-in (`ihow-memory telemetry on`). When enabled it records only a fixed allow-list — event name, runtime, package version, error type, timestamp — never memory content, file names, queries, paths or prompts. In the current alpha, events are appended to a local file (`~/.ihow-memory/telemetry-events.jsonl`) and are not uploaded anywhere.
+- Diagnostics are redacted by design; memory content is never included. `feedback` only prints a template — you decide whether to open the issue.
+
+## Hosted runtime
+
+A hosted runtime is not included in this npm package or this repository.
+
+## Status
+
+Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Validated on macOS and Linux; Windows is not yet a supported lane. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
+
+## Links
+
+- Website: [ihowmemory.com](https://ihowmemory.com)
+- Spec and conformance (open standard): [iHow1/ihow-memory-standard](https://github.com/iHow1/ihow-memory-standard)
+- Benchmark evidence manifest: [conformance/evidence/longmemeval-s-2026-05-11.md](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md)
+- npm package: [npmjs.com/package/ihow-memory](https://www.npmjs.com/package/ihow-memory)
+
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) (DCO sign-off required — [DCO.md](./DCO.md)). Security reports: [SECURITY.md](./SECURITY.md) — please do not open public issues for vulnerabilities.
 
 ## License
 
-Apache License 2.0. See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
+Apache License 2.0 — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE). The iHow / iHow Memory names and logos are trademarks; see [TRADEMARK.md](./TRADEMARK.md).

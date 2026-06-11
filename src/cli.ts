@@ -653,15 +653,15 @@ async function feedbackTemplate(
 ): Promise<{ body: string; url: string }> {
   const report = await diagnosticReport(result, options);
   const body = `## What happened
-[文案待 Commander]
+<!-- Describe what you ran and what went wrong. -->
 
 ## What I expected
-[文案待 Commander]
+<!-- Describe what you expected to happen. -->
 
 ## Steps to reproduce
 1. \`npx ihow-memory init\`
 2. \`ihow-memory doctor\`
-3. [文案待 Commander]
+3. <!-- next step -->
 
 ## Runtime
 - Runtime: ${options.runtime || 'not selected'}
@@ -762,7 +762,7 @@ async function runProof(options: WorkspaceOptions & { json?: boolean }): Promise
 async function maybeAskTelemetry(): Promise<void> {
   if (await telemetry.hasAsked()) return;
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
-    console.log('(想匿名帮我们改进? 跑 `ihow-memory telemetry on` —— 只报使用、绝不含记忆内容)');
+    console.log('(Want to help anonymously? Run `ihow-memory telemetry on` — usage only, never memory content.)');
     await telemetry.markAsked();
     return;
   }
@@ -770,14 +770,14 @@ async function maybeAskTelemetry(): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const answer = await new Promise<string>((resolve) => {
     rl.question(
-      '\n帮我们改进?(可选)\n  ✓ 只报: 何时用了 · 接哪个 agent · 版本 · 报错类型\n  ✗ 绝不报: 你的记忆 / 文件 / 项目 — 一字不传\n  随时关: ihow-memory telemetry off\n  参与匿名上报? [y/N] › ',
+      '\nHelp us improve? (optional)\n  ✓ Reports only: when used · which runtime · version · error type\n  ✗ Never reports: your memory / files / projects — nothing\n  Turn off anytime: ihow-memory telemetry off\n  Share anonymous usage? [y/N] › ',
       (a) => resolve(a),
     );
   });
   rl.close();
   const yes = /^y(es)?$/i.test(answer.trim());
   await telemetry.setEnabled(yes);
-  console.log(yes ? '✓ 已开启,谢谢!(随时 `ihow-memory telemetry off` 关闭)' : '已跳过,遥测保持关闭。');
+  console.log(yes ? '✓ Enabled, thank you! (turn off anytime: `ihow-memory telemetry off`)' : 'Skipped — telemetry stays off.');
 }
 
 async function main(): Promise<void> {
@@ -912,8 +912,8 @@ async function main(): Promise<void> {
 
   if (command === 'telemetry') {
     const sub = process.argv[3];
-    if (sub === 'on') { await telemetry.setEnabled(true); console.log('✓ 匿名遥测已开启(仅本地记录使用事件,当前版本不上传;绝不含记忆内容)。'); return; }
-    if (sub === 'off') { await telemetry.setEnabled(false); console.log('✓ 匿名遥测已关闭。'); return; }
+    if (sub === 'on') { await telemetry.setEnabled(true); console.log('✓ Anonymous telemetry enabled (records usage events locally only; not uploaded in this version; never includes memory content).'); return; }
+    if (sub === 'off') { await telemetry.setEnabled(false); console.log('✓ Anonymous telemetry disabled.'); return; }
     const st = await telemetry.status();
     if (options.json) printJson(st);
     else {
