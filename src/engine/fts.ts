@@ -74,9 +74,10 @@ function openDatabase(workspace: Workspace, opts: { initialize?: boolean } = {})
   return db;
 }
 
-// CJK 分词：unicode61 把连续汉字当一个长 token，中文子串检索全失效。
-// 在索引存入前与 query 解析前各套一次，让每个 CJK 表意字符成为独立 token。
-// 仅作用于 CJK 表意文字，ASCII/英文/数字不受影响（向后兼容）。
+// CJK segmentation: unicode61 treats a run of Han characters as a single long token,
+// which breaks substring search for CJK text. Apply this both before indexing and
+// before query parsing so each CJK ideograph becomes its own token. Only CJK
+// ideographs are affected; ASCII / Latin / digits are untouched (backward compatible).
 function cjkSegment(text: string): string {
   if (typeof text !== 'string' || !text) return text;
   return text.replace(/[㐀-鿿豈-﫿]/g, (char) => ` ${char} `);
