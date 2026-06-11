@@ -1,0 +1,61 @@
+{
+  "name": "ihow-memory",
+  "version": "0.1.0-alpha.1",
+  "type": "module",
+  "description": "Local-first shared memory for AI agents with zero-dependency FTS, citations, governance, and MCP.",
+  "keywords": [
+    "ai",
+    "agent",
+    "memory",
+    "mcp",
+    "local-first",
+    "sqlite",
+    "fts",
+    "codex",
+    "claude-code",
+    "cursor"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iHow1/ihow-memory-core.git"
+  },
+  "homepage": "https://github.com/iHow1/ihow-memory-core#readme",
+  "bugs": {
+    "url": "https://github.com/iHow1/ihow-memory-core/issues"
+  },
+  "files": [
+    "bin/",
+    "dist/cli.js",
+    "dist/core.js",
+    "dist/types.js",
+    "dist/workspace.js",
+    "dist/governance.js",
+    "dist/telemetry.js",
+    "dist/engine/",
+    "dist/store/",
+    "dist/mcp/",
+    "dist/http/console.js",
+    "LICENSE",
+    "NOTICE",
+    "TRADEMARK.md",
+    "README.md"
+  ],
+  "bin": {
+    "ihow-memory": "bin/ihow-memory.mjs",
+    "ihow-memory-mcp": "dist/mcp/server.js"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "node scripts/build-dist.mjs",
+    "precli": "npm run build",
+    "cli": "node bin/ihow-memory.mjs",
+    "mcp": "node --experimental-strip-types src/mcp/server.ts",
+    "preactivation-proof": "npm run build",
+    "activation-proof": "node scripts/activation-proof.mjs",
+    "proof": "node scripts/proof.mjs",
+    "prepack": "npm run build"
+  },
+  "license": "Apache-2.0"
+}
