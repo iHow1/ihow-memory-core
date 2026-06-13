@@ -17,6 +17,10 @@ with pre-release tags.
   over MCP, 03 two agents sharing one memory), synthetic data only.
 - Repository infrastructure: CONTRIBUTING, SECURITY, CODE_OF_CONDUCT,
   issue/PR templates, CI workflow (build, tests, pack check, secret scan).
+- `connect --runtime workbuddy`: one-command MCP setup for Tencent WorkBuddy
+  (safe backup + merge write to `~/.workbuddy/mcp.json`, stdio entry with an
+  absolute node path; never touches WorkBuddy's runtime/connector/approval files).
+  Connect guide: `examples/connect-workbuddy.md`.
 
 ### Changed
 

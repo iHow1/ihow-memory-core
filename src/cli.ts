@@ -32,7 +32,7 @@ type ParsedArgs = {
     dryRun?: boolean;
     realWrite?: boolean;
     actor?: string;
-    runtime?: 'claude-code' | 'codex' | 'cursor';
+    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy';
     shareDiagnostics?: boolean;
   };
   rest: string[];
@@ -70,8 +70,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--vector-timeout-ms') options.vectorTimeoutMs = Number(tail[++index]);
     else if (arg === '--runtime') {
       const runtime = tail[++index];
-      if (runtime === 'claude-code' || runtime === 'codex' || runtime === 'cursor') options.runtime = runtime;
-      else throw new Error('unsupported_runtime_use_claude-code_codex_or_cursor');
+      if (runtime === 'claude-code' || runtime === 'codex' || runtime === 'cursor' || runtime === 'workbuddy') options.runtime = runtime;
+      else throw new Error('unsupported_runtime_use_claude-code_codex_cursor_or_workbuddy');
     }
     else if (arg === '--share-diagnostics') options.shareDiagnostics = true;
     else if (arg === '--json') options.json = true;
@@ -123,6 +123,7 @@ function runtimeLabel(runtime?: string): string {
   if (runtime === 'claude-code') return 'Claude Code';
   if (runtime === 'codex') return 'Codex';
   if (runtime === 'cursor') return 'Cursor';
+  if (runtime === 'workbuddy') return 'WorkBuddy';
   return 'generic MCP client';
 }
 
@@ -157,6 +158,7 @@ function initBackupGuidance(runtime?: string): string {
   if (runtime === 'codex') return 'Before editing Codex config, copy the existing config file or commit it first.';
   if (runtime === 'claude-code') return 'Before editing Claude Code MCP settings, make a copy of the current settings file.';
   if (runtime === 'cursor') return 'Before editing Cursor MCP settings, copy the current MCP/settings JSON.';
+  if (runtime === 'workbuddy') return 'Before connect writes ~/.workbuddy/mcp.json, it backs the file up; you can also copy it yourself first.';
   return 'Before writing this snippet into any runtime config, back up the existing config file.';
 }
 
@@ -313,6 +315,14 @@ async function connectRuntime(
   if (runtime === 'cursor') {
     return writeJsonMcpConfig(path.join(home, '.cursor', 'mcp.json'), runtime, spec, options); // no official CLI
   }
+  if (runtime === 'workbuddy') {
+    // WorkBuddy (Tencent) stores user MCP servers in a local JSON file (global: ~/.workbuddy/mcp.json),
+    // same mcpServers/stdio model as Cursor. Use an absolute node path (process.execPath): WorkBuddy's
+    // GUI launch context may not have a complete PATH. Do NOT touch ~/.workbuddy/.mcp.json (runtime
+    // proxy, auto-regenerated), connectors/**/mcp.json (connector marketplace), or mcp-approvals.json.
+    const workbuddySpec = { command: process.execPath, args: spec.args };
+    return writeJsonMcpConfig(path.join(home, '.workbuddy', 'mcp.json'), runtime, workbuddySpec, options);
+  }
   throw new Error(`connect_unsupported_runtime: ${runtime}`);
 }
 
@@ -320,9 +330,9 @@ function help(): void {
   console.log(`iHow Memory Core v${packageVersion()}
 
 Usage:
-  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor]
+  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
-  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor] [--share-diagnostics] [--json]
+  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy] [--share-diagnostics] [--json]
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
   ihow-memory search <query> [--limit n]
@@ -330,10 +340,10 @@ Usage:
   ihow-memory write-candidate <text> [--space name]
   ihow-memory promote <candidate-path> [--scope name] [--title title]
   ihow-memory durable-promote <candidate-path> (--dry-run | --real-write) [--scope name] [--title title] [--path path]
-  ihow-memory feedback [--runtime claude-code|codex|cursor]
+  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
-  ihow-memory connect --runtime claude-code|codex|cursor [--dry-run] [--json]   # auto-config MCP (official CLI for claude/codex; safe backup+merge for cursor)
+  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy [--dry-run] [--json]   # auto-config MCP (official CLI for claude/codex; safe backup+merge for cursor/workbuddy)
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
 
 Defaults:
@@ -463,7 +473,7 @@ function nodeVersionAtLeast(actual: string, expected: string): boolean {
 }
 
 async function doctor(
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' },
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' },
 ): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
   const workspace = resolveWorkspace(options);
@@ -601,7 +611,7 @@ async function packageInfo(): Promise<{ name: string; version: string }> {
 
 async function diagnosticReport(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' } = {},
 ): Promise<Record<string, unknown>> {
   const sanitized = sanitizeDoctorResult(result, options);
   const info = await packageInfo();
@@ -649,7 +659,7 @@ function githubIssueUrl(body: string): string {
 
 async function feedbackTemplate(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' } = {},
 ): Promise<{ body: string; url: string }> {
   const report = await diagnosticReport(result, options);
   const body = `## What happened
@@ -826,7 +836,7 @@ async function main(): Promise<void> {
 
   if (command === 'connect') {
     if (!options.runtime) {
-      console.error('connect requires --runtime claude-code|codex|cursor');
+      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy');
       process.exitCode = 1;
       return;
     }

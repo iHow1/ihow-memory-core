@@ -2,9 +2,9 @@
 
 WorkBuddy (Tencent CodeBuddy's desktop AI agent) speaks the Model Context Protocol, so it can use iHow Memory as a governed, local, cross-tool memory layer — the same memory your Claude Code / Codex / Cursor sessions write to.
 
-> Status: WorkBuddy is not yet a one-command `connect` target. This is the manual path using iHow Memory's generic MCP snippet. It works today.
->
-> One open item being confirmed: whether WorkBuddy accepts **stdio** MCP servers (a local `node` command, which is what iHow Memory ships) or only **remote URL** MCP servers. If your WorkBuddy only accepts a URL, see "If WorkBuddy needs a URL" at the bottom.
+> One-command `connect` supports WorkBuddy. WorkBuddy stores user MCP servers in a local
+> JSON file (`~/.workbuddy/mcp.json`) and accepts stdio servers, so `connect` writes there
+> directly — with a backup, preserving your existing servers.
 
 ## Prerequisites
 
@@ -12,46 +12,28 @@ WorkBuddy (Tencent CodeBuddy's desktop AI agent) speaks the Model Context Protoc
 - WorkBuddy installed
 - A writable local directory
 
-## 1. Provision a memory workspace and get the MCP snippet
+## 1. One command
 
 ```bash
-npx ihow-memory init --space workbuddy
+npx ihow-memory connect --runtime workbuddy
 ```
 
-`init` prints a **generic MCP client** config snippet. It looks like this (your paths will be under `~/.ihow-memory/workbuddy/`):
+This:
 
-```json
-{
-  "mcpServers": {
-    "ihow-memory": {
-      "command": "node",
-      "args": [
-        "mcp/server.js",
-        "--memory-root", "<home>/.ihow-memory/workbuddy/memory",
-        "--state-root", "<home>/.ihow-memory"
-      ],
-      "cwd": "<home>/.ihow-memory/workbuddy/.runtime"
-    }
-  }
-}
+- provisions a managed memory workspace under `~/.ihow-memory/`,
+- upserts an `ihow-memory` entry into `~/.workbuddy/mcp.json` (stdio, absolute `node` path),
+- **backs up** the existing file first and **preserves** every other MCP server you already have,
+- never touches WorkBuddy's runtime proxy (`~/.workbuddy/.mcp.json`), connector files, or approvals.
+
+Preview without writing:
+
+```bash
+npx ihow-memory connect --runtime workbuddy --dry-run
 ```
 
-Copy the exact values that **your** `init` printed — don't hand-type the paths.
+Then **restart WorkBuddy** so it loads the new server. If WorkBuddy asks you to approve the MCP server on first use, approve it in its UI (that's WorkBuddy's own security step).
 
-## 2. Add it as a custom MCP server in WorkBuddy
-
-In WorkBuddy, open the agent's **technical/MCP settings** (where you add 技能 / 专家 / MCP), choose **add a custom MCP server**, and fill in the fields from the snippet:
-
-- **Name:** `ihow-memory`
-- **Command:** `node`
-- **Args:** `mcp/server.js`, `--memory-root`, `<your memory path>`, `--state-root`, `<your state path>`
-- **Working directory (cwd):** `<your .runtime path>`
-
-Then **save / publish** (WorkBuddy merges connectors into the agent's manifest on publish).
-
-> Exact menu labels follow your installed WorkBuddy version. If WorkBuddy expects a single JSON blob instead of separate fields, paste the whole `mcpServers` object above.
-
-## 3. Verify
+## 2. Verify
 
 In WorkBuddy, ask the agent something that exercises memory, e.g.:
 
@@ -60,8 +42,10 @@ In WorkBuddy, ask the agent something that exercises memory, e.g.:
 The agent should call `memory.write_candidate` then `memory.search`. You can also confirm from your shell:
 
 ```bash
-npx ihow-memory console --space workbuddy   # read-only local UI: status, search, audit
+npx ihow-memory console --space <your-space>   # read-only local UI: status, search, audit
 ```
+
+(`connect` derives the space from the current directory unless you pass `--space`.)
 
 ## MCP tools WorkBuddy will see
 
@@ -69,12 +53,30 @@ npx ihow-memory console --space workbuddy   # read-only local UI: status, search
 
 Writes are governed: the agent only **proposes** (`write_candidate`); promotion to durable memory is an explicit, audited step. Nothing is remembered without your say-so.
 
-## If WorkBuddy needs a URL (remote MCP only)
+## Manual alternative
 
-If your WorkBuddy only accepts a remote MCP endpoint (a URL) and not a local `node` command, iHow Memory's stdio server can't be added directly. Track this guide for an HTTP/SSE bridge, or use a WorkBuddy build that supports local (stdio) MCP servers. (We're confirming WorkBuddy's stdio support; this section will be updated.)
+If you prefer to edit config by hand, `npx ihow-memory init` prints a generic MCP snippet. Add it to `~/.workbuddy/mcp.json` (global) or `<project>/.workbuddy/mcp.json` (per project) under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "ihow-memory": {
+      "type": "stdio",
+      "command": "<absolute-path-to-node>",
+      "args": [
+        "<home>/.ihow-memory/<space>/.runtime/mcp/server.js",
+        "--memory-root", "<home>/.ihow-memory/<space>/memory",
+        "--state-root", "<home>/.ihow-memory"
+      ]
+    }
+  }
+}
+```
+
+Use an **absolute** `node` path — WorkBuddy's GUI launch context may not have a complete `PATH`.
 
 ## Notes
 
 - Local-first: no account, no API key, no required network calls; cloud and sync are disabled.
-- Same `--space` across tools = shared memory. Point Claude Code / Codex / Cursor / WorkBuddy at `--space workbuddy` (or any shared name) and they read each other's promoted memory.
-- Windows: use WSL until native Windows `connect` lands.
+- Same `--space` across tools = shared memory. Point Claude Code / Codex / Cursor / WorkBuddy at the same space and they read each other's promoted memory.
+- Windows: use WSL until native Windows lands.
