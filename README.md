@@ -159,6 +159,16 @@ In that mode the write boundary is strict: existing durable Markdown is read-onl
 3. If installed globally: `npm uninstall -g ihow-memory`.
 4. Delete any custom state root only after reviewing its contents.
 
+## Proactive memory (Claude Code skill)
+
+The MCP tools are available to any client, but agents only use memory if they decide to. To make
+Claude Code recall and record memory *proactively* — search at the start of a task, propose a
+candidate after a decision or handoff — install the bundled skill at
+[`skills/ihow-memory/SKILL.md`](./skills/ihow-memory/SKILL.md) (copy it into
+`~/.claude/skills/ihow-memory/`). The skill is a thin policy layer over the same MCP tools; it
+doesn't change the mechanism, just when to use it. Other runtimes get the same nudge from the
+tool descriptions themselves.
+
 ## Examples
 
 Runnable, self-contained walkthroughs live in [`examples/`](./examples/) (numbered 01–03). All examples use synthetic data only.

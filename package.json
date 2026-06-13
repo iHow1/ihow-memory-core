@@ -38,7 +38,8 @@
     "LICENSE",
     "NOTICE",
     "TRADEMARK.md",
-    "README.md"
+    "README.md",
+    "skills/"
   ],
   "bin": {
     "ihow-memory": "bin/ihow-memory.mjs",

@@ -944,6 +944,9 @@ async function main(): Promise<void> {
         if (result.backup) console.log(`backup: ${result.backup}`);
         if (result.replaced) console.log('(replaced an existing ihow-memory entry)');
         console.log(`Restart ${runtimeLabel(options.runtime)} to load the memory tools.`);
+        if (options.runtime === 'claude-code') {
+          console.log('Tip: for proactive recall/recording, install the memory skill — see skills/ihow-memory/SKILL.md (copy into ~/.claude/skills/ihow-memory/).');
+        }
       }
     }
     if (!result.dryRun) {
