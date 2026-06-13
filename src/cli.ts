@@ -344,7 +344,11 @@ async function connectRuntime(
       ? path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json')
       : path.join(home, '.config', 'Claude', 'claude_desktop_config.json');
     const desktopSpec = { command: process.execPath, args: spec.args };
-    return writeJsonMcpConfig(cfgPath, runtime, desktopSpec, options);
+    // Claude Desktop's mcpServers entry schema is { command, args?, env?, extensionId? } with no
+    // `type` field — omit it so a strict validator doesn't skip the entry.
+    return writeJsonMcpConfig(cfgPath, runtime, desktopSpec, options, {
+      buildEntry: (s) => ({ command: s.command, args: s.args }),
+    });
   }
   if (runtime === 'opencode') {
     // OpenCode (sst/opencode) uses a different shape: top-level `mcp` (not mcpServers), and a

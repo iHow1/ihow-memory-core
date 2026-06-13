@@ -45,8 +45,11 @@ test('claude-desktop connect adds mcpServers/stdio, preserves existing keys, bac
   const out = JSON.parse(fs.readFileSync(cfg, 'utf8'));
   assert.ok(out.preferences, 'unrelated top-level key preserved');
   assert.ok(out.mcpServers.existing, 'existing server preserved');
-  assert.equal(out.mcpServers['ihow-memory'].type, 'stdio');
-  assert.ok(path.isAbsolute(out.mcpServers['ihow-memory'].command), 'absolute node path (GUI app, no shell PATH)');
+  const e = out.mcpServers['ihow-memory'];
+  // Claude Desktop schema is { command, args?, env? } — no `type` field.
+  assert.equal(e.type, undefined, 'no type field (matches Claude Desktop schema)');
+  assert.ok(path.isAbsolute(e.command), 'absolute node path (GUI app, no shell PATH)');
+  assert.ok(Array.isArray(e.args) && e.args.some((a) => a.includes('mcp/server.js')), 'command string + args array with server entry');
   assert.ok(fs.readdirSync(path.dirname(cfg)).some((f) => f.includes('.ihow-bak-')), 'backed up');
 });
 
@@ -55,7 +58,8 @@ test('claude-desktop connect creates config when none exists', (t) => {
   init(home);
   connect(home, 'claude-desktop');
   const out = JSON.parse(fs.readFileSync(claudeDesktopPath(home), 'utf8'));
-  assert.equal(out.mcpServers['ihow-memory'].type, 'stdio');
+  assert.ok(path.isAbsolute(out.mcpServers['ihow-memory'].command), 'created with absolute node command');
+  assert.equal(out.mcpServers['ihow-memory'].type, undefined, 'no type field');
 });
 
 test('opencode connect uses the mcp container with a local array-command entry', (t) => {
