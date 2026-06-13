@@ -16,14 +16,14 @@ iHow Memory gives your AI agents one durable memory on your own machine. Memory 
 
 1. **Local-first.** Runs entirely on your machine: no account, no telemetry by default, no required network calls. Your memory is human-readable Markdown you can edit, diff and roll back.
 2. **Governed writes.** Agents only propose candidates. Promotion to durable memory is an explicit, audited step, and reads come back with citations — no agent silently rewrites shared memory.
-3. **One memory, many runtimes.** Claude Code, Codex, Cursor and Tencent WorkBuddy connect to the same local memory, one command each. Any MCP client can use the generic snippet from `init`.
+3. **One memory, many runtimes.** Claude Code, Codex, Cursor, Tencent WorkBuddy, Claude Desktop and OpenCode connect to the same local memory, one command each. Any MCP client can use the generic snippet from `init`.
 
 ## Quickstart
 
 ### 1. Connect a runtime
 
 ```bash
-npx ihow-memory connect --runtime claude-code   # or: codex | cursor | workbuddy
+npx ihow-memory connect --runtime claude-code   # or: codex | cursor | workbuddy | claude-desktop | opencode
 ```
 
 `connect` provisions a managed workspace under `~/.ihow-memory` (space name derived from the current directory unless you pass `--space`) and registers the `ihow-memory` MCP server with the selected runtime:
@@ -103,7 +103,7 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 
 ```text
 ihow-memory init             create a managed workspace, print the MCP config snippet
-ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy) [--dry-run]
+ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode) [--dry-run]
 ihow-memory doctor           environment + setup checks [--share-diagnostics for a redacted report]
 ihow-memory status           workspace, engine, index and sync state [--json]
 ihow-memory search <query>   citation-bearing local search [--limit n]

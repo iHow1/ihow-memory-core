@@ -21,6 +21,13 @@ with pre-release tags.
   (safe backup + merge write to `~/.workbuddy/mcp.json`, stdio entry with an
   absolute node path; never touches WorkBuddy's runtime/connector/approval files).
   Connect guide: `examples/connect-workbuddy.md`.
+- `connect --runtime claude-desktop`: one-command MCP setup for Claude Desktop
+  (standard `mcpServers` JSON at the OS config path, absolute node path for the GUI app).
+- `connect --runtime opencode`: one-command MCP setup for OpenCode
+  (`~/.config/opencode/opencode.json`, OpenCode's `mcp` container with a
+  `{ type: "local", command: [...], enabled: true }` entry).
+- All connect writers verified against real installs (WorkBuddy 5.0.3, Claude Desktop,
+  OpenCode) and covered by regression tests under `tests/`.
 
 ### Changed
 

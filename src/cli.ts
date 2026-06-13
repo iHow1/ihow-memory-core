@@ -32,7 +32,7 @@ type ParsedArgs = {
     dryRun?: boolean;
     realWrite?: boolean;
     actor?: string;
-    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy';
+    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode';
     shareDiagnostics?: boolean;
   };
   rest: string[];
@@ -70,8 +70,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--vector-timeout-ms') options.vectorTimeoutMs = Number(tail[++index]);
     else if (arg === '--runtime') {
       const runtime = tail[++index];
-      if (runtime === 'claude-code' || runtime === 'codex' || runtime === 'cursor' || runtime === 'workbuddy') options.runtime = runtime;
-      else throw new Error('unsupported_runtime_use_claude-code_codex_cursor_or_workbuddy');
+      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode'].includes(runtime)) options.runtime = runtime;
+      else throw new Error('unsupported_runtime_use_claude-code_codex_cursor_workbuddy_claude-desktop_or_opencode');
     }
     else if (arg === '--share-diagnostics') options.shareDiagnostics = true;
     else if (arg === '--json') options.json = true;
@@ -124,6 +124,8 @@ function runtimeLabel(runtime?: string): string {
   if (runtime === 'codex') return 'Codex';
   if (runtime === 'cursor') return 'Cursor';
   if (runtime === 'workbuddy') return 'WorkBuddy';
+  if (runtime === 'claude-desktop') return 'Claude Desktop';
+  if (runtime === 'opencode') return 'OpenCode';
   return 'generic MCP client';
 }
 
@@ -159,6 +161,8 @@ function initBackupGuidance(runtime?: string): string {
   if (runtime === 'claude-code') return 'Before editing Claude Code MCP settings, make a copy of the current settings file.';
   if (runtime === 'cursor') return 'Before editing Cursor MCP settings, copy the current MCP/settings JSON.';
   if (runtime === 'workbuddy') return 'Before connect writes ~/.workbuddy/mcp.json, it backs the file up; you can also copy it yourself first.';
+  if (runtime === 'claude-desktop') return 'Before editing Claude Desktop config, copy claude_desktop_config.json; connect also backs it up.';
+  if (runtime === 'opencode') return 'Before editing OpenCode config, copy ~/.config/opencode/opencode.json; connect also backs it up.';
   return 'Before writing this snippet into any runtime config, back up the existing config file.';
 }
 
@@ -202,7 +206,16 @@ async function writeJsonMcpConfig(
   runtime: string,
   spec: { command: string; args: string[] },
   options: { dryRun?: boolean },
+  // Per-runtime config shape. Defaults to the standard `mcpServers` + stdio entry used by
+  // claude/cursor/workbuddy/claude-desktop. OpenCode uses a different shape (`mcp` container,
+  // array-form command, `type: "local"`, `enabled`), so it overrides these.
+  shape: {
+    containerKey?: string;
+    buildEntry?: (s: { command: string; args: string[] }) => Record<string, unknown>;
+  } = {},
 ): Promise<Record<string, unknown>> {
+  const containerKey = shape.containerKey || 'mcpServers';
+  const buildEntry = shape.buildEntry || ((s) => ({ type: 'stdio', command: s.command, args: s.args }));
   let config: Record<string, unknown> = {};
   let existed = false;
   let raw: string | null = null;
@@ -233,11 +246,11 @@ async function writeJsonMcpConfig(
     backup = `${targetPath}.ihow-bak-${Date.now()}`;
     await fs.copyFile(targetPath, backup);
   }
-  const servers = (config.mcpServers && typeof config.mcpServers === 'object')
-    ? (config.mcpServers as Record<string, unknown>)
+  const servers = (config[containerKey] && typeof config[containerKey] === 'object')
+    ? (config[containerKey] as Record<string, unknown>)
     : {};
-  servers['ihow-memory'] = { type: 'stdio', command: spec.command, args: spec.args };
-  config.mcpServers = servers;
+  servers['ihow-memory'] = buildEntry(spec);
+  config[containerKey] = servers;
   if (!options.dryRun) {
     await fs.mkdir(path.dirname(targetPath), { recursive: true });
     // atomic write: temp then rename (same-dir rename is atomic)
@@ -323,6 +336,26 @@ async function connectRuntime(
     const workbuddySpec = { command: process.execPath, args: spec.args };
     return writeJsonMcpConfig(path.join(home, '.workbuddy', 'mcp.json'), runtime, workbuddySpec, options);
   }
+  if (runtime === 'claude-desktop') {
+    // Claude Desktop (Anthropic Electron app): standard mcpServers JSON. macOS keeps it under
+    // ~/Library/Application Support/Claude/, Linux under ~/.config/Claude/. Absolute node path
+    // because the GUI app does not inherit the shell PATH.
+    const cfgPath = process.platform === 'darwin'
+      ? path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json')
+      : path.join(home, '.config', 'Claude', 'claude_desktop_config.json');
+    const desktopSpec = { command: process.execPath, args: spec.args };
+    return writeJsonMcpConfig(cfgPath, runtime, desktopSpec, options);
+  }
+  if (runtime === 'opencode') {
+    // OpenCode (sst/opencode) uses a different shape: top-level `mcp` (not mcpServers), and a
+    // local entry of { type: "local", command: [<cmd>, ...args], enabled: true } (command is the
+    // full argv array). Config lives at ~/.config/opencode/opencode.json.
+    const openCodeSpec = { command: process.execPath, args: spec.args };
+    return writeJsonMcpConfig(path.join(home, '.config', 'opencode', 'opencode.json'), runtime, openCodeSpec, options, {
+      containerKey: 'mcp',
+      buildEntry: (s) => ({ type: 'local', command: [s.command, ...s.args], enabled: true }),
+    });
+  }
   throw new Error(`connect_unsupported_runtime: ${runtime}`);
 }
 
@@ -330,9 +363,9 @@ function help(): void {
   console.log(`iHow Memory Core v${packageVersion()}
 
 Usage:
-  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy]
+  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
-  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy] [--share-diagnostics] [--json]
+  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode] [--share-diagnostics] [--json]
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
   ihow-memory search <query> [--limit n]
@@ -340,10 +373,10 @@ Usage:
   ihow-memory write-candidate <text> [--space name]
   ihow-memory promote <candidate-path> [--scope name] [--title title]
   ihow-memory durable-promote <candidate-path> (--dry-run | --real-write) [--scope name] [--title title] [--path path]
-  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy]
+  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
-  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy [--dry-run] [--json]   # auto-config MCP (official CLI for claude/codex; safe backup+merge for cursor/workbuddy)
+  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode [--dry-run] [--json]   # auto-config MCP (official CLI for claude/codex; safe backup+merge for cursor/workbuddy/claude-desktop/opencode)
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
 
 Defaults:
@@ -473,7 +506,7 @@ function nodeVersionAtLeast(actual: string, expected: string): boolean {
 }
 
 async function doctor(
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' },
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' },
 ): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
   const workspace = resolveWorkspace(options);
@@ -611,7 +644,7 @@ async function packageInfo(): Promise<{ name: string; version: string }> {
 
 async function diagnosticReport(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' } = {},
 ): Promise<Record<string, unknown>> {
   const sanitized = sanitizeDoctorResult(result, options);
   const info = await packageInfo();
@@ -659,7 +692,7 @@ function githubIssueUrl(body: string): string {
 
 async function feedbackTemplate(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' } = {},
 ): Promise<{ body: string; url: string }> {
   const report = await diagnosticReport(result, options);
   const body = `## What happened
@@ -836,7 +869,7 @@ async function main(): Promise<void> {
 
   if (command === 'connect') {
     if (!options.runtime) {
-      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy');
+      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode');
       process.exitCode = 1;
       return;
     }
