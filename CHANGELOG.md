@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
+## [0.1.0-alpha.3] — 2026-06-13
+
+### Added
+
+- `connect` now covers seven runtimes one-command — claude-code, codex, cursor,
+  Tencent WorkBuddy, Claude Desktop, OpenCode, and Hermes (NousResearch). Each writer
+  was verified against a real install:
+  - WorkBuddy 5.0.3 — `~/.workbuddy/mcp.json` (stdio, absolute node); never touches its
+    runtime/connector/approval files.
+  - Claude Desktop — OS config path; entry omits `type` to match its schema.
+  - OpenCode — `~/.config/opencode/opencode.json`, the `mcp` container with a
+    `{ type: "local", command: [...], enabled: true }` entry.
+  - Hermes — via the official `hermes mcp add` CLI; roots passed through `--env`.
+  - Any other MCP client works via the generic snippet from `init`.
+- MCP tool descriptions now carry "when to use" guidance (search before answering /
+  continuing; write_candidate after decisions, results, blockers, handoffs; no secrets;
+  durable_promote defaults to dry-run) so agents use memory proactively across any client.
+- Claude Code memory skill at `skills/ihow-memory/SKILL.md` — a thin policy layer (search
+  at task start, propose candidates after decisions/handoffs, governed promote).
+  `connect --runtime claude-code` points to it; no auto-install.
+- Flagship walkthrough `examples/connect-workbuddy.md` and `examples/flagship-cross-tool-handoff.md`.
+- Regression tests for every connect writer under `tests/`.
+
+### Changed
+
+- Windows: native support is **experimental**. Claude Code and Claude Desktop connect use
+  cross-platform direct-write paths (`~/.claude.json`, `%APPDATA%\Claude`); CLI-based
+  codex/hermes connect print manual-setup guidance on Windows. WSL is the supported path.
+
 ## [0.1.0-alpha.2] — 2026-06-11
 
 ### Added
@@ -17,26 +46,6 @@ with pre-release tags.
   over MCP, 03 two agents sharing one memory), synthetic data only.
 - Repository infrastructure: CONTRIBUTING, SECURITY, CODE_OF_CONDUCT,
   issue/PR templates, CI workflow (build, tests, pack check, secret scan).
-- `connect --runtime workbuddy`: one-command MCP setup for Tencent WorkBuddy
-  (safe backup + merge write to `~/.workbuddy/mcp.json`, stdio entry with an
-  absolute node path; never touches WorkBuddy's runtime/connector/approval files).
-  Connect guide: `examples/connect-workbuddy.md`.
-- `connect --runtime claude-desktop`: one-command MCP setup for Claude Desktop
-  (standard `mcpServers` JSON at the OS config path, absolute node path for the GUI app).
-- `connect --runtime opencode`: one-command MCP setup for OpenCode
-  (`~/.config/opencode/opencode.json`, OpenCode's `mcp` container with a
-  `{ type: "local", command: [...], enabled: true }` entry).
-- All connect writers verified against real installs (WorkBuddy 5.0.3, Claude Desktop,
-  OpenCode) and covered by regression tests under `tests/`.
-- `connect --runtime hermes`: one-command MCP setup for Hermes (NousResearch) via its
-  official CLI (`hermes mcp add`); roots passed through `--env` to avoid the CLI's
-  argument collision. macOS/Linux.
-- MCP tool descriptions now include "when to use" guidance (search before answering /
-  continuing; write_candidate after decisions, results, blockers, handoffs; no secrets;
-  durable_promote defaults to dry-run) so agents use memory proactively across any client.
-- Windows: native support is **experimental**. Claude Code and Claude Desktop connect
-  use cross-platform direct-write paths (`~/.claude.json`, `%APPDATA%\Claude`); CLI-based
-  codex/hermes connect print manual-setup guidance on Windows. WSL is the supported path.
 
 ### Changed
 
