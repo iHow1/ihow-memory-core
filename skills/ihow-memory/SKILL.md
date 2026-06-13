@@ -37,6 +37,11 @@ Call `memory.write_candidate` when something durable happens:
 Keep each candidate concise and self-contained: one durable fact or decision, with enough
 context to act on it cold. Prefer a few high-value candidates over many noisy ones.
 
+**Link related memory.** Before writing a candidate that refines, extends, or relates to an
+existing decision, `memory.search` for it; if one exists, reference its path in your candidate
+text (e.g. "extends memory/scopes/team/…-api-timeout-policy.md"). This keeps related decisions
+connected instead of drifting into duplicates a future reader can't reconcile.
+
 ## What NOT to write
 
 - **Never** secrets, tokens, API keys, passwords, or credentials.
