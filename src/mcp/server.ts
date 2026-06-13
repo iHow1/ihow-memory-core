@@ -71,7 +71,7 @@ function error(id: JsonRpcRequest['id'], code: number, message: string): void {
 const TOOL_DEFINITIONS = [
   {
     name: 'memory.search',
-    description: 'Search local iHow Memory with FTS. Returns citation path and snippet.',
+    description: 'Search local iHow Memory with FTS; returns citation path and snippet. Use this before answering questions about prior work, decisions, user preferences, TODOs, or when continuing/resuming a project — recall before you re-derive or re-ask.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -83,7 +83,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory.read',
-    description: 'Read a memory markdown file by path and return exact content plus citation.',
+    description: 'Read a memory markdown file by path; returns exact content plus citation. Use to open the full source behind a search snippet before relying on it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -94,7 +94,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory.write_candidate',
-    description: 'Write a memory candidate into the sandbox inbox. Does not write durable memory.',
+    description: 'Propose a memory candidate into the sandbox inbox (does NOT write durable memory). Use after a meaningful decision, a verified result, a blocker, a stated user preference, or a handoff summary, so the next session/agent can recall it. Never store secrets, tokens, or credentials.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -108,7 +108,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory.promote',
-    description: 'Promote a candidate into governed staging with an audit event. Existing workspace mode uses memory/_mcp/promoted only.',
+    description: 'Promote a candidate into governed, durable memory with an audit event. Use after confirming the candidate is correct, non-sensitive, and worth keeping. Existing workspace mode uses memory/_mcp/promoted only.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -120,7 +120,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory.durable_promote',
-    description: 'Run a governed durable promote. Requires explicit dryRun=true or realWrite=true.',
+    description: 'Governed durable promote into the long-term layer. Requires explicit dryRun=true or realWrite=true — default to dryRun=true to preview the plan, and only set realWrite=true on explicit user confirmation.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -135,7 +135,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory.status',
-    description: 'Return workspace, local FTS provider, index, and sync status.',
+    description: 'Return workspace, local FTS provider, index, and sync status. Use to confirm the index is ready and that cloud/sync are disabled (local-only) before relying on recall.',
     inputSchema: {
       type: 'object',
       properties: {},

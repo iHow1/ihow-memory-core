@@ -28,6 +28,15 @@ with pre-release tags.
   `{ type: "local", command: [...], enabled: true }` entry).
 - All connect writers verified against real installs (WorkBuddy 5.0.3, Claude Desktop,
   OpenCode) and covered by regression tests under `tests/`.
+- `connect --runtime hermes`: one-command MCP setup for Hermes (NousResearch) via its
+  official CLI (`hermes mcp add`); roots passed through `--env` to avoid the CLI's
+  argument collision. macOS/Linux.
+- MCP tool descriptions now include "when to use" guidance (search before answering /
+  continuing; write_candidate after decisions, results, blockers, handoffs; no secrets;
+  durable_promote defaults to dry-run) so agents use memory proactively across any client.
+- Windows: native support is **experimental**. Claude Code and Claude Desktop connect
+  use cross-platform direct-write paths (`~/.claude.json`, `%APPDATA%\Claude`); CLI-based
+  codex/hermes connect print manual-setup guidance on Windows. WSL is the supported path.
 
 ### Changed
 

@@ -32,7 +32,7 @@ type ParsedArgs = {
     dryRun?: boolean;
     realWrite?: boolean;
     actor?: string;
-    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode';
+    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes';
     shareDiagnostics?: boolean;
   };
   rest: string[];
@@ -70,8 +70,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--vector-timeout-ms') options.vectorTimeoutMs = Number(tail[++index]);
     else if (arg === '--runtime') {
       const runtime = tail[++index];
-      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode'].includes(runtime)) options.runtime = runtime;
-      else throw new Error('unsupported_runtime_use_claude-code_codex_cursor_workbuddy_claude-desktop_or_opencode');
+      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes'].includes(runtime)) options.runtime = runtime;
+      else throw new Error('unsupported_runtime: use claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|hermes');
     }
     else if (arg === '--share-diagnostics') options.shareDiagnostics = true;
     else if (arg === '--json') options.json = true;
@@ -126,6 +126,7 @@ function runtimeLabel(runtime?: string): string {
   if (runtime === 'workbuddy') return 'WorkBuddy';
   if (runtime === 'claude-desktop') return 'Claude Desktop';
   if (runtime === 'opencode') return 'OpenCode';
+  if (runtime === 'hermes') return 'Hermes';
   return 'generic MCP client';
 }
 
@@ -310,6 +311,39 @@ function connectViaCodexCli(
   };
 }
 
+// hermes uses its official CLI (hermes mcp add); config is YAML (~/.hermes/config.yaml), so the CLI
+// is the safe path (no YAML writer needed). `hermes mcp add --args` is argparse nargs="*", which would
+// collide with our --memory-root/--state-root flags, so pass the roots via --env (the server reads
+// MEMORY_ROOT / IHOW_MEMORY_STATE_ROOT) and let --args carry only the server entry path. No `mcp get`;
+// use `mcp list` to check, remove-then-add for idempotency. timeout guards against any interactive hang.
+function connectViaHermesCli(
+  workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
+  spec: { command: string; args: string[] },
+  options: { dryRun?: boolean },
+): Record<string, unknown> {
+  if (!commandExists('hermes')) {
+    throw new Error('hermes_cli_not_found: install the Hermes Agent CLI to connect hermes (or run init for a manual ~/.hermes/config.yaml entry).');
+  }
+  const SP = { encoding: 'utf8' as const, timeout: 20000 };
+  const exists = /\bihow-memory\b/.test(spawnSync('hermes', ['mcp', 'list'], SP).stdout || '');
+  if (options.dryRun) {
+    return { ok: true, runtime: 'hermes', method: 'official-cli:hermes', alreadyExists: exists, dryRun: true };
+  }
+  if (exists) spawnSync('hermes', ['mcp', 'remove', 'ihow-memory'], SP);
+  const serverEntry = spec.args[0];
+  const add = spawnSync('hermes', [
+    'mcp', 'add', 'ihow-memory',
+    '--command', spec.command,
+    '--args', serverEntry,
+    '--env', `MEMORY_ROOT=${workspace.memoryDir}`,
+    '--env', `IHOW_MEMORY_STATE_ROOT=${workspace.root}`,
+  ], SP);
+  if (add.status !== 0) {
+    throw new Error(`hermes_mcp_add_failed: ${(add.stderr || add.stdout || '').slice(0, 300)}`);
+  }
+  return { ok: true, runtime: 'hermes', method: 'official-cli:hermes', target: '~/.hermes/config.yaml (hermes mcp add)', replaced: exists };
+}
+
 async function connectRuntime(
   workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
   runtime: string,
@@ -318,12 +352,25 @@ async function connectRuntime(
   const home = os.homedir();
   const spec = mcpServerSpec(workspace);
   if (runtime === 'claude-code') {
-    const viaCli = connectViaClaudeCli(spec, options); // official CLI first
-    if (viaCli) return viaCli;
-    return writeJsonMcpConfig(path.join(home, '.claude.json'), runtime, spec, options); // fallback: safe direct-write
+    // On Windows the claude CLI is a .cmd shim Node can't spawn directly; use the safe cross-platform
+    // direct-write to ~/.claude.json instead of the official CLI.
+    if (process.platform !== 'win32') {
+      const viaCli = connectViaClaudeCli(spec, options); // official CLI first
+      if (viaCli) return viaCli;
+    }
+    return writeJsonMcpConfig(path.join(home, '.claude.json'), runtime, spec, options); // fallback / Windows path: safe direct-write
   }
   if (runtime === 'codex') {
+    if (process.platform === 'win32') {
+      throw new Error('codex_connect_windows_unsupported: on Windows, run `ihow-memory init --runtime codex` and paste the printed snippet into ~/.codex/config.toml (codex CLI auto-config is not yet wired for Windows).');
+    }
     return connectViaCodexCli(spec, options);
+  }
+  if (runtime === 'hermes') {
+    if (process.platform === 'win32') {
+      throw new Error('hermes_connect_windows_unsupported: on Windows, run `ihow-memory init` and add the printed entry to ~/.hermes/config.yaml (hermes CLI auto-config is not yet wired for Windows).');
+    }
+    return connectViaHermesCli(workspace, spec, options);
   }
   if (runtime === 'cursor') {
     return writeJsonMcpConfig(path.join(home, '.cursor', 'mcp.json'), runtime, spec, options); // no official CLI
@@ -342,7 +389,9 @@ async function connectRuntime(
     // because the GUI app does not inherit the shell PATH.
     const cfgPath = process.platform === 'darwin'
       ? path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json')
-      : path.join(home, '.config', 'Claude', 'claude_desktop_config.json');
+      : process.platform === 'win32'
+        ? path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'Claude', 'claude_desktop_config.json')
+        : path.join(home, '.config', 'Claude', 'claude_desktop_config.json');
     const desktopSpec = { command: process.execPath, args: spec.args };
     // Claude Desktop's mcpServers entry schema is { command, args?, env?, extensionId? } with no
     // `type` field — omit it so a strict validator doesn't skip the entry.
@@ -367,9 +416,9 @@ function help(): void {
   console.log(`iHow Memory Core v${packageVersion()}
 
 Usage:
-  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode]
+  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
-  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode] [--share-diagnostics] [--json]
+  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes] [--share-diagnostics] [--json]
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
   ihow-memory search <query> [--limit n]
@@ -377,10 +426,10 @@ Usage:
   ihow-memory write-candidate <text> [--space name]
   ihow-memory promote <candidate-path> [--scope name] [--title title]
   ihow-memory durable-promote <candidate-path> (--dry-run | --real-write) [--scope name] [--title title] [--path path]
-  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode]
+  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
-  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode [--dry-run] [--json]   # auto-config MCP (official CLI for claude/codex; safe backup+merge for cursor/workbuddy/claude-desktop/opencode)
+  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes [--dry-run] [--json]   # auto-config MCP (official CLI for claude/codex; safe backup+merge for cursor/workbuddy/claude-desktop/opencode)
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
 
 Defaults:
@@ -510,7 +559,7 @@ function nodeVersionAtLeast(actual: string, expected: string): boolean {
 }
 
 async function doctor(
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' },
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' },
 ): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
   const workspace = resolveWorkspace(options);
@@ -648,7 +697,7 @@ async function packageInfo(): Promise<{ name: string; version: string }> {
 
 async function diagnosticReport(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' } = {},
 ): Promise<Record<string, unknown>> {
   const sanitized = sanitizeDoctorResult(result, options);
   const info = await packageInfo();
@@ -696,7 +745,7 @@ function githubIssueUrl(body: string): string {
 
 async function feedbackTemplate(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' } = {},
 ): Promise<{ body: string; url: string }> {
   const report = await diagnosticReport(result, options);
   const body = `## What happened
@@ -873,7 +922,7 @@ async function main(): Promise<void> {
 
   if (command === 'connect') {
     if (!options.runtime) {
-      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode');
+      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes');
       process.exitCode = 1;
       return;
     }
