@@ -1,0 +1,59 @@
+name: Release
+
+# Publishes to npm when a version tag (v*) is pushed. Auth uses an npm automation
+# token (repo secret NPM_TOKEN) which bypasses 2FA OTP, so a release is just a tag
+# push — no interactive publish step. The same build/test/proof/secret-scan gates as
+# CI run first, and the tag must match package.json version, so a broken or
+# mislabelled build can never be published.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write # for npm provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+      - name: Verify tag matches package.json version
+        run: |
+          set -e
+          PKG="v$(node -p "require('./package.json').version")"
+          if [ "$PKG" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json ($PKG)"; exit 1
+          fi
+          echo "version tag OK: $GITHUB_REF_NAME"
+      - name: Build
+        run: npm run build
+      - name: CLI smoke
+        run: node bin/ihow-memory.mjs --version
+      - name: Tests
+        run: |
+          if [ -d tests ]; then npm test; else echo "no tests/"; fi
+      - name: Governed-loop proof
+        run: node scripts/proof.mjs
+      - name: Secret scan
+        run: |
+          set -e
+          PATTERNS='ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|BEGIN[ A-Z]+PRIVATE KEY|yuntian|/Users/[a-z]+/'
+          HITS=$(grep -rnE "$PATTERNS" --include='*' . \
+            --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=dist \
+            --exclude=ci.yml --exclude=release.yml || true)
+          if [ -n "$HITS" ]; then
+            echo "Secret scan failed:"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "secret scan clean"
+      - name: Publish to npm
+        run: npm publish --tag latest --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
