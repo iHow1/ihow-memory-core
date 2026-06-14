@@ -1,6 +1,6 @@
 # iHow Memory
 
-> Local-first shared memory for AI agents — zero-dependency FTS5 search, citations, governance, stdio MCP.
+> Local shared-memory runtime for heterogeneous coding agents — one git-auditable Markdown memory they share and hand off through.
 
 [![npm version](https://img.shields.io/npm/v/ihow-memory.svg)](https://www.npmjs.com/package/ihow-memory)
 [![CI](https://github.com/iHow1/ihow-memory-core/actions/workflows/ci.yml/badge.svg)](https://github.com/iHow1/ihow-memory-core/actions/workflows/ci.yml)
@@ -10,13 +10,13 @@
 
 **Requires Node.js >= 22.12 · macOS / Linux (alpha; Windows via WSL, native Windows experimental).** No account, no API key, no third-party runtime dependencies.
 
-iHow Memory gives your AI agents one durable memory on your own machine. Memory is plain Markdown on disk. Retrieval is Node's built-in SQLite FTS5, and every result carries a citation. Writes go through an explicit governance flow instead of silent self-writes. Agents talk to it over a stdio MCP server; you use the same flow from the CLI.
+iHow Memory is a local, shared-memory runtime for heterogeneous coding agents — one human-readable, git-auditable memory that Claude Code, Codex, Cursor and other MCP clients share and hand off through. Memory is plain Markdown on disk that you read, diff and roll back with git. A pre-write check rejects candidates that look like they contain secrets, every promote is an audited event, and agents leave a handoff candidate — current state, evidence, blockers, next step — that the next agent reads. Agents talk to it over a stdio MCP server; you use the same flow from the CLI.
 
 ## Why it is different
 
-1. **Local-first.** Runs entirely on your machine: no account, no telemetry by default, no required network calls. Your memory is human-readable Markdown you can edit, diff and roll back.
-2. **Governed writes.** Agents only propose candidates. Promotion to durable memory is an explicit, audited step, and reads come back with citations — no agent silently rewrites shared memory.
-3. **One memory, many runtimes.** Claude Code, Codex, Cursor, Tencent WorkBuddy, Claude Desktop, OpenCode and Hermes connect to the same local memory, one command each. Any MCP client can use the generic snippet from `init`.
+1. **Cross-vendor by design.** One memory that Claude Code, Codex, Cursor, Tencent WorkBuddy, Claude Desktop, OpenCode and Hermes share — across vendors, on your machine, one command each. The big platforms have every reason to keep memory inside their own ecosystem; iHow is the neutral local layer between them.
+2. **Safe writes + handoff.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event. A handoff is a candidate the next agent reads — current state, evidence, blockers, next step — not just a search hit.
+3. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
 
 ## Quickstart
 
@@ -80,9 +80,9 @@ npx ihow-memory proof
 
 The default retrieval engine is zero-dependency local full-text search — Node built-ins plus `node:sqlite` FTS5 only: no third-party runtime deps, no embedding downloads, no model or API key, with citation-bearing results. An optional local vector provider (separate process) adds semantic retrieval; if unconfigured or unhealthy, retrieval falls back visibly to FTS. Governance, write guards and audit behavior never change with the retrieval backend. The memory itself stays human-readable, editable, rollback-able Markdown.
 
-## Benchmark
+### Retrieval-quality evidence
 
-We publish one LongMemEval_S retrieval-stage result: recall_all@10 = 1.0 across all 470 effective samples (500 raw; ndcg_any@10 0.946). Three boundaries: (1) this is retrieval-layer recall, not end-to-end LLM-judged answer accuracy — not directly comparable to the 90%+ figures reported by other vendors, which measure a different layer; (2) the score was produced on our experimental vector + lexical hybrid lane, while this published package defaults to zero-dependency FTS5 lexical search (with an optional local vector provider); (3) a one-command reproduction harness is WIP — until it lands, the public evidence manifest (metric definitions, run artifacts, full @5 disclosure incl. structural ceilings) is the auditable reference.
+As honest evidence of retrieval quality — not the product's differentiator — we publish one LongMemEval_S retrieval-stage result: recall_all@10 = 1.0 across all 470 effective samples (500 raw; ndcg_any@10 0.946). Three boundaries: (1) this is retrieval-layer recall, not end-to-end LLM-judged answer accuracy — not directly comparable to the 90%+ figures reported by other vendors, which measure a different layer; (2) the score was produced on our experimental vector + lexical hybrid lane, while this published package defaults to zero-dependency FTS5 lexical search (with an optional local vector provider); (3) a one-command reproduction harness is WIP — until it lands, the public evidence manifest (metric definitions, run artifacts, full @5 disclosure incl. structural ceilings) is the auditable reference.
 
 Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md).
 
@@ -190,7 +190,7 @@ Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest pu
 ## Links
 
 - Website: [ihowmemory.com](https://ihowmemory.com)
-- Spec and conformance (open standard): [iHow1/ihow-memory-standard](https://github.com/iHow1/ihow-memory-standard)
+- Format & conformance (mechanism): [iHow1/ihow-memory-standard](https://github.com/iHow1/ihow-memory-standard)
 - Benchmark evidence manifest: [conformance/evidence/longmemeval-s-2026-05-11.md](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md)
 - npm package: [npmjs.com/package/ihow-memory](https://www.npmjs.com/package/ihow-memory)
 
