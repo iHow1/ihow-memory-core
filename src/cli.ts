@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 iHow Memory
 import fs from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -39,6 +39,8 @@ type ParsedArgs = {
     installHook?: boolean;
     globalHook?: boolean;
     easy?: boolean;
+    auto?: boolean;
+    write?: boolean;
   };
   rest: string[];
 };
@@ -85,6 +87,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--no-install-hook') options.installHook = false;
     else if (arg === '--global-hook') options.globalHook = true;
     else if (arg === '--easy' || arg === '--yes') options.easy = true;
+    else if (arg === '--auto') options.auto = true;
+    else if (arg === '--write') options.write = true;
     else if (arg === '--json') options.json = true;
     else if (arg === '--limit') options.limit = Number(tail[++index]);
     else if (arg === '--dry-run') options.dryRun = true;
@@ -423,6 +427,78 @@ async function connectRuntime(
   throw new Error(`connect_unsupported_runtime: ${runtime}`);
 }
 
+// connect --auto: detect installed AI runtimes (a CLI on PATH for claude/codex/hermes, or the
+// runtime's on-disk config dir/file for the GUI ones) and, with --write, connect them all to ONE
+// shared workspace. Default is detect-and-report only — writing to up to 7 user configs needs --write.
+function runtimeDetectors(home: string): Array<{ runtime: string; cli?: string; paths: string[] }> {
+  const appdata = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+  return [
+    { runtime: 'claude-code', cli: 'claude', paths: [path.join(home, '.claude.json'), path.join(home, '.claude')] },
+    { runtime: 'codex', cli: 'codex', paths: [path.join(home, '.codex')] },
+    { runtime: 'hermes', cli: 'hermes', paths: [path.join(home, '.hermes')] },
+    { runtime: 'cursor', paths: [path.join(home, '.cursor')] },
+    { runtime: 'workbuddy', paths: [path.join(home, '.workbuddy')] },
+    { runtime: 'claude-desktop', paths: [
+      path.join(home, 'Library', 'Application Support', 'Claude'),
+      path.join(home, '.config', 'Claude'),
+      path.join(appdata, 'Claude'),
+    ] },
+    { runtime: 'opencode', paths: [path.join(home, '.config', 'opencode')] },
+  ];
+}
+
+function detectRuntimes(): Array<{ runtime: string; present: boolean; via: string | null }> {
+  const home = os.homedir();
+  return runtimeDetectors(home).map((d) => {
+    if (d.cli && commandExists(d.cli)) return { runtime: d.runtime, present: true, via: `cli:${d.cli}` };
+    for (const p of d.paths) {
+      if (existsSync(p)) return { runtime: d.runtime, present: true, via: `config:${p.replace(home, '~')}` };
+    }
+    return { runtime: d.runtime, present: false, via: null };
+  });
+}
+
+async function connectAuto(options: ParsedArgs['options']): Promise<void> {
+  const detected = detectRuntimes();
+  const present = detected.filter((d) => d.present);
+  console.log('detected AI runtimes:');
+  for (const d of detected) console.log(`  ${d.present ? '✓' : '·'} ${d.runtime}${d.via ? `  (${d.via})` : ''}`);
+
+  if (present.length === 0) {
+    console.log('\nNo known runtimes detected. Connect one explicitly: ihow-memory connect --runtime <name>.');
+    return;
+  }
+  if (!options.write) {
+    console.log(`\n${present.length} detected — detect-only, nothing was written.`);
+    console.log('Connect them all: ihow-memory connect --auto --write   (or one: connect --runtime <name>)');
+    console.log('Note: config-dir detection can match a leftover dir from an uninstalled app — review the list before --write.');
+    return;
+  }
+
+  // One shared workspace (derived from cwd) for every detected runtime — that shared store IS the
+  // cross-vendor point. Materialize once, then register each runtime; a per-runtime failure (missing
+  // CLI, unsupported platform) is downgraded to "skipped" so one bad runtime never aborts the sweep.
+  const workspace = await ensureWorkspace(resolveWorkspace(options));
+  await installRuntimeBundle(workspace);
+  const connected: string[] = [];
+  const skipped: Array<{ runtime: string; error: string }> = [];
+  console.log(`\nconnecting ${present.length} runtime(s) to workspace ${workspace.space}...`);
+  for (const d of present) {
+    try {
+      await connectRuntime(workspace, d.runtime, { dryRun: false });
+      connected.push(d.runtime);
+      console.log(`  ✓ ${d.runtime}`);
+    } catch (caught) {
+      const error = caught instanceof Error ? caught.message : String(caught);
+      skipped.push({ runtime: d.runtime, error });
+      console.log(`  · skipped ${d.runtime}: ${error}`);
+    }
+  }
+  if (connected.length) await telemetry.track('connect', { runtime: `auto:${connected.length}` });
+  if (options.json) printJson({ connected, skipped });
+  console.log(`\nconnected ${connected.length}, skipped ${skipped.length}. Restart each runtime to load the memory tools.`);
+}
+
 function help(): void {
   console.log(`iHow Memory Core v${packageVersion()}
 
@@ -444,6 +520,7 @@ Usage:
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
   ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the skill + a project-local auto-capture hook, no prompts
+  ihow-memory connect --auto [--write] [--json]   # detect installed runtimes; default reports only, --write connects them all to one shared workspace
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Claude Code Stop-hook handler (reads hook JSON on stdin; wired by the plugin) — emits a session-end capture instruction
   ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
@@ -1202,8 +1279,12 @@ async function main(): Promise<void> {
   }
 
   if (command === 'connect') {
+    if (options.auto) {
+      await connectAuto(options);
+      return;
+    }
     if (!options.runtime) {
-      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes');
+      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes (or --auto to detect installed runtimes)');
       process.exitCode = 1;
       return;
     }
