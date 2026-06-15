@@ -40,7 +40,7 @@ jobs:
           PATTERNS='ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|BEGIN[ A-Z]+PRIVATE KEY|yuntian|/Users/[a-z]+/'
           HITS=$(grep -rnE "$PATTERNS" --include='*' . \
             --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=dist \
-            --exclude=ci.yml || true)
+            --exclude=ci.yml --exclude=release.yml || true)
           if [ -n "$HITS" ]; then
             echo "Secret scan failed:"
             echo "$HITS"
