@@ -6,36 +6,52 @@
 // human promote step, so both get explicit coverage here (previously none).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { containsSecretLikeContent, isProtectedPath } from '../src/governance.ts';
+import { containsSecretLikeContent, isProtectedPath, redactSecretLikeContent } from '../src/governance.ts';
+
+// Provider-token fixtures are written split/concatenated so that NEITHER the repo's CI secret-scan
+// grep NOR GitHub push-protection's partner patterns flag this test file — same convention as
+// scripts/activation-proof.mjs. The runtime string is identical, so it still exercises the governance
+// regex exactly as a contiguous literal would. Shared by the detect + redact tests below.
+const SECRET_FIXTURES = {
+  'assignment api_key': 'api_key: ABCDEF0123456789',
+  'assignment password': 'password=hunter2longenough',
+  'assignment client_secret': 'client_secret = abcdef123456',
+  'assignment access_token': 'access_token: zzzzzzzzzzzz',
+  'OpenAI sk-': 'key is ' + 'sk' + '-ABCDEFGHIJKLMNOP12345',
+  'Stripe live': 'sk' + '_live_abcdEFGH12345678ZZZZ',
+  'GitHub PAT classic': 'gh' + 'p_ABCDEFGHIJKLMNOPQRST0123456789',
+  'GitHub gho_': 'gho' + '_ABCDEFGHIJKLMNOPQRST',
+  'GitHub fine-grained': 'github' + '_pat_ABCDEFGHIJKLMNOPQRSTUVWX',
+  'AWS access key id': 'AKIA' + 'ABCDEFGHIJKLMNOP',
+  'Google API key': 'AIza' + 'SyA1234567890abcdefghijklmnopqrstuv',
+  'Google OAuth': 'ya29' + '.A0ARrdaM-abcdefghijklmnop',
+  'Slack token': 'xoxb' + '-1234567890-abcdefghijkl',
+  'Twilio SK': 'SK' + '0123456789abcdef0123456789abcdef',
+  'JWT': 'eyJ' + 'hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQabcdef',
+  'PEM private key': '-----BEGIN ' + 'OPENSSH ' + 'PRIVATE KEY-----',
+  'email': 'contact me at someone@example.com',
+  'CJK 密码': '密码：correct-horse',
+};
 
 test('secret reject gate flags each high-precision secret type', () => {
-  // Provider-token fixtures are written split/concatenated so that NEITHER the repo's CI secret-scan
-  // grep NOR GitHub push-protection's partner patterns flag this test file — same convention as
-  // scripts/activation-proof.mjs. The runtime string is identical, so it still exercises the
-  // governance regex (containsSecretLikeContent) exactly as a contiguous literal would.
-  const secrets = {
-    'assignment api_key': 'api_key: ABCDEF0123456789',
-    'assignment password': 'password=hunter2longenough',
-    'assignment client_secret': 'client_secret = abcdef123456',
-    'assignment access_token': 'access_token: zzzzzzzzzzzz',
-    'OpenAI sk-': 'key is ' + 'sk' + '-ABCDEFGHIJKLMNOP12345',
-    'Stripe live': 'sk' + '_live_abcdEFGH12345678ZZZZ',
-    'GitHub PAT classic': 'gh' + 'p_ABCDEFGHIJKLMNOPQRST0123456789',
-    'GitHub gho_': 'gho' + '_ABCDEFGHIJKLMNOPQRST',
-    'GitHub fine-grained': 'github' + '_pat_ABCDEFGHIJKLMNOPQRSTUVWX',
-    'AWS access key id': 'AKIA' + 'ABCDEFGHIJKLMNOP',
-    'Google API key': 'AIza' + 'SyA1234567890abcdefghijklmnopqrstuv',
-    'Google OAuth': 'ya29' + '.A0ARrdaM-abcdefghijklmnop',
-    'Slack token': 'xoxb' + '-1234567890-abcdefghijkl',
-    'Twilio SK': 'SK' + '0123456789abcdef0123456789abcdef',
-    'JWT': 'eyJ' + 'hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQabcdef',
-    'PEM private key': '-----BEGIN ' + 'OPENSSH ' + 'PRIVATE KEY-----',
-    'email': 'contact me at someone@example.com',
-    'CJK 密码': '密码：correct-horse',
-  };
-  for (const [label, text] of Object.entries(secrets)) {
+  for (const [label, text] of Object.entries(SECRET_FIXTURES)) {
     assert.equal(containsSecretLikeContent(text), true, `should flag: ${label}`);
   }
+});
+
+test('redactSecretLikeContent is same-source: removes the value AND clears the hard detector', () => {
+  // OpenClaw automation-v2 signing condition: any text entering the journal must be redactable so the
+  // FULL hard detector (not just CLI redactSecrets' narrower set) no longer hits — else appendJournal's
+  // assertNoSecretLikeContent throws and the hook's no-throw contract turns it into silent capture loss.
+  for (const [label, text] of Object.entries(SECRET_FIXTURES)) {
+    assert.equal(containsSecretLikeContent(redactSecretLikeContent(text)), false, `hard detector must be clean after redaction: ${label}`);
+  }
+  // the secret VALUE is removed, not merely the keyword (assignment-style) and not left in place
+  assert.doesNotMatch(redactSecretLikeContent('api_key: ABCDEF0123456789'), /ABCDEF0123456789/);
+  assert.doesNotMatch(redactSecretLikeContent('contact me at someone@example.com'), /someone@example\.com/);
+  // benign engineering prose is left untouched
+  const benign = 'We decided to add retry logic with a 30s timeout to the API handler.';
+  assert.equal(redactSecretLikeContent(benign), benign);
 });
 
 test('secret reject gate does not flag benign engineering prose', () => {

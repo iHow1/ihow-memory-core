@@ -73,6 +73,25 @@ export function containsSecretLikeContent(text: string): boolean {
   return SECRET_LIKE_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+// SAME-SOURCE redactor for the auto-capture path (OpenClaw signing condition for automation v2):
+// redact `text` so it carries no secret VALUE and containsSecretLikeContent() is guaranteed clean
+// afterwards. Built from the SAME SECRET_LIKE_PATTERNS so detector and redactor cannot drift; the
+// assignment-style detector (keyword[:=]) is extended to also consume the value — otherwise only the
+// keyword would be stripped and the value would leak. Use THIS (never the narrower CLI redactSecrets)
+// before journaling auto-ingested transcript text, so an email/account hit degrades to a redaction
+// instead of an assertNoSecretLikeContent hard-throw (which the hook's no-throw contract would
+// otherwise swallow as silent total capture loss).
+export function redactSecretLikeContent(text: string): string {
+  const asGlobal = (p: RegExp): RegExp => (p.flags.includes('g') ? p : new RegExp(p.source, `${p.flags}g`));
+  let out = text;
+  // assignment "keyword[:=] VALUE" — derive a value-swallowing variant from the same assignment detector
+  const assignment = SECRET_LIKE_PATTERNS[0];
+  out = out.replace(asGlobal(new RegExp(`${assignment.source}\\s*\\S+`, assignment.flags)), '[redacted]');
+  // every detector (value-style + the CJK assignment already swallows its value), applied globally
+  for (const pattern of SECRET_LIKE_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
+  return out;
+}
+
 function assertNoSecretLikeContent(text: string): void {
   if (containsSecretLikeContent(text)) {
     throw new Error('candidate_contains_secret_like_content');
