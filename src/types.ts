@@ -25,6 +25,7 @@ export type Workspace = {
   promotedDir: string;
   eventsDir: string;
   historyDir: string;
+  journalDir: string;
   indexPath: string;
   indexManifestPath: string;
   lockPath: string;
@@ -93,6 +94,21 @@ export type WriteCandidateResult = {
   candidateId: string;
   path: string;
   status: 'candidate';
+};
+
+export type JournalPayload = {
+  text?: string;
+  content?: string;
+  title?: string;
+  sourceAgent?: string;
+  source?: string;
+};
+
+export type JournalResult = {
+  path: string;
+  status: 'journaled';
+  eventId: string;
+  day: string;
 };
 
 export type PromoteTarget = {

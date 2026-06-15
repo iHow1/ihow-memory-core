@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
+## [0.1.0-alpha.4] — 2026-06-15 (experimental · Claude Code-first)
+
+> Auto-capture is **experimental and Claude Code-first**. The Stop hook blocks once to request a
+> session-end handoff into a low-weight journal — it is **not** a guaranteed autonomous capture
+> loop; a real Claude Code app smoke has passed, but multi-session dogfood is still pending. Other runtimes remain
+> connect + tool-description nudge.
+
+### Added
+
+- **Layered memory: an append-only, low-weight journal lane.** `memory.journal` (MCP) and
+  `ihow-memory journal` (CLI) write directly into a daily journal that is searchable but always
+  ranked **below** curated/promoted memory, so auto-capture cannot displace high-weight recall.
+  Writes still pass the pre-write secret reject gate and emit audit events.
+- **Session-end auto-capture for Claude Code (experimental).** `ihow-memory hook-stop` is a
+  Stop-hook handler; `ihow-memory install-hook` wires it into this project's
+  `.claude/settings.local.json` (or `--global-hook` for user-wide). At session end it asks the
+  in-session agent to record a handoff via `memory.journal`. Best-effort at-least-once
+  (re-prompts as the session grows, stops once a journal entry is recorded), recursion-guarded,
+  skips trivial sessions.
+- **One-command Claude Code setup.** `connect --runtime claude-code [--install-skill]
+  [--install-hook]` registers the MCP server, optionally copies the skill, and optionally installs
+  the Stop hook — each consent-gated, with backups, never clobbering user-modified files.
+- **Audit + rollback.** `ihow-memory audit [--since]` lists the append-only event log;
+  `ihow-memory rollback --event <id>` reverses one auto-captured journal entry.
+- Expanded the pre-write secret reject gate (JWT, PEM private-key headers, Slack, Google, Stripe,
+  Twilio, more GitHub token shapes) and added the curated anchors (preferences, active-anchors) to
+  the protected paths so auto-writes can never clobber them.
+
+### Honesty / security notes
+
+- Auto-captured notes land in a **low-weight journal, not curated memory**: searchable, auditable,
+  and reversible, but **unreviewed**. Use `promote` / `durable-promote` for trusted long-term memory.
+- The secret gate is a **high-precision pre-write reject, not a full DLP guarantee**.
+
 ## [0.1.0-alpha.3] — 2026-06-13
 
 ### Added

@@ -54,6 +54,14 @@ jobs:
           fi
           echo "secret scan clean"
       - name: Publish to npm
-        run: npm publish --tag latest --provenance
+        # Prereleases (-alpha/-beta/-rc) publish under the `next` dist-tag so `npm install ihow-memory`
+        # keeps resolving the last stable/`latest`; stable tags publish to `latest`.
+        run: |
+          TAG=latest
+          case "$GITHUB_REF_NAME" in
+            *-alpha*|*-beta*|*-rc*) TAG=next ;;
+          esac
+          echo "publishing $GITHUB_REF_NAME with dist-tag: $TAG"
+          npm publish --tag "$TAG" --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

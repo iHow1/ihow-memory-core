@@ -6,6 +6,8 @@ import crypto from 'node:crypto';
 import type {
   DurablePromoteOptions,
   DurablePromoteResult,
+  JournalPayload,
+  JournalResult,
   PromoteResult,
   PromoteTarget,
   Workspace,
@@ -13,7 +15,7 @@ import type {
   WriteCandidateResult,
 } from './types.ts';
 import { absoluteFromMemoryPath, isMcpSandboxPath, relativeToMemory, relativeToSpace } from './workspace.ts';
-import { appendEvent } from './store/events.ts';
+import { appendEvent, readEvents } from './store/events.ts';
 import { atomicWriteFile, nowCompact, readMemoryFile, safeFileSlug } from './store/files.ts';
 import { withWorkspaceLock } from './store/lock.ts';
 
@@ -28,16 +30,34 @@ export const DEFAULT_PROTECTED_PATTERNS = [
   'memory/IDENTITY.md',
   'memory/MEMORY.md',
   'current.md',
+  // Curated anchors — high-value, low-volume memory that auto-capture must never clobber.
+  'preferences.md',
+  'active-anchors.md',
+  'anchors.md',
+  'active-topics.md',
 ];
 
+// High-precision secret detectors. These match secret *values* (or assignment-style
+// `keyword: value`), not bare keywords, to keep the hard-reject low on false positives.
+// NOTE: prose-style secrets ("the password is hunter2") and generic high-entropy blobs are
+// intentionally NOT matched here — they carry a real false-positive cost and belong on the
+// auto-capture path as a quarantine (not a hard drop), pending a false-positive-tolerance call.
 const SECRET_LIKE_PATTERNS = [
-  /\b(api[_-]?key|secret|token|password|passwd|cookie|authorization|bearer|refresh[_-]?token)\b\s*[:=]/i,
+  // assignment-style: keyword followed by : or =
+  /\b(api[_-]?key|secret|token|password|passwd|pwd|cookie|authorization|bearer|refresh[_-]?token|access[_-]?token|private[_-]?key|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?access[_-]?key[_-]?id)\b\s*[:=]/i,
   /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/i,
-  /\bsk-[A-Za-z0-9_-]{16,}\b/i,
-  /\bghp_[A-Za-z0-9_]{16,}\b/i,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i,
-  /(?:账号|账户|邮箱)\s*[:：=]\s*\S+/i,
+  /\bsk-[A-Za-z0-9_-]{16,}\b/i, // OpenAI-style
+  /\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b/, // Stripe live key
+  /\b(?:github_pat_[0-9A-Za-z_]{20,}|gh[oprsu]_[0-9A-Za-z]{16,})\b/, // GitHub PAT / gho_/ghp_/ghr_/ghs_/ghu_
+  /\bAKIA[0-9A-Z]{16}\b/, // AWS access key id
+  /\bAIza[0-9A-Za-z_-]{35}\b/, // Google API key
+  /\bya29\.[0-9A-Za-z._-]{20,}/, // Google OAuth token
+  /\bxox[baprs]-[0-9A-Za-z-]{10,}/, // Slack token
+  /\bSK[0-9a-f]{32}\b/, // Twilio
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/, // JWT
+  /-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA )?PRIVATE KEY-----/, // PEM private key
+  /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i, // email address
+  /(?:账号|账户|邮箱|密码|密钥|令牌)\s*[:：=]\s*\S+/i, // CJK account/secret assignment
 ];
 
 function candidateText(payload: WriteCandidatePayload): string {
@@ -49,14 +69,18 @@ function candidateText(payload: WriteCandidatePayload): string {
   return text.trim();
 }
 
+export function containsSecretLikeContent(text: string): boolean {
+  return SECRET_LIKE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 function assertNoSecretLikeContent(text: string): void {
-  if (SECRET_LIKE_PATTERNS.some((pattern) => pattern.test(text))) {
+  if (containsSecretLikeContent(text)) {
     throw new Error('candidate_contains_secret_like_content');
   }
 }
 
 function assertNoSecretLikeDurableCandidate(content: string): void {
-  if (SECRET_LIKE_PATTERNS.some((pattern) => pattern.test(content))) {
+  if (containsSecretLikeContent(content)) {
     throw new Error('redact_check_failed_candidate_contains_secret_like_content');
   }
 }
@@ -208,6 +232,96 @@ function assertCandidateFrontMatter(content: string): void {
   if (!hasCandidateType || !hasCandidateStatus) {
     throw new Error('candidate_frontmatter_required');
   }
+}
+
+function journalFileHeader(day: string): string {
+  return `${frontMatter({ type: 'memory_journal', weight: 'low', date: day })}\n# Journal ${day}\n\n> Auto-captured, append-only, low-weight. Searchable but ranked below curated memory.\n`;
+}
+
+async function readFileOrEmpty(targetPath: string): Promise<string> {
+  try {
+    return await fs.readFile(targetPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+// Auto-capture lane: append-only, low-weight daily journal. Bypasses the candidate->promote
+// gate (so a session-end hook can capture without a human step), but STILL hard-rejects
+// secret-like content and stays contained via withWorkspaceLock + atomicWriteFile. Journal
+// entries are indexed and searchable, yet demoted below curated memory at query time (see
+// engine/fts.ts), so automatic capture can never pollute high-weight retrieval.
+export async function appendJournal(workspace: Workspace, payload: JournalPayload): Promise<JournalResult> {
+  const text = payload.text ?? payload.content;
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new Error('journal_text_required');
+  }
+  assertNoSecretLikeContent(text);
+  const sourceAgent = payload.sourceAgent || payload.source || 'unknown';
+  const title = payload.title?.trim();
+  return await withWorkspaceLock(workspace, async () => {
+    const at = new Date().toISOString();
+    const day = at.slice(0, 10);
+    const targetPath = path.join(workspace.journalDir, `${day}.md`);
+    const existing = await readFileOrEmpty(targetPath);
+    const header = existing ? '' : journalFileHeader(day);
+    const entry = `\n## ${at} · ${sourceAgent}${title ? ` · ${title}` : ''}\n\n${text.trim()}\n`;
+    await atomicWriteFile(targetPath, `${header}${existing}${entry}`, workspace.memoryDir);
+    const relativePath = relativeToSpace(workspace, targetPath);
+    const event = await appendEvent(workspace, {
+      type: 'memory.journal.appended',
+      path: relativePath,
+      actor: sourceAgent,
+      metadata: { day, weight: 'low', auto: true, entryAt: at },
+    });
+    return { path: relativePath, status: 'journaled', eventId: event.id, day };
+  });
+}
+
+export type RollbackResult = {
+  eventId: string;
+  type: string;
+  path?: string;
+  removed: boolean;
+  rolledbackEventId: string;
+};
+
+// Remove one journal entry (identified by its ISO heading timestamp) from a daily journal file.
+// Entries are delimited by "\n## <ISO> · ..."; the preamble and other entries are preserved.
+function removeJournalEntry(content: string, entryAt: string): { content: string; removed: boolean } {
+  const parts = content.split('\n## ');
+  if (parts.length < 2) return { content, removed: false };
+  const [preamble, ...entries] = parts;
+  const kept = entries.filter((entry) => !entry.startsWith(`${entryAt} `));
+  if (kept.length === entries.length) return { content, removed: false };
+  const rebuilt = kept.length ? `${preamble}\n## ${kept.join('\n## ')}` : preamble;
+  return { content: rebuilt, removed: true };
+}
+
+// Rollback a single auto-captured journal entry by its audit eventId — the auto-write lane's undo.
+// Only journal entries are reversible this way; durable/promote writes are human-gated (not
+// auto-written), so they are out of scope. Emits a memory.rolledback audit event either way.
+export async function rollbackJournalEvent(workspace: Workspace, eventId: string): Promise<RollbackResult> {
+  const target = (await readEvents(workspace)).find((event) => event.id === eventId);
+  if (!target) throw new Error('rollback_event_not_found');
+  if (target.type !== 'memory.journal.appended') throw new Error('rollback_unsupported_event_type');
+  const entryAt = typeof target.metadata?.entryAt === 'string' ? target.metadata.entryAt : '';
+  const relativePath = target.path;
+  if (!entryAt || !relativePath) throw new Error('rollback_missing_entry_metadata');
+  return await withWorkspaceLock(workspace, async () => {
+    const absolute = absoluteFromMemoryPath(workspace, relativePath);
+    const existing = await readFileOrEmpty(absolute);
+    const { content, removed } = removeJournalEntry(existing, entryAt);
+    if (removed) await atomicWriteFile(absolute, content, workspace.memoryDir);
+    const event = await appendEvent(workspace, {
+      type: 'memory.rolledback',
+      path: relativePath,
+      actor: 'core.rollback',
+      metadata: { rolledBackEventId: eventId, entryAt, removed },
+    });
+    return { eventId, type: target.type, path: relativePath, removed, rolledbackEventId: event.id };
+  });
 }
 
 export async function writeCandidate(

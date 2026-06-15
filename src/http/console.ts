@@ -6,9 +6,7 @@
 // Serves a single static page plus read-only JSON endpoints backed by the existing core API.
 import http from 'node:http';
 import path from 'node:path';
-import fs from 'node:fs/promises';
 import { openCore } from '../core.ts';
-import type { MemoryCore } from '../core.ts';
 import type { WorkspaceOptions } from '../types.ts';
 
 type ConsoleOptions = WorkspaceOptions & {
@@ -53,29 +51,6 @@ function assertSafeRef(ref: string): void {
   }
 }
 
-async function auditEvents(core: MemoryCore, limit: number): Promise<Array<Record<string, unknown>>> {
-  let entries: string[];
-  try {
-    entries = await fs.readdir(core.workspace.eventsDir);
-  } catch {
-    return [];
-  }
-  const files = entries.filter((entry) => entry.endsWith('.ndjson')).sort().slice(-10);
-  const events: Array<Record<string, unknown>> = [];
-  for (const file of files) {
-    const content = await fs.readFile(path.join(core.workspace.eventsDir, file), 'utf8');
-    for (const line of content.split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        events.push(JSON.parse(line));
-      } catch {
-        // skip malformed audit line, never crash the console
-      }
-    }
-  }
-  return events.slice(-limit);
-}
-
 export async function createConsoleServer(options: ConsoleOptions = {}): Promise<http.Server> {
   const core = await openCore(options);
 
@@ -105,7 +80,10 @@ export async function createConsoleServer(options: ConsoleOptions = {}): Promise
       }
       if (route === '/api/audit') {
         const limit = Math.min(Number(url.searchParams.get('limit') || 25), 100);
-        return json(res, 200, { ok: true, events: await auditEvents(core, limit) });
+        // Delegate to core.audit() so the panel spans BOTH the main and _mcp auto-capture lanes
+        // (single two-lane source of truth) instead of hand-reading only the main eventsDir.
+        const events = await core.audit();
+        return json(res, 200, { ok: true, events: events.slice(-limit) });
       }
       return json(res, 404, { ok: false, error: 'not_found' });
     } catch (caught) {

@@ -174,13 +174,14 @@ export async function searchFts(
         SELECT
           path,
           snippet(memory_fts, 1, '[', ']', '...', 24) AS snippet,
-          bm25(memory_fts) AS rank
+          bm25(memory_fts) AS rank,
+          (CASE WHEN path LIKE 'memory/journal/%' OR path LIKE 'memory/_mcp/journal/%' THEN 1 ELSE 0 END) AS is_journal
         FROM memory_fts
         WHERE memory_fts MATCH ?
-        ORDER BY rank
+        ORDER BY is_journal ASC, rank
         LIMIT ?
       `)
-      .all(queryToFts(query), limit) as Array<{ path: string; snippet: string; rank: number }>;
+      .all(queryToFts(query), limit) as Array<{ path: string; snippet: string; rank: number; is_journal: number }>;
     return rows.map((row) => ({
       path: row.path,
       snippet: row.snippet,

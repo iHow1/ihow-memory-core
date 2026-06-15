@@ -90,7 +90,7 @@ Evidence manifest：[LongMemEval_S 检索阶段运行记录，2026-05-11](https:
 
 ## MCP 工具
 
-stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）提供六个工具：
+stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）提供七个工具：
 
 | 工具 | 作用 |
 | --- | --- |
@@ -99,6 +99,7 @@ stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）
 | `memory.write_candidate` | 向沙箱 inbox 写入 candidate，不写持久记忆。 |
 | `memory.promote` | 把 candidate 升级到受治理的 staging，并记审计事件。 |
 | `memory.durable_promote` | 受治理的持久写入，必须显式传 `dryRun: true` 或 `realWrite: true`。 |
+| `memory.journal` | 向每日 journal 追加一条低权重、只追加（append-only）的条目（自动捕获通道）；可检索，但排序始终低于受治理记忆。 |
 | `memory.status` | 报告 workspace、检索 provider、索引与 sync 状态。 |
 
 ## CLI 速查
@@ -106,6 +107,8 @@ stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）
 ```text
 ihow-memory init             创建受管 workspace，打印 MCP 配置片段
 ihow-memory connect          自动配置 runtime（claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes）[--dry-run]
+ihow-memory install-skill    安装 Claude Code 记忆 skill 到 ~/.claude/skills
+ihow-memory install-hook     安装会话结束自动捕获的 Stop hook（默认 project-local；--global-hook 用户级）
 ihow-memory doctor           环境与配置检查 [--share-diagnostics 输出脱敏报告]
 ihow-memory status           workspace、引擎、索引与 sync 状态 [--json]
 ihow-memory search <query>   带引用的本地检索 [--limit n]
@@ -113,6 +116,9 @@ ihow-memory read <path>      读取单个记忆文件（带引用）
 ihow-memory write-candidate  提出记忆 candidate（进入沙箱 inbox）
 ihow-memory promote          升级 candidate（显式、留审计）
 ihow-memory durable-promote  持久写入——必须传 --dry-run 或 --real-write
+ihow-memory journal          追加一条低权重 journal 条目（自动捕获通道）
+ihow-memory audit            列出只追加的审计事件日志 [--since]
+ihow-memory rollback         撤销一条自动捕获的 journal 条目（--event <id>）
 ihow-memory reindex          从 Markdown 重建 SQLite 索引
 ihow-memory proof            在一次性 space 中跑完整治理闭环证明
 ihow-memory feedback         打印预填的 GitHub issue 与脱敏诊断
@@ -122,6 +128,12 @@ ihow-memory telemetry        on | off | status——匿名计数，默认关闭
 ```
 
 默认值：root 为 `~/.ihow-memory`；space 由当前目录推导，除非显式传 `--space`。完整参数见 `npx ihow-memory --help`。
+
+## 主动记忆（Claude Code，实验性）
+
+`connect --runtime claude-code --install-hook` 会装一个 Stop hook：会话结束时请求在场 agent 通过 `memory.journal` 把一次交接记入低权重 `journal` 通道。它是**尽力而为**（随会话增长重提示、写入一条后即停）、**默认 project-local**（`--global-hook` 用户级）、**可回滚**（`ihow-memory audit` / `rollback`）。
+
+> **实验性、且 Claude Code 优先。** 这是一次 Stop-hook 交接，**不是**有保证的自动捕获循环——是否写入取决于 agent 是否照提示执行。机制（会话结束自动触发 → agent 经 MCP 写入 → 低权重 journal）已在本地与另一 runtime 验证；真实 Claude Code app smoke 已通过，多轮 dogfood 仍待做。自动捕获的笔记是**低权重、未经审阅**的——可信长期记忆请用 `promote` / `durable-promote`。完整说明以英文 README 为准。
 
 ## 记忆布局与写入边界
 

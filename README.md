@@ -88,7 +88,7 @@ Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://githu
 
 ## MCP tools
 
-The stdio MCP server (registered by `connect`, or manually via the `init` snippet) exposes six tools:
+The stdio MCP server (registered by `connect`, or manually via the `init` snippet) exposes seven tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -97,6 +97,7 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 | `memory.write_candidate` | Write a candidate into the sandbox inbox. Does not write durable memory. |
 | `memory.promote` | Promote a candidate into governed staging, with an audit event. |
 | `memory.durable_promote` | Governed durable promote. Requires explicit `dryRun: true` or `realWrite: true`. |
+| `memory.journal` | Append a low-weight, append-only journal entry (auto-capture lane). Searchable but ranked below curated memory. |
 | `memory.status` | Report workspace, retrieval provider, index and sync status. |
 
 ## CLI reference
@@ -104,6 +105,8 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 ```text
 ihow-memory init             create a managed workspace, print the MCP config snippet
 ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes) [--dry-run]
+ihow-memory install-skill    copy the Claude Code proactive-memory skill into ~/.claude/skills/
+ihow-memory install-hook     add the session-end auto-capture Stop hook (Claude Code; --global-hook for user-wide)
 ihow-memory doctor           environment + setup checks [--share-diagnostics for a redacted report]
 ihow-memory status           workspace, engine, index and sync state [--json]
 ihow-memory search <query>   citation-bearing local search [--limit n]
@@ -111,6 +114,9 @@ ihow-memory read <path>      read one memory file with citation
 ihow-memory write-candidate  propose a memory candidate (sandbox inbox)
 ihow-memory promote          promote a candidate (explicit, audited)
 ihow-memory durable-promote  durable write — requires --dry-run or --real-write
+ihow-memory journal <text>   append a low-weight auto-capture entry (searchable, ranked below curated)
+ihow-memory audit            list the append-only event log [--since YYYY-MM-DD]
+ihow-memory rollback         undo one auto-captured journal entry (--event <id>)
 ihow-memory reindex          rebuild the SQLite index from Markdown
 ihow-memory proof            one-command governed-loop proof in a throwaway space
 ihow-memory feedback         print a prefilled GitHub issue + redacted diagnostics
@@ -159,15 +165,27 @@ In that mode the write boundary is strict: existing durable Markdown is read-onl
 3. If installed globally: `npm uninstall -g ihow-memory`.
 4. Delete any custom state root only after reviewing its contents.
 
-## Proactive memory (Claude Code skill)
+## Proactive memory (Claude Code)
 
-The MCP tools are available to any client, but agents only use memory if they decide to. To make
-Claude Code recall and record memory *proactively* — search at the start of a task, propose a
-candidate after a decision or handoff — install the bundled skill at
-[`skills/ihow-memory/SKILL.md`](./skills/ihow-memory/SKILL.md) (copy it into
-`~/.claude/skills/ihow-memory/`). The skill is a thin policy layer over the same MCP tools; it
-doesn't change the mechanism, just when to use it. Other runtimes get the same nudge from the
-tool descriptions themselves.
+The MCP tools are available to any client, but agents use memory only if they decide to. iHow Memory
+adds two layers to raise that on Claude Code:
+
+- **Skill — recall + record discipline.** `ihow-memory install-skill` (or `connect --runtime
+  claude-code --install-skill`) installs a thin policy layer ([`skills/ihow-memory/SKILL.md`](./skills/ihow-memory/SKILL.md))
+  that nudges Claude Code to search at the start of a task and record a candidate after a decision or
+  handoff. It changes *when* memory is used, not the mechanism. Other runtimes get the same nudge from
+  the MCP tool descriptions.
+- **Session-end auto-capture — experimental.** `connect --runtime claude-code --install-hook` adds a
+  Stop hook that, at session end, asks the in-session agent to record a handoff into the low-weight
+  `journal` lane via `memory.journal`. It is best-effort (re-prompts as the session grows, stops once
+  an entry is recorded), **project-scoped by default** (`--global-hook` for user-wide), and reversible
+  (`ihow-memory audit` / `rollback`).
+
+> **Experimental & Claude Code-first.** This is a Stop-hook handoff, **not** a guaranteed autonomous
+> capture loop — whether an entry is written depends on the agent following the prompt. The mechanism
+> (session-end auto-fire → agent MCP write → low-weight journal) is validated locally and on another
+> runtime; a real Claude Code app smoke has passed, and a multi-session dogfood is still pending. Auto-captured notes are **low-weight and
+> unreviewed** — use `promote` / `durable-promote` for trusted long-term memory.
 
 ## Examples
 

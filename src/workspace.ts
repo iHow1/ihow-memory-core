@@ -64,6 +64,7 @@ export function resolveWorkspace(options: WorkspaceOptions = {}): Workspace {
     promotedDir: path.join(mcpDir, 'promoted'),
     eventsDir,
     historyDir,
+    journalDir: path.join(memoryDir, 'journal'),
     indexPath: path.join(spaceDir, 'index.sqlite'),
     indexManifestPath: path.join(spaceDir, 'index-manifest.json'),
     lockPath: path.join(spaceDir, '.lock'),
@@ -90,6 +91,7 @@ function resolveExistingMemoryRootWorkspace(options: WorkspaceOptions, memoryRoo
     promotedDir: path.join(mcpDir, 'promoted'),
     eventsDir: path.join(mcpDir, '_events'),
     historyDir: path.join(mcpDir, 'history'),
+    journalDir: path.join(mcpDir, 'journal'),
     indexPath: path.join(spaceDir, 'index.sqlite'),
     indexManifestPath: path.join(spaceDir, 'index-manifest.json'),
     lockPath: path.join(spaceDir, '.lock'),
@@ -104,6 +106,7 @@ export async function ensureWorkspace(workspace: Workspace): Promise<Workspace> 
   }
   await fs.mkdir(workspace.eventsDir, { recursive: true });
   await fs.mkdir(workspace.historyDir, { recursive: true });
+  await fs.mkdir(workspace.journalDir, { recursive: true });
   await fs.mkdir(path.dirname(workspace.indexPath), { recursive: true });
   await ensureIndexManifest(workspace);
   return workspace;

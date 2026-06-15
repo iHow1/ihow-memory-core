@@ -11,6 +11,7 @@ import { openCore } from './core.ts';
 import { defaultRoot, ensureWorkspace, resolveWorkspace } from './workspace.ts';
 import { resolveEngineConfig } from './engine/retrieval.ts';
 import { sqliteRuntimeStatus } from './engine/fts.ts';
+import { readEventsAllLanes } from './store/events.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
 
@@ -34,6 +35,9 @@ type ParsedArgs = {
     actor?: string;
     runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes';
     shareDiagnostics?: boolean;
+    installSkill?: boolean;
+    installHook?: boolean;
+    globalHook?: boolean;
   };
   rest: string[];
 };
@@ -74,6 +78,11 @@ function parseArgs(argv: string[]): ParsedArgs {
       else throw new Error('unsupported_runtime: use claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|hermes');
     }
     else if (arg === '--share-diagnostics') options.shareDiagnostics = true;
+    else if (arg === '--install-skill') options.installSkill = true;
+    else if (arg === '--no-install-skill') options.installSkill = false;
+    else if (arg === '--install-hook') options.installHook = true;
+    else if (arg === '--no-install-hook') options.installHook = false;
+    else if (arg === '--global-hook') options.globalHook = true;
     else if (arg === '--json') options.json = true;
     else if (arg === '--limit') options.limit = Number(tail[++index]);
     else if (arg === '--dry-run') options.dryRun = true;
@@ -424,13 +433,19 @@ Usage:
   ihow-memory search <query> [--limit n]
   ihow-memory read <memory/path.md>
   ihow-memory write-candidate <text> [--space name]
+  ihow-memory journal <text> [--title t] [--actor name] [--space name]   # append a low-weight auto-capture entry (searchable but ranked below curated memory)
   ihow-memory promote <candidate-path> [--scope name] [--title title]
   ihow-memory durable-promote <candidate-path> (--dry-run | --real-write) [--scope name] [--title title] [--path path]
+  ihow-memory audit [--since YYYY-MM-DD] [--space name]   # list the append-only audit log (candidate / promote / journal / rollback events)
+  ihow-memory rollback --event <eventId> [--space name]   # undo one auto-captured journal entry by its audit eventId
   ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
   ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes [--dry-run] [--json]   # auto-config MCP (official CLI for claude/codex; safe backup+merge for cursor/workbuddy/claude-desktop/opencode)
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
+  ihow-memory hook-stop                   # Claude Code Stop-hook handler (reads hook JSON on stdin; wired by the plugin) — emits a session-end capture instruction
+  ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
+  ihow-memory install-hook [--global-hook] [--no-install-hook]   # add the session-end auto-capture Stop hook (default: this project's .claude/settings.local.json; --global-hook: ~/.claude/settings.json)
 
 Defaults:
   root: ${defaultRoot()}
@@ -876,6 +891,255 @@ async function maybeAskTelemetry(): Promise<void> {
   console.log(yes ? '✓ Enabled, thank you! (turn off anytime: `ihow-memory telemetry off`)' : 'Skipped — telemetry stays off.');
 }
 
+// Optionally copy the bundled Claude Code skill into ~/.claude/skills/ihow-memory/. Consent-gated
+// (--install-skill / --no-install-skill, or a TTY [y/N]); non-interactive without the flag prints a
+// tip and writes nothing (safe for agents/CI). Mirrors the connect MCP-write safety: never clobbers
+// a user-modified file (backs it up first), atomic temp+rename. The skill ships in the npm package
+// (files: skills/), not in dist/, so the source is packageDir()/skills.
+async function maybeInstallClaudeSkill(options: ParsedArgs['options']): Promise<void> {
+  const source = path.join(packageDir(), 'skills', 'ihow-memory', 'SKILL.md');
+  let sourceContent: string;
+  try {
+    sourceContent = await fs.readFile(source, 'utf8');
+  } catch {
+    console.log('Tip: install the memory skill — copy skills/ihow-memory/SKILL.md into ~/.claude/skills/ihow-memory/.');
+    return;
+  }
+  const dest = path.join(os.homedir(), '.claude', 'skills', 'ihow-memory', 'SKILL.md');
+
+  let proceed = options.installSkill === true;
+  if (options.installSkill === undefined) {
+    if (process.stdout.isTTY && process.stdin.isTTY) {
+      const readline = await import('node:readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise<string>((resolve) => {
+        rl.question(`\nInstall the proactive-memory skill for Claude Code into ${dest}? [y/N] › `, (a) => resolve(a));
+      });
+      rl.close();
+      proceed = /^y(es)?$/i.test(answer.trim());
+    } else {
+      console.log('Tip: for proactive recall/recording, re-run with --install-skill, or copy skills/ihow-memory/SKILL.md into ~/.claude/skills/ihow-memory/.');
+      return;
+    }
+  }
+  if (!proceed) {
+    console.log('Skipped skill install. (Run with --install-skill, or copy skills/ihow-memory/SKILL.md into ~/.claude/skills/ihow-memory/ later.)');
+    return;
+  }
+
+  try {
+    const existing = await fs.readFile(dest, 'utf8');
+    if (existing === sourceContent) {
+      console.log(`✓ memory skill already current at ${dest}`);
+      return;
+    }
+    const backup = `${dest}.ihow-bak-${Date.now()}`;
+    await fs.copyFile(dest, backup);
+    console.log(`backup: ${backup}`);
+  } catch {
+    // dest does not exist yet — fresh install
+  }
+  await fs.mkdir(path.dirname(dest), { recursive: true });
+  const tmp = `${dest}.ihow-tmp-${process.pid}`;
+  await fs.writeFile(tmp, sourceContent, 'utf8');
+  await fs.rename(tmp, dest);
+  console.log(`✓ installed memory skill → ${dest} (restart Claude Code to load it)`);
+}
+
+// The Stop-hook command Claude Code runs: an absolute `node <bin> hook-stop` so it is fast (no npx
+// resolution) and works regardless of PATH. Paths are JSON-quoted for shell safety.
+function stopHookCommand(options: ParsedArgs['options']): string {
+  const bin = path.join(packageDir(), 'bin', 'ihow-memory.mjs');
+  const parts = [JSON.stringify(process.execPath), JSON.stringify(bin), 'hook-stop'];
+  // Bind the connect-time workspace into the hook so hook-stop resolves the SAME memory the MCP
+  // server writes to — otherwise, under a custom root/memory-root, the marker and the journal can
+  // diverge ("hook fired but nothing in memory").
+  if (options.root) parts.push('--root', JSON.stringify(options.root));
+  if (options.space) parts.push('--space', JSON.stringify(options.space));
+  if (options.memoryRoot) parts.push('--memory-root', JSON.stringify(options.memoryRoot));
+  if (options.stateRoot) parts.push('--state-root', JSON.stringify(options.stateRoot));
+  return parts.join(' ');
+}
+
+// Optionally wire the session-end auto-capture Stop hook into ~/.claude/settings.json. Consent-gated
+// like the skill install. Mirrors connect's MCP-write safety: merges into existing settings (never
+// drops other hooks/keys), refuses to clobber unparseable JSON, backs up before writing, atomic
+// temp+rename, idempotent (skips if our hook is already present).
+async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<void> {
+  // Default to this project's gitignored local settings (the hook command carries a machine-specific
+  // absolute path, so it must NOT be committed, and a Stop hook should not fire for unrelated repos).
+  // --global-hook opts into the user-wide ~/.claude/settings.json (fires for every Claude Code project).
+  const scopeLabel = options.globalHook ? 'global · all Claude Code projects' : 'this project only';
+  const dest = options.globalHook
+    ? path.join(os.homedir(), '.claude', 'settings.json')
+    : path.join(path.resolve(options.cwd || process.cwd()), '.claude', 'settings.local.json');
+
+  let proceed = options.installHook === true;
+  if (options.installHook === undefined) {
+    if (process.stdout.isTTY && process.stdin.isTTY) {
+      const readline = await import('node:readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise<string>((resolve) => {
+        rl.question(`\nInstall the session-end auto-capture Stop hook into ${dest}? [y/N] › `, (a) => resolve(a));
+      });
+      rl.close();
+      proceed = /^y(es)?$/i.test(answer.trim());
+    } else {
+      console.log('Tip: for automatic session-end capture, re-run with --install-hook (adds a project-local Stop hook to .claude/settings.local.json by default; --global-hook for ~/.claude/settings.json).');
+      return;
+    }
+  }
+  if (!proceed) {
+    console.log('Skipped auto-capture hook. (Add it later with --install-hook.)');
+    return;
+  }
+
+  // The hook command points at this package's bin (absolute path). That is stable for a global
+  // (`npm i -g`) or local node_modules install, but an `npx` one-off lives in a cache that can be
+  // cleared — which would silently break the hook. Warn so the user installs durably.
+  if (/[\\/]_npx[\\/]/.test(packageDir())) {
+    console.log('Note: installing from an npx cache path, which can be cleared and break the hook. For a durable hook, install globally first (npm i -g ihow-memory), then re-run install-hook.');
+  }
+
+  let settings: Record<string, unknown> = {};
+  let existed = false;
+  try {
+    const raw = await fs.readFile(dest, 'utf8');
+    existed = true;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not_object');
+    settings = parsed as Record<string, unknown>;
+  } catch {
+    if (existed) {
+      console.error(`refusing to modify unparseable ${dest} — fix it, or add the Stop hook by hand.`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  const hooks = (settings.hooks && typeof settings.hooks === 'object' && !Array.isArray(settings.hooks)
+    ? settings.hooks
+    : {}) as Record<string, unknown>;
+  const stop = Array.isArray(hooks.Stop) ? (hooks.Stop as unknown[]) : [];
+  const alreadyPresent = stop.some((group) => {
+    const entries = (group as { hooks?: unknown[] })?.hooks;
+    return Array.isArray(entries) && entries.some((entry) => {
+      const command = (entry as { command?: string })?.command;
+      return typeof command === 'string' && command.includes('hook-stop') && command.includes('ihow-memory');
+    });
+  });
+  if (alreadyPresent) {
+    console.log(`✓ auto-capture Stop hook already present in ${dest}`);
+    return;
+  }
+
+  stop.push({ hooks: [{ type: 'command', command: stopHookCommand(options), timeout: 30 }] });
+  hooks.Stop = stop;
+  settings.hooks = hooks;
+
+  if (existed) {
+    const backup = `${dest}.ihow-bak-${Date.now()}`;
+    await fs.copyFile(dest, backup);
+    console.log(`backup: ${backup}`);
+  }
+  await fs.mkdir(path.dirname(dest), { recursive: true });
+  const tmp = `${dest}.ihow-tmp-${process.pid}`;
+  await fs.writeFile(tmp, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+  await fs.rename(tmp, dest);
+  console.log(`✓ installed auto-capture Stop hook [${scopeLabel}] → ${dest} (restart Claude Code to load it)`);
+}
+
+const STOP_HOOK_REASON =
+  'iHow Memory — session-end capture. Project convention: before this session ends, record a brief handoff to shared memory. Call the ihow-memory MCP tool memory.journal with a few sentences covering the current state, key decisions, verified results, blockers, and the next step, so the next session or a different agent can continue. Do not include secrets, tokens, or credentials. If nothing substantive happened, you may skip.';
+
+async function readStdinSafe(): Promise<string> {
+  if (process.stdin.isTTY) return '';
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function hookMarkerName(sessionId: string): string {
+  const safe = String(sessionId || 'unknown').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
+  return `stop-${safe}.json`;
+}
+
+async function transcriptEntryCount(transcriptPath: string): Promise<number> {
+  try {
+    const raw = await fs.readFile(transcriptPath, 'utf8');
+    return raw.split('\n').filter((line) => line.trim()).length;
+  } catch {
+    return 0;
+  }
+}
+
+// Claude Code Stop-hook handler. Reads the hook payload JSON on stdin and, for a substantive
+// session not yet captured, emits {decision:"block", reason} so Claude records a handoff to
+// memory in-session (via the memory.journal MCP tool) before stopping. Designed to NEVER throw
+// or disrupt the session: any problem -> exit 0 with no output. Captures at most once per
+// session (Stop fires on every turn), and short-circuits when our own block re-fired it.
+async function runStopHook(options: ParsedArgs['options']): Promise<void> {
+  let payload: Record<string, unknown> = {};
+  try {
+    const raw = await readStdinSafe();
+    if (raw.trim()) payload = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return; // unparseable input -> no-op
+  }
+  if (payload.stop_hook_active === true) return; // recursion guard
+
+  const sessionId = typeof payload.session_id === 'string' ? payload.session_id : 'unknown';
+  const cwd = typeof payload.cwd === 'string' ? payload.cwd : options.cwd;
+  let workspace;
+  try {
+    workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd }));
+  } catch {
+    return;
+  }
+  const transcriptPath = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
+  const entries = transcriptPath ? await transcriptEntryCount(transcriptPath) : 0;
+  const MIN_TRANSCRIPT_ENTRIES = 4;
+  if (entries < MIN_TRANSCRIPT_ENTRIES) return; // skip trivial / short sessions
+
+  // The marker records what we PROMPTED (not what was captured — the agent does the actual write).
+  // To avoid the "prompted once then permanently miss" failure, this is best-effort at-least-once:
+  // re-prompt as the session keeps growing, until a journal entry actually lands (verified against
+  // the audit log) or a small prompt cap is hit. Once captured, stop nudging (no duplicate spam).
+  const markerDir = path.join(workspace.spaceDir, '.hooks');
+  const marker = path.join(markerDir, hookMarkerName(sessionId));
+  const GROWTH = 6; // transcript entries of new activity before re-prompting
+  const MAX_PROMPTS = 3;
+
+  let state: { prompts: number; lastAt: string; lastEntries: number } | undefined;
+  try {
+    state = JSON.parse(await fs.readFile(marker, 'utf8'));
+  } catch {
+    state = undefined;
+  }
+
+  if (state) {
+    try {
+      // Auto-capture via the MCP memory.journal tool lands in the _mcp lane while this hook resolves
+      // the managed-space main lane; readEventsAllLanes checks BOTH so we detect a journal that landed
+      // and stop nudging — otherwise we re-prompt and cause duplicate captures.
+      const captured = (await readEventsAllLanes(workspace)).some(
+        (event) => event.type === 'memory.journal.appended' && typeof event.at === 'string' && event.at > state!.lastAt,
+      );
+      if (captured) return; // a journal entry landed since we last prompted — done, stop nudging
+    } catch {
+      // audit unreadable → fall through to growth-based re-prompt
+    }
+    if (state.prompts >= MAX_PROMPTS || entries - state.lastEntries < GROWTH) return;
+  }
+
+  await fs.mkdir(markerDir, { recursive: true });
+  const next = { prompts: (state?.prompts ?? 0) + 1, lastAt: new Date().toISOString(), lastEntries: entries };
+  await fs.writeFile(marker, JSON.stringify(next), 'utf8');
+  process.stdout.write(`${JSON.stringify({ decision: 'block', reason: STOP_HOOK_REASON })}\n`);
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   const { command, options, rest } = parsed;
@@ -886,6 +1150,21 @@ async function main(): Promise<void> {
 
   if (command === '--version' || command === '-v' || command === 'version') {
     console.log(packageVersion());
+    return;
+  }
+
+  if (command === 'hook-stop') {
+    await runStopHook(options);
+    return;
+  }
+
+  if (command === 'install-skill') {
+    await maybeInstallClaudeSkill({ ...options, installSkill: options.installSkill !== false });
+    return;
+  }
+
+  if (command === 'install-hook') {
+    await maybeInstallStopHook({ ...options, installHook: options.installHook !== false });
     return;
   }
 
@@ -945,7 +1224,8 @@ async function main(): Promise<void> {
         if (result.replaced) console.log('(replaced an existing ihow-memory entry)');
         console.log(`Restart ${runtimeLabel(options.runtime)} to load the memory tools.`);
         if (options.runtime === 'claude-code') {
-          console.log('Tip: for proactive recall/recording, install the memory skill — see skills/ihow-memory/SKILL.md (copy into ~/.claude/skills/ihow-memory/).');
+          await maybeInstallClaudeSkill(options);
+          await maybeInstallStopHook(options);
         }
       }
     }
@@ -1104,6 +1384,16 @@ async function main(): Promise<void> {
     printJson(await core.write_candidate({ text: rest.join(' '), sourceAgent: 'cli' }));
     return;
   }
+  if (command === 'journal') {
+    const parts: string[] = [];
+    let title: string | undefined;
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--title') title = rest[++index];
+      else parts.push(rest[index]);
+    }
+    printJson(await core.journal({ text: parts.join(' '), title, sourceAgent: options.actor || 'cli' }));
+    return;
+  }
   if (command === 'promote') {
     const candidate = rest[0];
     const target: Record<string, string> = {};
@@ -1130,6 +1420,23 @@ async function main(): Promise<void> {
         target,
       }),
     );
+    return;
+  }
+  if (command === 'audit') {
+    let since: string | undefined;
+    for (let index = 0; index < rest.length; index += 1) if (rest[index] === '--since') since = rest[++index];
+    printJson(await core.audit({ since }));
+    return;
+  }
+  if (command === 'rollback') {
+    let eventId: string | undefined;
+    for (let index = 0; index < rest.length; index += 1) if (rest[index] === '--event') eventId = rest[++index];
+    if (!eventId) {
+      console.error('rollback requires --event <eventId> (find ids via: ihow-memory audit)');
+      process.exitCode = 1;
+      return;
+    }
+    printJson(await core.rollback(eventId));
     return;
   }
 

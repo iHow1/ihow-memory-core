@@ -134,6 +134,19 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'memory.journal',
+    description: 'Append a low-weight, append-only entry to the daily journal (auto-capture lane). Unlike write_candidate -> promote, this writes directly: the entry is searchable but always ranked BELOW curated memory, so it is safe for automatic session-end capture of what happened. Never store secrets. For high-value durable facts worth keeping, use write_candidate + promote instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string' },
+        title: { type: 'string' },
+        sourceAgent: { type: 'string' },
+      },
+      required: ['text'],
+    },
+  },
+  {
     name: 'memory.status',
     description: 'Return workspace, local FTS provider, index, and sync status. Use to confirm the index is ready and that cloud/sync are disabled (local-only) before relying on recall.',
     inputSchema: {
@@ -189,14 +202,20 @@ async function main(): Promise<void> {
             actor: typeof args.actor === 'string' ? args.actor : 'mcp',
             target: (args.target || {}) as Record<string, string>,
           });
+        } else if (name === 'memory.journal') {
+          payload = await core.journal(args);
         } else if (name === 'memory.status') {
           payload = await core.status();
         } else {
           throw new Error('unknown_tool');
         }
+        // MCP requires structuredContent to be a JSON object; tools that return an array
+        // (e.g. memory.search) otherwise fail client-side schema validation
+        // ("expected record, received array"). Wrap array payloads in an object.
+        const structured = Array.isArray(payload) ? { results: payload } : payload;
         result(id, {
-          content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
-          structuredContent: payload,
+          content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+          structuredContent: structured,
         });
       } else {
         error(id, -32601, 'method_not_found');
