@@ -38,6 +38,7 @@ type ParsedArgs = {
     installSkill?: boolean;
     installHook?: boolean;
     globalHook?: boolean;
+    easy?: boolean;
   };
   rest: string[];
 };
@@ -83,6 +84,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--install-hook') options.installHook = true;
     else if (arg === '--no-install-hook') options.installHook = false;
     else if (arg === '--global-hook') options.globalHook = true;
+    else if (arg === '--easy' || arg === '--yes') options.easy = true;
     else if (arg === '--json') options.json = true;
     else if (arg === '--limit') options.limit = Number(tail[++index]);
     else if (arg === '--dry-run') options.dryRun = true;
@@ -441,7 +443,7 @@ Usage:
   ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
-  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes [--dry-run] [--json]   # auto-config MCP (official CLI for claude/codex; safe backup+merge for cursor/workbuddy/claude-desktop/opencode)
+  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the skill + a project-local auto-capture hook, no prompts
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Claude Code Stop-hook handler (reads hook JSON on stdin; wired by the plugin) — emits a session-end capture instruction
   ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
@@ -1204,6 +1206,17 @@ async function main(): Promise<void> {
       console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes');
       process.exitCode = 1;
       return;
+    }
+    // Easy mode (`--easy` / `--yes`): one command does the whole Claude Code setup — MCP + skill +
+    // a project-local auto-capture hook — with no per-step prompts (the flag IS the consent, so it
+    // is also safe in non-TTY/agent use). Explicit --no-install-skill / --no-install-hook still win,
+    // and the bare `connect` defaults (skill/hook OFF unless opted in) are unchanged.
+    if (options.easy) {
+      if (options.runtime === 'claude-code' && !options.dryRun) {
+        console.log('easy setup: MCP + skill + a project-local auto-capture hook (no prompts; --global-hook for user-wide)');
+      }
+      if (options.installSkill === undefined) options.installSkill = true;
+      if (options.installHook === undefined) options.installHook = true;
     }
     const workspace = await ensureWorkspace(resolveWorkspace(options));
     if (!options.dryRun) await installRuntimeBundle(workspace); // dry-run: don't materialize the bundle
