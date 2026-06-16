@@ -79,3 +79,26 @@ test('hook-stop: re-prompts as the session grows, then stops once a journal entr
   // session grows again, but the audit log shows capture happened → no more prompts (no duplicate spam)
   assert.equal(runHookStop({ session_id: 'g1', transcript_path: await mkTranscript(20) }, root, 'h').trim(), '');
 });
+
+test('hook-stop: marker records the session window (session_id/cwd/transcriptPath/startedAt) for correlation', async (t) => {
+  const root = await mkdtempReal('ihow-hook-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const transcript = path.join(root, 'win.jsonl');
+  await fs.writeFile(
+    transcript,
+    ['{"role":"user"}', '{"role":"assistant"}', '{"role":"user"}', '{"role":"assistant"}', '{"role":"user"}'].join('\n') + '\n',
+    'utf8',
+  );
+  runHookStop({ session_id: 'win-sess', cwd: root, transcript_path: transcript }, root, 'h');
+
+  const hooksDir = path.join(root, 'h', '.hooks');
+  const files = (await fs.readdir(hooksDir)).filter((f) => f.startsWith('stop-') && f.endsWith('.json'));
+  assert.equal(files.length, 1, 'exactly one stop marker');
+  const m = JSON.parse(await fs.readFile(path.join(hooksDir, files[0]), 'utf8'));
+  assert.equal(m.schemaVersion, 1);
+  assert.equal(m.sessionId, 'win-sess');
+  assert.equal(m.cwd, root);
+  assert.equal(m.transcriptPath, transcript);
+  assert.ok(typeof m.startedAt === 'string' && !Number.isNaN(Date.parse(m.startedAt)), 'startedAt is an ISO timestamp');
+  assert.ok(typeof m.lastAt === 'string' && !Number.isNaN(Date.parse(m.lastAt)), 'lastAt is an ISO timestamp');
+});

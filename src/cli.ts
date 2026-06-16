@@ -1191,7 +1191,7 @@ async function runStopHook(options: ParsedArgs['options']): Promise<void> {
   const GROWTH = 6; // transcript entries of new activity before re-prompting
   const MAX_PROMPTS = 3;
 
-  let state: { prompts: number; lastAt: string; lastEntries: number } | undefined;
+  let state: { prompts: number; lastAt: string; lastEntries: number; startedAt?: string } | undefined;
   try {
     state = JSON.parse(await fs.readFile(marker, 'utf8'));
   } catch {
@@ -1214,7 +1214,21 @@ async function runStopHook(options: ParsedArgs['options']): Promise<void> {
   }
 
   await fs.mkdir(markerDir, { recursive: true });
-  const next = { prompts: (state?.prompts ?? 0) + 1, lastAt: new Date().toISOString(), lastEntries: entries };
+  const nowIso = new Date().toISOString();
+  // Record a session WINDOW (not just the prompt count). Session-correlated dogfood telemetry (the
+  // collaboration-rate oracle) attributes a journal to the session whose [startedAt, lastAt] window +
+  // cwd contains the journal's timestamp — Claude Code does NOT expose session_id to the MCP server
+  // that writes the cooperative journal, so (cwd, time) correlation is the only reliable attribution.
+  const next = {
+    schemaVersion: 1,
+    sessionId,
+    cwd: cwd ?? null,
+    transcriptPath: transcriptPath || null,
+    startedAt: state?.startedAt ?? nowIso,
+    prompts: (state?.prompts ?? 0) + 1,
+    lastAt: nowIso,
+    lastEntries: entries,
+  };
   await fs.writeFile(marker, JSON.stringify(next), 'utf8');
   process.stdout.write(`${JSON.stringify({ decision: 'block', reason: STOP_HOOK_REASON })}\n`);
 }
