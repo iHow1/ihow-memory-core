@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
@@ -78,6 +78,29 @@ test('hook-stop: re-prompts as the session grows, then stops once a journal entr
   execFileSync(process.execPath, [CLI, 'journal', 'captured handoff', '--root', root, '--space', 'h'], { encoding: 'utf8' });
   // session grows again, but the audit log shows capture happened → no more prompts (no duplicate spam)
   assert.equal(runHookStop({ session_id: 'g1', transcript_path: await mkTranscript(20) }, root, 'h').trim(), '');
+});
+
+test('hook-stop: stderr observability is opt-in (IHOW_HOOK_DEBUG) and never pollutes stdout', async (t) => {
+  const root = await mkdtempReal('ihow-hook-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const transcript = path.join(root, 'obs.jsonl');
+  await fs.writeFile(transcript, ['{"i":1}', '{"i":2}', '{"i":3}', '{"i":4}', '{"i":5}'].join('\n') + '\n', 'utf8');
+  const run = (sid, env) =>
+    spawnSync(process.execPath, [CLI, 'hook-stop', '--root', root, '--space', 'h'], {
+      input: JSON.stringify({ session_id: sid, transcript_path: transcript }),
+      encoding: 'utf8',
+      env: { ...process.env, ...env },
+    });
+
+  // default OFF: stdout still carries the decision; stderr has no hook log
+  const off = run('obs-off', { IHOW_HOOK_DEBUG: '' });
+  assert.equal(JSON.parse(off.stdout).decision, 'block', 'stdout carries the decision');
+  assert.ok(!/ihow-memory hook:/.test(off.stderr), 'no hook log on stderr when IHOW_HOOK_DEBUG is unset');
+
+  // opt-in ON (fresh session): a concise outcome line lands on STDERR, stdout unchanged
+  const on = run('obs-on', { IHOW_HOOK_DEBUG: '1' });
+  assert.equal(JSON.parse(on.stdout).decision, 'block', 'stdout unchanged — logging goes to stderr only');
+  assert.match(on.stderr, /ihow-memory hook: stop: re-prompt/, 'opt-in stderr outcome line present');
 });
 
 test('hook-stop: marker schema v2 records honest hook timestamps + floor-processed state', async (t) => {

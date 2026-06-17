@@ -1225,6 +1225,18 @@ function markerLastAt(m: StopMarker | undefined): string | undefined {
   return m?.hookLastAt ?? m?.lastAt;
 }
 
+// Opt-in hook observability. STDOUT is the hook's control channel (the decision JSON / silence), so
+// diagnostics go to STDERR and ONLY when IHOW_HOOK_DEBUG is set — off by default so a normal session is
+// never polluted. Never throws (a logging failure must not break a hook). Lets a dogfood operator see
+// what the Stop/SessionStart hooks decided (fired / skipped-why / floor outcome) without guessing.
+function hookLog(msg: string): void {
+  try {
+    if (process.env.IHOW_HOOK_DEBUG) process.stderr.write(`ihow-memory hook: ${msg}\n`);
+  } catch {
+    // observability must never disrupt the hook
+  }
+}
+
 // Claude Code Stop-hook handler. Reads the hook payload JSON on stdin and, for a substantive
 // session not yet captured, emits {decision:"block", reason} so Claude records a handoff to
 // memory in-session (via the memory.journal MCP tool) before stopping. Designed to NEVER throw
@@ -1308,6 +1320,7 @@ async function runStopHook(options: ParsedArgs['options']): Promise<void> {
     processed: state?.processed ?? false,
   };
   await fs.writeFile(marker, JSON.stringify(next), 'utf8');
+  hookLog(`stop: re-prompt (decision=block) session=${sessionId} prompt#${next.prompts} entries=${entries}`);
   process.stdout.write(`${JSON.stringify({ decision: 'block', reason: STOP_HOOK_REASON })}\n`);
 }
 
@@ -1480,7 +1493,9 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
     } catch {
       // could not persist processed-state — leave the marker; idempotency still holds via floorAt
     }
+    hookLog(`session-start: marker ${m.sessionId ?? '?'} -> ${outcome}${floorEventId ? ` (eventId=${floorEventId})` : ''}`);
   }
+  hookLog(`session-start: processed ${candidates.length} marker(s); pending(unprocessed)=${markers.filter((x) => x.m.processed !== true).length}`);
   // recall stays OFF (OpenClaw lock): SessionStart performs SILENT floor capture only — it writes NO
   // context injection to stdout, so capture and recall are never enabled together.
 }
