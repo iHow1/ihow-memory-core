@@ -34,13 +34,17 @@ async function readJson(p) {
 function stopCommands(settings) {
   return (settings.hooks?.Stop ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
 }
+function sessionStartCommands(settings) {
+  return (settings.hooks?.SessionStart ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
+}
 
-test('install-hook defaults to this project (.claude/settings.local.json)', async (t) => {
+test('install-hook defaults to this project (.claude/settings.local.json), wiring BOTH capture hooks', async (t) => {
   const proj = await mkdtempReal('ihow-proj-');
   t.after(async () => { await fs.rm(proj, { recursive: true, force: true }); });
-  assert.match(runInstallHook({ cwd: proj }), /installed auto-capture Stop hook/);
-  const cmds = stopCommands(await readJson(path.join(proj, '.claude', 'settings.local.json')));
-  assert.ok(cmds.some((c) => c.includes('hook-stop') && c.includes('ihow-memory')), 'project-local hook present');
+  assert.match(runInstallHook({ cwd: proj }), /installed auto-capture hooks/);
+  const settings = await readJson(path.join(proj, '.claude', 'settings.local.json'));
+  assert.ok(stopCommands(settings).some((c) => c.includes('hook-stop') && c.includes('ihow-memory')), 'project-local Stop hook present');
+  assert.ok(sessionStartCommands(settings).some((c) => c.includes('hook-session-start') && c.includes('ihow-memory')), 'project-local SessionStart floor hook present');
 });
 
 test('install-hook --global-hook targets ~/.claude/settings.json and not the project', async (t) => {

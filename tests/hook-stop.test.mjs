@@ -80,7 +80,7 @@ test('hook-stop: re-prompts as the session grows, then stops once a journal entr
   assert.equal(runHookStop({ session_id: 'g1', transcript_path: await mkTranscript(20) }, root, 'h').trim(), '');
 });
 
-test('hook-stop: marker records the session window (session_id/cwd/transcriptPath/startedAt) for correlation', async (t) => {
+test('hook-stop: marker schema v2 records honest hook timestamps + floor-processed state', async (t) => {
   const root = await mkdtempReal('ihow-hook-');
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
   const transcript = path.join(root, 'win.jsonl');
@@ -95,10 +95,17 @@ test('hook-stop: marker records the session window (session_id/cwd/transcriptPat
   const files = (await fs.readdir(hooksDir)).filter((f) => f.startsWith('stop-') && f.endsWith('.json'));
   assert.equal(files.length, 1, 'exactly one stop marker');
   const m = JSON.parse(await fs.readFile(path.join(hooksDir, files[0]), 'utf8'));
-  assert.equal(m.schemaVersion, 1);
+  assert.equal(m.schemaVersion, 2, 'schema v2 (OpenClaw §4.1: honest field names)');
   assert.equal(m.sessionId, 'win-sess');
   assert.equal(m.cwd, root);
   assert.equal(m.transcriptPath, transcript);
-  assert.ok(typeof m.startedAt === 'string' && !Number.isNaN(Date.parse(m.startedAt)), 'startedAt is an ISO timestamp');
-  assert.ok(typeof m.lastAt === 'string' && !Number.isNaN(Date.parse(m.lastAt)), 'lastAt is an ISO timestamp');
+  // hook-observed timestamps are NOT a real session span; named honestly so the oracle can't be misled.
+  assert.ok(typeof m.hookStartedAt === 'string' && !Number.isNaN(Date.parse(m.hookStartedAt)), 'hookStartedAt is an ISO timestamp');
+  assert.ok(typeof m.hookLastAt === 'string' && !Number.isNaN(Date.parse(m.hookLastAt)), 'hookLastAt is an ISO timestamp');
+  assert.ok(typeof m.markerCreatedAt === 'string' && !Number.isNaN(Date.parse(m.markerCreatedAt)), 'markerCreatedAt is an ISO timestamp');
+  assert.ok(typeof m.transcriptMtime === 'string' && !Number.isNaN(Date.parse(m.transcriptMtime)), 'transcriptMtime captured from the transcript file');
+  assert.equal(m.processed, false, 'floor not yet processed — the SessionStart hook sets this');
+  // legacy v1 names are gone (the oracle reads hookStartedAt ?? startedAt for backward compat)
+  assert.equal(m.startedAt, undefined);
+  assert.equal(m.lastAt, undefined);
 });

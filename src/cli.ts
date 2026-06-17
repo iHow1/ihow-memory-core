@@ -9,9 +9,11 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { openCore } from './core.ts';
 import { defaultRoot, ensureWorkspace, resolveWorkspace } from './workspace.ts';
-import { resolveEngineConfig } from './engine/retrieval.ts';
+import { indexWithEngineFallback, resolveEngineConfig } from './engine/retrieval.ts';
 import { sqliteRuntimeStatus } from './engine/fts.ts';
 import { readEventsAllLanes } from './store/events.ts';
+import { appendJournal, redactSecretLikeContent } from './governance.ts';
+import { parseTranscript, summarizeTranscript } from './transcript.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
 
@@ -523,8 +525,9 @@ Usage:
   ihow-memory connect --auto [--write] [--json]   # detect installed runtimes; default reports only, --write connects them all to one shared workspace
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Claude Code Stop-hook handler (reads hook JSON on stdin; wired by the plugin) — emits a session-end capture instruction
+  ihow-memory hook-session-start          # Claude Code SessionStart-hook handler (reads hook JSON on stdin; wired by the plugin) — floors the previous session deterministically if it ended without a cooperative journal
   ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
-  ihow-memory install-hook [--global-hook] [--no-install-hook]   # add the session-end auto-capture Stop hook (default: this project's .claude/settings.local.json; --global-hook: ~/.claude/settings.json)
+  ihow-memory install-hook [--global-hook] [--no-install-hook]   # add the auto-capture hooks: Stop (session-end nudge) + SessionStart (next-session floor) (default: this project's .claude/settings.local.json; --global-hook: ~/.claude/settings.json)
 
 Defaults:
   root: ${defaultRoot()}
@@ -1040,6 +1043,19 @@ function stopHookCommand(options: ParsedArgs['options']): string {
   return parts.join(' ');
 }
 
+// The SessionStart-hook command — the capture FLOOR. Same absolute-node + workspace-binding shape as
+// the Stop hook (so it resolves the SAME memory), but runs `hook-session-start` to floor the PREVIOUS
+// session's transcript when that session ended without a cooperative journal.
+function sessionStartHookCommand(options: ParsedArgs['options']): string {
+  const bin = path.join(packageDir(), 'bin', 'ihow-memory.mjs');
+  const parts = [JSON.stringify(process.execPath), JSON.stringify(bin), 'hook-session-start'];
+  if (options.root) parts.push('--root', JSON.stringify(options.root));
+  if (options.space) parts.push('--space', JSON.stringify(options.space));
+  if (options.memoryRoot) parts.push('--memory-root', JSON.stringify(options.memoryRoot));
+  if (options.stateRoot) parts.push('--state-root', JSON.stringify(options.stateRoot));
+  return parts.join(' ');
+}
+
 // Optionally wire the session-end auto-capture Stop hook into ~/.claude/settings.json. Consent-gated
 // like the skill install. Mirrors connect's MCP-write safety: merges into existing settings (never
 // drops other hooks/keys), refuses to clobber unparseable JSON, backs up before writing, atomic
@@ -1099,21 +1115,34 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
   const hooks = (settings.hooks && typeof settings.hooks === 'object' && !Array.isArray(settings.hooks)
     ? settings.hooks
     : {}) as Record<string, unknown>;
-  const stop = Array.isArray(hooks.Stop) ? (hooks.Stop as unknown[]) : [];
-  const alreadyPresent = stop.some((group) => {
-    const entries = (group as { hooks?: unknown[] })?.hooks;
-    return Array.isArray(entries) && entries.some((entry) => {
-      const command = (entry as { command?: string })?.command;
-      return typeof command === 'string' && command.includes('hook-stop') && command.includes('ihow-memory');
+
+  // Idempotently ensure one command-hook is present under a hook event (Stop / SessionStart), matched
+  // by a command substring so it survives reinstalls. Merges into the existing list — never drops other
+  // hooks or keys. Returns true if it added the hook, false if ours was already present.
+  const ensureHook = (event: string, marker: string, command: string): boolean => {
+    const list = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
+    const present = list.some((group) => {
+      const entries = (group as { hooks?: unknown[] })?.hooks;
+      return Array.isArray(entries) && entries.some((entry) => {
+        const cmd = (entry as { command?: string })?.command;
+        return typeof cmd === 'string' && cmd.includes(marker) && cmd.includes('ihow-memory');
+      });
     });
-  });
-  if (alreadyPresent) {
-    console.log(`✓ auto-capture Stop hook already present in ${dest}`);
+    if (present) return false;
+    list.push({ hooks: [{ type: 'command', command, timeout: 30 }] });
+    hooks[event] = list;
+    return true;
+  };
+
+  // Two hooks form the auto-capture feature: the Stop hook nudges the agent to journal a handoff at
+  // session end (the primary, cooperative path), and the SessionStart hook floors the PREVIOUS session
+  // deterministically if it ended without one (the backstop). Both bind the same workspace.
+  const addedStop = ensureHook('Stop', 'hook-stop', stopHookCommand(options));
+  const addedStart = ensureHook('SessionStart', 'hook-session-start', sessionStartHookCommand(options));
+  if (!addedStop && !addedStart) {
+    console.log(`✓ auto-capture hooks already present in ${dest}`);
     return;
   }
-
-  stop.push({ hooks: [{ type: 'command', command: stopHookCommand(options), timeout: 30 }] });
-  hooks.Stop = stop;
   settings.hooks = hooks;
 
   if (existed) {
@@ -1125,7 +1154,8 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
   const tmp = `${dest}.ihow-tmp-${process.pid}`;
   await fs.writeFile(tmp, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
   await fs.rename(tmp, dest);
-  console.log(`✓ installed auto-capture Stop hook [${scopeLabel}] → ${dest} (restart Claude Code to load it)`);
+  const added = [addedStop ? 'Stop (session-end nudge)' : null, addedStart ? 'SessionStart (next-session floor)' : null].filter(Boolean).join(' + ');
+  console.log(`✓ installed auto-capture hooks [${scopeLabel}]: ${added} → ${dest} (restart Claude Code to load them)`);
 }
 
 const STOP_HOOK_REASON =
@@ -1152,6 +1182,47 @@ async function transcriptEntryCount(transcriptPath: string): Promise<number> {
   } catch {
     return 0;
   }
+}
+
+async function transcriptMtimeIso(transcriptPath: string): Promise<string | null> {
+  try {
+    return (await fs.stat(transcriptPath)).mtime.toISOString();
+  } catch {
+    return null;
+  }
+}
+
+// A Stop-hook marker. schemaVersion 2 (OpenClaw §4.1) names the hook-observed timestamps honestly —
+// hookStartedAt/hookLastAt are when the HOOK fired (NOT a real session span; Claude Code never tells
+// the hook when the session actually began), markerCreatedAt is when the file was first written, and
+// transcriptMtime is the transcript file's mtime at the last fire. `processed` is the floor-capture
+// state set by the SessionStart hook so the next session floors this transcript at most once. v1
+// markers (startedAt/lastAt, no schemaVersion) are read tolerantly via the accessors below.
+type StopMarker = {
+  schemaVersion?: number;
+  sessionId?: string;
+  cwd?: string | null;
+  transcriptPath?: string | null;
+  hookStartedAt?: string;
+  hookLastAt?: string;
+  markerCreatedAt?: string;
+  transcriptMtime?: string | null;
+  prompts?: number;
+  lastEntries?: number;
+  processed?: boolean;
+  processedAt?: string;
+  floorOutcome?: string;
+  floorEventId?: string;
+  // legacy v1 fields (read-only fallback)
+  startedAt?: string;
+  lastAt?: string;
+};
+
+function markerStartedAt(m: StopMarker | undefined): string | undefined {
+  return m?.hookStartedAt ?? m?.startedAt;
+}
+function markerLastAt(m: StopMarker | undefined): string | undefined {
+  return m?.hookLastAt ?? m?.lastAt;
 }
 
 // Claude Code Stop-hook handler. Reads the hook payload JSON on stdin and, for a substantive
@@ -1191,9 +1262,9 @@ async function runStopHook(options: ParsedArgs['options']): Promise<void> {
   const GROWTH = 6; // transcript entries of new activity before re-prompting
   const MAX_PROMPTS = 3;
 
-  let state: { prompts: number; lastAt: string; lastEntries: number; startedAt?: string } | undefined;
+  let state: StopMarker | undefined;
   try {
-    state = JSON.parse(await fs.readFile(marker, 'utf8'));
+    state = JSON.parse(await fs.readFile(marker, 'utf8')) as StopMarker;
   } catch {
     state = undefined;
   }
@@ -1203,34 +1274,206 @@ async function runStopHook(options: ParsedArgs['options']): Promise<void> {
       // Auto-capture via the MCP memory.journal tool lands in the _mcp lane while this hook resolves
       // the managed-space main lane; readEventsAllLanes checks BOTH so we detect a journal that landed
       // and stop nudging — otherwise we re-prompt and cause duplicate captures.
+      const since = markerLastAt(state) ?? '';
       const captured = (await readEventsAllLanes(workspace)).some(
-        (event) => event.type === 'memory.journal.appended' && typeof event.at === 'string' && event.at > state!.lastAt,
+        (event) => event.type === 'memory.journal.appended' && typeof event.at === 'string' && event.at > since,
       );
       if (captured) return; // a journal entry landed since we last prompted — done, stop nudging
     } catch {
       // audit unreadable → fall through to growth-based re-prompt
     }
-    if (state.prompts >= MAX_PROMPTS || entries - state.lastEntries < GROWTH) return;
+    if ((state.prompts ?? 0) >= MAX_PROMPTS || entries - (state.lastEntries ?? 0) < GROWTH) return;
   }
 
   await fs.mkdir(markerDir, { recursive: true });
   const nowIso = new Date().toISOString();
-  // Record a session WINDOW (not just the prompt count). Session-correlated dogfood telemetry (the
-  // collaboration-rate oracle) attributes a journal to the session whose [startedAt, lastAt] window +
-  // cwd contains the journal's timestamp — Claude Code does NOT expose session_id to the MCP server
-  // that writes the cooperative journal, so (cwd, time) correlation is the only reliable attribution.
-  const next = {
-    schemaVersion: 1,
+  // Record what the hook actually OBSERVED — honest field names (OpenClaw §4.1): hookStartedAt /
+  // hookLastAt are when this hook fired (the first / latest turn-end), NOT a true session span; Claude
+  // Code never tells the hook when the session began. markerCreatedAt pins the marker's birth, and
+  // transcriptMtime is the transcript file's mtime now. The collaboration-rate oracle attributes a
+  // cooperative journal to the most-recent prior marker (by hookStartedAt) bounded by the next marker —
+  // CC does NOT expose session_id to the MCP server that writes the journal, so (cwd, time) is the only
+  // attribution available. `processed` is the floor-capture state the SessionStart hook later sets.
+  const next: StopMarker = {
+    schemaVersion: 2,
     sessionId,
     cwd: cwd ?? null,
     transcriptPath: transcriptPath || null,
-    startedAt: state?.startedAt ?? nowIso,
+    hookStartedAt: markerStartedAt(state) ?? nowIso,
+    hookLastAt: nowIso,
+    markerCreatedAt: state?.markerCreatedAt ?? markerStartedAt(state) ?? nowIso,
+    transcriptMtime: transcriptPath ? await transcriptMtimeIso(transcriptPath) : null,
     prompts: (state?.prompts ?? 0) + 1,
-    lastAt: nowIso,
     lastEntries: entries,
+    processed: state?.processed ?? false,
   };
   await fs.writeFile(marker, JSON.stringify(next), 'utf8');
   process.stdout.write(`${JSON.stringify({ decision: 'block', reason: STOP_HOOK_REASON })}\n`);
+}
+
+// Floor-capture tuning. The floor is a BACKSTOP, not the primary path: it only fires for a prior
+// session that did NOT cooperatively journal, it is low-weight + rollbackable, and it is bounded so a
+// backlog can never make a SessionStart slow or spammy.
+const FLOOR_SOURCE_AGENT = 'claude-code-hook';
+const FLOOR_TITLE = 'auto-capture (deterministic)';
+const FLOOR_LOOKBACK_MS = 48 * 60 * 60 * 1000; // only floor markers seen in the last 48h
+const FLOOR_MAX_PER_START = 5; // process at most N backlog markers per SessionStart (bounded scan)
+
+// Claude Code SessionStart-hook handler — the automation-v2 capture FLOOR. When a new session starts,
+// look back at the PREVIOUS session's Stop-hook marker(s); for any that did not already capture a
+// cooperative journal in-session, deterministically summarize that session's transcript (locked scope:
+// assistant text + file paths + command binary names + first prompt — NEVER tool_result / raw Bash),
+// redact it (secret VALUES degrade to [redacted]; content is preserved), and write it as a LOW-WEIGHT,
+// rollbackable journal entry (sourceAgent='claude-code-hook'). This is the safety net for sessions that
+// ended without the agent honoring the Stop-hook nudge. It NEVER injects context into the new session
+// (recall stays OFF) and NEVER throws — any problem exits 0 with no output.
+async function runSessionStartHook(options: ParsedArgs['options']): Promise<void> {
+  let payload: Record<string, unknown> = {};
+  try {
+    const raw = await readStdinSafe();
+    if (raw.trim()) payload = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return; // unparseable input -> no-op
+  }
+  const currentSessionId = typeof payload.session_id === 'string' ? payload.session_id : '';
+  const cwd = typeof payload.cwd === 'string' ? payload.cwd : options.cwd;
+  let workspace;
+  try {
+    workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd }));
+  } catch {
+    return;
+  }
+
+  const markerDir = path.join(workspace.spaceDir, '.hooks');
+  let files: string[];
+  try {
+    files = (await fs.readdir(markerDir)).filter((f) => /^stop-.*\.json$/.test(f));
+  } catch {
+    return; // no markers yet -> nothing to floor
+  }
+
+  const markers: Array<{ file: string; m: StopMarker }> = [];
+  for (const f of files) {
+    try {
+      markers.push({ file: path.join(markerDir, f), m: JSON.parse(await fs.readFile(path.join(markerDir, f), 'utf8')) as StopMarker });
+    } catch {
+      // skip an unreadable / malformed marker — never throw
+    }
+  }
+
+  // Every marker's hookStartedAt, for the oracle-consistent upper bound (a journal belongs to the most
+  // recent prior marker, bounded by the NEXT marker's start). Computed once, shared across candidates.
+  const allStartsMs = markers
+    .map(({ m }) => Date.parse(markerStartedAt(m) ?? ''))
+    .filter((n) => !Number.isNaN(n))
+    .sort((a, b) => a - b);
+
+  const nowMs = Date.now();
+  // Candidates: unprocessed, NOT the current session, and recent (bounded lookback). Oldest first, and
+  // capped — a large backlog must not make SessionStart slow or write a burst of entries.
+  const candidates = markers
+    .filter(({ m }) => m.processed !== true)
+    .filter(({ m }) => m.sessionId !== currentSessionId)
+    .filter(({ m }) => {
+      const s = Date.parse(markerStartedAt(m) ?? '');
+      return !Number.isNaN(s) && nowMs - s <= FLOOR_LOOKBACK_MS;
+    })
+    .sort((a, b) => Date.parse(markerStartedAt(a.m) ?? '') - Date.parse(markerStartedAt(b.m) ?? ''))
+    .slice(0, FLOOR_MAX_PER_START);
+
+  if (candidates.length === 0) return;
+
+  // Audit across BOTH lanes: a cooperative (in-session) journal lands in the _mcp lane with a non-floor
+  // actor; a floor entry we already wrote lands with actor === FLOOR_SOURCE_AGENT. Split them so we can
+  // (a) skip floor when cooperation already happened and (b) stay idempotent even if a prior marker-write
+  // failed to persist `processed`.
+  let events: Awaited<ReturnType<typeof readEventsAllLanes>> = [];
+  try {
+    events = await readEventsAllLanes(workspace);
+  } catch {
+    events = [];
+  }
+  const appendedAt = (predicate: (actor: string) => boolean): number[] =>
+    events
+      .filter((e) => e.type === 'memory.journal.appended' && predicate(typeof e.actor === 'string' ? e.actor : ''))
+      .map((e) => Date.parse(typeof e.at === 'string' ? e.at : ''))
+      .filter((n) => !Number.isNaN(n));
+  const cooperativeAt = appendedAt((actor) => actor !== FLOOR_SOURCE_AGENT);
+  const floorAt = appendedAt((actor) => actor === FLOOR_SOURCE_AGENT);
+
+  const engineConfig = resolveEngineConfig(options);
+
+  for (const { file, m } of candidates) {
+    const startMs = Date.parse(markerStartedAt(m) ?? '');
+    // Upper bound = the next marker's start (any cwd), else now — the current session, starting now,
+    // bounds the prior one. A journal in [start, upper) belongs to this marker's session.
+    const upperMs = allStartsMs.find((s) => s > startMs) ?? nowMs;
+    const inWindow = (t: number): boolean => t >= startMs && t < upperMs;
+
+    let outcome: string;
+    let floorEventId: string | undefined;
+    if (cooperativeAt.some(inWindow)) {
+      outcome = 'skipped-cooperative'; // the session journaled in-session — floor must not duplicate it
+    } else if (floorAt.some(inWindow)) {
+      outcome = 'skipped-already-floored'; // a prior SessionStart already floored this window (idempotent)
+    } else {
+      const tp = typeof m.transcriptPath === 'string' ? m.transcriptPath : '';
+      let raw = '';
+      let readable = false;
+      if (tp) {
+        try {
+          raw = await fs.readFile(tp, 'utf8');
+          readable = true;
+        } catch {
+          readable = false;
+        }
+      }
+      if (!tp || !readable) {
+        outcome = 'unreadable'; // transcript gone / unreadable — record it (metric), never throw
+      } else {
+        let body = '';
+        try {
+          body = summarizeTranscript(parseTranscript(raw)).body;
+        } catch {
+          body = '';
+        }
+        if (!body.trim()) {
+          outcome = 'skipped-empty';
+        } else {
+          // Locked-scope body still may contain an in-scope email/secret-like value -> redact (degrade
+          // the VALUE, keep the surrounding content) so appendJournal's hard-detector gate passes. We use
+          // redactSecretLikeContent (preserve), NEVER containsSecretLikeContent (withhold the whole entry).
+          const redacted = redactSecretLikeContent(body);
+          try {
+            const result = await appendJournal(workspace, { text: redacted, sourceAgent: FLOOR_SOURCE_AGENT, title: FLOOR_TITLE });
+            outcome = 'journaled';
+            floorEventId = result.eventId;
+            try {
+              await indexWithEngineFallback(workspace, engineConfig); // best-effort: searchable, but never fatal
+            } catch {
+              // index failure does not undo the journal entry — it lands on the next rebuild
+            }
+          } catch {
+            outcome = 'error'; // e.g. a residual hard-detector hit — never crash the SessionStart hook
+          }
+        }
+      }
+    }
+
+    // Mark the marker processed (idempotent: a session is floored at most once). If persisting fails the
+    // floorAt/cooperativeAt window check above still prevents a duplicate on the next start.
+    const updated: StopMarker = { ...m, processed: true, processedAt: new Date().toISOString(), floorOutcome: outcome };
+    if (floorEventId) updated.floorEventId = floorEventId;
+    try {
+      const tmp = `${file}.ihow-tmp-${process.pid}`;
+      await fs.writeFile(tmp, JSON.stringify(updated), 'utf8');
+      await fs.rename(tmp, file);
+    } catch {
+      // could not persist processed-state — leave the marker; idempotency still holds via floorAt
+    }
+  }
+  // recall stays OFF (OpenClaw lock): SessionStart performs SILENT floor capture only — it writes NO
+  // context injection to stdout, so capture and recall are never enabled together.
 }
 
 async function main(): Promise<void> {
@@ -1248,6 +1491,11 @@ async function main(): Promise<void> {
 
   if (command === 'hook-stop') {
     await runStopHook(options);
+    return;
+  }
+
+  if (command === 'hook-session-start') {
+    await runSessionStartHook(options);
     return;
   }
 
