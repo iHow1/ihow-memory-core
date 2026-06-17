@@ -84,6 +84,49 @@ test('locked scope: tool_result content NEVER enters the body (security red line
   assert.ok(!body.includes('cat secrets'), 'raw Bash command is not dumped');
 });
 
+test('Did line: a quoted regex alternation does NOT leak its branches as fake binaries', () => {
+  // dogfood 2026-06-17: `grep -nE "marker|hook-stop|runStopHook" f` used to split on the in-quote `|`
+  // and list marker/hook-stop/runStopHook as "binaries". Quote-aware splitting keeps only real binaries;
+  // an out-of-quote pipe still splits into each real stage.
+  const records = [
+    usr('排查 hook'),
+    {
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'tool_use', name: 'Bash', input: { command: 'grep -nE "marker|hook-stop|runStopHook|sessionStart" src/cli.ts | head -5' } },
+          { type: 'text', text: '排查完成：定位到 hook 注册点,确认 marker 写入路径正确,下一步补可观测日志后即可收口验证。' },
+        ],
+      },
+    },
+  ];
+  const { body } = summarizeTranscript(records);
+  assert.match(body, /Did: 1 shell commands/);
+  assert.ok(/\bgrep\b/.test(body) && /\bhead\b/.test(body), 'real binaries (grep, the piped head) are kept');
+  for (const fake of ['hook-stop', 'runStopHook', 'sessionStart']) {
+    assert.ok(!new RegExp(`\\(${'[^)]*'}${fake}`).test(body.split('Did:')[1] ?? ''), `regex branch ${fake} is not listed as a binary`);
+  }
+});
+
+test('Did line: a heredoc body does NOT leak its content lines as fake binaries', () => {
+  // dogfood 2026-06-17: `git commit -F - <<'EOF' ... EOF` leaked `EOF` + body words (workspace/memory)
+  // as binaries. Heredoc bodies are literal data, not commands — stripHeredocs removes them first.
+  const cmd = "git commit -F - <<'EOF'\nfeat: thing\n- touched workspace and memory\nEOF\necho done";
+  const records = [
+    usr('提交'),
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: cmd } }, { type: 'text', text: '提交完成：改动已落库,验证通过,下一步推分支后通知评审,状态可继续。' }] },
+    },
+  ];
+  const { body } = summarizeTranscript(records);
+  const didLine = (body.split('Did:')[1] ?? '').split('\n')[0];
+  assert.match(didLine, /\bgit\b/, 'the real binary (git) is kept');
+  for (const leak of ['EOF', 'workspace', 'memory', 'feat']) {
+    assert.ok(!new RegExp(`\\b${leak}\\b`).test(didLine), `heredoc body token ${leak} does not leak as a binary`);
+  }
+});
+
 test('redact zero-hit: a body containing an email is hard-detector-clean after redaction', () => {
   const withEmail = '上线收口：新版已发布并独立验证；企业咨询联系 hi@ihowmemory.com，按钮点击可复制邮箱。'.repeat(3);
   const records = [usr('继续官网'), asst(withEmail)];

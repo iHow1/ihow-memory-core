@@ -45,6 +45,42 @@ const CLOSING_CAP = 500;
 // shell glue that is never a meaningful "Did" binary
 const GLUE = new Set(['cd', 'echo', 'then', 'fi', 'if', 'for', 'do', 'done', 'else', 'export', 'set', '[', 'test', 'sudo', 'env']);
 
+// Strip heredoc bodies (`cmd <<TAG ... \nTAG`) before tokenizing. A heredoc body is literal data (a
+// commit message, a file written via `cat <<EOF`, a node script) — NOT a sequence of commands — so its
+// lines must not be split into fake "binaries" (dogfood 2026-06-17 saw `EOF` and content words like
+// `workspace`/`memory` leak into the Did line). Quote-protected `node -e '...'` is already safe via
+// splitTopLevel; this handles the unquoted heredoc case. Conservative: only well-formed <<TAG…TAG blocks.
+function stripHeredocs(cmd: string): string {
+  return cmd.replace(/<<-?\s*(['"]?)([A-Za-z_]\w*)\1[\s\S]*?\n\s*\2\b[^\n]*/g, ' ');
+}
+
+// Split a shell command on TOP-LEVEL operators (& | ; newline) only — never inside single/double
+// quotes. Without quote-awareness, a quoted regex such as `grep -E "marker|hook-stop|runStopHook"`
+// would split on the alternation `|` and leak `marker`/`hook-stop`/`runStopHook` as fake "binaries"
+// in the Did line (dogfood 2026-06-17 caught exactly this noise). Pipes/operators OUTSIDE quotes are
+// real command separators and still split, so genuine pipelines still yield each stage's binary.
+function splitTopLevel(cmd: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let quote: string | null = null;
+  for (const ch of cmd) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      cur += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+    } else if (ch === '&' || ch === '|' || ch === ';' || ch === '\n') {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
 // Extract plain text from a message.content that is a STRING or an ARRAY of blocks. Only text
 // blocks count; tool_use / tool_result / thinking / image are skipped (the scope red line).
 function textOf(content: unknown): string {
@@ -147,7 +183,7 @@ export function summarizeTranscript(records: TranscriptRecord[]): TranscriptSumm
         } else if (b.name === 'Bash' && typeof input.command === 'string') {
           cmdCount += 1;
           // a raw command dump is both noise AND a leak surface; keep only meaningful binary names
-          for (const seg of input.command.split(/[&|;\n]+/)) {
+          for (const seg of splitTopLevel(stripHeredocs(input.command))) {
             const tok = seg.trim().split(/\s+/)[0];
             if (!tok) continue;
             const bin = tok.replace(/^.*\//, '').replace(/['"]/g, '');
