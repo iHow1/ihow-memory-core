@@ -39,6 +39,12 @@ function runSessionStart(payload, root, space) {
 function runJournal(text, actor, root, space) {
   return execFileSync(process.execPath, [CLI, 'journal', text, '--actor', actor, '--root', root, '--space', space], { encoding: 'utf8' });
 }
+function runAudit(root, space) {
+  return JSON.parse(execFileSync(process.execPath, [CLI, 'audit', '--root', root, '--space', space], { encoding: 'utf8' }));
+}
+function runRollback(eventId, root, space) {
+  return JSON.parse(execFileSync(process.execPath, [CLI, 'rollback', '--event', eventId, '--root', root, '--space', space], { encoding: 'utf8' }));
+}
 // Seed a v2 Stop marker on disk under <root>/<space>/.hooks/.
 async function writeMarker(root, space, name, marker) {
   const dir = path.join(root, space, '.hooks');
@@ -182,6 +188,70 @@ test('floor: redact zero-hit — a body that contained an email is hard-detector
   assert.ok(!j.includes('hi@ihowmemory.com'), 'the email VALUE was redacted out of the floor entry');
   assert.ok(!containsSecretLikeContent(j), 'POST-redaction the on-disk floor journal is hard-detector zero-hit (OpenClaw §3.5)');
   assert.ok(j.includes('上线收口'), 'redaction preserved the surrounding useful content');
+});
+
+test('floor: dedup window is SAME-CWD (a journal landing after another cwd started still credits its own session)', async (t) => {
+  // Regression for OpenClaw 2026-06-17 §4: the SessionStart dedup upper bound must match the metrics
+  // oracle (next SAME-CWD marker), not "next any-cwd marker". P (cwd a) ran; then Q (cwd b) started in a
+  // different project sharing the workspace; then P's handoff journal lands. With an any-cwd bound, Q's
+  // start would close P's window early and exclude P's journal -> false floor (double-write). With the
+  // same-cwd bound, P's window stays open and the journal is correctly credited -> skip.
+  const root = await mkdtempReal('ihow-floor-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  const transcript = path.join(root, 'p.jsonl');
+  const closing = '交接：cwd A 的会话足够长的实质收尾段,描述状态/下一步/回滚点,超过最小阈值用于被段选择器选中而非回退最长。'.repeat(2);
+  await fs.writeFile(transcript, realTranscript(closing), 'utf8');
+  const pFile = await writeMarker(root, space, 'P-cwdA', {
+    sessionId: 'P-sess', cwd: '/proj/a', transcriptPath: transcript,
+    hookStartedAt: iso(30 * 60 * 1000), hookLastAt: iso(29 * 60 * 1000), markerCreatedAt: iso(30 * 60 * 1000),
+  });
+  // A different-cwd session started AFTER P. It is already processed (not a candidate) — present only so
+  // it would (wrongly) bound P's window under the old any-cwd logic.
+  await writeMarker(root, space, 'Q-cwdB', {
+    sessionId: 'Q-sess', cwd: '/proj/b', transcriptPath: path.join(root, 'q.jsonl'),
+    hookStartedAt: iso(20 * 60 * 1000), hookLastAt: iso(20 * 60 * 1000), markerCreatedAt: iso(20 * 60 * 1000),
+    processed: true, floorOutcome: 'skipped-cooperative',
+  });
+  // P's cooperative handoff lands now (after Q started). It belongs to P's still-open same-cwd window.
+  runJournal('P 的迟到协作 handoff', 'claude-code', root, space);
+
+  runSessionStart({ session_id: 'new-sess', cwd: root, transcript_path: path.join(root, 'new.jsonl') }, root, space);
+
+  assert.equal((await readMarker(pFile)).floorOutcome, 'skipped-cooperative', 'same-cwd open-ended window credits P\'s late journal (would be journaled=false-floor under any-cwd bound)');
+  assert.ok(!(await journalText(root, space)).includes('claude-code-hook'), 'no floor double-write');
+});
+
+test('floor: a journaled floor entry is audit-visible and rollback-able by its floorEventId (OpenClaw §5.1)', async (t) => {
+  const root = await mkdtempReal('ihow-floor-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  const transcript = path.join(root, 'prev.jsonl');
+  const closing = '交接：足够长的实质收尾段用于触发段选择器,描述状态/下一步/回滚点,超过最小阈值,这条会被 floor 兜底记下来。'.repeat(2);
+  await fs.writeFile(transcript, realTranscript(closing), 'utf8');
+  const markerFile = await writeMarker(root, space, 'prev', {
+    sessionId: 'prev-sess', cwd: root, transcriptPath: transcript,
+    hookStartedAt: iso(10 * 60 * 1000), hookLastAt: iso(9 * 60 * 1000), markerCreatedAt: iso(10 * 60 * 1000),
+  });
+
+  runSessionStart({ session_id: 'new-sess', cwd: root, transcript_path: path.join(root, 'new.jsonl') }, root, space);
+  const m = await readMarker(markerFile);
+  assert.equal(m.floorOutcome, 'journaled');
+  const eventId = m.floorEventId;
+  assert.ok(typeof eventId === 'string' && eventId.length > 0, 'floorEventId recorded');
+
+  // audit-visible (both lanes), attributed to the floor actor
+  const audit = runAudit(root, space);
+  const ev = audit.find((e) => e.id === eventId);
+  assert.ok(ev, 'floor event is visible in `audit`');
+  assert.equal(ev.type, 'memory.journal.appended');
+  assert.equal(ev.actor, 'claude-code-hook');
+  assert.ok((await journalText(root, space)).includes('floor 兜底记下来'), 'floor body on disk before rollback');
+
+  // rollback-able by that eventId -> entry removed
+  const rb = runRollback(eventId, root, space);
+  assert.equal(rb.removed, true, 'rollback removed the floor entry');
+  assert.ok(!(await journalText(root, space)).includes('floor 兜底记下来'), 'floor body gone after rollback');
 });
 
 test('floor: unreadable transcript -> floorOutcome=unreadable, no journal, never throws', async (t) => {

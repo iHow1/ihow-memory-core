@@ -1361,12 +1361,14 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
     }
   }
 
-  // Every marker's hookStartedAt, for the oracle-consistent upper bound (a journal belongs to the most
-  // recent prior marker, bounded by the NEXT marker's start). Computed once, shared across candidates.
-  const allStartsMs = markers
-    .map(({ m }) => Date.parse(markerStartedAt(m) ?? ''))
-    .filter((n) => !Number.isNaN(n))
-    .sort((a, b) => a - b);
+  // Every marker as (cwd, start), for the oracle-consistent upper bound. A cooperative journal belongs
+  // to the most recent prior marker, bounded by the next marker IN THE SAME CWD (open-ended otherwise).
+  // This MUST match dogfood-metrics.mjs's attribution: using "any next marker" here would, when two cwds
+  // interleave in one workspace, exclude a cwd's late cooperative journal from its own window and make
+  // the floor double-write a session the oracle counts as cooperated. Computed once, shared across candidates.
+  const allStarts = markers
+    .map(({ m }) => ({ cwd: m.cwd ?? null, startMs: Date.parse(markerStartedAt(m) ?? '') }))
+    .filter((o) => !Number.isNaN(o.startMs));
 
   const nowMs = Date.now();
   // Candidates: unprocessed, NOT the current session, and recent (bounded lookback). Oldest first, and
@@ -1405,9 +1407,16 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
 
   for (const { file, m } of candidates) {
     const startMs = Date.parse(markerStartedAt(m) ?? '');
-    // Upper bound = the next marker's start (any cwd), else now — the current session, starting now,
-    // bounds the prior one. A journal in [start, upper) belongs to this marker's session.
-    const upperMs = allStartsMs.find((s) => s > startMs) ?? nowMs;
+    const cwd = m.cwd ?? null;
+    // Upper bound = the next SAME-CWD marker's start, else now (the current session, starting now, bounds
+    // it). Same-cwd (not any-cwd) so the hook's "did this session cooperate?" decision is identical to the
+    // metrics oracle's attribution — otherwise an interleaved other-cwd marker could shrink this window
+    // and make the floor double-write a session the oracle already credits. A journal in [start, upper)
+    // belongs to this marker's session.
+    const nextSameCwdMs = allStarts
+      .filter((o) => o.cwd === cwd && o.startMs > startMs)
+      .reduce((min, o) => Math.min(min, o.startMs), Infinity);
+    const upperMs = nextSameCwdMs === Infinity ? nowMs : nextSameCwdMs;
     const inWindow = (t: number): boolean => t >= startMs && t < upperMs;
 
     let outcome: string;
