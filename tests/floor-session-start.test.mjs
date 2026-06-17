@@ -74,7 +74,7 @@ function realTranscript(closing) {
     JSON.stringify({ type: 'user', message: { content: '帮我把官网收口' } }),
     JSON.stringify({ type: 'attachment', foo: 1 }), // non-conversational -> skipped
     'not json at all {{{', // malformed -> skipped
-    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/Users/x/site/index.html' } }, { type: 'text', text: '读了首页，准备改导航。' }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/tmp/x/site/index.html' } }, { type: 'text', text: '读了首页，准备改导航。' }] } }),
     JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '中间汇报：导航改完，验证中。' }] } }),
     JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: closing }] } }),
   ].join('\n') + '\n';

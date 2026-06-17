@@ -70,7 +70,7 @@ test('locked scope: tool_result content NEVER enters the body (security red line
       type: 'assistant',
       message: {
         content: [
-          { type: 'tool_use', name: 'Read', input: { file_path: '/Users/x/notes.md' } },
+          { type: 'tool_use', name: 'Read', input: { file_path: '/tmp/x/notes.md' } },
           { type: 'tool_use', name: 'Bash', input: { command: `cat secrets && echo ${leak}` } },
           { type: 'text', text: '完成了对账：核对了三张表与 68 条记录，下一步把结论写回交接文档，状态稳定可清理。' },
         ],
