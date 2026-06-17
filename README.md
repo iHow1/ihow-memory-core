@@ -76,6 +76,19 @@ One-command version of the same proof, in a throwaway space:
 npx ihow-memory proof
 ```
 
+## Runtime support
+
+`connect` generates the MCP registration for seven runtimes. Verification depth differs — be aware of what is end-to-end smoke-tested vs. config-generation only:
+
+| Runtime | `connect` config | Verified |
+| --- | --- | --- |
+| Claude Code | ✓ (`claude mcp add-json`) | ✓ real-app smoke + ongoing dogfood; skill + auto-capture hooks |
+| Codex | ✓ (`codex mcp add`) | ⚠ config generation + tests; no end-to-end app smoke yet (CLI-only) |
+| Cursor | ✓ (merges `~/.cursor/mcp.json`) | ⚠ config generation + tests; no end-to-end app smoke yet |
+| WorkBuddy / Claude Desktop / OpenCode / Hermes | ✓ | ⚠ config generation + tests; no end-to-end app smoke yet |
+
+The MCP tools and governed loop are runtime-agnostic; only the proactive skill + auto-capture hooks are Claude Code-specific today.
+
 ## Retrieval engine
 
 The default retrieval engine is zero-dependency local full-text search — Node built-ins plus `node:sqlite` FTS5 only: no third-party runtime deps, no embedding downloads, no model or API key, with citation-bearing results. An optional local vector provider (separate process) adds semantic retrieval; if unconfigured or unhealthy, retrieval falls back visibly to FTS. Governance, write guards and audit behavior never change with the retrieval backend. The memory itself stays human-readable, editable, rollback-able Markdown.
@@ -164,6 +177,16 @@ In that mode the write boundary is strict: existing durable Markdown is read-onl
 2. Delete demo spaces with `npx ihow-memory reset --space <name>`.
 3. If installed globally: `npm uninstall -g ihow-memory`.
 4. Delete any custom state root only after reviewing its contents.
+
+## Troubleshooting
+
+- **A write was rejected as secret-like but isn't.** The pre-write check is deliberately conservative (it pattern-matches tokens/keys/credentials). Rephrase to drop the secret-shaped substring, or keep the value out of memory entirely. Auto-capture redacts rather than rejects, so this affects manual `write-candidate` / `promote`.
+- **`search` finds nothing you just wrote.** The FTS index rebuilds on write, but if it looks stale run `npx ihow-memory reindex` to rebuild from Markdown. Confirm the index status with `npx ihow-memory status`.
+- **`doctor` flags `node:sqlite`.** You need Node.js ≥ 22.12 (the version that ships `node:sqlite`). Check with `node -v`.
+- **Hook installed but nothing captured (Claude Code).** Restart Claude Code after `install-hook` so it loads the settings. The cooperative Stop hook depends on the agent honoring the prompt; the deterministic SessionStart floor only fires for a *previous* session that ended without a cooperative journal (so a session that already journaled is correctly skipped). Inspect outcomes with `npx ihow-memory audit`.
+- **`connect --auto` across projects only backs up one.** Floor capture is single-cwd (see Limitations).
+- **npx cache cleared / hook command broke.** Installing from an `npx` cache path can be wiped; for a durable hook install globally (`npm i -g ihow-memory`) then re-run `install-hook`.
+- **Windows.** Use WSL; native Windows is experimental.
 
 ## Proactive memory (Claude Code)
 
