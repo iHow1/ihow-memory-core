@@ -108,7 +108,7 @@ stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）
 ihow-memory init             创建受管 workspace，打印 MCP 配置片段
 ihow-memory connect          自动配置 runtime（claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes）[--dry-run]
 ihow-memory install-skill    安装 Claude Code 记忆 skill 到 ~/.claude/skills
-ihow-memory install-hook     安装会话结束自动捕获的 Stop hook（默认 project-local；--global-hook 用户级）
+ihow-memory install-hook     安装自动捕获 hooks——Stop（协作式提示）+ SessionStart（确定式 floor）（默认 project-local；--global-hook 用户级）
 ihow-memory doctor           环境与配置检查 [--share-diagnostics 输出脱敏报告]
 ihow-memory status           workspace、引擎、索引与 sync 状态 [--json]
 ihow-memory search <query>   带引用的本地检索 [--limit n]
@@ -131,9 +131,12 @@ ihow-memory telemetry        on | off | status——匿名计数，默认关闭
 
 ## 主动记忆（Claude Code，实验性）
 
-`connect --runtime claude-code --install-hook` 会装一个 Stop hook：会话结束时请求在场 agent 通过 `memory.journal` 把一次交接记入低权重 `journal` 通道。它是**尽力而为**（随会话增长重提示、写入一条后即停）、**默认 project-local**（`--global-hook` 用户级）、**可回滚**（`ihow-memory audit` / `rollback`）。
+自动捕获分两层：
 
-> **实验性、且 Claude Code 优先。** 这是一次 Stop-hook 交接，**不是**有保证的自动捕获循环——是否写入取决于 agent 是否照提示执行。机制（会话结束自动触发 → agent 经 MCP 写入 → 低权重 journal）已在本地与另一 runtime 验证；真实 Claude Code app smoke 已通过，多轮 dogfood 仍待做。自动捕获的笔记是**低权重、未经审阅**的——可信长期记忆请用 `promote` / `durable-promote`。完整说明以英文 README 为准。
+- **会话结束协作式捕获——实验性。** `connect --runtime claude-code --install-hook` 装一个 Stop hook：会话结束时请求在场 agent 通过 `memory.journal` 把一次交接记入低权重 `journal` 通道。它是**尽力而为**（随会话增长重提示、写入一条后即停）、**默认 project-local**（`--global-hook` 用户级）、**可回滚**（`ihow-memory audit` / `rollback`）。
+- **下一会话 floor 兜底（确定式）——实验性，仅 `next`。** 同一个 `install-hook` 还会装一个 SessionStart hook：新会话启动时，**若上一会话没有协作式 journal**，就确定式地把上一会话兜底——解析其 transcript，在**锁死的范围**内（assistant 文本 + 文件路径 + 命令二进制名 + 首个 prompt；绝不含工具输出、绝不含原始 shell）取"最后实质段"摘要，脱敏后写为一条低权重、可审计、可回滚的 journal 条目。它是协作式提示之下的安全网：**单 cwd**、静默（绝不注入上下文——recall 保持关闭）、永不抛错。已在 22 个真实历史 transcript 上离线评分通过 backstop 质量门；真实的自然 floor 命中仍在 dogfood 中（因为目前协作式捕获覆盖了所有观察到的会话）。
+
+> **实验性、且 Claude Code 优先。** 自动捕获 = 协作式 Stop-hook 提示（是否写入取决于 agent 是否照做）+ 确定式 SessionStart floor 兜底（仅 `next`，在提示没被照做时捕获上一会话）。两者都写**低权重、未经审阅**的笔记——可信长期记忆请用 `promote` / `durable-promote`。floor 仅作离线验证过的 backstop，尚未升为 primary/默认权重路径；`recall`（把记忆读回新会话）默认**关闭**。完整说明以英文 README 为准。
 
 ## 记忆布局与写入边界
 
@@ -190,6 +193,22 @@ Hosted runtime 不包含在本 npm 包与本仓库中。
 ## 状态
 
 Alpha 预发布（`0.1.0-alpha` 系列——上方 npm 徽章即最新发布版本；详见 [CHANGELOG.md](./CHANGELOG.md)）。已在 macOS 与 Linux 上验证；Windows 暂不在支持范围。npm 包内含编译后的 CLI、stdio MCP server 与只读本地 console；TypeScript 源码就在本仓库。alpha 版本间可能有破坏性变更。
+
+**哪个版本有什么（dist-tag）。** 预发布版发布在 `next` dist-tag 下；`npm install ihow-memory` 解析到 `latest`。
+
+| dist-tag | 自动捕获 |
+| --- | --- |
+| `latest` | 仅协作式 Stop-hook 提示（取决于 agent 是否照做） |
+| `next` | 增加**确定式 SessionStart floor** 兜底（单 cwd、低权重、离线验证过）；`recall` 仍关闭 |
+
+想试 floor 兜底：`npm install ihow-memory@next`。普通 `npm install ihow-memory` 留在保守的 `latest`。
+
+## 局限（Limitations）
+
+- **Floor 捕获是单 cwd 的。** SessionStart floor 只兜底其指定的 workspace/cwd。若 `connect --auto` 跨多个共享同一 workspace 的项目，floor 只覆盖一个 cwd；多 cwd 广推待进一步 dogfood。
+- **默认检索是词法、非语义。** 出厂默认是零依赖 FTS5 词法检索。「向量 + 词法」混合（公开召回数字背后的那套）是**可选**的本地 provider，不在开箱二进制里。
+- **自动捕获笔记是低权重、未经审阅**的，确定式 floor 是兜底、尚非 primary/默认权重路径。`recall`（把记忆读回会话）默认关闭。可信长期记忆请用 `promote` / `durable-promote`。
+- **Windows 原生为实验性**（请用 WSL）；仅 macOS 与 Linux 是验证过的支持线。
 
 ## 链接
 

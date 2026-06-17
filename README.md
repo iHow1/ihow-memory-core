@@ -106,7 +106,7 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 ihow-memory init             create a managed workspace, print the MCP config snippet
 ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes) [--dry-run]
 ihow-memory install-skill    copy the Claude Code proactive-memory skill into ~/.claude/skills/
-ihow-memory install-hook     add the session-end auto-capture Stop hook (Claude Code; --global-hook for user-wide)
+ihow-memory install-hook     add the auto-capture hooks — Stop (cooperative nudge) + SessionStart (deterministic floor) (Claude Code; --global-hook for user-wide)
 ihow-memory doctor           environment + setup checks [--share-diagnostics for a redacted report]
 ihow-memory status           workspace, engine, index and sync state [--json]
 ihow-memory search <query>   citation-bearing local search [--limit n]
@@ -175,17 +175,27 @@ adds two layers to raise that on Claude Code:
   that nudges Claude Code to search at the start of a task and record a candidate after a decision or
   handoff. It changes *when* memory is used, not the mechanism. Other runtimes get the same nudge from
   the MCP tool descriptions.
-- **Session-end auto-capture — experimental.** `connect --runtime claude-code --install-hook` adds a
+- **Session-end auto-capture (cooperative) — experimental.** `connect --runtime claude-code --install-hook` adds a
   Stop hook that, at session end, asks the in-session agent to record a handoff into the low-weight
   `journal` lane via `memory.journal`. It is best-effort (re-prompts as the session grows, stops once
   an entry is recorded), **project-scoped by default** (`--global-hook` for user-wide), and reversible
   (`ihow-memory audit` / `rollback`).
+- **Next-session floor (deterministic) — experimental, `next` only.** The same `install-hook` also wires a
+  SessionStart hook: when a new session starts, it floors the **previous** session deterministically *iff*
+  that session ended without a cooperative journal. It parses the prior transcript, composes a
+  last-substantive-segment summary within a **locked scope** (assistant text + file paths + command binary
+  names + first prompt — never tool output, never raw shell), redacts it, and writes a low-weight,
+  auditable, rollback-able journal entry. It is the safety net under the cooperative nudge: **single-cwd**,
+  silent (never injects context — recall stays off), and never throws. Offline evaluation on 22 real
+  historical transcripts passed the backstop quality gate; live *natural* floor hits remain under dogfood
+  because cooperative capture currently covers all observed sessions.
 
-> **Experimental & Claude Code-first.** This is a Stop-hook handoff, **not** a guaranteed autonomous
-> capture loop — whether an entry is written depends on the agent following the prompt. The mechanism
-> (session-end auto-fire → agent MCP write → low-weight journal) is validated locally and on another
-> runtime; a real Claude Code app smoke has passed, and a multi-session dogfood is still pending. Auto-captured notes are **low-weight and
-> unreviewed** — use `promote` / `durable-promote` for trusted long-term memory.
+> **Experimental & Claude Code-first.** Auto-capture is two layers: a cooperative Stop-hook nudge (whether
+> an entry is written depends on the agent following the prompt) and a deterministic SessionStart floor
+> backstop (`next` only) that captures the prior session when the nudge was not honored. Both write
+> **low-weight, unreviewed** notes — use `promote` / `durable-promote` for trusted long-term memory. The
+> floor is offline-validated as a backstop; it is not yet promoted to a primary/default-weight path, and
+> `recall` (reading memory back into a new session) stays **off** by default.
 
 ## Examples
 
@@ -204,6 +214,22 @@ A hosted runtime is not included in this npm package or this repository.
 ## Status
 
 Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Validated on macOS and Linux; Windows is not yet a supported lane. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
+
+**Which version has what (dist-tags).** Prereleases publish under the `next` dist-tag; `npm install ihow-memory` resolves `latest`.
+
+| dist-tag | auto-capture |
+| --- | --- |
+| `latest` | cooperative Stop-hook nudge only (depends on the agent honoring it) |
+| `next` | adds the **deterministic SessionStart floor** backstop (single-cwd, low-weight, offline-validated); `recall` still off |
+
+To try the floor backstop: `npm install ihow-memory@next`. A plain `npm install ihow-memory` stays on the conservative `latest`.
+
+## Limitations
+
+- **Floor capture is single-cwd.** The SessionStart floor backs up only its designated workspace/cwd. If you `connect --auto` across multiple projects sharing one workspace, the floor covers one cwd; broad multi-cwd rollout is pending further dogfood.
+- **Default retrieval is lexical, not semantic.** The shipped default is zero-dependency FTS5 lexical search. The vector + lexical hybrid (behind the published recall figures) is an *optional* local provider, not in the out-of-the-box binary.
+- **Auto-capture notes are low-weight and unreviewed**, and the deterministic floor is a backstop, not yet a primary/default-weight path. `recall` (reading memory back into a session) is off by default. Use `promote` / `durable-promote` for trusted long-term memory.
+- **Windows native is experimental** (use WSL); only macOS and Linux are validated lanes.
 
 ## Links
 
