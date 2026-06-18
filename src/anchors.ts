@@ -29,7 +29,7 @@ export type GitAnchors = {
 // failure (not a repo, git missing, timeout, non-zero exit).
 function git(cwd: string, args: string[]): string | null {
   try {
-    const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 4000 });
+    const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 4000, maxBuffer: 10 * 1024 * 1024 });
     if (r.status !== 0 || typeof r.stdout !== 'string') return null;
     return r.stdout.trim();
   } catch {
@@ -55,10 +55,13 @@ export function gitAnchors(cwd: string): GitAnchors {
     if (Number.isFinite(b)) behind = b;
   }
 
+  // On detached HEAD (and mid-rebase) abbrev-ref returns the literal "HEAD"; render it as detached
+  // rather than a branch literally named HEAD.
+  const branchRaw = git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
   return {
     isRepo: true,
     repo: path.basename(top),
-    branch: git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']) ?? undefined,
+    branch: branchRaw === 'HEAD' ? '(detached)' : (branchRaw ?? undefined),
     head: git(cwd, ['rev-parse', '--short', 'HEAD']) ?? undefined,
     headSubject: git(cwd, ['log', '-1', '--pretty=%s']) ?? undefined,
     ahead,

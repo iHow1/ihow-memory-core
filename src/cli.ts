@@ -1273,7 +1273,16 @@ async function findLatestStopMarker(
   } catch {
     return undefined;
   }
-  const target = path.resolve(cwd);
+  // realpath both sides so a symlinked cwd (e.g. macOS /tmp -> /private/tmp, worktrees) still matches;
+  // fall back to resolve() when the path no longer exists on disk.
+  const realOr = async (p: string): Promise<string> => {
+    try {
+      return await fs.realpath(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  const target = await realOr(cwd);
   const at = (m: StopMarker): string => markerLastAt(m) ?? m.markerCreatedAt ?? markerStartedAt(m) ?? '';
   let best: StopMarker | undefined;
   for (const f of files) {
@@ -1284,7 +1293,9 @@ async function findLatestStopMarker(
       continue; // skip an unreadable marker — never throw
     }
     if (!m.transcriptPath) continue;
-    if (m.cwd && path.resolve(m.cwd) !== target) continue;
+    // A marker with no cwd cannot be attributed to THIS project — never match it, so an unrelated
+    // session's narrative can't surface in a different cwd's handoff.
+    if (!m.cwd || (await realOr(m.cwd)) !== target) continue;
     if (!best || at(m) > at(best)) best = m;
   }
   return best;
@@ -1890,13 +1901,22 @@ async function main(): Promise<void> {
     const cwd = path.resolve(options.cwd || process.cwd());
     let workspace;
     try {
-      workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd }));
+      // resolveWorkspace only (no ensureWorkspace): continue is read-only — it reads spaceDir/.hooks
+      // and git; it must not create workspace dirs just to print a handoff.
+      workspace = resolveWorkspace({ ...options, cwd });
     } catch {
       console.error('continue: could not resolve a workspace');
       process.exitCode = 1;
       return;
     }
     const anchors = gitAnchors(cwd);
+    // Anchors are git-derived facts, but the FREE-TEXT fields (commit subject, branch, dirty filenames,
+    // repo name) are author-controlled and can carry secret values — redact them like the narrative so a
+    // secret in a commit message can't leak through the "facts" block.
+    if (anchors.headSubject) anchors.headSubject = redactSecretLikeContent(anchors.headSubject);
+    if (anchors.branch) anchors.branch = redactSecretLikeContent(anchors.branch);
+    if (anchors.repo) anchors.repo = redactSecretLikeContent(anchors.repo);
+    if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
     const marker = await findLatestStopMarker(workspace, cwd);
     let body = '';
     if (marker?.transcriptPath) {
