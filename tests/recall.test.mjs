@@ -212,3 +212,22 @@ test('recall: intent-aware PII — redacted on an identity query, revealed when 
   const valCtx = valq.stdout.trim() ? JSON.parse(valq.stdout).hookSpecificOutput.additionalContext : '';
   assert.ok(valCtx.includes('137-0000-2222'), 'the mobile IS surfaced when the prompt explicitly asks for the number');
 });
+
+test('recall: recency/supersession — injects the current entry, drops the superseded one', async (t) => {
+  // harm-eval 2026-06-17: recall co-injected a superseded value beside its current version. The recency/
+  // contradiction collapse keeps only the current (currency-marked / latest) entry of a same-topic pair.
+  const root = await mkdtempReal('ihow-recall-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  const c1 = JSON.parse(cli(['write-candidate', 'The widget service runs on cluster-alpha for all traffic.'], root, space)).path;
+  cli(['promote', c1, '--scope', 'team', '--title', 'widget-cluster-old'], root, space);
+  const c2 = JSON.parse(cli(['write-candidate', 'Update: the widget service was migrated to cluster-beta; cluster-alpha is deprecated, do not use.'], root, space)).path;
+  cli(['promote', c2, '--scope', 'team', '--title', 'widget-cluster-new'], root, space);
+
+  const out = recall('which cluster does the widget service run on', root, space);
+  const ctx = out.stdout.trim() ? JSON.parse(out.stdout).hookSpecificOutput.additionalContext : '';
+  const bullets = ctx.split('\n').filter((l) => l.startsWith('- '));
+  assert.match(ctx, /cluster-beta/, 'the current (superseding) entry is injected');
+  assert.ok(!/runs on cluster-alpha for all traffic/.test(ctx), 'the superseded entry is NOT co-injected');
+  assert.equal(bullets.length, 1, 'same-topic pair collapses to a single current entry');
+});
