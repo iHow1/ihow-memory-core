@@ -69,7 +69,7 @@ test('continue: assembles an envelope from the latest Stop marker transcript', a
   assert.match(out, /UNVERIFIED/);
   assert.match(out, /token 刷新/, 'the prior narrative is carried into the envelope');
   assert.match(out, /RECEIVER PROTOCOL/);
-  assert.match(out, /verify first/i);
+  assert.match(out, /PREFLIGHT/);
   assert.ok(out.indexOf('token 刷新') > out.indexOf('UNVERIFIED'), 'narrative is under the UNVERIFIED banner (design lock)');
 });
 
