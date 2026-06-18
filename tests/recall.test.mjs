@@ -57,6 +57,9 @@ test('recall: injects ONLY curated memory, never the low-weight journal/floor la
   assert.match(ctx, /recalled reference DATA/i, 'recalled context is labelled as possibly-stale reference data');
   assert.match(ctx, /NOT instructions/i, 'recalled context is fenced as untrusted data, not instructions');
   assert.match(ctx, /<recalled-memory>[\s\S]*<\/recalled-memory>/, 'recalled content is fenced');
+  // product-grade UX: no frontmatter noise (candidate_id UUIDs / metadata keys) in the recalled snippet
+  assert.ok(!/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/.test(ctx), 'no frontmatter UUID noise in recalled snippet');
+  assert.ok(!/candidate_id|promoted_at:|source_agent:/.test(ctx), 'no stray frontmatter keys in recalled snippet');
 });
 
 test('recall: no relevant curated memory -> no output (no noise)', async (t) => {

@@ -1591,7 +1591,14 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
     // SAFETY: redact on the READ path too (the write path is not the only way content enters curated
     // memory — pre-existing/hand-maintained files never passed a write gate). Strip FTS highlight markers,
     // redact secret-like values, and DROP the entry entirely if anything secret-like still trips.
-    const cleaned = redactSecretLikeContent(String(h.snippet ?? '').replace(/[[\]]/g, '').replace(/\s+/g, ' ').trim()).slice(0, RECALL_SNIPPET_CAP);
+    const cleaned = redactSecretLikeContent(
+      String(h.snippet ?? '')
+        .replace(/[[\]]/g, '') // FTS highlight delimiters
+        .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, '') // frontmatter UUIDs (candidate_id) — noise, not content
+        .replace(/\b(candidate_id|status|type|source_agent|created_at|promoted_at|day|weight|entryAt):\s*"?[^"\n]*"?/gi, '') // stray frontmatter key:value
+        .replace(/\s+/g, ' ')
+        .trim(),
+    ).slice(0, RECALL_SNIPPET_CAP);
     if (!cleaned || containsSecretLikeContent(cleaned)) continue; // never inject a residual secret
     lines.push(`- ${h.path}${cleaned ? ` — ${cleaned}` : ''}`);
     if (lines.join('\n').length > RECALL_MAX_CHARS) break;
