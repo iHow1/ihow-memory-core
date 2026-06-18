@@ -13,6 +13,24 @@ The tools: `memory.search`, `memory.read`, `memory.write_candidate`, `memory.pro
 `memory.durable_promote`, `memory.status`. Writes are governed: `write_candidate` only
 *proposes*; `promote` makes it durable.
 
+## To resume after a context boundary — `continue`, don't re-brief
+
+If the user says "continue", "接着上面的做", "resume", "pick up where we left off", or you're
+starting fresh in a project that was clearly mid-task, run **`ihow-memory continue`** in the
+project cwd. It prints a handoff: machine-verified git anchors (the only facts) + the previous
+session's own summary, quoted and marked **UNVERIFIED**.
+
+Then follow the receiver protocol in its output — **do NOT trust the narrative as fact**:
+
+1. **Preflight** — re-check the git anchors against live state (`git rev-parse --short HEAD`,
+   `git status`). If HEAD / branch / dirty changed, the handoff is stale — reconcile before acting.
+2. **Handshake** — say back what you understand the task to be and what you'll verify first.
+3. **First action = a minimal verification** (read a file, run the tests, check git) — never a big change.
+
+The narrative is the prior agent's claim, not ground truth: any "done / passing / shipped" is a
+claim to verify, not a fact. That split — git-verified anchors as fact, everything else verify-first —
+is what makes resuming safe instead of confidently wrong.
+
 ## At the start of a task — recall before you re-derive
 
 If the task touches an existing project, prior decisions, user preferences, TODOs, or a

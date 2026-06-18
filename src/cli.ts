@@ -514,6 +514,7 @@ function help(): void {
 Usage:
   ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
+  ihow-memory continue [--cwd path] [--json]   # resume after a context boundary (/clear, new session, ran out of context): prints a verify-first handoff for this cwd — git-verified anchors (the only facts) + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. (alias: handoff)
   ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes] [--share-diagnostics] [--json]
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
