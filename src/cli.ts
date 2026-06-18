@@ -40,6 +40,7 @@ type ParsedArgs = {
     installSkill?: boolean;
     installHook?: boolean;
     globalHook?: boolean;
+    recall?: boolean;
     easy?: boolean;
     auto?: boolean;
     write?: boolean;
@@ -88,6 +89,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--install-hook') options.installHook = true;
     else if (arg === '--no-install-hook') options.installHook = false;
     else if (arg === '--global-hook') options.globalHook = true;
+    else if (arg === '--recall') options.recall = true;
     else if (arg === '--easy' || arg === '--yes') options.easy = true;
     else if (arg === '--auto') options.auto = true;
     else if (arg === '--write') options.write = true;
@@ -526,8 +528,9 @@ Usage:
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Claude Code Stop-hook handler (reads hook JSON on stdin; wired by the plugin) — emits a session-end capture instruction
   ihow-memory hook-session-start          # Claude Code SessionStart-hook handler (reads hook JSON on stdin; wired by the plugin) — floors the previous session deterministically if it ended without a cooperative journal
+  ihow-memory hook-user-prompt-submit     # Claude Code UserPromptSubmit-hook handler (recall — experimental, opt-in) — injects relevant curated memory into a new prompt
   ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
-  ihow-memory install-hook [--global-hook] [--no-install-hook]   # add the auto-capture hooks: Stop (session-end nudge) + SessionStart (next-session floor) (default: this project's .claude/settings.local.json; --global-hook: ~/.claude/settings.json)
+  ihow-memory install-hook [--global-hook] [--recall] [--no-install-hook]   # add the auto-capture hooks: Stop (session-end nudge) + SessionStart (next-session floor); --recall also adds experimental UserPromptSubmit recall (default OFF). (default: this project's .claude/settings.local.json; --global-hook: ~/.claude/settings.json)
 
 Defaults:
   root: ${defaultRoot()}
@@ -1056,6 +1059,18 @@ function sessionStartHookCommand(options: ParsedArgs['options']): string {
   return parts.join(' ');
 }
 
+// The UserPromptSubmit-hook command — RECALL (OpenClaw-gated; opt-in only). Same workspace binding so it
+// reads the SAME memory the capture hooks write. Default-off: wired only when the operator passes --recall.
+function recallHookCommand(options: ParsedArgs['options']): string {
+  const bin = path.join(packageDir(), 'bin', 'ihow-memory.mjs');
+  const parts = [JSON.stringify(process.execPath), JSON.stringify(bin), 'hook-user-prompt-submit'];
+  if (options.root) parts.push('--root', JSON.stringify(options.root));
+  if (options.space) parts.push('--space', JSON.stringify(options.space));
+  if (options.memoryRoot) parts.push('--memory-root', JSON.stringify(options.memoryRoot));
+  if (options.stateRoot) parts.push('--state-root', JSON.stringify(options.stateRoot));
+  return parts.join(' ');
+}
+
 // Optionally wire the session-end auto-capture Stop hook into ~/.claude/settings.json. Consent-gated
 // like the skill install. Mirrors connect's MCP-write safety: merges into existing settings (never
 // drops other hooks/keys), refuses to clobber unparseable JSON, backs up before writing, atomic
@@ -1134,13 +1149,17 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
     return true;
   };
 
-  // Two hooks form the auto-capture feature: the Stop hook nudges the agent to journal a handoff at
-  // session end (the primary, cooperative path), and the SessionStart hook floors the PREVIOUS session
+  // Two hooks form the auto-capture (write) feature: the Stop hook nudges the agent to journal a handoff
+  // at session end (the cooperative path), and the SessionStart hook floors the PREVIOUS session
   // deterministically if it ended without one (the backstop). Both bind the same workspace.
   const addedStop = ensureHook('Stop', 'hook-stop', stopHookCommand(options));
   const addedStart = ensureHook('SessionStart', 'hook-session-start', sessionStartHookCommand(options));
-  if (!addedStop && !addedStart) {
-    console.log(`✓ auto-capture hooks already present in ${dest}`);
+  // RECALL (read path) is OpenClaw-GATED and DEFAULT-OFF — wired ONLY when the operator explicitly passes
+  // --recall, never by connect / --easy / a plain install-hook. It reads curated memory back into a new
+  // prompt; see runRecallHook for the safety guards (curated-only, bounded, never-block).
+  const addedRecall = options.recall ? ensureHook('UserPromptSubmit', 'hook-user-prompt-submit', recallHookCommand(options)) : false;
+  if (!addedStop && !addedStart && !addedRecall) {
+    console.log(`✓ ${options.recall ? 'auto-capture + recall hooks' : 'auto-capture hooks'} already present in ${dest}`);
     return;
   }
   settings.hooks = hooks;
@@ -1154,8 +1173,15 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
   const tmp = `${dest}.ihow-tmp-${process.pid}`;
   await fs.writeFile(tmp, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
   await fs.rename(tmp, dest);
-  const added = [addedStop ? 'Stop (session-end nudge)' : null, addedStart ? 'SessionStart (next-session floor)' : null].filter(Boolean).join(' + ');
-  console.log(`✓ installed auto-capture hooks [${scopeLabel}]: ${added} → ${dest} (restart Claude Code to load them)`);
+  const added = [
+    addedStop ? 'Stop (session-end nudge)' : null,
+    addedStart ? 'SessionStart (next-session floor)' : null,
+    addedRecall ? 'UserPromptSubmit (recall — experimental, reads curated memory back)' : null,
+  ].filter(Boolean).join(' + ');
+  console.log(`✓ installed ${added} [${scopeLabel}] → ${dest} (restart Claude Code to load them)`);
+  if (addedRecall) {
+    console.log('  recall is experimental + opt-in: it injects ONLY curated/promoted memory (never low-weight auto-capture), bounded, never blocks. Disable anytime with IHOW_RECALL_OFF=1 or by removing the UserPromptSubmit hook.');
+  }
 }
 
 const STOP_HOOK_REASON =
@@ -1500,6 +1526,77 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
   // context injection to stdout, so capture and recall are never enabled together.
 }
 
+// Recall tuning. Recall is the OpenClaw-GATED reading path: it injects relevant prior memory into a new
+// prompt. It is DEFAULT-OFF (never wired by connect / --easy / plain install-hook — only by the explicit
+// `install-hook --recall` opt-in) and SAFETY-FIRST: it injects ONLY high-confidence curated/promoted
+// memory, NEVER the low-weight unreviewed journal/floor lanes (that is the recall-harm guard), is bounded,
+// labels recalled text as "may be stale, verify", never blocks the prompt, and never throws.
+const RECALL_SEARCH_LIMIT = 6; // search depth before filtering
+const RECALL_MAX_INJECT = 3; // max curated entries injected
+const RECALL_MAX_CHARS = 1200; // total injected-context budget
+const RECALL_SNIPPET_CAP = 280; // per-entry snippet cap
+
+// Low-weight lanes (auto-capture journal + deterministic floor) — UNREVIEWED, so recall must NEVER inject
+// them. Only curated/promoted/durable memory is high-confidence enough to read back into a session.
+function isLowWeightMemoryPath(p: string): boolean {
+  return p.startsWith('memory/journal/') || p.startsWith('memory/_mcp/journal/');
+}
+
+// Claude Code UserPromptSubmit-hook handler — the recall path (OpenClaw-GATED; default-off, opt-in only).
+// On a new prompt it searches memory, keeps ONLY curated hits (never low-weight floor/journal), and emits
+// a bounded, clearly-labelled context block via the documented additionalContext form. Never blocks the
+// prompt, never throws (any problem -> exit 0 with no output). A kill-switch env (IHOW_RECALL_OFF) disables
+// injection without uninstalling.
+async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
+  if (process.env.IHOW_RECALL_OFF) return; // kill-switch: disable injection without uninstalling
+  let payload: Record<string, unknown> = {};
+  try {
+    const raw = await readStdinSafe();
+    if (raw.trim()) payload = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return; // unparseable input -> no-op, never block
+  }
+  // The user's prompt text. `prompt` is the documented field; accept a few aliases defensively.
+  const prompt = ['prompt', 'user_prompt', 'userPrompt', 'message', 'input']
+    .map((k) => payload[k])
+    .find((v): v is string => typeof v === 'string' && v.trim().length > 0) ?? '';
+  if (!prompt.trim()) return; // nothing to recall against
+  const cwd = typeof payload.cwd === 'string' ? payload.cwd : options.cwd;
+
+  let core;
+  try {
+    core = await openCore({ ...options, cwd });
+  } catch {
+    return;
+  }
+  let hits: Awaited<ReturnType<typeof core.search>> = [];
+  try {
+    hits = await core.search(prompt, { limit: RECALL_SEARCH_LIMIT });
+  } catch {
+    return;
+  }
+  // SAFETY (OpenClaw recall-harm guard): inject ONLY curated/promoted memory — never the low-weight,
+  // unreviewed journal/floor lanes. A weak or empty curated result injects NOTHING (no noise).
+  const curated = hits.filter((h) => h && typeof h.path === 'string' && !isLowWeightMemoryPath(h.path)).slice(0, RECALL_MAX_INJECT);
+  if (!curated.length) return;
+
+  const lines = ['## Relevant prior memory (iHow Memory — recalled; may be stale, verify before relying)'];
+  for (const h of curated) {
+    // strip the FTS highlight delimiters ([ ]) so recalled text reads naturally, then collapse + cap
+    const snippet = String(h.snippet ?? '').replace(/[[\]]/g, '').replace(/\s+/g, ' ').trim().slice(0, RECALL_SNIPPET_CAP);
+    lines.push(`- ${h.path}${snippet ? ` — ${snippet}` : ''}`);
+    if (lines.join('\n').length > RECALL_MAX_CHARS) break;
+  }
+  const additionalContext = lines.join('\n').slice(0, RECALL_MAX_CHARS);
+  try {
+    // UserPromptSubmit context injection (documented JSON form). Exit 0, never block the prompt.
+    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext } })}\n`);
+  } catch {
+    return;
+  }
+  hookLog(`recall: injected ${curated.length} curated hit(s) (prompt ${prompt.length} chars)`);
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   const { command, options, rest } = parsed;
@@ -1520,6 +1617,11 @@ async function main(): Promise<void> {
 
   if (command === 'hook-session-start') {
     await runSessionStartHook(options);
+    return;
+  }
+
+  if (command === 'hook-user-prompt-submit') {
+    await runRecallHook(options);
     return;
   }
 

@@ -41,10 +41,12 @@ function sessionStartCommands(settings) {
 test('install-hook defaults to this project (.claude/settings.local.json), wiring BOTH capture hooks', async (t) => {
   const proj = await mkdtempReal('ihow-proj-');
   t.after(async () => { await fs.rm(proj, { recursive: true, force: true }); });
-  assert.match(runInstallHook({ cwd: proj }), /installed auto-capture hooks/);
+  assert.match(runInstallHook({ cwd: proj }), /installed Stop .* SessionStart/);
   const settings = await readJson(path.join(proj, '.claude', 'settings.local.json'));
   assert.ok(stopCommands(settings).some((c) => c.includes('hook-stop') && c.includes('ihow-memory')), 'project-local Stop hook present');
   assert.ok(sessionStartCommands(settings).some((c) => c.includes('hook-session-start') && c.includes('ihow-memory')), 'project-local SessionStart floor hook present');
+  // recall (UserPromptSubmit) is DEFAULT-OFF — not wired without --recall
+  assert.ok(!(settings.hooks?.UserPromptSubmit ?? []).length, 'no recall hook by default');
 });
 
 test('install-hook --global-hook targets ~/.claude/settings.json and not the project', async (t) => {
