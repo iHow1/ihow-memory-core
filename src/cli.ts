@@ -1553,7 +1553,9 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
   } catch {
     return; // unparseable input -> no-op, never block
   }
-  // The user's prompt text. `prompt` is the documented field; accept a few aliases defensively.
+  // The user's prompt text. `prompt` is the field a real Claude Code UserPromptSubmit payload carries
+  // (live-verified 2026-06-17: stdin keys = session_id/transcript_path/cwd/permission_mode/hook_event_name/
+  // prompt/session_title); the aliases are defensive fallbacks for other clients/versions.
   const prompt = ['prompt', 'user_prompt', 'userPrompt', 'message', 'input']
     .map((k) => payload[k])
     .find((v): v is string => typeof v === 'string' && v.trim().length > 0) ?? '';
