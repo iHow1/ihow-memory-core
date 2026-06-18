@@ -1535,9 +1535,37 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
 // memory, NEVER the low-weight unreviewed journal/floor lanes (that is the recall-harm guard), is bounded,
 // labels recalled text as "may be stale, verify", never blocks the prompt, and never throws.
 const RECALL_SEARCH_LIMIT = 6; // search depth before filtering
-const RECALL_MAX_INJECT = 3; // max curated entries injected
+const RECALL_MAX_INJECT = 3; // max curated entries injected (variable 0..N — only the relevant ones)
 const RECALL_MAX_CHARS = 1200; // total injected-context budget
 const RECALL_SNIPPET_CAP = 280; // per-entry snippet cap
+
+// Relevance gate (harm-eval 2026-06-17 fix): FTS can match on stopwords and the result was padded to a
+// fixed 3 entries, so recall injected off-topic memory on EVERY prompt (100% irrelevant — even "capital
+// of France" got Postgres/API entries). Require a shared MEANINGFUL term between the prompt and the
+// entry's snippet, and inject only the entries that pass (0..N). No relevant entry -> recall stays SILENT.
+const RECALL_STOPWORDS = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'of', 'to', 'in', 'on', 'for', 'and', 'or', 'what', 'which', 'how', 'who', 'whom', 'when', 'where', 'why', 'do', 'does', 'did', 'this', 'that', 'these', 'those', 'about', 'with', 'as', 'at', 'be', 'by', 'from', 'can', 'could', 'should', 'would', 'will', 'have', 'has', 'had', 'you', 'your', 'our', 'we', 'it', 'its', 'me', 'my']);
+function recallTerms(s: string): Set<string> {
+  const out = new Set<string>();
+  for (const tok of s.toLowerCase().match(/[a-z0-9]+|[一-鿿]+/g) || []) {
+    if (/[一-鿿]/.test(tok)) {
+      if (tok.length >= 2) out.add(tok); // CJK run of >=2 chars
+    } else if (tok.length >= 4 && !RECALL_STOPWORDS.has(tok)) {
+      out.add(tok); // latin word >=4 chars, not a stopword
+    }
+  }
+  return out;
+}
+function recallSharesTerm(promptTerms: Set<string>, text: string): boolean {
+  const t = text.toLowerCase();
+  for (const term of promptTerms) {
+    if (/[一-鿿]/.test(term)) {
+      if (t.includes(term)) return true; // CJK substring
+    } else if (new RegExp(`\\b${term}`).test(t)) {
+      return true; // latin word-boundary (prefix-tolerant)
+    }
+  }
+  return false;
+}
 
 // Claude Code UserPromptSubmit-hook handler — the recall path (OpenClaw-GATED; default-off, opt-in only).
 // On a new prompt it searches memory, keeps ONLY curated hits (allowlist — never candidates / journal /
@@ -1575,10 +1603,15 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
     return;
   }
   // SAFETY (OpenClaw recall-harm guard): inject ONLY curated memory via the ALLOWLIST — candidates, the
-  // auto-capture journal/floor lanes, _mcp internals and any unknown lane are rejected by default. A weak
-  // or empty curated result injects NOTHING (no noise).
-  const curated = hits.filter((h) => h && typeof h.path === 'string' && isCuratedMemoryPath(h.path)).slice(0, RECALL_MAX_INJECT);
-  if (!curated.length) return;
+  // auto-capture journal/floor lanes, _mcp internals and any unknown lane are rejected by default.
+  // RELEVANCE gate: also require a shared meaningful term with the prompt, and inject only the entries that
+  // pass (0..N) — so recall stays silent on an off-topic prompt instead of padding to a fixed N (harm-eval).
+  const promptTerms = recallTerms(prompt);
+  const curated = hits
+    .filter((h) => h && typeof h.path === 'string' && isCuratedMemoryPath(h.path))
+    .filter((h) => recallSharesTerm(promptTerms, String(h.snippet ?? '')))
+    .slice(0, RECALL_MAX_INJECT);
+  if (!curated.length) return; // nothing curated AND relevant -> stay silent (no noise)
 
   // The recalled text is UNTRUSTED reference DATA, not instructions: fence it so a directive embedded in a
   // memory entry cannot hijack the agent, and label it as possibly-stale.

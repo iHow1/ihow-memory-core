@@ -178,3 +178,16 @@ test('recall: a secret in curated memory is redacted on the READ path, never inj
   assert.ok(!ctx.includes('hunter2supersecretvalue'), 'the raw secret value is NEVER injected (read-path redaction)');
   assert.match(ctx, /\[redacted\]/, 'the secret was redacted in place');
 });
+
+test('recall: relevance gate — an off-topic prompt injects NOTHING even when curated memory exists', async (t) => {
+  // harm-eval 2026-06-17: FTS matched on stopwords + a fixed 3-entry budget made recall inject off-topic
+  // memory on every prompt (e.g. "capital of France" surfaced Postgres/API entries). The relevance gate
+  // requires a shared meaningful term, so an unrelated prompt stays silent.
+  const root = await mkdtempReal('ihow-recall-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  await seed(root, space); // curated zetaframework/dashboard memory exists
+  const out = recall('what is the capital of France', root, space);
+  assert.equal(out.status, 0);
+  assert.equal(out.stdout.trim(), '', 'off-topic prompt -> no injection (relevance gate), despite curated memory present');
+});
