@@ -14,6 +14,8 @@ import { sqliteRuntimeStatus } from './engine/fts.ts';
 import { readEventsAllLanes } from './store/events.ts';
 import { appendJournal, containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
 import { parseTranscript, summarizeTranscript } from './transcript.ts';
+import { gitAnchors } from './anchors.ts';
+import { assembleEnvelope } from './envelope.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
 
@@ -1254,6 +1256,39 @@ function markerLastAt(m: StopMarker | undefined): string | undefined {
   return m?.hookLastAt ?? m?.lastAt;
 }
 
+// Find the most recent Stop-hook marker for a cwd whose transcript we can read back. Powers the
+// `continue` command's lazy handoff: the previous session's Stop marker recorded its transcript_path,
+// so we can summarize that session on demand WITHOUT any hook firing in this new session. Most recent
+// wins (by hookLastAt). Returns undefined when no usable marker exists (then `continue` shows live
+// anchors + an honest "no prior session captured" note).
+async function findLatestStopMarker(
+  workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
+  cwd: string,
+): Promise<StopMarker | undefined> {
+  const markerDir = path.join(workspace.spaceDir, '.hooks');
+  let files: string[];
+  try {
+    files = (await fs.readdir(markerDir)).filter((f) => /^stop-.*\.json$/.test(f));
+  } catch {
+    return undefined;
+  }
+  const target = path.resolve(cwd);
+  const at = (m: StopMarker): string => markerLastAt(m) ?? m.markerCreatedAt ?? markerStartedAt(m) ?? '';
+  let best: StopMarker | undefined;
+  for (const f of files) {
+    let m: StopMarker;
+    try {
+      m = JSON.parse(await fs.readFile(path.join(markerDir, f), 'utf8')) as StopMarker;
+    } catch {
+      continue; // skip an unreadable marker — never throw
+    }
+    if (!m.transcriptPath) continue;
+    if (m.cwd && path.resolve(m.cwd) !== target) continue;
+    if (!best || at(m) > at(best)) best = m;
+  }
+  return best;
+}
+
 // Opt-in hook observability. STDOUT is the hook's control channel (the decision JSON / silence), so
 // diagnostics go to STDERR and ONLY when IHOW_HOOK_DEBUG is set — off by default so a normal session is
 // never polluted. Never throws (a logging failure must not break a hook). Lets a dogfood operator see
@@ -1841,6 +1876,60 @@ async function main(): Promise<void> {
       console.log(`index: ${status.index.status}, documents=${status.index.documents}`);
       console.log(`index path: ${status.index.path}`);
       console.log(`sync: enabled=${status.sync.enabled}`);
+    }
+    return;
+  }
+
+  // `continue` / `handoff`: assemble a verify-first handoff envelope for the current cwd from the most
+  // recent captured session (lazily, no hook needed) + live git anchors, and print it with the fixed
+  // receiver protocol. The envelope is a DUMB transport container: machine anchors are the only facts;
+  // the prior session's summary is carried verbatim under an UNVERIFIED banner; all truth-judgment is
+  // pushed to the receiving agent (design lock, n=12 A/B 2026-06-18). Read-only, never mutates memory.
+  if (command === 'continue' || command === 'handoff') {
+    const cwd = path.resolve(options.cwd || process.cwd());
+    let workspace;
+    try {
+      workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd }));
+    } catch {
+      console.error('continue: could not resolve a workspace');
+      process.exitCode = 1;
+      return;
+    }
+    const anchors = gitAnchors(cwd);
+    const marker = await findLatestStopMarker(workspace, cwd);
+    let body = '';
+    if (marker?.transcriptPath) {
+      try {
+        const raw = await fs.readFile(marker.transcriptPath, 'utf8');
+        body = redactSecretLikeContent(summarizeTranscript(parseTranscript(raw)).body);
+      } catch {
+        body = ''; // transcript gone / unreadable -> honest empty narrative, anchors still shown
+      }
+    }
+    const envelope = assembleEnvelope({
+      cwd,
+      producerAgent: marker?.sessionId ? `claude-code:${marker.sessionId.slice(0, 8)}` : 'ihow-continue',
+      createdAt: new Date().toISOString(),
+      anchors,
+      quotedBody: body,
+      sourceSessionId: marker?.sessionId,
+      transcriptRef: marker?.transcriptPath ?? undefined,
+    });
+    if (options.json) {
+      printJson({
+        cwd,
+        anchors,
+        quotedBody: body,
+        transcriptRef: marker?.transcriptPath ?? null,
+        sourceSession: marker?.sessionId ?? null,
+      });
+    } else {
+      console.log(envelope);
+      if (!marker?.transcriptPath) {
+        console.log(
+          '\n(no captured prior session for this cwd yet — the anchors above are live git state. Run `ihow-memory install-hook` so future sessions leave a handoff to continue from.)',
+        );
+      }
     }
     return;
   }
