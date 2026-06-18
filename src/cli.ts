@@ -1567,6 +1567,23 @@ function recallSharesTerm(promptTerms: Set<string>, text: string): boolean {
   return false;
 }
 
+// INTENT-AWARE PII gating (harm-eval 2026-06-17): PII (personal mobile / home address) is fine to surface
+// WHEN the prompt asks for the VALUE — but a "who do I contact" question wants the NAME + escalation path,
+// not someone's home address, and an unrelated query should never get it. So recall redacts PII VALUES by
+// default (keeping name/role/path) and reveals them ONLY when the prompt explicitly asks for that value.
+// This keeps the experience good (you get the contact when you want it) while stopping over-exposure.
+const RECALL_PII_VALUE_INTENT = /\b(phone|mobile|cell ?phone|number|e-?mail|address)\b|电话|手机|邮箱|邮件地址|住址|地址/i;
+function recallPromptWantsPiiValue(prompt: string): boolean {
+  return RECALL_PII_VALUE_INTENT.test(prompt);
+}
+function redactRecallPII(text: string): string {
+  return text
+    .replace(/\b(?:\+?\d{1,3}[-\s])?\d{3}[-\s]\d{3,4}[-\s]\d{4}\b/g, '[redacted]') // separated phone (e.g. 138-0000-1111)
+    .replace(/\b1\d{10}\b/g, '[redacted]') // bare CN mobile (11 digits)
+    .replace(/\bhome address[^.,;。，；]*/gi, 'home address [redacted]') // "home address on file"
+    .replace(/住址[^。，；.,;]*/g, '住址[redacted]');
+}
+
 // Claude Code UserPromptSubmit-hook handler — the recall path (OpenClaw-GATED; default-off, opt-in only).
 // On a new prompt it searches memory, keeps ONLY curated hits (allowlist — never candidates / journal /
 // floor / any non-curated lane), redacts each on the read path, fences the result as untrusted DATA, and
@@ -1607,6 +1624,7 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
   // RELEVANCE gate: also require a shared meaningful term with the prompt, and inject only the entries that
   // pass (0..N) — so recall stays silent on an off-topic prompt instead of padding to a fixed N (harm-eval).
   const promptTerms = recallTerms(prompt);
+  const wantsPiiValue = recallPromptWantsPiiValue(prompt); // reveal PII values only when the prompt asks
   const curated = hits
     .filter((h) => h && typeof h.path === 'string' && isCuratedMemoryPath(h.path))
     .filter((h) => recallSharesTerm(promptTerms, String(h.snippet ?? '')))
@@ -1624,7 +1642,7 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
     // SAFETY: redact on the READ path too (the write path is not the only way content enters curated
     // memory — pre-existing/hand-maintained files never passed a write gate). Strip FTS highlight markers,
     // redact secret-like values, and DROP the entry entirely if anything secret-like still trips.
-    const cleaned = redactSecretLikeContent(
+    let cleaned = redactSecretLikeContent(
       String(h.snippet ?? '')
         .replace(/[[\]]/g, '') // FTS highlight delimiters
         .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, '') // frontmatter UUIDs (candidate_id) — noise, not content
@@ -1632,6 +1650,9 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
         .replace(/\s+/g, ' ')
         .trim(),
     ).slice(0, RECALL_SNIPPET_CAP);
+    // INTENT-AWARE PII: redact personal mobile / home address unless the prompt explicitly asks for the
+    // value — keeps name + escalation path useful, stops over-exposure into unrelated/identity queries.
+    if (!wantsPiiValue) cleaned = redactRecallPII(cleaned);
     if (!cleaned || containsSecretLikeContent(cleaned)) continue; // never inject a residual secret
     lines.push(`- ${h.path}${cleaned ? ` — ${cleaned}` : ''}`);
     if (lines.join('\n').length > RECALL_MAX_CHARS) break;

@@ -191,3 +191,24 @@ test('recall: relevance gate — an off-topic prompt injects NOTHING even when c
   assert.equal(out.status, 0);
   assert.equal(out.stdout.trim(), '', 'off-topic prompt -> no injection (relevance gate), despite curated memory present');
 });
+
+test('recall: intent-aware PII — redacted on an identity query, revealed when the value is asked', async (t) => {
+  // harm-eval 2026-06-17: recall over-exposed a personal mobile + home address. Gate it by INTENT:
+  // a "who do I contact" query keeps name+escalation but redacts the mobile/address; an explicit
+  // "what is the phone number" query reveals it (good UX — you asked).
+  const root = await mkdtempReal('ihow-recall-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  const cand = JSON.parse(cli(['write-candidate', 'On-call rotation: primary contact is Dana Lee, mobile 137-0000-2222, home address on file; escalate to Sam.'], root, space)).path;
+  cli(['promote', cand, '--scope', 'team', '--title', 'on-call'], root, space);
+
+  const idq = recall('who do I contact about the on-call rotation', root, space);
+  const idCtx = idq.stdout.trim() ? JSON.parse(idq.stdout).hookSpecificOutput.additionalContext : '';
+  assert.ok(idCtx.includes('Dana Lee') || idCtx.includes('Sam'), 'useful contact name / escalation path is kept');
+  assert.ok(!idCtx.includes('137-0000-2222'), 'personal mobile NOT over-exposed on an identity query');
+  assert.ok(!/home address on file/i.test(idCtx), 'home address NOT over-exposed on an identity query');
+
+  const valq = recall('what is the on-call mobile phone number', root, space);
+  const valCtx = valq.stdout.trim() ? JSON.parse(valq.stdout).hookSpecificOutput.additionalContext : '';
+  assert.ok(valCtx.includes('137-0000-2222'), 'the mobile IS surfaced when the prompt explicitly asks for the number');
+});
