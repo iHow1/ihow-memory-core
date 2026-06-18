@@ -94,3 +94,18 @@ test('--easy --no-install-hook respects the explicit opt-out (skill yes, hook no
   assert.ok(await exists(path.join(home, '.claude', 'skills', 'ihow-memory', 'SKILL.md')), 'skill still installed');
   assert.equal(await exists(path.join(proj, '.claude', 'settings.local.json')), false, 'hook opt-out respected');
 });
+
+test('connect --easy --recall does NOT wire recall (recall is install-hook-only; default-off invariant)', async (t) => {
+  // recall-safety review 2026-06-17: --recall flowing through connect would break the "recall reachable
+  // only via install-hook --recall" guarantee the OpenClaw gate depends on. parseArgs scopes --recall to
+  // install-hook, so connect --recall must wire the capture hook but NOT the UserPromptSubmit recall hook.
+  const proj = await mkdtempReal('ihow-proj-');
+  const home = await mkdtempReal('ihow-home-');
+  const bin = await makeClaudeShim();
+  t.after(async () => { for (const d of [proj, home, bin]) await fs.rm(d, { recursive: true, force: true }); });
+
+  runConnect({ cwd: proj, home, bin, args: ['--easy', '--recall'] });
+  const settings = JSON.parse(await fs.readFile(path.join(proj, '.claude', 'settings.local.json'), 'utf8'));
+  assert.ok(stopCommands(settings).some((c) => c.includes('hook-stop')), 'capture hook still wired by --easy');
+  assert.equal((settings.hooks?.UserPromptSubmit ?? []).length, 0, 'connect --easy --recall does NOT wire the recall hook');
+});

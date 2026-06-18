@@ -164,3 +164,21 @@ export function isMcpSandboxPath(workspace: Workspace, absolutePath: string): bo
   const sandbox = path.resolve(workspace.mcpDir);
   return resolved === sandbox || resolved.startsWith(`${sandbox}${path.sep}`);
 }
+
+// ALLOWLIST of CURATED/REVIEWED memory lanes — content that passed the promote / durable-promote gate.
+// Used by recall to decide what may be read back into a session: it injects ONLY curated memory and
+// rejects everything else BY DEFAULT (candidates, the auto-capture journal/floor lanes, _mcp internals,
+// and any unknown future lane). This is an allowlist, not a denylist, precisely so a lane nobody
+// remembered to exclude can never leak unreviewed content into the model's context (recall-safety review
+// 2026-06-17 reproduced an unreviewed candidate leaking via a journal-only denylist in existing-memory-root
+// mode). `relativePath` may be space-relative ("memory/...") or memory-relative.
+export function isCuratedMemoryPath(relativePath: string): boolean {
+  const normalized = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const mem = normalized.startsWith('memory/') ? normalized.slice('memory/'.length) : normalized;
+  if (mem.startsWith('scopes/')) return true; // promoted (managed-space) + durable scope writes
+  if (mem.startsWith('_mcp/promoted/')) return true; // promoted (existing-memory-root)
+  if (mem.startsWith('inbox/')) return true; // durable inbox
+  if (mem.startsWith('projects/') || normalized.startsWith('projects/')) return true; // durable projects
+  if (/^\d{4}-\d{2}-\d{2}\.md$/.test(mem)) return true; // durable dated daily memory
+  return false;
+}
