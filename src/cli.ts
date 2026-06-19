@@ -511,10 +511,185 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
   console.log(`\nconnected ${connected.length}, skipped ${skipped.length}. Restart each runtime to load the memory tools.`);
 }
 
+// Zero-config one-command onboarding. Detect runtimes → wire MCP for each → (Claude Code) install the
+// memory skill + auto-capture hook → verify with doctor → print a crisp, idempotent success state.
+// Models connectAuto's detect+sweep, then layers the Claude Code skill/hook install (forced on via
+// `!== false` so it never blocks on a prompt in agent/CI use; explicit --no-install-* still wins) and a
+// doctor pass. Additive, idempotent (re-running only re-affirms), reversible, no network; recall stays
+// OFF (unreachable from here). This is the discoverable front door — `setup` with no flags just works.
+async function runSetup(options: ParsedArgs['options']): Promise<void> {
+  const dryRun = options.dryRun === true;
+  const json = options.json === true;
+  const line = (s = ''): void => { if (!json) console.log(s); };
+  // Run a printing helper with stdout silenced — so reused install functions don't pollute --json output.
+  const silently = async (fn: () => Promise<void>): Promise<void> => {
+    if (!json) return fn();
+    const orig = console.log;
+    console.log = () => {};
+    try { await fn(); } finally { console.log = orig; }
+  };
+
+  line(`iHow Memory · setup${dryRun ? '  [dry-run — nothing will be written]' : ''}`);
+  line('cloud: disabled / local only');
+  line('');
+
+  // 1/4 detect (or honor an explicit --runtime)
+  line('1/4  detecting AI runtimes');
+  let present: Array<{ runtime: string; present: boolean; via: string | null }>;
+  if (options.runtime) {
+    present = [{ runtime: options.runtime, present: true, via: 'explicit' }];
+    line(`       ✓ ${options.runtime}  (explicit)`);
+  } else {
+    const detected = detectRuntimes();
+    for (const d of detected) line(`       ${d.present ? '✓' : '·'} ${d.runtime}${d.via ? `  (${d.via})` : ''}`);
+    present = detected.filter((d) => d.present);
+  }
+  const detectedNames = present.map((d) => d.runtime);
+
+  // empty short-circuit: ready the local store, then stop (exit 0 — not an error, just nothing to wire)
+  if (present.length === 0) {
+    let space: string | undefined;
+    try { space = (await ensureWorkspace(resolveWorkspace(options))).space; } catch { /* store is best-effort here */ }
+    line('');
+    line('No AI runtime detected — nothing to connect.');
+    if (space) line(`Workspace is ready at ${space} (local only).`);
+    line('Install Claude Code or Codex, then re-run: ihow-memory setup');
+    if (json) printJson({ ok: true, dryRun, detected: [], connected: [], skipped: [], skill: 'not-applicable', hook: 'not-applicable', hookScope: null, doctor: null, nextSteps: ['install-a-runtime'] });
+    return;
+  }
+
+  // workspace + bundle (once); a write failure here is the one hard stop
+  let workspace;
+  try {
+    workspace = await ensureWorkspace(resolveWorkspace(options));
+    if (!dryRun) await installRuntimeBundle(workspace);
+  } catch (caught) {
+    const err = caught instanceof Error ? caught.message : String(caught);
+    if (json) printJson({ ok: false, dryRun, error: `workspace-unwritable: ${err}` });
+    else console.error(`setup: could not prepare the workspace (${err}). Re-run with a writable --root <dir>.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // 2/4 MCP connect each present runtime; a per-runtime failure is downgraded to "skipped", never aborts
+  line('');
+  line(`2/4  connecting runtimes to workspace ${workspace.space}`);
+  const connected: string[] = [];
+  const skipped: Array<{ runtime: string; error: string }> = [];
+  for (const d of present) {
+    try {
+      const r = await connectRuntime(workspace, d.runtime, { dryRun });
+      if (dryRun) line(`       · ${d.runtime}  [dry-run] would register MCP via ${r.method}`);
+      else {
+        connected.push(d.runtime);
+        line(`       ✓ ${d.runtime}  ${r.replaced ? '(reconnected)' : r.alreadyExists ? '(already connected)' : 'MCP connected'}`);
+      }
+    } catch (caught) {
+      const error = caught instanceof Error ? caught.message : String(caught);
+      skipped.push({ runtime: d.runtime, error });
+      line(`       · skipped ${d.runtime}: ${error}`);
+    }
+  }
+
+  // 3/4 Claude Code only: install the memory skill + auto-capture hook (forced non-interactive)
+  const hasClaude = present.some((d) => d.runtime === 'claude-code');
+  let skill = 'not-applicable';
+  let hook = 'not-applicable';
+  line('');
+  line('3/4  enabling memory for Claude Code');
+  if (!hasClaude) {
+    line('       · (no Claude Code detected — skill + auto-capture hook are Claude Code only)');
+  } else if (dryRun) {
+    line('       · would install memory skill → ~/.claude/skills/ihow-memory/');
+    line(`       · would install Stop + SessionStart auto-capture hook ${options.globalHook ? '[all Claude Code projects]' : '[this project only]'}`);
+    skill = 'dry-run'; hook = 'dry-run';
+  } else {
+    await silently(() => maybeInstallClaudeSkill({ ...options, installSkill: options.installSkill !== false }));
+    await silently(() => maybeInstallStopHook({ ...options, installHook: options.installHook !== false }));
+    line('       · recall stays OFF (never reads your prompts; opt in later: install-hook --recall)');
+    skill = options.installSkill === false ? 'skipped' : 'installed';
+    hook = options.installHook === false ? 'skipped' : 'installed';
+  }
+
+  // 4/4 verify with doctor (pass the primary runtime so its runtime check is green, not a warning)
+  let doctorResult: Awaited<ReturnType<typeof doctor>> | null = null;
+  if (!dryRun) {
+    line('');
+    line('4/4  verifying (doctor)');
+    const primary = (hasClaude ? 'claude-code' : connected[0] || present[0].runtime) as ParsedArgs['options']['runtime'];
+    doctorResult = await doctor({ ...options, runtime: primary });
+    for (const c of doctorResult.checks) {
+      const label = c.ok ? 'ok' : c.required === false ? 'action' : 'fail';
+      line(`       ${label} ${c.name}: ${c.detail}`);
+      if (!c.ok && c.hint) line(`         hint: ${c.hint}`);
+    }
+  }
+
+  if (!dryRun && connected.length) {
+    await telemetry.track('setup', { runtime: `auto:${connected.length}` });
+    if (!json) await maybeAskTelemetry(); // the consent nudge is human-only — never pollute --json
+  }
+
+  const allFailed = connected.length === 0; // every attempted runtime failed (present.length >= 1 here)
+  const doctorRed = !!doctorResult && doctorResult.ok === false;
+  if (!dryRun && (allFailed || doctorRed)) process.exitCode = 1;
+
+  if (json) {
+    printJson({
+      ok: !dryRun && !allFailed && !doctorRed,
+      dryRun,
+      workspace: workspace.space,
+      detected: detectedNames,
+      connected,
+      skipped,
+      skill,
+      hook,
+      hookScope: hasClaude ? (options.globalHook ? 'global' : 'project') : null,
+      doctor: doctorResult ? { ok: doctorResult.ok, checks: doctorResult.checks } : null,
+      nextSteps: hasClaude ? ['restart-claude-code', 'say-continue-after-clear'] : ['restart-runtime', 'run-continue'],
+    });
+    return;
+  }
+
+  // human banner
+  const sep = '─'.repeat(56);
+  line('');
+  line(sep);
+  if (dryRun) { line('Dry run — nothing was written. Run for real:  ihow-memory setup'); return; }
+  if (doctorRed) {
+    const fails = doctorResult!.checks.filter((c) => !c.ok && c.required !== false);
+    line(`⚠ Set up, but ${fails.length} check${fails.length === 1 ? '' : 's'} need attention before memory works:`);
+    for (const c of fails) { line(`  ${c.name} — ${c.detail}`); if (c.hint) line(`    → ${c.hint}`); }
+    line('');
+    line('Already-written config (MCP / skill / hook) is kept. Fix the above, then re-run:  ihow-memory setup');
+    return;
+  }
+  const memOn = hasClaude ? ' · memory ON for Claude Code' : '';
+  line(`✓ iHow Memory is set up.  ${connected.length} runtime${connected.length === 1 ? '' : 's'} connected${memOn}`);
+  if (skipped.length) line(`  (${skipped.length} skipped: ${skipped.map((s) => s.runtime).join(', ')} — fix its CLI, then re-run; setup is idempotent)`);
+  line('');
+  line('  Next:');
+  if (hasClaude) {
+    line('    1. Restart Claude Code once → loads the MCP tools + memory skill.');
+    line('       (The auto-capture hooks take effect from your next Claude Code session.)');
+    line('    2. Then just work — it captures decisions, results, and blockers for you.');
+    line('    3. After /clear or in a new session, say "继续" (or run: ihow-memory continue) to pick up where you left off — a fresh session even reminds you it can.');
+  } else {
+    line('    1. Restart your runtime(s) to load the memory tools.');
+    line('    2. Resume after a context boundary with:  ihow-memory continue');
+  }
+  line('');
+  line('  Local only: no cloud, nothing uploaded, recall off by default.');
+  line('  Re-check anytime: ihow-memory doctor   ·   re-running setup is safe (idempotent).');
+}
+
 function help(): void {
   console.log(`iHow Memory Core v${packageVersion()}
 
+New here? One command does everything:  ihow-memory setup
+
 Usage:
+  ihow-memory setup [--runtime name] [--global-hook] [--dry-run] [--json]   # zero-config: detect your AI runtimes → wire MCP + memory skill + auto-capture hook → verify. No prompts, idempotent (safe to re-run), local only.
   ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
   ihow-memory continue [project-keyword] [--cwd path] [--json]   # resume after a context boundary (/clear, new session, out of context): prints a verify-first handoff for the project you were working on — auto-detected from the files you EDITED, with that project's git anchors + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. Pass a keyword to choose which project; works even if you launch every session from one dir. (alias: handoff)
@@ -2035,6 +2210,11 @@ async function main(): Promise<void> {
       console.log(`backup first: ${result.backupBeforeWrite}`);
       printRuntimeSnippet(snippet, options.runtime);
     }
+    return;
+  }
+
+  if (command === 'setup') {
+    await runSetup(options);
     return;
   }
 
