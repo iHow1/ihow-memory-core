@@ -65,6 +65,7 @@ export function assembleEnvelope(input: EnvelopeInput): string {
   if (input.sourceSessionId) lines.push(`source_session: ${input.sourceSessionId}`);
   if (input.transcriptRef) lines.push(`transcript_ref: ${input.transcriptRef}`);
   if (input.projectDir) lines.push(`project: ${input.projectDir}  (inferred from files touched; anchors below are for THIS project)`);
+  else lines.push('project: UNDETERMINED  (no files were edited this session; anchors below are for session_cwd, not an inferred project — use `ihow-memory continue <keyword>` to target a specific project)');
   lines.push(`session_cwd: ${input.cwd}`);
   lines.push('');
   lines.push('--- MACHINE ANCHORS — git facts for the project above (re-check live before trusting) ---');

@@ -1265,6 +1265,7 @@ function markerLastAt(m: StopMarker | undefined): string | undefined {
 async function findLatestStopMarker(
   workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
   cwd: string,
+  excludeSessionId?: string,
 ): Promise<StopMarker | undefined> {
   const markerDir = path.join(workspace.spaceDir, '.hooks');
   let files: string[];
@@ -1293,6 +1294,9 @@ async function findLatestStopMarker(
       continue; // skip an unreadable marker — never throw
     }
     if (!m.transcriptPath) continue;
+    // Never hand the CURRENTLY-RUNNING session back to itself: its own Stop marker may already exist
+    // and be the newest, which would make `continue` replay this session as its own "prior handoff".
+    if (excludeSessionId && m.sessionId === excludeSessionId) continue;
     // A marker with no cwd cannot be attributed to THIS project — never match it, so an unrelated
     // session's narrative can't surface in a different cwd's handoff.
     if (!m.cwd || (await realOr(m.cwd)) !== target) continue;
@@ -1312,6 +1316,7 @@ async function findLatestStopMarker(
 async function pickTranscriptHandoff(
   cwd: string,
   hint?: string,
+  excludeSessionId?: string,
 ): Promise<{ transcriptPath: string; sessionId: string; summary: ReturnType<typeof summarizeTranscript>; projectDir?: string } | undefined> {
   const encoded = path.resolve(cwd).replace(/[^A-Za-z0-9]/g, '-');
   const dir = path.join(os.homedir(), '.claude', 'projects', encoded);
@@ -1334,6 +1339,9 @@ async function pickTranscriptHandoff(
   const SCAN = 25; // bound how many recent transcripts we parse when matching a hint
   const needle = hint?.trim().toLowerCase();
   for (const { file } of stamped.slice(0, SCAN)) {
+    // Never resume the CURRENTLY-RUNNING session: its own transcript is the newest file on disk, so
+    // without this guard `continue` would replay this very session back to itself as a "prior handoff".
+    if (excludeSessionId && file.replace(/\.jsonl$/, '') === excludeSessionId) continue;
     const full = path.join(dir, file);
     let raw: string;
     try {
@@ -1344,8 +1352,10 @@ async function pickTranscriptHandoff(
     const records = parseTranscript(raw);
     if (records.length < MIN_ENTRIES) continue;
     const summary = summarizeTranscript(records);
-    // prefer files that were WRITTEN/EDITED (the active project) over incidental reads
-    const projectDir = inferProjectDir(summary.editedList.length ? summary.editedList : summary.fileList);
+    // Infer the project ONLY from files this session WROTE/EDITED — never from incidental reads.
+    // A read-only session (e.g. one that only read memory files) must not claim a project it merely
+    // browsed; leaving this undefined makes the envelope honestly say "project UNDETERMINED".
+    const projectDir = inferProjectDir(summary.editedList);
     if (needle) {
       // match the hint against the inferred project path OR the summary text (Topic / Files / Summary)
       const hay = `${projectDir ?? ''}\n${summary.body}`.toLowerCase();
@@ -1967,13 +1977,16 @@ async function main(): Promise<void> {
     // Optional project hint: `ihow-memory continue <hint>` resumes the most recent session whose
     // inferred project (or summary) matches — for users who run every session from one terminal cwd.
     const hint = rest[0];
+    // The session running this command, if Claude Code exposed it — used to exclude THIS session's own
+    // transcript/marker so `continue` resumes the PRIOR session, never replays itself back to itself.
+    const selfSessionId = process.env.CLAUDE_CODE_SESSION_ID?.trim() || undefined;
     // Prefer the real latest transcript on disk (robust to a frozen Stop marker / a differently
     // configured workspace); fall back to a Stop marker for other runtimes/layouts.
     let body = '';
     let projectDir: string | undefined;
     let sourceSessionId: string | undefined;
     let transcriptRef: string | undefined;
-    const picked = await pickTranscriptHandoff(cwd, hint);
+    const picked = await pickTranscriptHandoff(cwd, hint, selfSessionId);
     if (picked) {
       body = redactSecretLikeContent(picked.summary.body);
       projectDir = picked.projectDir;
@@ -1982,12 +1995,12 @@ async function main(): Promise<void> {
     } else {
       // TRUST BOUNDARY: a Stop-marker transcriptPath is input we wrote ourselves, not user-supplied; a
       // read failure degrades to an empty narrative (anchors still shown).
-      const fallback = await findLatestStopMarker(workspace, cwd);
+      const fallback = await findLatestStopMarker(workspace, cwd, selfSessionId);
       if (fallback?.transcriptPath) {
         try {
           const summary = summarizeTranscript(parseTranscript(await fs.readFile(fallback.transcriptPath, 'utf8')));
           body = redactSecretLikeContent(summary.body);
-          projectDir = inferProjectDir(summary.editedList.length ? summary.editedList : summary.fileList);
+          projectDir = inferProjectDir(summary.editedList); // edits only — never infer a project from reads
         } catch {
           body = '';
         }
