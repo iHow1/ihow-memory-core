@@ -693,7 +693,7 @@ Usage:
   ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
   ihow-memory continue [project-keyword] [--cwd path] [--json]   # resume after a context boundary (/clear, new session, out of context): prints a verify-first handoff for the project you were working on — auto-detected from the files you EDITED, with that project's git anchors + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. Pass a keyword to choose which project; works even if you launch every session from one dir. (alias: handoff)
-  ihow-memory continue --list [--limit n] [--json]   # list the most recent resumable sessions across all recorded projects (inferred project, git branch+HEAD, last activity, summary snippet; newest first) so you can pick which one to continue
+  ihow-memory continue --list [--limit n] [--json]   # list the most recent resumable sessions across all recorded projects (inferred project, git branch+HEAD, last activity, summary snippet; newest first); resume one by its number with: ihow-memory continue <N>
   ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes] [--share-diagnostics] [--json]
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
@@ -2346,31 +2346,56 @@ async function main(): Promise<void> {
     let sourceSessionId: string | undefined;
     let transcriptRef: string | undefined;
     let sourceAgeMs: number | undefined; // how old the captured session is (now - transcript mtime) — drives the loud staleness banner
-    const picked = await pickTranscriptHandoff(cwd, hint, selfSessionId);
-    if (picked) {
-      body = redactSecretLikeContent(picked.summary.body);
-      projectDir = picked.projectDir;
-      sourceSessionId = picked.sessionId;
-      transcriptRef = picked.transcriptPath;
-      sourceAgeMs = Date.now() - picked.mtimeMs;
+    // `continue <N>`: a pure-integer arg resumes the Nth row of `continue --list` (1-based) — pick the
+    // session you SAW in the picker without retyping a keyword. Indexes the same global list --list shows.
+    const pickIndex = hint && /^\d+$/.test(hint) ? Number.parseInt(hint, 10) : undefined;
+    if (pickIndex !== undefined && pickIndex >= 1) {
+      const sessions = await listResumableSessions(Math.max(pickIndex, 10), selfSessionId);
+      const chosen = sessions[pickIndex - 1];
+      if (!chosen) {
+        console.log(`(no resumable session #${pickIndex} — run \`ihow-memory continue --list\` to see what's available.)`);
+        return;
+      }
+      try {
+        body = redactSecretLikeContent(summarizeTranscript(parseTranscript(await fs.readFile(chosen.transcriptPath, 'utf8'))).body);
+      } catch {
+        body = '';
+      }
+      projectDir = chosen.projectDir;
+      sourceSessionId = chosen.sessionId;
+      transcriptRef = chosen.transcriptPath;
+      try {
+        sourceAgeMs = Date.now() - (await fs.stat(chosen.transcriptPath)).mtimeMs;
+      } catch {
+        // mtime unavailable -> no freshness line
+      }
     } else {
-      // TRUST BOUNDARY: a Stop-marker transcriptPath is input we wrote ourselves, not user-supplied; a
-      // read failure degrades to an empty narrative (anchors still shown).
-      const fallback = await findLatestStopMarker(workspace, cwd, selfSessionId);
-      if (fallback?.transcriptPath) {
-        try {
-          const summary = summarizeTranscript(parseTranscript(await fs.readFile(fallback.transcriptPath, 'utf8')));
-          body = redactSecretLikeContent(summary.body);
-          projectDir = inferProjectDir(summary.editedList); // edits only — never infer a project from reads
-        } catch {
-          body = '';
-        }
-        sourceSessionId = fallback.sessionId;
-        transcriptRef = fallback.transcriptPath ?? undefined;
-        try {
-          sourceAgeMs = Date.now() - (await fs.stat(fallback.transcriptPath)).mtimeMs;
-        } catch {
-          // mtime unavailable -> no freshness line (still never silent: empty body still triggers the banner)
+      const picked = await pickTranscriptHandoff(cwd, hint, selfSessionId);
+      if (picked) {
+        body = redactSecretLikeContent(picked.summary.body);
+        projectDir = picked.projectDir;
+        sourceSessionId = picked.sessionId;
+        transcriptRef = picked.transcriptPath;
+        sourceAgeMs = Date.now() - picked.mtimeMs;
+      } else {
+        // TRUST BOUNDARY: a Stop-marker transcriptPath is input we wrote ourselves, not user-supplied; a
+        // read failure degrades to an empty narrative (anchors still shown).
+        const fallback = await findLatestStopMarker(workspace, cwd, selfSessionId);
+        if (fallback?.transcriptPath) {
+          try {
+            const summary = summarizeTranscript(parseTranscript(await fs.readFile(fallback.transcriptPath, 'utf8')));
+            body = redactSecretLikeContent(summary.body);
+            projectDir = inferProjectDir(summary.editedList); // edits only — never infer a project from reads
+          } catch {
+            body = '';
+          }
+          sourceSessionId = fallback.sessionId;
+          transcriptRef = fallback.transcriptPath ?? undefined;
+          try {
+            sourceAgeMs = Date.now() - (await fs.stat(fallback.transcriptPath)).mtimeMs;
+          } catch {
+            // mtime unavailable -> no freshness line (still never silent: empty body still triggers the banner)
+          }
         }
       }
     }
