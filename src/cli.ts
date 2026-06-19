@@ -34,6 +34,7 @@ type ParsedArgs = {
   options: WorkspaceOptions & {
     json?: boolean;
     limit?: number;
+    list?: boolean;
     dryRun?: boolean;
     realWrite?: boolean;
     actor?: string;
@@ -99,6 +100,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--auto') options.auto = true;
     else if (arg === '--write') options.write = true;
     else if (arg === '--json') options.json = true;
+    else if (arg === '--list') options.list = true;
     else if (arg === '--limit') options.limit = Number(tail[++index]);
     else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--real-write') options.realWrite = true;
@@ -515,6 +517,7 @@ Usage:
   ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
   ihow-memory continue [project-keyword] [--cwd path] [--json]   # resume after a context boundary (/clear, new session, out of context): prints a verify-first handoff for the project you were working on — auto-detected from the files you EDITED, with that project's git anchors + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. Pass a keyword to choose which project; works even if you launch every session from one dir. (alias: handoff)
+  ihow-memory continue --list [--limit n] [--json]   # list the most recent resumable sessions across all recorded projects (inferred project, git branch+HEAD, last activity, summary snippet; newest first) so you can pick which one to continue
   ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes] [--share-diagnostics] [--json]
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
@@ -1366,6 +1369,131 @@ async function pickTranscriptHandoff(
   return undefined;
 }
 
+type ResumableSession = {
+  sessionId: string;
+  transcriptPath: string;
+  projectDir?: string; // inferred from EDITED files only (never reads) — undefined => UNDETERMINED
+  modifiedAt: string; // transcript file mtime, ISO — the "last activity" used for sort + display
+  anchors: GitAnchors; // git facts for projectDir (machine-verified; free-text fields redacted)
+  snippet: string; // redacted, single-line summary fragment of the prior session
+};
+
+// Power `continue --list`: enumerate the most recent RESUMABLE sessions across EVERY project Claude
+// Code recorded under ~/.claude/projects/<encoded-cwd>/*.jsonl, newest activity first, so the user can
+// pick which one to resume even when every session launches from one terminal dir. Reuses the SAME
+// discovery/inference primitives as the single-session `continue`: substantive-transcript threshold,
+// inferProjectDir over EDITED files only (a read-only session stays UNDETERMINED, never claims a repo
+// it merely browsed), excludeSessionId so the live session never lists itself, deterministic git
+// anchors, and redactSecretLikeContent on every free-text field (snippet + anchor subject/branch/repo/
+// dirty files) so a secret in a commit subject or summary can't leak into the list. Read-only: parses
+// transcripts and reads git; mutates nothing. Never throws on a single bad file/dir — it is skipped.
+async function listResumableSessions(
+  limit: number,
+  excludeSessionId?: string,
+): Promise<ResumableSession[]> {
+  const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+  let projectDirs: string[];
+  try {
+    projectDirs = await fs.readdir(projectsRoot);
+  } catch {
+    return []; // no Claude Code projects dir at all -> nothing to list
+  }
+  const MIN_ENTRIES = 4; // skip trivial / freshly-cleared sessions (same threshold as pickTranscriptHandoff)
+  // First pass: stamp every transcript by mtime so we can globally sort newest-first and bound how many
+  // we actually PARSE (parsing is the costly part). We over-collect a little (limit * 4 + 8) before
+  // parsing, because some of the newest files may be trivial/self and get filtered out below.
+  const stamped: Array<{ full: string; sessionId: string; mtimeMs: number }> = [];
+  for (const enc of projectDirs) {
+    const dir = path.join(projectsRoot, enc);
+    let files: string[];
+    try {
+      files = (await fs.readdir(dir)).filter((f) => f.endsWith('.jsonl'));
+    } catch {
+      continue; // not a readable dir (or a stray file) -> skip
+    }
+    for (const f of files) {
+      const sessionId = f.replace(/\.jsonl$/, '');
+      // Never list the CURRENTLY-RUNNING session — its own transcript is the newest file on disk and
+      // would otherwise top the list as a "resume me" entry (self-replay, same guard as continue).
+      if (excludeSessionId && sessionId === excludeSessionId) continue;
+      const full = path.join(dir, f);
+      try {
+        stamped.push({ full, sessionId, mtimeMs: (await fs.stat(full)).mtimeMs });
+      } catch {
+        // skip an unstattable file
+      }
+    }
+  }
+  stamped.sort((a, b) => b.mtimeMs - a.mtimeMs); // newest activity first
+  const SCAN_CAP = Math.max(limit * 4, limit + 8); // bound parsing work
+  const out: ResumableSession[] = [];
+  for (const { full, sessionId, mtimeMs } of stamped.slice(0, SCAN_CAP)) {
+    if (out.length >= limit) break;
+    let raw: string;
+    try {
+      raw = await fs.readFile(full, 'utf8');
+    } catch {
+      continue; // unreadable transcript -> skip
+    }
+    const records = parseTranscript(raw);
+    if (records.length < MIN_ENTRIES) continue; // trivial / freshly-cleared
+    const summary = summarizeTranscript(records);
+    // EDITED files only — a read-only session must not claim a project it merely browsed.
+    const projectDir = inferProjectDir(summary.editedList);
+    const anchors = gitAnchors(projectDir ?? path.dirname(full));
+    if (projectDir) {
+      // Free-text anchor fields are redacted like the narrative (a secret in a commit subject must not
+      // leak as a "fact"); only carry anchors when we actually inferred a project (else they describe
+      // the unrelated transcript dir and are meaningless).
+      if (anchors.headSubject) anchors.headSubject = redactSecretLikeContent(anchors.headSubject);
+      if (anchors.branch) anchors.branch = redactSecretLikeContent(anchors.branch);
+      if (anchors.repo) anchors.repo = redactSecretLikeContent(anchors.repo);
+      if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
+    }
+    const snippet = redactSecretLikeContent(summary.body).replace(/\s+/g, ' ').trim().slice(0, 160);
+    out.push({
+      sessionId,
+      transcriptPath: full,
+      projectDir,
+      modifiedAt: new Date(mtimeMs).toISOString(),
+      anchors: projectDir ? anchors : { isRepo: false },
+      snippet,
+    });
+  }
+  return out;
+}
+
+// Render the `continue --list` picker as a compact, human-scannable block. Each row: an index to pass
+// back to `continue <keyword>`, the inferred project (or UNDETERMINED), branch+short-HEAD when the
+// project is a git repo, last-activity time, and a one-line redacted summary snippet.
+function renderResumableList(sessions: ResumableSession[]): string {
+  if (!sessions.length) {
+    return [
+      'No resumable sessions found.',
+      '(Run your work sessions from a project dir and `ihow-memory install-hook` so future sessions are recorded;',
+      ' then `ihow-memory continue --list` will show what you can pick up.)',
+    ].join('\n');
+  }
+  const lines: string[] = [
+    `Resumable sessions (most recent first) — pick one with \`ihow-memory continue <keyword>\`:`,
+    '',
+  ];
+  sessions.forEach((s, i) => {
+    const project = s.projectDir ?? 'UNDETERMINED (no files edited this session)';
+    const anchor = s.anchors.isRepo
+      ? `${s.anchors.branch ?? '?'} @ ${s.anchors.head ?? '?'}${(s.anchors.dirtyCount ?? 0) > 0 ? ` (+${s.anchors.dirtyCount} dirty)` : ''}`
+      : '(not a git repo / project undetermined)';
+    lines.push(`${String(i + 1).padStart(2, ' ')}. ${project}`);
+    lines.push(`    git: ${anchor}`);
+    lines.push(`    last activity: ${s.modifiedAt}`);
+    lines.push(`    session: ${s.sessionId}`);
+    if (s.snippet) lines.push(`    summary: ${s.snippet}`);
+    lines.push('');
+  });
+  lines.push('These are UNVERIFIED prior-session summaries — `continue` will verify git anchors before you act.');
+  return lines.join('\n');
+}
+
 // Opt-in hook observability. STDOUT is the hook's control channel (the decision JSON / silence), so
 // diagnostics go to STDERR and ONLY when IHOW_HOOK_DEBUG is set — off by default so a normal session is
 // never polluted. Never throws (a logging failure must not break a hook). Lets a dogfood operator see
@@ -1980,6 +2108,30 @@ async function main(): Promise<void> {
     // The session running this command, if Claude Code exposed it — used to exclude THIS session's own
     // transcript/marker so `continue` resumes the PRIOR session, never replays itself back to itself.
     const selfSessionId = process.env.CLAUDE_CODE_SESSION_ID?.trim() || undefined;
+    // `continue --list`: instead of assembling one handoff, enumerate the most recent resumable
+    // sessions across ALL recorded projects so the user can choose which one to pick up (then resume
+    // with `continue <keyword>`). Same discovery/inference/redaction primitives, just fanned out.
+    if (options.list) {
+      const limit = Number.isFinite(options.limit) && (options.limit as number) > 0 ? Math.floor(options.limit as number) : 10;
+      const sessions = await listResumableSessions(limit, selfSessionId);
+      if (options.json) {
+        printJson({
+          sessions: sessions.map((s) => ({
+            sessionId: s.sessionId,
+            project: s.projectDir ?? null,
+            branch: s.anchors.isRepo ? s.anchors.branch ?? null : null,
+            head: s.anchors.isRepo ? s.anchors.head ?? null : null,
+            dirtyCount: s.anchors.isRepo ? s.anchors.dirtyCount ?? 0 : null,
+            lastActivity: s.modifiedAt,
+            transcriptRef: s.transcriptPath,
+            snippet: s.snippet,
+          })),
+        });
+      } else {
+        console.log(renderResumableList(sessions));
+      }
+      return;
+    }
     // Prefer the real latest transcript on disk (robust to a frozen Stop marker / a differently
     // configured workspace); fall back to a Stop marker for other runtimes/layouts.
     let body = '';
