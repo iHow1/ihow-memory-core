@@ -1920,6 +1920,10 @@ async function main(): Promise<void> {
     const marker = await findLatestStopMarker(workspace, cwd);
     let body = '';
     if (marker?.transcriptPath) {
+      // TRUST BOUNDARY: transcriptPath comes from a Stop-hook marker we wrote ourselves (it is the
+      // Claude Code transcript path the hook recorded), so this read is trusted input — not a
+      // user-supplied path. A read failure degrades to an empty narrative (anchors still shown), and
+      // the summarizer scope is locked + redacted, so a surprising path can leak nothing.
       try {
         const raw = await fs.readFile(marker.transcriptPath, 'utf8');
         body = redactSecretLikeContent(summarizeTranscript(parseTranscript(raw)).body);
