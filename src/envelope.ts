@@ -61,7 +61,7 @@ export type EnvelopeInput = {
 // never an LLM judgement.
 const STALE_HANDOFF_MS = 24 * 60 * 60 * 1000; // > 1 day since the source session was last active
 
-function formatAge(ms: number): string {
+export function formatAge(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 90) return `${s}s`;
   const m = s / 60;

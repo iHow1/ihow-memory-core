@@ -15,7 +15,7 @@ import { readEventsAllLanes } from './store/events.ts';
 import { appendJournal, containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
 import { parseTranscript, summarizeTranscript } from './transcript.ts';
 import { gitAnchors, inferProjectDir } from './anchors.ts';
-import { assembleEnvelope } from './envelope.ts';
+import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
@@ -1625,6 +1625,32 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
     workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd }));
   } catch {
     return;
+  }
+
+  // RESUME AWARENESS (opt out: IHOW_RESUME_HINT=0). On a FRESH context (a brand-new session or one
+  // started after /clear), surface a ONE-LINE pointer that a prior session is resumable — never its
+  // content. This respects the user who deliberately wants a clean start: nothing prior is loaded
+  // unless they explicitly say "继续". Content stays opt-in; this is only awareness so they don't
+  // forget the option. Skipped on 'compact'/'resume' sources (same task continuing — not a fresh start)
+  // and when nothing is resumable. Reuses the exact discovery `continue` uses, so the hint names what
+  // `continue` would actually resume. Best-effort: a failure here must never disrupt the floor below.
+  const source = typeof payload.source === 'string' ? payload.source : '';
+  const freshContext = source === '' || source === 'startup' || source === 'clear';
+  if (process.env.IHOW_RESUME_HINT !== '0' && freshContext && typeof cwd === 'string' && cwd) {
+    try {
+      const resumable = await pickTranscriptHandoff(cwd, undefined, currentSessionId);
+      if (resumable) {
+        const proj = resumable.projectDir ? path.basename(resumable.projectDir) : 'your previous session';
+        const age = formatAge(Date.now() - resumable.mtimeMs);
+        const hint =
+          `💡 iHow Memory: a resumable session is available (${proj}, last active ${age} ago). ` +
+          `Say "继续" / "continue" to pick it up with a verify-first handoff — or just start your task ` +
+          `to begin fresh (nothing prior is loaded unless you ask).`;
+        process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: hint } })}\n`);
+      }
+    } catch {
+      // awareness is best-effort — never disrupt the floor or the session
+    }
   }
 
   const markerDir = path.join(workspace.spaceDir, '.hooks');
