@@ -33,7 +33,9 @@ function sha(s: string, n = 16): string {
 // HEAD. A narrative that claims "HEAD 9cd4dc2 / 16 commits to push" when HEAD is really e1d482b will
 // surface 9cd4dc2 here — a deterministic, no-LLM proxy for "narrative conflicts with reality".
 export function anchorConflicts(narrative: string, head?: string): { total: number; stale: number; referencesHead: boolean } {
-  const tokens = new Set((narrative.toLowerCase().match(/\b[0-9a-f]{7,40}\b/g) ?? []));
+  // Require ≥1 hex LETTER so pure-decimal runs (line counts, durations, timestamps, issue IDs like
+  // "12345678") aren't miscounted as commit SHAs — that would inflate the grooming-decay signal with noise.
+  const tokens = new Set((narrative.toLowerCase().match(/\b[0-9a-f]{7,40}\b/g) ?? []).filter((t) => /[a-f]/.test(t)));
   const liveHead = head?.toLowerCase();
   let stale = 0;
   let referencesHead = false;

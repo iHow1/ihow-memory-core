@@ -14,7 +14,7 @@ import { sqliteRuntimeStatus } from './engine/fts.ts';
 import { readEventsAllLanes } from './store/events.ts';
 import { appendJournal, containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
 import { parseTranscript, summarizeTranscript } from './transcript.ts';
-import { gitAnchors, inferProjectDir } from './anchors.ts';
+import { gitAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
 import type { WorkspaceOptions } from './types.ts';
@@ -549,7 +549,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   // empty short-circuit: ready the local store, then stop (exit 0 — not an error, just nothing to wire)
   if (present.length === 0) {
     let space: string | undefined;
-    try { space = (await ensureWorkspace(resolveWorkspace(options))).space; } catch { /* store is best-effort here */ }
+    try { space = (dryRun ? resolveWorkspace(options) : await ensureWorkspace(resolveWorkspace(options))).space; } catch { /* store is best-effort here */ }
     line('');
     line('No AI runtime detected — nothing to connect.');
     if (space) line(`Workspace is ready at ${space} (local only).`);
@@ -561,7 +561,9 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   // workspace + bundle (once); a write failure here is the one hard stop
   let workspace;
   try {
-    workspace = await ensureWorkspace(resolveWorkspace(options));
+    // dry-run must touch NOTHING: resolveWorkspace is pure (computes paths, no fs writes); ensureWorkspace
+    // materializes the dir tree + index-manifest. Only materialize for a real run.
+    workspace = dryRun ? resolveWorkspace(options) : await ensureWorkspace(resolveWorkspace(options));
     if (!dryRun) await installRuntimeBundle(workspace);
   } catch (caught) {
     const err = caught instanceof Error ? caught.message : String(caught);
@@ -604,11 +606,31 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     line(`       · would install Stop + SessionStart auto-capture hook ${options.globalHook ? '[all Claude Code projects]' : '[this project only]'}`);
     skill = 'dry-run'; hook = 'dry-run';
   } else {
-    await silently(() => maybeInstallClaudeSkill({ ...options, installSkill: options.installSkill !== false }));
-    await silently(() => maybeInstallStopHook({ ...options, installHook: options.installHook !== false }));
+    // The install helpers can no-op (unparseable settings, unreadable bundle) or throw on an fs error;
+    // never let that crash setup, and never claim "installed" from the FLAG. Run them, then read the
+    // actual on-disk outcome — the ground truth — to set status, and fold any failure into ok/exitCode.
+    let skillThrew = false;
+    let hookThrew = false;
+    try { await silently(() => maybeInstallClaudeSkill({ ...options, installSkill: options.installSkill !== false })); } catch { skillThrew = true; }
+    try { await silently(() => maybeInstallStopHook({ ...options, installHook: options.installHook !== false })); } catch { hookThrew = true; }
     line('       · recall stays OFF (never reads your prompts; opt in later: install-hook --recall)');
-    skill = options.installSkill === false ? 'skipped' : 'installed';
-    hook = options.installHook === false ? 'skipped' : 'installed';
+    if (options.installSkill === false) skill = 'skipped';
+    else {
+      const present = await fs.access(path.join(os.homedir(), '.claude', 'skills', 'ihow-memory', 'SKILL.md')).then(() => true, () => false);
+      skill = !skillThrew && present ? 'installed' : 'failed';
+    }
+    if (options.installHook === false) hook = 'skipped';
+    else {
+      const settingsPath = options.globalHook
+        ? path.join(os.homedir(), '.claude', 'settings.json')
+        : path.join(path.resolve(options.cwd || process.cwd()), '.claude', 'settings.local.json');
+      let wired = false;
+      try {
+        const raw = await fs.readFile(settingsPath, 'utf8');
+        wired = raw.includes('hook-stop') && raw.includes('hook-session-start') && raw.includes('ihow-memory');
+      } catch { wired = false; }
+      hook = !hookThrew && wired ? 'installed' : 'failed';
+    }
   }
 
   // 4/4 verify with doctor (pass the primary runtime so its runtime check is green, not a warning)
@@ -632,11 +654,14 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
 
   const allFailed = connected.length === 0; // every attempted runtime failed (present.length >= 1 here)
   const doctorRed = !!doctorResult && doctorResult.ok === false;
-  if (!dryRun && (allFailed || doctorRed)) process.exitCode = 1;
+  const installFailed = skill === 'failed' || hook === 'failed'; // a helper no-op'd / threw despite being asked
+  if (!dryRun && (allFailed || doctorRed || installFailed)) process.exitCode = 1;
+  // ok must never contradict a non-zero exit a sub-step already set (e.g. unparseable settings)
+  const ok = !dryRun && !allFailed && !doctorRed && !installFailed && process.exitCode !== 1;
 
   if (json) {
     printJson({
-      ok: !dryRun && !allFailed && !doctorRed,
+      ok,
       dryRun,
       workspace: workspace.space,
       detected: detectedNames,
@@ -656,10 +681,13 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   line('');
   line(sep);
   if (dryRun) { line('Dry run — nothing was written. Run for real:  ihow-memory setup'); return; }
-  if (doctorRed) {
-    const fails = doctorResult!.checks.filter((c) => !c.ok && c.required !== false);
-    line(`⚠ Set up, but ${fails.length} check${fails.length === 1 ? '' : 's'} need attention before memory works:`);
-    for (const c of fails) { line(`  ${c.name} — ${c.detail}`); if (c.hint) line(`    → ${c.hint}`); }
+  if (doctorRed || installFailed) {
+    const probs: string[] = [];
+    if (skill === 'failed') probs.push('memory skill — install did not land (see the message above)');
+    if (hook === 'failed') probs.push('auto-capture hook — not wired (see the message above)');
+    if (doctorResult) for (const c of doctorResult.checks.filter((c) => !c.ok && c.required !== false)) probs.push(`${c.name} — ${c.detail}${c.hint ? `\n    → ${c.hint}` : ''}`);
+    line(`⚠ Set up partially — ${probs.length} thing${probs.length === 1 ? '' : 's'} need attention before memory works:`);
+    for (const p of probs) line(`  ${p}`);
     line('');
     line('Already-written config (MCP / skill / hook) is kept. Fix the above, then re-run:  ihow-memory setup');
     return;
@@ -1967,8 +1995,10 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
     hookLog(`session-start: marker ${m.sessionId ?? '?'} -> ${outcome}${floorEventId ? ` (eventId=${floorEventId})` : ''}`);
   }
   hookLog(`session-start: processed ${candidates.length} marker(s); pending(unprocessed)=${markers.filter((x) => x.m.processed !== true).length}`);
-  // recall stays OFF (OpenClaw lock): SessionStart performs SILENT floor capture only — it writes NO
-  // context injection to stdout, so capture and recall are never enabled together.
+  // recall stays OFF (OpenClaw lock): the floor capture itself injects NO memory/recall CONTENT into the
+  // session. The ONLY thing SessionStart may write to stdout is the opt-out, content-free resume-AWARENESS
+  // pointer above (a project name + age on a fresh context, never prior narrative) — distinct from the
+  // gated recall read-path, which stays off. Capture and recall are never enabled together.
 }
 
 // Recall tuning. Recall is the OpenClaw-GATED reading path: it injects relevant prior memory into a new
@@ -2350,8 +2380,8 @@ async function main(): Promise<void> {
     // session you SAW in the picker without retyping a keyword. Indexes the same global list --list shows.
     const pickIndex = hint && /^\d+$/.test(hint) ? Number.parseInt(hint, 10) : undefined;
     if (pickIndex !== undefined && pickIndex >= 1) {
-      const sessions = await listResumableSessions(Math.max(pickIndex, 10), selfSessionId);
-      const chosen = sessions[pickIndex - 1];
+      const sessions = await listResumableSessions(Math.min(Math.max(pickIndex, 10), 100), selfSessionId);
+      const chosen = sessions[pickIndex - 1]; // > the fetched ceiling -> undefined -> honest refusal below
       if (!chosen) {
         console.log(`(no resumable session #${pickIndex} — run \`ihow-memory continue --list\` to see what's available.)`);
         return;

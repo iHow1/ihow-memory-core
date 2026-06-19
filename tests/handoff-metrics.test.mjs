@@ -30,6 +30,8 @@ test('anchorConflicts: counts stale SHA refs and recognizes the live HEAD', () =
   assert.equal(b.referencesHead, true, 'recognizes the narrative cites the live head');
   // no sha-shaped tokens at all
   assert.deepEqual(anchorConflicts('没有任何提交哈希', 'e1d482b'), { total: 0, stale: 0, referencesHead: false });
+  // pure-decimal runs (line counts, durations, issue IDs) must NOT be mistaken for commit SHAs
+  assert.deepEqual(anchorConflicts('处理了 12345678 行，耗时 9876543 毫秒，issue 1234567', 'e1d482b'), { total: 0, stale: 0, referencesHead: false });
 });
 
 async function makeRepo(dir) {

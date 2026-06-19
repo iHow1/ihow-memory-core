@@ -84,6 +84,8 @@ test('setup --dry-run writes NOTHING', async (t) => {
   assert.equal(await exists(path.join(home, '.claude', 'skills', 'ihow-memory', 'SKILL.md')), false, 'no skill written');
   assert.equal(await exists(path.join(proj, '.claude', 'settings.local.json')), false, 'no hook settings written');
   assert.equal(await exists(path.join(home, '.claude.json')), false, 'no MCP config written');
+  // zero-write means the workspace tree is NOT materialized either (no ensureWorkspace under dry-run)
+  assert.equal(await exists(path.join(root, 't')), false, 'no workspace dir tree materialized under --root');
 });
 
 test('setup --json emits clean parseable output (install prints suppressed)', async (t) => {
@@ -97,6 +99,22 @@ test('setup --json emits clean parseable output (install prints suppressed)', as
   assert.equal(j.skill, 'installed');
   assert.equal(j.hook, 'installed');
   assert.equal(j.doctor.ok, true, 'doctor verified clean');
+});
+
+test('setup --json is honest when the hook fails to wire (unparseable settings → ok:false, hook:failed)', async (t) => {
+  const { home, root, proj } = await dirs(t);
+  // a pre-existing broken settings file makes maybeInstallStopHook refuse to write (no hook wired)
+  await fs.mkdir(path.join(proj, '.claude'), { recursive: true });
+  await fs.writeFile(path.join(proj, '.claude', 'settings.local.json'), '{ not valid json', 'utf8');
+  let out;
+  try {
+    out = run(['setup', '--runtime', 'claude-code', '--json', '--root', root, '--space', 't', '--cwd', proj], home);
+  } catch (e) {
+    out = e.stdout; // non-zero exit (hook failure) — read stdout from the error
+  }
+  const j = JSON.parse(out);
+  assert.equal(j.hook, 'failed', 'reports the hook was NOT wired, not a flag-based "installed"');
+  assert.equal(j.ok, false, 'ok is false — never contradicts the failure');
 });
 
 test('setup with no runtime detected is an honest exit-0 no-op', async (t) => {
