@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/opt/homebrew/Cellar/node@24/24.14.1/bin/node\" \"/Users/zyh/Desktop/ihow-staging/ihow-memory-core/bin/ihow-memory.mjs\" hook-stop",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

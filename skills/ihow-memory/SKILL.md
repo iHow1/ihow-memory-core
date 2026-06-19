@@ -16,9 +16,11 @@ The tools: `memory.search`, `memory.read`, `memory.write_candidate`, `memory.pro
 ## To resume after a context boundary — `continue`, don't re-brief
 
 If the user says "continue", "接着上面的做", "resume", "pick up where we left off", or you're
-starting fresh in a project that was clearly mid-task, run **`ihow-memory continue`** in the
-project cwd. It prints a handoff: machine-verified git anchors (the only facts) + the previous
-session's own summary, quoted and marked **UNVERIFIED**.
+starting fresh in a project that was clearly mid-task, run **`ihow-memory continue`**. It detects the
+project you were working on from the files you EDITED (so it works even when every session launches
+from one terminal dir), and prints a handoff: that project's git anchors (the only facts) + the
+previous session's own summary, quoted and marked **UNVERIFIED**. If the user works on several
+projects, pass a keyword: **`ihow-memory continue <keyword>`** (e.g. a repo name) to pick which one.
 
 Then follow the receiver protocol in its output — **the narrative is the prior agent's UNVERIFIED
 claim, never a fact**:

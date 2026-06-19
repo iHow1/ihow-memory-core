@@ -14,7 +14,7 @@ import { sqliteRuntimeStatus } from './engine/fts.ts';
 import { readEventsAllLanes } from './store/events.ts';
 import { appendJournal, containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
 import { parseTranscript, summarizeTranscript } from './transcript.ts';
-import { gitAnchors } from './anchors.ts';
+import { gitAnchors, inferProjectDir } from './anchors.ts';
 import { assembleEnvelope } from './envelope.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
@@ -514,7 +514,7 @@ function help(): void {
 Usage:
   ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
-  ihow-memory continue [--cwd path] [--json]   # resume after a context boundary (/clear, new session, ran out of context): prints a verify-first handoff for this cwd — git-verified anchors (the only facts) + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. (alias: handoff)
+  ihow-memory continue [project-keyword] [--cwd path] [--json]   # resume after a context boundary (/clear, new session, out of context): prints a verify-first handoff for the project you were working on — auto-detected from the files you EDITED, with that project's git anchors + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. Pass a keyword to choose which project; works even if you launch every session from one dir. (alias: handoff)
   ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes] [--share-diagnostics] [--json]
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
@@ -1309,7 +1309,10 @@ async function findLatestStopMarker(
 // Claude Code encodes the project dir by replacing every non-alphanumeric char of the absolute cwd
 // with '-'. A freshly /cleared session's tiny transcript is skipped (entry threshold) so we resume the
 // real prior work. Returns the same {transcriptPath, sessionId} shape; undefined if none found.
-async function findLatestTranscriptForCwd(cwd: string): Promise<{ transcriptPath: string; sessionId?: string } | undefined> {
+async function pickTranscriptHandoff(
+  cwd: string,
+  hint?: string,
+): Promise<{ transcriptPath: string; sessionId: string; summary: ReturnType<typeof summarizeTranscript>; projectDir?: string } | undefined> {
   const encoded = path.resolve(cwd).replace(/[^A-Za-z0-9]/g, '-');
   const dir = path.join(os.homedir(), '.claude', 'projects', encoded);
   let files: string[];
@@ -1328,16 +1331,27 @@ async function findLatestTranscriptForCwd(cwd: string): Promise<{ transcriptPath
   }
   stamped.sort((a, b) => b.mtimeMs - a.mtimeMs); // newest first
   const MIN_ENTRIES = 4; // skip a trivial / freshly-cleared session
-  for (const { file } of stamped) {
+  const SCAN = 25; // bound how many recent transcripts we parse when matching a hint
+  const needle = hint?.trim().toLowerCase();
+  for (const { file } of stamped.slice(0, SCAN)) {
     const full = path.join(dir, file);
+    let raw: string;
     try {
-      const raw = await fs.readFile(full, 'utf8');
-      if (parseTranscript(raw).length >= MIN_ENTRIES) {
-        return { transcriptPath: full, sessionId: file.replace(/\.jsonl$/, '') };
-      }
+      raw = await fs.readFile(full, 'utf8');
     } catch {
-      // skip an unreadable transcript
+      continue; // skip an unreadable transcript
     }
+    const records = parseTranscript(raw);
+    if (records.length < MIN_ENTRIES) continue;
+    const summary = summarizeTranscript(records);
+    // prefer files that were WRITTEN/EDITED (the active project) over incidental reads
+    const projectDir = inferProjectDir(summary.editedList.length ? summary.editedList : summary.fileList);
+    if (needle) {
+      // match the hint against the inferred project path OR the summary text (Topic / Files / Summary)
+      const hay = `${projectDir ?? ''}\n${summary.body}`.toLowerCase();
+      if (!hay.includes(needle)) continue;
+    }
+    return { transcriptPath: full, sessionId: file.replace(/\.jsonl$/, ''), summary, projectDir };
   }
   return undefined;
 }
@@ -1950,52 +1964,64 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    const anchors = gitAnchors(cwd);
-    // Anchors are git-derived facts, but the FREE-TEXT fields (commit subject, branch, dirty filenames,
-    // repo name) are author-controlled and can carry secret values — redact them like the narrative so a
-    // secret in a commit message can't leak through the "facts" block.
+    // Optional project hint: `ihow-memory continue <hint>` resumes the most recent session whose
+    // inferred project (or summary) matches — for users who run every session from one terminal cwd.
+    const hint = rest[0];
+    // Prefer the real latest transcript on disk (robust to a frozen Stop marker / a differently
+    // configured workspace); fall back to a Stop marker for other runtimes/layouts.
+    let body = '';
+    let projectDir: string | undefined;
+    let sourceSessionId: string | undefined;
+    let transcriptRef: string | undefined;
+    const picked = await pickTranscriptHandoff(cwd, hint);
+    if (picked) {
+      body = redactSecretLikeContent(picked.summary.body);
+      projectDir = picked.projectDir;
+      sourceSessionId = picked.sessionId;
+      transcriptRef = picked.transcriptPath;
+    } else {
+      // TRUST BOUNDARY: a Stop-marker transcriptPath is input we wrote ourselves, not user-supplied; a
+      // read failure degrades to an empty narrative (anchors still shown).
+      const fallback = await findLatestStopMarker(workspace, cwd);
+      if (fallback?.transcriptPath) {
+        try {
+          const summary = summarizeTranscript(parseTranscript(await fs.readFile(fallback.transcriptPath, 'utf8')));
+          body = redactSecretLikeContent(summary.body);
+          projectDir = inferProjectDir(summary.editedList.length ? summary.editedList : summary.fileList);
+        } catch {
+          body = '';
+        }
+        sourceSessionId = fallback.sessionId;
+        transcriptRef = fallback.transcriptPath ?? undefined;
+      }
+    }
+    // Anchors come from the INFERRED PROJECT (where the work landed on disk), not the session cwd —
+    // this keeps the handoff project-aware when every session runs from one terminal dir. The FREE-TEXT
+    // anchor fields are redacted like the narrative (a secret in a commit subject must not leak as a fact).
+    const anchors = gitAnchors(projectDir ?? cwd);
     if (anchors.headSubject) anchors.headSubject = redactSecretLikeContent(anchors.headSubject);
     if (anchors.branch) anchors.branch = redactSecretLikeContent(anchors.branch);
     if (anchors.repo) anchors.repo = redactSecretLikeContent(anchors.repo);
     if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
-    // Prefer the real latest transcript on disk (robust to a frozen Stop marker / a workspace
-    // configured elsewhere); fall back to a Stop marker for other runtimes/layouts.
-    const marker = (await findLatestTranscriptForCwd(cwd)) ?? (await findLatestStopMarker(workspace, cwd));
-    let body = '';
-    if (marker?.transcriptPath) {
-      // TRUST BOUNDARY: transcriptPath comes from a Stop-hook marker we wrote ourselves (it is the
-      // Claude Code transcript path the hook recorded), so this read is trusted input — not a
-      // user-supplied path. A read failure degrades to an empty narrative (anchors still shown), and
-      // the summarizer scope is locked + redacted, so a surprising path can leak nothing.
-      try {
-        const raw = await fs.readFile(marker.transcriptPath, 'utf8');
-        body = redactSecretLikeContent(summarizeTranscript(parseTranscript(raw)).body);
-      } catch {
-        body = ''; // transcript gone / unreadable -> honest empty narrative, anchors still shown
-      }
-    }
     const envelope = assembleEnvelope({
       cwd,
-      producerAgent: marker?.sessionId ? `claude-code:${marker.sessionId.slice(0, 8)}` : 'ihow-continue',
+      producerAgent: sourceSessionId ? `claude-code:${sourceSessionId.slice(0, 8)}` : 'ihow-continue',
       createdAt: new Date().toISOString(),
       anchors,
       quotedBody: body,
-      sourceSessionId: marker?.sessionId,
-      transcriptRef: marker?.transcriptPath ?? undefined,
+      projectDir,
+      sourceSessionId,
+      transcriptRef,
     });
     if (options.json) {
-      printJson({
-        cwd,
-        anchors,
-        quotedBody: body,
-        transcriptRef: marker?.transcriptPath ?? null,
-        sourceSession: marker?.sessionId ?? null,
-      });
+      printJson({ cwd, projectDir: projectDir ?? null, anchors, quotedBody: body, transcriptRef: transcriptRef ?? null, sourceSession: sourceSessionId ?? null });
     } else {
       console.log(envelope);
-      if (!marker?.transcriptPath) {
+      if (!transcriptRef) {
         console.log(
-          '\n(no captured prior session for this cwd yet — the anchors above are live git state. Run `ihow-memory install-hook` so future sessions leave a handoff to continue from.)',
+          hint
+            ? `\n(no recent session matching "${hint}" found. Try \`ihow-memory continue\` with no keyword, or a different one.)`
+            : '\n(no captured prior session found — anchors above are live git state. Run sessions from your project dir and `ihow-memory install-hook` so future sessions leave a handoff.)',
         );
       }
     }

@@ -11,6 +11,7 @@
 
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
+import os from 'node:os';
 
 export type GitAnchors = {
   isRepo: boolean;
@@ -87,4 +88,27 @@ export function renderAnchors(a: GitAnchors): string {
   if (a.dirtyFiles && a.dirtyFiles.length) lines.push(...a.dirtyFiles.map((f) => `  ${f}`));
   if (a.lastCommitRel) lines.push(`last commit: ${a.lastCommitRel}`);
   return lines.join('\n');
+}
+
+// Infer the project a session worked on from the files it touched: the git repo root that contains the
+// most of them. This keeps `continue` project-aware even when every session is launched from one
+// terminal cwd — the project is "where the work landed on disk", not the session's cwd. Returns the
+// dominant git repo root, or undefined when none of the touched files live in a git repo.
+export function inferProjectDir(files: string[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const f of files) {
+    if (!f) continue;
+    const expanded = f.startsWith('~/') ? path.join(os.homedir(), f.slice(2)) : f;
+    const root = git(path.dirname(expanded), ['rev-parse', '--show-toplevel']);
+    if (root) counts.set(root, (counts.get(root) ?? 0) + 1);
+  }
+  let best: string | undefined;
+  let bestN = 0;
+  for (const [root, n] of counts) {
+    if (n > bestN) {
+      bestN = n;
+      best = root;
+    }
+  }
+  return best;
 }

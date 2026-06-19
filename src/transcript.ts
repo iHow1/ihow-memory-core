@@ -33,6 +33,8 @@ export type TranscriptSummary = {
   body: string; // RAW composed body (NOT yet redacted — caller MUST redact before journaling)
   selector: SelectorMeta;
   files: number;
+  fileList: string[]; // raw absolute paths of touched files — for inferring which project this was
+  editedList: string[]; // raw absolute paths of files WRITTEN/EDITED — the strongest project signal
   cmds: number;
   turns: number;
 };
@@ -171,6 +173,7 @@ export function summarizeTranscript(records: TranscriptRecord[]): TranscriptSumm
   }
 
   const files = new Set<string>();
+  const edited = new Set<string>(); // Write/Edit/NotebookEdit only — the project being WORKED ON
   let cmdCount = 0;
   const cmdBins = new Set<string>();
   for (const r of records) {
@@ -180,6 +183,7 @@ export function summarizeTranscript(records: TranscriptRecord[]): TranscriptSumm
         const input = b.input as Record<string, unknown>;
         if (['Read', 'Write', 'Edit', 'NotebookEdit'].includes(b.name as string) && typeof input.file_path === 'string') {
           files.add(input.file_path);
+          if (b.name !== 'Read') edited.add(input.file_path); // a write/edit signals the active project
         } else if (b.name === 'Bash' && typeof input.command === 'string') {
           cmdCount += 1;
           // a raw command dump is both noise AND a leak surface; keep only meaningful binary names
@@ -206,5 +210,5 @@ export function summarizeTranscript(records: TranscriptRecord[]): TranscriptSumm
   if (cmdCount) parts.push(`Did: ${cmdCount} shell commands (${[...cmdBins].slice(0, 10).join(', ')})`);
   if (closing) parts.push(`Summary: ${closing}`);
 
-  return { body: parts.join('\n').slice(0, MAX_BODY), selector: meta, files: files.size, cmds: cmdCount, turns: assistantTexts.length };
+  return { body: parts.join('\n').slice(0, MAX_BODY), selector: meta, files: files.size, fileList: [...files].slice(0, MAX_FILES), editedList: [...edited].slice(0, 30), cmds: cmdCount, turns: assistantTexts.length };
 }
