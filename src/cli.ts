@@ -1301,6 +1301,47 @@ async function findLatestStopMarker(
   return best;
 }
 
+// PRIMARY transcript source for `continue`: the latest SUBSTANTIAL Claude Code transcript for a cwd,
+// read straight from ~/.claude/projects/<encoded-cwd>/*.jsonl by file mtime. This is robust to the two
+// ways a Stop marker can fail to point at the real prior session: (a) the marker froze (the Stop hook
+// stops rewriting it once it has nudged enough / a journal landed), and (b) the marker lives in a
+// workspace configured elsewhere (so a plain `continue` resolving a cwd-derived space can't see it).
+// Claude Code encodes the project dir by replacing every non-alphanumeric char of the absolute cwd
+// with '-'. A freshly /cleared session's tiny transcript is skipped (entry threshold) so we resume the
+// real prior work. Returns the same {transcriptPath, sessionId} shape; undefined if none found.
+async function findLatestTranscriptForCwd(cwd: string): Promise<{ transcriptPath: string; sessionId?: string } | undefined> {
+  const encoded = path.resolve(cwd).replace(/[^A-Za-z0-9]/g, '-');
+  const dir = path.join(os.homedir(), '.claude', 'projects', encoded);
+  let files: string[];
+  try {
+    files = (await fs.readdir(dir)).filter((f) => f.endsWith('.jsonl'));
+  } catch {
+    return undefined; // no project dir for this cwd -> fall back to Stop markers
+  }
+  const stamped: Array<{ file: string; mtimeMs: number }> = [];
+  for (const f of files) {
+    try {
+      stamped.push({ file: f, mtimeMs: (await fs.stat(path.join(dir, f))).mtimeMs });
+    } catch {
+      // skip an unstattable file
+    }
+  }
+  stamped.sort((a, b) => b.mtimeMs - a.mtimeMs); // newest first
+  const MIN_ENTRIES = 4; // skip a trivial / freshly-cleared session
+  for (const { file } of stamped) {
+    const full = path.join(dir, file);
+    try {
+      const raw = await fs.readFile(full, 'utf8');
+      if (parseTranscript(raw).length >= MIN_ENTRIES) {
+        return { transcriptPath: full, sessionId: file.replace(/\.jsonl$/, '') };
+      }
+    } catch {
+      // skip an unreadable transcript
+    }
+  }
+  return undefined;
+}
+
 // Opt-in hook observability. STDOUT is the hook's control channel (the decision JSON / silence), so
 // diagnostics go to STDERR and ONLY when IHOW_HOOK_DEBUG is set — off by default so a normal session is
 // never polluted. Never throws (a logging failure must not break a hook). Lets a dogfood operator see
@@ -1917,7 +1958,9 @@ async function main(): Promise<void> {
     if (anchors.branch) anchors.branch = redactSecretLikeContent(anchors.branch);
     if (anchors.repo) anchors.repo = redactSecretLikeContent(anchors.repo);
     if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
-    const marker = await findLatestStopMarker(workspace, cwd);
+    // Prefer the real latest transcript on disk (robust to a frozen Stop marker / a workspace
+    // configured elsewhere); fall back to a Stop marker for other runtimes/layouts.
+    const marker = (await findLatestTranscriptForCwd(cwd)) ?? (await findLatestStopMarker(workspace, cwd));
     let body = '';
     if (marker?.transcriptPath) {
       // TRUST BOUNDARY: transcriptPath comes from a Stop-hook marker we wrote ourselves (it is the
