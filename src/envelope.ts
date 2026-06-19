@@ -51,10 +51,29 @@ export type EnvelopeInput = {
   projectDir?: string; // the project inferred from touched files (anchors are for THIS dir, not cwd)
   sourceSessionId?: string;
   transcriptRef?: string;
+  sourceAgeMs?: number; // now - source transcript mtime; undefined when no capture / timing unknown
 };
+
+// A handoff product that silently hands over a STALE or EMPTY capsule is worse than no product: the
+// receiver says "继续", gets nothing useful, and never knows the capture broke. So the envelope ALWAYS
+// reports its own freshness, and degrades LOUDLY (a banner) when the capture is empty or old enough
+// that the hook may have stopped firing. Deterministic — based on transcript mtime + body emptiness,
+// never an LLM judgement.
+const STALE_HANDOFF_MS = 24 * 60 * 60 * 1000; // > 1 day since the source session was last active
+
+function formatAge(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  const m = s / 60;
+  if (m < 90) return `${Math.round(m)}m`;
+  const h = m / 60;
+  if (h < 36) return `${h.toFixed(1)}h`;
+  return `${(h / 24).toFixed(1)}d`;
+}
 
 // Assemble the dumb transport envelope. Pure string assembly — no LLM, no asserted facts.
 export function assembleEnvelope(input: EnvelopeInput): string {
+  const captureEmpty = input.quotedBody.trim().length === 0;
   const body = input.quotedBody.trim() || '(no substantive prior-session summary was captured)';
   const lines: string[] = [
     '=== ihow handoff — attributed transport envelope (NOT a report) ===',
@@ -67,6 +86,18 @@ export function assembleEnvelope(input: EnvelopeInput): string {
   if (input.projectDir) lines.push(`project: ${input.projectDir}  (inferred from files touched; anchors below are for THIS project)`);
   else lines.push('project: UNDETERMINED  (no files were edited this session; anchors below are for session_cwd, not an inferred project — use `ihow-memory continue <keyword>` to target a specific project)');
   lines.push(`session_cwd: ${input.cwd}`);
+  // CAPTURE HEALTH — never hand over silence. Loud banner when empty/stale; freshness line otherwise.
+  if (captureEmpty) {
+    lines.push('');
+    lines.push('--- ⚠️ CAPTURE HEALTH: EMPTY — no prior session captured ---');
+    lines.push('There is NO handoff narrative to resume. The Stop hook may not be running (or this is a fresh setup). The MACHINE ANCHORS below are live git state, but nothing was captured to continue from — run `ihow-memory doctor` / `ihow-memory install-hook` to check capture.');
+  } else if (input.sourceAgeMs !== undefined && input.sourceAgeMs > STALE_HANDOFF_MS) {
+    lines.push('');
+    lines.push(`--- ⚠️ CAPTURE HEALTH: POSSIBLY STALE — source last active ${formatAge(input.sourceAgeMs)} ago ---`);
+    lines.push('If you have worked since then, this handoff is out of date and the capture hook may have stopped firing. Re-verify against live state before relying on the narrative below.');
+  } else if (input.sourceAgeMs !== undefined) {
+    lines.push(`source_freshness: source session last active ${formatAge(input.sourceAgeMs)} ago`);
+  }
   lines.push('');
   lines.push('--- MACHINE ANCHORS — git facts for the project above (re-check live before trusting) ---');
   lines.push(renderAnchors(input.anchors));

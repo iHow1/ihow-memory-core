@@ -16,6 +16,7 @@ import { appendJournal, containsSecretLikeContent, redactSecretLikeContent } fro
 import { parseTranscript, summarizeTranscript } from './transcript.ts';
 import { gitAnchors, inferProjectDir } from './anchors.ts';
 import { assembleEnvelope } from './envelope.ts';
+import { recordHandoffMetric } from './handoff-metrics.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
 
@@ -1320,7 +1321,7 @@ async function pickTranscriptHandoff(
   cwd: string,
   hint?: string,
   excludeSessionId?: string,
-): Promise<{ transcriptPath: string; sessionId: string; summary: ReturnType<typeof summarizeTranscript>; projectDir?: string } | undefined> {
+): Promise<{ transcriptPath: string; sessionId: string; summary: ReturnType<typeof summarizeTranscript>; projectDir?: string; mtimeMs: number } | undefined> {
   const encoded = path.resolve(cwd).replace(/[^A-Za-z0-9]/g, '-');
   const dir = path.join(os.homedir(), '.claude', 'projects', encoded);
   let files: string[];
@@ -1341,7 +1342,7 @@ async function pickTranscriptHandoff(
   const MIN_ENTRIES = 4; // skip a trivial / freshly-cleared session
   const SCAN = 25; // bound how many recent transcripts we parse when matching a hint
   const needle = hint?.trim().toLowerCase();
-  for (const { file } of stamped.slice(0, SCAN)) {
+  for (const { file, mtimeMs } of stamped.slice(0, SCAN)) {
     // Never resume the CURRENTLY-RUNNING session: its own transcript is the newest file on disk, so
     // without this guard `continue` would replay this very session back to itself as a "prior handoff".
     if (excludeSessionId && file.replace(/\.jsonl$/, '') === excludeSessionId) continue;
@@ -1364,7 +1365,7 @@ async function pickTranscriptHandoff(
       const hay = `${projectDir ?? ''}\n${summary.body}`.toLowerCase();
       if (!hay.includes(needle)) continue;
     }
-    return { transcriptPath: full, sessionId: file.replace(/\.jsonl$/, ''), summary, projectDir };
+    return { transcriptPath: full, sessionId: file.replace(/\.jsonl$/, ''), summary, projectDir, mtimeMs };
   }
   return undefined;
 }
@@ -2138,12 +2139,14 @@ async function main(): Promise<void> {
     let projectDir: string | undefined;
     let sourceSessionId: string | undefined;
     let transcriptRef: string | undefined;
+    let sourceAgeMs: number | undefined; // how old the captured session is (now - transcript mtime) — drives the loud staleness banner
     const picked = await pickTranscriptHandoff(cwd, hint, selfSessionId);
     if (picked) {
       body = redactSecretLikeContent(picked.summary.body);
       projectDir = picked.projectDir;
       sourceSessionId = picked.sessionId;
       transcriptRef = picked.transcriptPath;
+      sourceAgeMs = Date.now() - picked.mtimeMs;
     } else {
       // TRUST BOUNDARY: a Stop-marker transcriptPath is input we wrote ourselves, not user-supplied; a
       // read failure degrades to an empty narrative (anchors still shown).
@@ -2158,6 +2161,11 @@ async function main(): Promise<void> {
         }
         sourceSessionId = fallback.sessionId;
         transcriptRef = fallback.transcriptPath ?? undefined;
+        try {
+          sourceAgeMs = Date.now() - (await fs.stat(fallback.transcriptPath)).mtimeMs;
+        } catch {
+          // mtime unavailable -> no freshness line (still never silent: empty body still triggers the banner)
+        }
       }
     }
     // Anchors come from the INFERRED PROJECT (where the work landed on disk), not the session cwd —
@@ -2177,7 +2185,12 @@ async function main(): Promise<void> {
       projectDir,
       sourceSessionId,
       transcriptRef,
+      sourceAgeMs,
     });
+    // B② grooming-decay measurement (opt-out via IHOW_HANDOFF_METRICS=0): append one derived, hashed,
+    // content-free row per handoff so the anchor-conflict trend can be read over weeks. Fully
+    // fault-tolerant — never throws, never blocks the handoff, never touches the network.
+    await recordHandoffMetric({ projectDir, anchors, narrative: body, sourceSessionId, sourceAgeMs });
     if (options.json) {
       printJson({ cwd, projectDir: projectDir ?? null, anchors, quotedBody: body, transcriptRef: transcriptRef ?? null, sourceSession: sourceSessionId ?? null });
     } else {
