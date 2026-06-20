@@ -40,7 +40,7 @@ type ParsedArgs = {
     dryRun?: boolean;
     realWrite?: boolean;
     actor?: string;
-    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes';
+    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw';
     shareDiagnostics?: boolean;
     installSkill?: boolean;
     installHook?: boolean;
@@ -85,8 +85,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--vector-timeout-ms') options.vectorTimeoutMs = Number(tail[++index]);
     else if (arg === '--runtime') {
       const runtime = tail[++index];
-      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes'].includes(runtime)) options.runtime = runtime;
-      else throw new Error('unsupported_runtime: use claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|hermes');
+      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw'].includes(runtime)) options.runtime = runtime;
+      else throw new Error('unsupported_runtime: use claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw');
     }
     else if (arg === '--share-diagnostics') options.shareDiagnostics = true;
     else if (arg === '--install-skill') options.installSkill = true;
@@ -155,6 +155,7 @@ function runtimeLabel(runtime?: string): string {
   if (runtime === 'claude-desktop') return 'Claude Desktop';
   if (runtime === 'opencode') return 'OpenCode';
   if (runtime === 'hermes') return 'Hermes';
+  if (runtime === 'openclaw') return 'OpenClaw';
   return 'generic MCP client';
 }
 
@@ -192,6 +193,7 @@ function initBackupGuidance(runtime?: string): string {
   if (runtime === 'workbuddy') return 'Before connect writes ~/.workbuddy/mcp.json, it backs the file up; you can also copy it yourself first.';
   if (runtime === 'claude-desktop') return 'Before editing Claude Desktop config, copy claude_desktop_config.json; connect also backs it up.';
   if (runtime === 'opencode') return 'Before editing OpenCode config, copy ~/.config/opencode/opencode.json; connect also backs it up.';
+  if (runtime === 'openclaw') return 'Before editing OpenClaw config, copy ~/.openclaw/openclaw.json; connect also backs it up.';
   return 'Before writing this snippet into any runtime config, back up the existing config file.';
 }
 
@@ -243,7 +245,7 @@ async function writeJsonMcpConfig(
     buildEntry?: (s: { command: string; args: string[] }) => Record<string, unknown>;
   } = {},
 ): Promise<Record<string, unknown>> {
-  const containerKey = shape.containerKey || 'mcpServers';
+  const containerPath = (shape.containerKey || 'mcpServers').split('.'); // supports nested, e.g. 'mcp.servers' (OpenClaw)
   const buildEntry = shape.buildEntry || ((s) => ({ type: 'stdio', command: s.command, args: s.args }));
   let config: Record<string, unknown> = {};
   let existed = false;
@@ -275,11 +277,18 @@ async function writeJsonMcpConfig(
     backup = `${targetPath}.ihow-bak-${Date.now()}`;
     await fs.copyFile(targetPath, backup);
   }
-  const servers = (config[containerKey] && typeof config[containerKey] === 'object')
-    ? (config[containerKey] as Record<string, unknown>)
+  // descend (creating as needed) into the possibly-nested container, e.g. config.mcp.servers (OpenClaw)
+  let parent: Record<string, unknown> = config;
+  for (const key of containerPath.slice(0, -1)) {
+    if (!parent[key] || typeof parent[key] !== 'object') parent[key] = {};
+    parent = parent[key] as Record<string, unknown>;
+  }
+  const leafKey = containerPath[containerPath.length - 1];
+  const servers = (parent[leafKey] && typeof parent[leafKey] === 'object')
+    ? (parent[leafKey] as Record<string, unknown>)
     : {};
   servers['ihow-memory'] = buildEntry(spec);
-  config[containerKey] = servers;
+  parent[leafKey] = servers;
   if (!options.dryRun) {
     await fs.mkdir(path.dirname(targetPath), { recursive: true });
     // atomic write: temp then rename (same-dir rename is atomic)
@@ -437,6 +446,16 @@ async function connectRuntime(
       buildEntry: (s) => ({ type: 'local', command: [s.command, ...s.args], enabled: true }),
     });
   }
+  if (runtime === 'openclaw') {
+    // OpenClaw keeps MCP servers NESTED under `mcp.servers` in ~/.openclaw/openclaw.json. It runs from a
+    // LaunchAgent/gateway that may not inherit the shell PATH, so use the absolute node path. Entry schema
+    // is { command, args } (no `type` field), and the nested container is addressed via 'mcp.servers'.
+    const openclawSpec = { command: process.execPath, args: spec.args };
+    return writeJsonMcpConfig(path.join(home, '.openclaw', 'openclaw.json'), runtime, openclawSpec, options, {
+      containerKey: 'mcp.servers',
+      buildEntry: (s) => ({ command: s.command, args: s.args }),
+    });
+  }
   throw new Error(`connect_unsupported_runtime: ${runtime}`);
 }
 
@@ -457,6 +476,7 @@ function runtimeDetectors(home: string): Array<{ runtime: string; cli?: string; 
       path.join(appdata, 'Claude'),
     ] },
     { runtime: 'opencode', paths: [path.join(home, '.config', 'opencode')] },
+    { runtime: 'openclaw', paths: [path.join(home, '.openclaw', 'openclaw.json'), path.join(home, '.openclaw')] },
   ];
 }
 
@@ -546,6 +566,65 @@ async function maybeInstallWorkbuddyResume(): Promise<'installed' | 'already' | 
   } catch {
     return 'failed';
   }
+}
+
+// Generic markdown resume-guidance injector — the WorkBuddy pattern reused for runtimes whose always-on
+// instructions live in a markdown file (OpenClaw AGENTS.md, Hermes SOUL.md). Idempotent (marker-checked),
+// backed up before augmenting. create:false = only augment an existing file (never fabricate one);
+// create:true = also create when absent (a documented customization file the app reads, e.g. Hermes SOUL.md).
+async function maybeInjectMarkdownResume(file: string, opts: { create?: boolean } = {}): Promise<'installed' | 'already' | 'skipped' | 'failed'> {
+  let existing = '';
+  let existed = true;
+  try { existing = await fs.readFile(file, 'utf8'); } catch { existed = false; if (!opts.create) return 'skipped'; }
+  if (existing.includes(WB_RESUME_MARKER)) return 'already';
+  try {
+    if (existed) await fs.writeFile(`${file}.ihow-bak-${Date.now()}`, existing, 'utf8');
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, existed ? `${existing.trimEnd()}\n${WB_RESUME_SECTION}` : `# iHow Memory${WB_RESUME_SECTION}`, 'utf8');
+    return 'installed';
+  } catch { return 'failed'; }
+}
+
+// OpenCode loads files listed in opencode.json `instructions` as always-on context. Write a resume guide
+// file + reference it (idempotent, backed up). Never creates opencode.json (only augments an install);
+// refuses to clobber an unparseable config.
+const OPENCODE_RESUME_DOC = `# iHow Memory — resume across sessions
+
+When the user says "继续 / continue / resume", or you start fresh after a reset: FIRST call the
+\`memory.continue\` MCP tool to get a cross-tool verify-first handoff packet. Treat its narrative as
+UNVERIFIED — check the git anchors it gives before acting. If it returns nothing, continue normally.
+`;
+async function maybeInstallOpenCodeResume(): Promise<'installed' | 'already' | 'skipped' | 'failed'> {
+  const dir = path.join(os.homedir(), '.config', 'opencode');
+  const cfgPath = path.join(dir, 'opencode.json');
+  let raw: string;
+  try { raw = await fs.readFile(cfgPath, 'utf8'); } catch { return 'skipped'; } // no OpenCode config -> nothing to augment
+  let config: Record<string, unknown>;
+  try { const p = JSON.parse(raw); if (!p || typeof p !== 'object') throw new Error('not-object'); config = p as Record<string, unknown>; }
+  catch { return 'failed'; } // refuse to clobber an unparseable config
+  const guide = path.join(dir, 'ihow-resume.md');
+  const ins = Array.isArray(config.instructions) ? (config.instructions as unknown[]).filter((x): x is string => typeof x === 'string') : [];
+  if (ins.includes(guide) && existsSync(guide)) return 'already';
+  try {
+    await fs.writeFile(guide, OPENCODE_RESUME_DOC, 'utf8');
+    if (!ins.includes(guide)) ins.push(guide);
+    config.instructions = ins;
+    await fs.copyFile(cfgPath, `${cfgPath}.ihow-bak-${Date.now()}`);
+    const tmp = `${cfgPath}.ihow-tmp-${process.pid}`;
+    await fs.writeFile(tmp, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    await fs.rename(tmp, cfgPath);
+    return 'installed';
+  } catch { return 'failed'; }
+}
+
+// Proactive-resume guidance for the runtimes NOT covered by Claude(skill/hook) / WorkBuddy(BOOTSTRAP).
+// Cursor has no global rules file we can safely auto-write (User Rules are app-managed) -> not-applicable.
+async function injectResumeGuidance(runtime: string): Promise<'installed' | 'already' | 'skipped' | 'failed' | 'not-applicable'> {
+  const home = os.homedir();
+  if (runtime === 'openclaw') return maybeInjectMarkdownResume(path.join(home, '.openclaw', 'workspace', 'AGENTS.md'), { create: false });
+  if (runtime === 'hermes') return maybeInjectMarkdownResume(path.join(home, '.hermes', 'SOUL.md'), { create: true });
+  if (runtime === 'opencode') return maybeInstallOpenCodeResume();
+  return 'not-applicable';
 }
 
 // Zero-config one-command onboarding. Detect runtimes → wire MCP for each → (Claude Code) install the
@@ -686,6 +765,25 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     }
   }
 
+  // 3/4 (cont.) proactive resume guidance for the markdown/config runtimes (OpenClaw AGENTS.md,
+  // Hermes SOUL.md, OpenCode instructions). Same intent as the Claude hook / WorkBuddy BOOTSTRAP: make the
+  // agent call memory.continue at a context boundary. Non-fatal, idempotent, backed up.
+  const guidanceRuntimes = ['openclaw', 'hermes', 'opencode'].filter((rt) => present.some((d) => d.runtime === rt));
+  const resumeGuidance: Record<string, string> = {};
+  for (const rt of guidanceRuntimes) {
+    if (dryRun) { line(`       · would add memory.continue resume guidance → ${rt}`); resumeGuidance[rt] = 'dry-run'; continue; }
+    if (options.installHook === false) { resumeGuidance[rt] = 'skipped'; continue; }
+    const orig = console.log;
+    if (json) console.log = () => {};
+    try { resumeGuidance[rt] = await injectResumeGuidance(rt); } catch { resumeGuidance[rt] = 'failed'; } finally { if (json) console.log = orig; }
+    if (resumeGuidance[rt] === 'installed') line(`       ✓ added memory.continue resume guidance → ${rt}`);
+    else if (resumeGuidance[rt] === 'already') line(`       · resume guidance already present → ${rt}`);
+    else if (resumeGuidance[rt] === 'skipped') line(`       · ${rt}: no convention file to augment (skipped)`);
+  }
+  if (present.some((d) => d.runtime === 'cursor')) {
+    line('       · Cursor: memory.continue available; add a User Rule to call it on resume (no global rules file to auto-write)');
+  }
+
   // 4/4 verify with doctor (pass the primary runtime so its runtime check is green, not a warning)
   let doctorResult: Awaited<ReturnType<typeof doctor>> | null = null;
   if (!dryRun) {
@@ -773,11 +871,11 @@ New here? One command does everything:  ihow-memory setup
 
 Usage:
   ihow-memory setup [--runtime name] [--global-hook] [--dry-run] [--json]   # zero-config: detect your AI runtimes → wire MCP + memory skill + auto-capture hook → verify. No prompts, idempotent (safe to re-run), local only.
-  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
+  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
   ihow-memory continue [project-keyword] [--cwd path] [--json]   # resume after a context boundary (/clear, new session, out of context): prints a verify-first handoff for the project you were working on — auto-detected from the files you EDITED, with that project's git anchors + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. Pass a keyword to choose which project; works even if you launch every session from one dir. (alias: handoff)
   ihow-memory continue --list [--limit n] [--json]   # list the most recent resumable sessions across all recorded projects (inferred project, git branch+HEAD, last activity, summary snippet; newest first); resume one by its number with: ihow-memory continue <N>
-  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes] [--share-diagnostics] [--json]
+  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw] [--share-diagnostics] [--json]
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
   ihow-memory search <query> [--limit n]
@@ -788,10 +886,10 @@ Usage:
   ihow-memory durable-promote <candidate-path> (--dry-run | --real-write) [--scope name] [--title title] [--path path]
   ihow-memory audit [--since YYYY-MM-DD] [--space name]   # list the append-only audit log (candidate / promote / journal / rollback events)
   ihow-memory rollback --event <eventId> [--space name]   # undo one auto-captured journal entry by its audit eventId
-  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes]
+  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
-  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the skill + a project-local auto-capture hook, no prompts
+  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the skill + a project-local auto-capture hook, no prompts
   ihow-memory connect --auto [--write] [--json]   # detect installed runtimes; default reports only, --write connects them all to one shared workspace
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Claude Code Stop-hook handler (reads hook JSON on stdin; wired by the plugin) — emits a session-end capture instruction
@@ -2154,7 +2252,7 @@ async function main(): Promise<void> {
       return;
     }
     if (!options.runtime) {
-      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes (or --auto to detect installed runtimes)');
+      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw (or --auto to detect installed runtimes)');
       process.exitCode = 1;
       return;
     }
