@@ -24,8 +24,16 @@ async function makeRepo(dir) {
   git(dir, ['add', '-A']);
   git(dir, ['commit', '-q', '-m', 'seed']);
 }
-// WorkBuddy record: top-level role + content list + inline cwd (NOT message.content).
-const wbMsg = (role, text, cwd, sid) => JSON.stringify({ id: 'r', timestamp: '2026-06-19T00:00:01Z', type: 'message', role, content: [{ type: 'text', text }], cwd, sessionId: sid });
+// WorkBuddy record: top-level role + content list + inline cwd (NOT message.content). REAL block types
+// are input_text/output_text (+ non-text blocks like image_blob_ref that must be excluded).
+const wbMsg = (role, text, cwd, sid) => JSON.stringify({
+  id: 'r', timestamp: '2026-06-19T00:00:01Z', type: 'message', role,
+  content: [
+    { type: 'image_blob_ref', blob_id: 'b1', mime: 'image/png' }, // non-text block — must be skipped
+    { type: role === 'user' ? 'input_text' : 'output_text', text },
+  ],
+  cwd, sessionId: sid,
+});
 
 test('workbuddy thread surfaces in the handoff packet (tool-tagged, cwd project, agent-* excluded)', async (t) => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-home-'));

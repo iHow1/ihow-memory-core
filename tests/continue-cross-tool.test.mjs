@@ -24,7 +24,8 @@ async function makeRepo(dir) {
   git(dir, ['add', '-A']);
   git(dir, ['commit', '-q', '-m', 'seed']);
 }
-const wbMsg = (role, text, cwd, sid) => JSON.stringify({ id: 'r', timestamp: '2026-06-19T00:00:01Z', type: 'message', role, content: [{ type: 'text', text }], cwd, sessionId: sid });
+// REAL WorkBuddy block types: input_text (user) / output_text (assistant).
+const wbMsg = (role, text, cwd, sid) => JSON.stringify({ id: 'r', timestamp: '2026-06-19T00:00:01Z', type: 'message', role, content: [{ type: role === 'user' ? 'input_text' : 'output_text', text }], cwd, sessionId: sid });
 function run(args, home) {
   return execFileSync(process.execPath, [CLI, ...args], {
     encoding: 'utf8',

@@ -252,9 +252,10 @@ async function parseWorkbuddyThread(file: string): Promise<CaptureUnit | undefin
       const parts: string[] = [];
       const content = Array.isArray(rec.content) ? rec.content : typeof rec.content === 'string' ? [rec.content] : [];
       for (const c of content) {
-        // only genuine text blocks — never tool-call/tool-output/other block types
+        // genuine text blocks only (real WorkBuddy uses input_text/output_text; also plain text) —
+        // never image_blob_ref / tool-call / other block types.
         if (typeof c === 'string') parts.push(c);
-        else if (c && c.type === 'text' && typeof c.text === 'string') parts.push(c.text);
+        else if (c && typeof c.type === 'string' && c.type.endsWith('text') && typeof c.text === 'string') parts.push(c.text);
       }
       if (parts.length) records.push({ type: rec.role, message: { content: [{ type: 'text', text: parts.join('\n') }] } });
     }
