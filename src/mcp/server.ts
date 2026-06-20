@@ -7,6 +7,7 @@ import type { WorkspaceOptions } from '../types.ts';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildHandoffPacket } from '../handoff.ts';
 
 type JsonRpcRequest = {
   jsonrpc?: '2.0';
@@ -154,6 +155,19 @@ const TOOL_DEFINITIONS = [
       properties: {},
     },
   },
+  {
+    name: 'memory.continue',
+    description: 'RESUME after a context boundary (/clear, new thread, switched tool/model). Returns a runtime-neutral handoff PACKET: candidate resumable projects, each with MACHINE ANCHORS (git branch/HEAD/dirty — the only facts), the prior session narrative VERBATIM and UNVERIFIED (never trust it blind), code-computed freshness + anchor-conflict counts, and what to verify first. Call this FIRST when the user says "继续"/"continue"/"resume". The narrative is a claim to verify, not a fact — run the verifyFirst checks before acting. This tool does not itself resume; it hands you an auditable packet.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string', description: 'your current working dir (informational; discovery is global across recorded projects)' },
+        projectHint: { type: 'string', description: 'optional keyword to filter candidates to a project' },
+        limit: { type: 'number', description: 'max candidate projects to return (default 5)' },
+        excludeSessionId: { type: 'string', description: 'your own session id, to avoid listing the live session as a candidate' },
+      },
+    },
+  },
 ] as const;
 
 async function main(): Promise<void> {
@@ -206,6 +220,13 @@ async function main(): Promise<void> {
           payload = await core.journal(args);
         } else if (name === 'memory.status') {
           payload = await core.status();
+        } else if (name === 'memory.continue') {
+          payload = await buildHandoffPacket({
+            cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
+            projectHint: typeof args.projectHint === 'string' ? args.projectHint : undefined,
+            limit: Number.isFinite(args.limit as number) ? Number(args.limit) : undefined,
+            excludeSessionId: typeof args.excludeSessionId === 'string' ? args.excludeSessionId : undefined,
+          });
         } else {
           throw new Error('unknown_tool');
         }
