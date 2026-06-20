@@ -1,6 +1,6 @@
 {
   "name": "ihow-memory",
-  "version": "0.1.0-alpha.6",
+  "version": "0.1.0-alpha.7",
   "type": "module",
   "description": "Local-first shared memory for AI agents with zero-dependency FTS, citations, governance, and MCP.",
   "keywords": [
@@ -25,20 +25,12 @@
   },
   "files": [
     "bin/",
-    "dist/cli.js",
-    "dist/core.js",
-    "dist/types.js",
-    "dist/workspace.js",
-    "dist/governance.js",
-    "dist/telemetry.js",
-    "dist/engine/",
-    "dist/store/",
-    "dist/mcp/",
-    "dist/http/console.js",
+    "dist/",
     "LICENSE",
     "NOTICE",
     "TRADEMARK.md",
     "README.md",
+    "README.zh-CN.md",
     "skills/"
   ],
   "bin": {
