@@ -117,6 +117,27 @@ test('setup --json is honest when the hook fails to wire (unparseable settings �
   assert.equal(j.ok, false, 'ok is false — never contradicts the failure');
 });
 
+test('setup --runtime workbuddy wires cross-thread resume into BOOTSTRAP.md (idempotent, backed up)', async (t) => {
+  const { home, root } = await dirs(t);
+  const wbDir = path.join(home, '.workbuddy');
+  await fs.mkdir(wbDir, { recursive: true });
+  await fs.writeFile(path.join(wbDir, 'BOOTSTRAP.md'), '# BOOTSTRAP.md\n\n## The Conversation\nbe yourself.\n', 'utf8');
+  const args = ['setup', '--runtime', 'workbuddy', '--root', root, '--space', 't'];
+
+  run(args, home);
+  const bootstrap = await fs.readFile(path.join(wbDir, 'BOOTSTRAP.md'), 'utf8');
+  assert.match(bootstrap, /resume across threads/, 'resume instruction injected');
+  assert.match(bootstrap, /memory\.continue/, 'tells the agent to call memory.continue');
+  assert.match(bootstrap, /be yourself\./, 'existing BOOTSTRAP content is preserved');
+  const wbBaks = async () => (await fs.readdir(wbDir)).filter((f) => f.startsWith('BOOTSTRAP.md.ihow-bak-')).length;
+  assert.equal(await wbBaks(), 1, 'BOOTSTRAP backed up once before augmenting');
+
+  run(args, home); // re-run
+  const after = await fs.readFile(path.join(wbDir, 'BOOTSTRAP.md'), 'utf8');
+  assert.equal((after.match(/resume across threads/g) || []).length, 1, 'idempotent — not duplicated on re-run');
+  assert.equal(await wbBaks(), 1, 're-run does not re-back-up or re-augment BOOTSTRAP');
+});
+
 test('setup with no runtime detected is an honest exit-0 no-op', async (t) => {
   const { home, root } = await dirs(t); // empty HOME, hermetic PATH -> nothing detected
   const out = run(['setup', '--root', root, '--space', 't'], home);

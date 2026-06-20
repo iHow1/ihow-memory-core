@@ -512,6 +512,42 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
   console.log(`\nconnected ${connected.length}, skipped ${skipped.length}. Restart each runtime to load the memory tools.`);
 }
 
+// WorkBuddy resume wiring (the analog of Claude's skill/hook): WorkBuddy has no lifecycle hook, but it
+// reads ~/.workbuddy/BOOTSTRAP.md at agent start. Append a one-time instruction telling the agent to
+// call memory.continue on a fresh thread — that's what makes cross-thread resume automatic for the
+// customer. Idempotent (marker-checked), backed up, reversible. Never CREATES the file (only augments an
+// existing WorkBuddy install). Returns the on-disk outcome.
+const WB_RESUME_MARKER = 'iHow Memory — resume across threads';
+const WB_RESUME_SECTION = `
+## ${WB_RESUME_MARKER}
+At the START of a thread, call the \`memory.continue\` MCP tool to pick up where a prior thread left off
+(it returns candidate projects + a verify-first handoff packet for this machine). Treat the returned
+narrative as UNVERIFIED — run its verifyFirst git checks before acting. This is how your memory carries
+across threads and tools.
+`;
+async function maybeInstallWorkbuddyResume(): Promise<'installed' | 'already' | 'skipped' | 'failed'> {
+  const file = path.join(os.homedir(), '.workbuddy', 'BOOTSTRAP.md');
+  let existing: string;
+  try {
+    existing = await fs.readFile(file, 'utf8');
+  } catch {
+    return 'skipped'; // no WorkBuddy BOOTSTRAP.md -> nothing to augment (never create it)
+  }
+  if (existing.includes(WB_RESUME_MARKER)) {
+    console.log(`✓ WorkBuddy resume instruction already present in ${file}`);
+    return 'already';
+  }
+  try {
+    const backup = `${file}.ihow-bak-${Date.now()}`;
+    await fs.writeFile(backup, existing, 'utf8'); // back up before augmenting
+    await fs.writeFile(file, `${existing.trimEnd()}\n${WB_RESUME_SECTION}`, 'utf8');
+    console.log(`✓ added WorkBuddy resume instruction → ${file} (backup: ${path.basename(backup)})`);
+    return 'installed';
+  } catch {
+    return 'failed';
+  }
+}
+
 // Zero-config one-command onboarding. Detect runtimes → wire MCP for each → (Claude Code) install the
 // memory skill + auto-capture hook → verify with doctor → print a crisp, idempotent success state.
 // Models connectAuto's detect+sweep, then layers the Claude Code skill/hook install (forced on via
@@ -599,7 +635,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   let skill = 'not-applicable';
   let hook = 'not-applicable';
   line('');
-  line('3/4  enabling memory for Claude Code');
+  line('3/4  enabling memory (per runtime)');
   if (!hasClaude) {
     line('       · (no Claude Code detected — skill + auto-capture hook are Claude Code only)');
   } else if (dryRun) {
@@ -634,6 +670,22 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     }
   }
 
+  // 3/4 (cont.) WorkBuddy has no lifecycle hook; wire cross-thread resume via its BOOTSTRAP.md instead.
+  const hasWorkbuddy = present.some((d) => d.runtime === 'workbuddy');
+  let workbuddyResume = 'not-applicable';
+  if (hasWorkbuddy) {
+    if (dryRun) {
+      line('       · would add the resume instruction → ~/.workbuddy/BOOTSTRAP.md (WorkBuddy)');
+      workbuddyResume = 'dry-run';
+    } else if (options.installHook === false) {
+      workbuddyResume = 'skipped';
+    } else {
+      const orig = console.log;
+      if (json) console.log = () => {}; // keep --json clean
+      try { workbuddyResume = await maybeInstallWorkbuddyResume(); } catch { workbuddyResume = 'failed'; } finally { if (json) console.log = orig; }
+    }
+  }
+
   // 4/4 verify with doctor (pass the primary runtime so its runtime check is green, not a warning)
   let doctorResult: Awaited<ReturnType<typeof doctor>> | null = null;
   if (!dryRun) {
@@ -655,7 +707,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
 
   const allFailed = connected.length === 0; // every attempted runtime failed (present.length >= 1 here)
   const doctorRed = !!doctorResult && doctorResult.ok === false;
-  const installFailed = skill === 'failed' || hook === 'failed'; // a helper no-op'd / threw despite being asked
+  const installFailed = skill === 'failed' || hook === 'failed' || workbuddyResume === 'failed'; // a helper no-op'd / threw despite being asked
   if (!dryRun && (allFailed || doctorRed || installFailed)) process.exitCode = 1;
   // ok must never contradict a non-zero exit a sub-step already set (e.g. unparseable settings)
   const ok = !dryRun && !allFailed && !doctorRed && !installFailed && process.exitCode !== 1;
@@ -671,6 +723,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
       skill,
       hook,
       hookScope: hasClaude ? (options.globalHook ? 'global' : 'project') : null,
+      workbuddyResume: hasWorkbuddy ? workbuddyResume : null,
       doctor: doctorResult ? { ok: doctorResult.ok, checks: doctorResult.checks } : null,
       nextSteps: hasClaude ? ['restart-claude-code', 'say-continue-after-clear'] : ['restart-runtime', 'run-continue'],
     });
@@ -693,7 +746,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     line('Already-written config (MCP / skill / hook) is kept. Fix the above, then re-run:  ihow-memory setup');
     return;
   }
-  const memOn = hasClaude ? ' · memory ON for Claude Code' : '';
+  const memOnTools = [hasClaude ? 'Claude Code' : null, hasWorkbuddy && workbuddyResume !== 'failed' ? 'WorkBuddy' : null].filter(Boolean);
+  const memOn = memOnTools.length ? ` · memory ON for ${memOnTools.join(' + ')}` : '';
   line(`✓ iHow Memory is set up.  ${connected.length} runtime${connected.length === 1 ? '' : 's'} connected${memOn}`);
   if (skipped.length) line(`  (${skipped.length} skipped: ${skipped.map((s) => s.runtime).join(', ')} — fix its CLI, then re-run; setup is idempotent)`);
   line('');

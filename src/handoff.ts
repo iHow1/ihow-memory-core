@@ -267,7 +267,58 @@ async function parseWorkbuddyThread(file: string): Promise<CaptureUnit | undefin
   return { sessionId, body, editedList: [], projectDir: cwd };
 }
 
-const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource];
+// OpenClaw: ~/.openclaw/agents/<agent>/sessions/<id>.trajectory.jsonl — an EVENT stream
+// {type,ts,sessionId,workspaceDir,data,...}. User text is prompt.submitted.data.prompt; assistant text
+// is model.completed.data.assistantTexts[]; workspaceDir is the project. One session per file.
+const openclawSource: SessionSource = {
+  tool: 'openclaw',
+  list: async () => {
+    const root = path.join(os.homedir(), '.openclaw', 'agents');
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    let agents: string[];
+    try { agents = await fs.readdir(root); } catch { return out; }
+    for (const a of agents) {
+      const sdir = path.join(root, a, 'sessions');
+      let files: string[];
+      try { files = (await fs.readdir(sdir)).filter((f) => f.endsWith('.jsonl')); } catch { continue; }
+      for (const f of files) {
+        const full = path.join(sdir, f);
+        try { out.push({ file: full, mtimeMs: (await fs.stat(full)).mtimeMs }); } catch { /* skip */ }
+      }
+    }
+    return out;
+  },
+  read: async (file) => parseOpenclawTrajectory(file),
+};
+
+async function parseOpenclawTrajectory(file: string): Promise<CaptureUnit | undefined> {
+  const raw = await readSessionFile(file);
+  if (raw === undefined) return undefined;
+  let cwd: string | undefined;
+  let sessionId = path.basename(file).replace(/\.trajectory\.jsonl$/, '').replace(/\.jsonl$/, '');
+  const records: TranscriptRecord[] = []; // synthetic Claude-shape -> shared summarizeTranscript scope
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let rec: any;
+    try { rec = JSON.parse(t); } catch { continue; }
+    if (typeof rec?.workspaceDir === 'string') cwd = rec.workspaceDir;
+    if (typeof rec?.sessionId === 'string') sessionId = rec.sessionId;
+    const data = rec?.data;
+    if (rec?.type === 'prompt.submitted' && data && typeof data.prompt === 'string') {
+      records.push({ type: 'user', message: { content: [{ type: 'text', text: data.prompt }] } });
+    } else if (rec?.type === 'model.completed' && data && Array.isArray(data.assistantTexts)) {
+      const text = data.assistantTexts.filter((x: unknown) => typeof x === 'string').join('\n');
+      if (text) records.push({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
+    }
+  }
+  if (records.length < 2) return undefined; // trivial
+  const body = summarizeTranscript(records).body; // locked scope + MAX_BODY cap, shared with all tools
+  if (!body) return undefined;
+  return { sessionId, body, editedList: [], projectDir: cwd };
+}
+
+const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource, openclawSource];
 
 // Enumerate the most recent RESUMABLE sessions across EVERY recorded runtime (Claude, Codex, ...),
 // newest activity first. Each source contributes a reader; project inference, anchors and redaction are
