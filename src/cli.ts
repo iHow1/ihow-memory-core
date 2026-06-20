@@ -2223,6 +2223,7 @@ async function main(): Promise<void> {
     let sourceSessionId: string | undefined;
     let transcriptRef: string | undefined;
     let sourceAgeMs: number | undefined; // how old the captured session is (now - transcript mtime) — drives the loud staleness banner
+    let sourceTool = 'claude-code'; // the runtime that recorded the resumed session (continue <N> can pick codex/workbuddy)
     // `continue <N>`: a pure-integer arg resumes the Nth row of `continue --list` (1-based) — pick the
     // session you SAW in the picker without retyping a keyword. Indexes the same global list --list shows.
     const pickIndex = hint && /^\d+$/.test(hint) ? Number.parseInt(hint, 10) : undefined;
@@ -2233,19 +2234,15 @@ async function main(): Promise<void> {
         console.log(`(no resumable session #${pickIndex} — run \`ihow-memory continue --list\` to see what's available.)`);
         return;
       }
-      try {
-        body = redactSecretLikeContent(summarizeTranscript(parseTranscript(await fs.readFile(chosen.transcriptPath, 'utf8'))).body);
-      } catch {
-        body = '';
-      }
+      // `chosen` already carries the body parsed by the SESSION'S OWN reader (Claude/Codex/WorkBuddy) and
+      // already redacted — reuse it. Re-reading with the Claude-only parser here would yield an empty
+      // handoff for any non-Claude row (and mislabel the producer), silently breaking cross-tool resume.
+      body = chosen.body;
       projectDir = chosen.projectDir;
       sourceSessionId = chosen.sessionId;
+      sourceTool = chosen.tool;
       transcriptRef = chosen.transcriptPath;
-      try {
-        sourceAgeMs = Date.now() - (await fs.stat(chosen.transcriptPath)).mtimeMs;
-      } catch {
-        // mtime unavailable -> no freshness line
-      }
+      sourceAgeMs = Date.now() - Date.parse(chosen.modifiedAt);
     } else {
       const picked = await pickTranscriptHandoff(cwd, hint, selfSessionId);
       if (picked) {
@@ -2286,7 +2283,7 @@ async function main(): Promise<void> {
     if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
     const envelope = assembleEnvelope({
       cwd,
-      producerAgent: sourceSessionId ? `claude-code:${sourceSessionId.slice(0, 8)}` : 'ihow-continue',
+      producerAgent: sourceSessionId ? `${sourceTool}:${sourceSessionId.slice(0, 8)}` : 'ihow-continue',
       createdAt: new Date().toISOString(),
       anchors,
       quotedBody: body,

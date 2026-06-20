@@ -58,4 +58,5 @@ test('workbuddy thread surfaces in the handoff packet (tool-tagged, cwd project,
   assert.match(c.narrative.text, /WB-RESUME-NARRATIVE/, 'carries the thread narrative verbatim');
   assert.doesNotMatch(c.narrative.text, /SUBAGENT-NOISE/, 'agent-*.jsonl sub-agent noise is excluded');
   assert.equal(c.narrative.unverified, true, 'narrative flagged UNVERIFIED');
+  assert.match(c.narrative.source, /workbuddy/, 'provenance is tool-correct (not hardcoded claude-transcript)');
 });

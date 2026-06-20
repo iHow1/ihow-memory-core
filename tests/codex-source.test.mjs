@@ -59,4 +59,5 @@ test('codex rollout surfaces in the handoff packet (tool-tagged, cwd project, la
   assert.match(c.narrative.text, /LATEST-CODEX-NARRATIVE/, 'carries the LATEST session narrative');
   assert.doesNotMatch(c.narrative.text, /OLD-CODEX-SESSION/, 'older session in the same file is not surfaced');
   assert.equal(c.narrative.unverified, true, 'narrative still flagged UNVERIFIED');
+  assert.match(c.narrative.source, /codex/, 'provenance is tool-correct (not hardcoded claude-transcript)');
 });

@@ -16,7 +16,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { parseTranscript, summarizeTranscript } from './transcript.ts';
+import { parseTranscript, summarizeTranscript, type TranscriptRecord } from './transcript.ts';
 import { gitAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { redactSecretLikeContent } from './governance.ts';
 import { anchorConflicts } from './handoff-metrics.ts';
@@ -82,12 +82,8 @@ export async function pickTranscriptHandoff(
     // Never resume the CURRENTLY-RUNNING session: its own transcript is the newest file on disk.
     if (excludeSessionId && file.replace(/\.jsonl$/, '') === excludeSessionId) continue;
     const full = path.join(dir, file);
-    let raw: string;
-    try {
-      raw = await fs.readFile(full, 'utf8');
-    } catch {
-      continue; // skip an unreadable transcript
-    }
+    const raw = await readSessionFile(full);
+    if (raw === undefined) continue; // unreadable / too large
     const records = parseTranscript(raw);
     if (records.length < MIN_ENTRIES) continue;
     const summary = summarizeTranscript(records);
@@ -100,6 +96,17 @@ export async function pickTranscriptHandoff(
     return { transcriptPath: full, sessionId: file.replace(/\.jsonl$/, ''), summary, projectDir, mtimeMs };
   }
   return undefined;
+}
+
+// A pathological session file (some Codex rollouts run to many MB) must not be read whole into memory.
+const MAX_SESSION_FILE_BYTES = 25 * 1024 * 1024;
+async function readSessionFile(file: string): Promise<string | undefined> {
+  try {
+    if ((await fs.stat(file)).size > MAX_SESSION_FILE_BYTES) return undefined; // skip — too large to parse safely
+    return await fs.readFile(file, 'utf8');
+  } catch {
+    return undefined;
+  }
 }
 
 // ---- per-runtime session sources (each = a discovery list + a reader; downstream is shared) ----
@@ -124,8 +131,8 @@ const claudeSource: SessionSource = {
     return out;
   },
   read: async (file) => {
-    let raw: string;
-    try { raw = await fs.readFile(file, 'utf8'); } catch { return undefined; }
+    const raw = await readSessionFile(file);
+    if (raw === undefined) return undefined;
     const records = parseTranscript(raw);
     if (records.length < 4) return undefined; // trivial / freshly-cleared
     const summary = summarizeTranscript(records);
@@ -164,12 +171,14 @@ const codexSource: SessionSource = {
 // Extract the LATEST session from a Codex rollout file -> narrative + cwd + edited files. Each
 // `session_meta` resets accumulation so only the final session's content remains.
 async function parseCodexRollout(file: string): Promise<CaptureUnit | undefined> {
-  let raw: string;
-  try { raw = await fs.readFile(file, 'utf8'); } catch { return undefined; }
+  const raw = await readSessionFile(file);
+  if (raw === undefined) return undefined;
   let sessionId = '';
   let cwd: string | undefined;
-  const texts: string[] = [];
-  const edited = new Set<string>();
+  // Build synthetic Claude-shape records so the SHARED summarizeTranscript governs scope for EVERY tool:
+  // only a capped Topic (first user prompt) + the closing assistant segment leave — never full user turns.
+  let records: TranscriptRecord[] = [];
+  let edited = new Set<string>();
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -179,22 +188,26 @@ async function parseCodexRollout(file: string): Promise<CaptureUnit | undefined>
     if (rec?.type === 'session_meta' && p) {
       sessionId = typeof p.id === 'string' ? p.id : sessionId; // new session starts -> keep only the LATEST
       cwd = typeof p.cwd === 'string' ? p.cwd : cwd;
-      texts.length = 0;
-      edited.clear();
+      records = [];
+      edited = new Set<string>();
     } else if (rec?.type === 'response_item' && p?.type === 'message' && (p.role === 'user' || p.role === 'assistant')) {
+      const parts: string[] = [];
       for (const c of Array.isArray(p.content) ? p.content : []) {
-        if (c && typeof c.text === 'string' && typeof c.type === 'string' && c.type.endsWith('text')) texts.push(c.text);
+        if (c && typeof c.text === 'string' && typeof c.type === 'string' && c.type.endsWith('text')) parts.push(c.text);
       }
+      if (parts.length) records.push({ type: p.role, message: { content: [{ type: 'text', text: parts.join('\n') }] } });
     } else if (rec?.type === 'response_item' && typeof p?.type === 'string') {
-      // apply_patch arrives as a function/tool call; pull edited file paths from its header lines
-      for (const m of JSON.stringify(p).matchAll(/\*\*\* (?:Add|Update|Delete) File: (.+?)(?:\\n|")/g)) {
+      // apply_patch arrives as a function/tool call; pull edited file paths from its header lines.
+      // Stop at the first quote/backslash/newline so a JSON-escaped patch body can't trail into the path.
+      for (const m of JSON.stringify(p).matchAll(/\*\*\* (?:Add|Update|Delete) File: ([^"\\\n]+)/g)) {
         const fp = m[1].trim();
         if (fp) edited.add(cwd && !path.isAbsolute(fp) ? path.join(cwd, fp) : fp);
       }
     }
   }
-  const body = texts.join('\n').trim();
-  if (!sessionId || body.length < 40) return undefined; // trivial / unparseable
+  if (!sessionId || records.length < 2) return undefined; // trivial / unparseable
+  const body = summarizeTranscript(records).body; // locked scope + MAX_BODY cap, shared with Claude
+  if (!body) return undefined;
   return { sessionId, body, editedList: [...edited], projectDir: cwd };
 }
 
@@ -223,12 +236,11 @@ const workbuddySource: SessionSource = {
 };
 
 async function parseWorkbuddyThread(file: string): Promise<CaptureUnit | undefined> {
-  let raw: string;
-  try { raw = await fs.readFile(file, 'utf8'); } catch { return undefined; }
+  const raw = await readSessionFile(file);
+  if (raw === undefined) return undefined;
   let cwd: string | undefined;
   let sessionId = path.basename(file).replace(/\.jsonl$/, '');
-  const texts: string[] = [];
-  let msgCount = 0;
+  const records: TranscriptRecord[] = []; // synthetic Claude-shape -> shared summarizeTranscript scope
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -237,16 +249,19 @@ async function parseWorkbuddyThread(file: string): Promise<CaptureUnit | undefin
     if (typeof rec?.cwd === 'string') cwd = rec.cwd;
     if (typeof rec?.sessionId === 'string') sessionId = rec.sessionId;
     if (rec?.type === 'message' && (rec.role === 'user' || rec.role === 'assistant')) {
-      msgCount += 1;
+      const parts: string[] = [];
       const content = Array.isArray(rec.content) ? rec.content : typeof rec.content === 'string' ? [rec.content] : [];
       for (const c of content) {
-        if (typeof c === 'string') texts.push(c);
-        else if (c && typeof c.text === 'string') texts.push(c.text);
+        // only genuine text blocks — never tool-call/tool-output/other block types
+        if (typeof c === 'string') parts.push(c);
+        else if (c && c.type === 'text' && typeof c.text === 'string') parts.push(c.text);
       }
+      if (parts.length) records.push({ type: rec.role, message: { content: [{ type: 'text', text: parts.join('\n') }] } });
     }
   }
-  const body = texts.join('\n').trim();
-  if (msgCount < 2 || body.length < 40) return undefined; // trivial
+  if (records.length < 2) return undefined; // trivial
+  const body = summarizeTranscript(records).body; // locked scope + MAX_BODY cap, shared with Claude
+  if (!body) return undefined;
   // editedList left empty in v1: projectDir comes straight from the inline cwd, so project mapping does
   // not depend on it. (A v2 can mine file-history-snapshot records for the edited set.)
   return { sessionId, body, editedList: [], projectDir: cwd };
@@ -268,6 +283,7 @@ export async function listResumableSessions(
   stamped.sort((a, b) => b.mtimeMs - a.mtimeMs); // newest activity first across all tools
   const SCAN_CAP = Math.max(limit * 4, limit + 8); // bound parsing work
   const out: ResumableSession[] = [];
+  const anchorCache = new Map<string, GitAnchors>(); // memoize per project — many sessions share one repo
   for (const { file, mtimeMs, src } of stamped.slice(0, SCAN_CAP)) {
     if (out.length >= limit) break;
     let unit: CaptureUnit | undefined;
@@ -275,12 +291,20 @@ export async function listResumableSessions(
     if (!unit) continue;
     if (excludeSessionId && unit.sessionId === excludeSessionId) continue; // no self-replay
     const projectDir = unit.projectDir ?? inferProjectDir(unit.editedList); // tool-recorded cwd wins; else edits-only
-    const anchors = gitAnchors(projectDir ?? path.dirname(file));
+    // Compute git anchors ONLY for a real project (don't spawn git on the transcript-storage dir for an
+    // undetermined session), and memoize per project so N sessions in one repo cost one anchor lookup.
+    let anchors: GitAnchors = { isRepo: false };
     if (projectDir) {
-      if (anchors.headSubject) anchors.headSubject = redactSecretLikeContent(anchors.headSubject);
-      if (anchors.branch) anchors.branch = redactSecretLikeContent(anchors.branch);
-      if (anchors.repo) anchors.repo = redactSecretLikeContent(anchors.repo);
-      if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
+      const cached = anchorCache.get(projectDir);
+      if (cached) anchors = cached;
+      else {
+        anchors = gitAnchors(projectDir);
+        if (anchors.headSubject) anchors.headSubject = redactSecretLikeContent(anchors.headSubject);
+        if (anchors.branch) anchors.branch = redactSecretLikeContent(anchors.branch);
+        if (anchors.repo) anchors.repo = redactSecretLikeContent(anchors.repo);
+        if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
+        anchorCache.set(projectDir, anchors);
+      }
     }
     const body = redactSecretLikeContent(unit.body);
     const snippet = body.replace(/\s+/g, ' ').trim().slice(0, 160);
@@ -290,7 +314,7 @@ export async function listResumableSessions(
       transcriptPath: file,
       projectDir,
       modifiedAt: new Date(mtimeMs).toISOString(),
-      anchors: projectDir ? anchors : { isRepo: false },
+      anchors,
       body,
       snippet,
     });
@@ -338,8 +362,10 @@ export async function buildHandoffPacket(opts: {
   excludeSessionId?: string;
 }): Promise<HandoffPacket> {
   const limit = Number.isFinite(opts.limit) && (opts.limit as number) > 0 ? Math.min(Math.floor(opts.limit as number), 20) : 5;
-  let sessions = await listResumableSessions(limit * 3, opts.excludeSessionId); // over-fetch, then filter by hint
   const needle = opts.projectHint?.trim().toLowerCase();
+  // With a hint, scan a wider window before filtering so a match further back isn't missed; without one,
+  // a small over-fetch is enough (we only return `limit`).
+  let sessions = await listResumableSessions(needle ? 100 : limit * 3, opts.excludeSessionId);
   if (needle) sessions = sessions.filter((s) => `${s.projectDir ?? ''}\n${s.body}`.toLowerCase().includes(needle));
   sessions = sessions.slice(0, limit);
   const now = Date.now();
@@ -355,7 +381,7 @@ export async function buildHandoffPacket(opts: {
         ? `inferred from files edited this session in ${basename}`
         : 'no files were edited this session — project undetermined',
       anchors: s.anchors,
-      narrative: { text: s.body, source: 'claude-transcript', sessionId: s.sessionId, capturedAt: s.modifiedAt, unverified: true },
+      narrative: { text: s.body, source: `${s.tool}-transcript`, sessionId: s.sessionId, capturedAt: s.modifiedAt, unverified: true },
       freshness: { ageMs, stale: ageMs > STALE_HANDOFF_MS },
       conflicts: { staleShaRefs: conflict.stale, referencesCurrentHead: conflict.referencesHead },
       verifyFirst: [
