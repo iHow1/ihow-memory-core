@@ -21,6 +21,7 @@ import { gitAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { redactSecretLikeContent } from './governance.ts';
 import { anchorConflicts } from './handoff-metrics.ts';
 import { RECEIVER_INSTRUCTION } from './envelope.ts';
+import { loadDatabaseSync } from './engine/fts.ts';
 
 export type ResumableSession = {
   sessionId: string;
@@ -319,7 +320,210 @@ async function parseOpenclawTrajectory(file: string): Promise<CaptureUnit | unde
   return { sessionId, body, editedList: [], projectDir: cwd };
 }
 
-const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource, openclawSource];
+
+// Hermes: ~/.hermes/sessions/session_*.json, one JSON object per session. Messages are OpenAI-like
+// {role,content,tool_calls}. There is no top-level cwd; the strongest project signal is buried in
+// tool-call arguments (notably terminal.workdir). We synthesize the same Claude-shape records used by
+// the other readers so summarizeTranscript keeps the global scope lock: first user topic + assistant
+// text + file paths + Bash binary names only, never tool result content.
+const hermesSource: SessionSource = {
+  tool: 'hermes',
+  list: async () => {
+    const dir = path.join(os.homedir(), '.hermes', 'sessions');
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    let files: string[];
+    try { files = (await fs.readdir(dir)).filter((f) => f.startsWith('session_') && f.endsWith('.json')); } catch { return out; }
+    for (const f of files) {
+      const full = path.join(dir, f);
+      try { out.push({ file: full, mtimeMs: (await fs.stat(full)).mtimeMs }); } catch { /* skip */ }
+    }
+    return out;
+  },
+  read: async (file) => parseHermesSession(file),
+};
+
+function hermesTextOf(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((b) => {
+      if (typeof b === 'string') return b;
+      if (!b || typeof b !== 'object' || typeof (b as { text?: unknown }).text !== 'string') return '';
+      const type = (b as { type?: unknown }).type;
+      // Scope lock: text blocks only. Skip images, tool/function-call blocks, and any unknown typed
+      // block that happens to carry a `text` field.
+      if (typeof type === 'string' && !type.endsWith('text')) return '';
+      return (b as { text: string }).text;
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function parseToolArgs(args: unknown): Record<string, unknown> | undefined {
+  if (args && typeof args === 'object' && !Array.isArray(args)) return args as Record<string, unknown>;
+  if (typeof args !== 'string' || !args.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(args);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function addHermesFileBlock(blocks: Array<Record<string, unknown>>, toolName: string, fp: unknown): void {
+  if (typeof fp !== 'string' || !fp) return;
+  const map: Record<string, string> = {
+    read_file: 'Read',
+    read: 'Read',
+    write_file: 'Write',
+    write: 'Write',
+    edit_file: 'Edit',
+    update_file: 'Edit',
+    str_replace: 'Edit',
+  };
+  const name = map[toolName];
+  if (name) blocks.push({ type: 'tool_use', name, input: { file_path: fp } });
+}
+
+function chooseHermesProject(workdirs: string[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const wd of workdirs) {
+    if (!wd) continue;
+    const expanded = wd.startsWith('~/') ? path.join(os.homedir(), wd.slice(2)) : wd;
+    counts.set(expanded, (counts.get(expanded) ?? 0) + 1);
+  }
+  let bestRepo: string | undefined;
+  let bestRepoN = 0;
+  for (const [wd, n] of counts) {
+    if (gitAnchors(wd).isRepo && n > bestRepoN) {
+      bestRepoN = n;
+      bestRepo = wd;
+    }
+  }
+  return bestRepo;
+}
+
+// Shared core: turn an OpenAI-shaped Hermes message list (role/content/tool_calls[]) into a CaptureUnit.
+// BOTH Hermes readers — legacy JSON file and current state.db — normalize their messages to this shape
+// and call here, so scope-lock (first user topic + assistant text + file paths + Bash binary names, never
+// tool-result content), project inference, and exclusions stay identical across stores. tool_calls must
+// already be an array (the JSON store has it parsed; the state.db store JSON-parses its per-row string).
+function hermesCaptureFromMessages(messages: unknown[], sessionId: string): CaptureUnit | undefined {
+  if (!Array.isArray(messages) || messages.length < 2) return undefined;
+  const records: TranscriptRecord[] = [];
+  const workdirs: string[] = [];
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue;
+    const role = (m as { role?: unknown }).role;
+    if (role !== 'user' && role !== 'assistant') continue; // never ingest tool-result content
+    const blocks: Array<Record<string, unknown>> = [];
+    const text = hermesTextOf((m as { content?: unknown }).content).trim();
+    if (text) blocks.push({ type: 'text', text });
+    if (role === 'assistant' && Array.isArray((m as { tool_calls?: unknown }).tool_calls)) {
+      for (const call of (m as { tool_calls: unknown[] }).tool_calls) {
+        const fn = (call as any)?.function ?? call;
+        const name = typeof fn?.name === 'string' ? fn.name : typeof (call as any)?.name === 'string' ? (call as any).name : '';
+        const args = parseToolArgs(fn?.arguments ?? (call as any)?.arguments);
+        if (!name || !args) continue;
+        if (typeof args.workdir === 'string') workdirs.push(args.workdir);
+        if (typeof args.cwd === 'string') workdirs.push(args.cwd);
+        if (name === 'terminal' && typeof args.command === 'string') {
+          blocks.push({ type: 'tool_use', name: 'Bash', input: { command: args.command } });
+        }
+        addHermesFileBlock(blocks, name, args.path ?? args.file_path ?? args.filename);
+      }
+    }
+    if (blocks.length) records.push({ type: role, message: { content: blocks } });
+  }
+  if (records.length < 2) return undefined;
+  const summary = summarizeTranscript(records);
+  if (!summary.body) return undefined;
+  return { sessionId, body: summary.body, editedList: summary.editedList, projectDir: chooseHermesProject(workdirs) };
+}
+
+async function parseHermesSession(file: string): Promise<CaptureUnit | undefined> {
+  const raw = await readSessionFile(file);
+  if (raw === undefined) return undefined;
+  let doc: any;
+  try { doc = JSON.parse(raw); } catch { return undefined; }
+  const messages = Array.isArray(doc?.messages) ? doc.messages : [];
+  const sessionId = typeof doc?.session_id === 'string' ? doc.session_id : path.basename(file).replace(/^session_/, '').replace(/\.json$/, '');
+  return hermesCaptureFromMessages(messages, sessionId);
+}
+
+// Hermes CURRENT store: ~/.hermes/state.db (SQLite). The 2026.5 desktop build moved sessions out of the
+// legacy JSON files (which stop at the last pre-migration session) into state.db — tables
+// `sessions(id, started_at, ...)` and `messages(session_id, role, content, tool_calls, timestamp)`. Without
+// this source, a runtime's RECENT Hermes work would never surface as resumable. Read-only via node:sqlite
+// (the same engine the FTS index uses); one synthetic "file" per session = `<db-path>#<sessionId>`.
+function openHermesStateDb():
+  | { db: { prepare(sql: string): { all(...p: unknown[]): unknown[] }; close(): void }; path: string }
+  | undefined {
+  const dbPath = path.join(os.homedir(), '.hermes', 'state.db');
+  try {
+    const DatabaseSync = loadDatabaseSync();
+    const db = new DatabaseSync(dbPath, { readOnly: true }) as unknown as {
+      prepare(sql: string): { all(...p: unknown[]): unknown[] };
+      close(): void;
+    };
+    return { db, path: dbPath };
+  } catch {
+    return undefined; // no Hermes db / sqlite unavailable -> this source contributes nothing
+  }
+}
+
+function parseJsonArray(v: unknown): unknown[] {
+  if (Array.isArray(v)) return v;
+  if (typeof v !== 'string' || !v.trim()) return [];
+  try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return []; }
+}
+
+async function parseHermesStateDbSession(file: string): Promise<CaptureUnit | undefined> {
+  const hash = file.lastIndexOf('#');
+  if (hash < 0) return undefined;
+  const sessionId = file.slice(hash + 1);
+  const handle = openHermesStateDb();
+  if (!handle) return undefined;
+  try {
+    const rows = handle.db
+      .prepare('SELECT role, content, tool_calls AS toolCalls FROM messages WHERE session_id = ? ORDER BY timestamp')
+      .all(sessionId) as Array<{ role: unknown; content: unknown; toolCalls: unknown }>;
+    // Normalize to the shared shape: the JSON store keeps tool_calls parsed; state.db keeps a JSON string.
+    const messages = rows.map((r) => ({ role: r.role, content: r.content, tool_calls: parseJsonArray(r.toolCalls) }));
+    return hermesCaptureFromMessages(messages, sessionId);
+  } catch {
+    return undefined;
+  } finally {
+    try { handle.db.close(); } catch { /* ignore */ }
+  }
+}
+
+const hermesStateDbSource: SessionSource = {
+  tool: 'hermes',
+  list: async () => {
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    const handle = openHermesStateDb();
+    if (!handle) return out;
+    try {
+      // last activity per session = newest message timestamp (epoch SECONDS, float) -> ms for the sort
+      const rows = handle.db
+        .prepare('SELECT session_id AS sid, MAX(timestamp) AS lastTs FROM messages GROUP BY session_id')
+        .all() as Array<{ sid: unknown; lastTs: unknown }>;
+      for (const r of rows) {
+        if (!r || typeof r.sid !== 'string' || typeof r.lastTs !== 'number') continue;
+        out.push({ file: `${handle.path}#${r.sid}`, mtimeMs: r.lastTs * 1000 });
+      }
+    } catch {
+      /* unreadable schema -> contribute nothing */
+    } finally {
+      try { handle.db.close(); } catch { /* ignore */ }
+    }
+    return out;
+  },
+  read: async (file) => parseHermesStateDbSession(file),
+};
+
+const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource, openclawSource, hermesSource, hermesStateDbSource];
 
 // Enumerate the most recent RESUMABLE sessions across EVERY recorded runtime (Claude, Codex, ...),
 // newest activity first. Each source contributes a reader; project inference, anchors and redaction are
