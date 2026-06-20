@@ -1533,7 +1533,7 @@ function renderResumableList(sessions: ResumableSession[]): string {
     const anchor = s.anchors.isRepo
       ? `${s.anchors.branch ?? '?'} @ ${s.anchors.head ?? '?'}${(s.anchors.dirtyCount ?? 0) > 0 ? ` (+${s.anchors.dirtyCount} dirty)` : ''}`
       : '(not a git repo / project undetermined)';
-    lines.push(`${String(i + 1).padStart(2, ' ')}. ${project}`);
+    lines.push(`${String(i + 1).padStart(2, ' ')}. ${project}   [${s.tool}]`);
     lines.push(`    git: ${anchor}`);
     lines.push(`    last activity: ${s.modifiedAt}`);
     lines.push(`    session: ${s.sessionId}`);
@@ -2201,6 +2201,7 @@ async function main(): Promise<void> {
         printJson({
           sessions: sessions.map((s) => ({
             sessionId: s.sessionId,
+            tool: s.tool,
             project: s.projectDir ?? null,
             branch: s.anchors.isRepo ? s.anchors.branch ?? null : null,
             head: s.anchors.isRepo ? s.anchors.head ?? null : null,

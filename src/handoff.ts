@@ -24,12 +24,30 @@ import { RECEIVER_INSTRUCTION } from './envelope.ts';
 
 export type ResumableSession = {
   sessionId: string;
+  tool: string; // which runtime recorded it: claude-code | codex | ...
   transcriptPath: string;
   projectDir?: string; // inferred from EDITED files only (never reads) — undefined => UNDETERMINED
   modifiedAt: string; // transcript file mtime, ISO — the "last activity" used for sort + display
   anchors: GitAnchors; // git facts for projectDir (machine-verified; free-text fields redacted)
   body: string; // full redacted prior-session narrative (UNVERIFIED) — the handoff narrative source
   snippet: string; // single-line fragment of body for compact list rendering
+};
+
+// The runtime-neutral unit a per-tool reader produces from one session file. Downstream
+// (inferProjectDir / gitAnchors / redaction / buildHandoffPacket) is identical for every tool — adding a
+// runtime = one reader + one schema mapping, nothing in the core changes.
+export type CaptureUnit = {
+  sessionId: string;
+  body: string; // raw (un-redacted) narrative — the caller redacts
+  editedList: string[]; // absolute paths the session WROTE/EDITED — the strongest project signal
+  projectDir?: string; // when the tool records cwd inline (Codex/WorkBuddy); else inferred from editedList
+};
+
+// A per-runtime session source: how to enumerate its session files and parse the latest session in one.
+type SessionSource = {
+  tool: string;
+  list: () => Promise<Array<{ file: string; mtimeMs: number }>>;
+  read: (file: string) => Promise<CaptureUnit | undefined>; // undefined => trivial/unreadable, skip
 };
 
 // Single-session handoff source for the cwd-scoped `continue`: the latest SUBSTANTIAL transcript under
@@ -84,70 +102,138 @@ export async function pickTranscriptHandoff(
   return undefined;
 }
 
-// Enumerate the most recent RESUMABLE sessions across EVERY project recorded under
-// ~/.claude/projects/*/, newest activity first. Reuses the same primitives as pickTranscriptHandoff:
-// substantive threshold, edits-only inference (read-only session stays UNDETERMINED), excludeSessionId
-// (no self-replay), redaction on every free-text field. Read-only; never throws on a single bad file.
+// ---- per-runtime session sources (each = a discovery list + a reader; downstream is shared) ----
+
+// Claude Code: one session per ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl. No per-line cwd, so
+// projectDir is inferred from edited files downstream.
+const claudeSource: SessionSource = {
+  tool: 'claude-code',
+  list: async () => {
+    const root = path.join(os.homedir(), '.claude', 'projects');
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    let dirs: string[];
+    try { dirs = await fs.readdir(root); } catch { return out; }
+    for (const enc of dirs) {
+      let files: string[];
+      try { files = (await fs.readdir(path.join(root, enc))).filter((f) => f.endsWith('.jsonl')); } catch { continue; }
+      for (const f of files) {
+        const full = path.join(root, enc, f);
+        try { out.push({ file: full, mtimeMs: (await fs.stat(full)).mtimeMs }); } catch { /* skip unstattable */ }
+      }
+    }
+    return out;
+  },
+  read: async (file) => {
+    let raw: string;
+    try { raw = await fs.readFile(file, 'utf8'); } catch { return undefined; }
+    const records = parseTranscript(raw);
+    if (records.length < 4) return undefined; // trivial / freshly-cleared
+    const summary = summarizeTranscript(records);
+    return { sessionId: path.basename(file).replace(/\.jsonl$/, ''), body: summary.body, editedList: summary.editedList };
+  },
+};
+
+// Codex: ~/.codex/{sessions,archived_sessions}/**/rollout-*.jsonl, each a STREAM of {timestamp,type,
+// payload}. One file can hold MANY sessions delimited by `session_meta`; we surface the LATEST session
+// per file (the resume-relevant one). cwd comes straight from session_meta (exact project mapping),
+// editedList from apply_patch headers, narrative from response_item message texts.
+const codexSource: SessionSource = {
+  tool: 'codex',
+  list: async () => {
+    const base = path.join(os.homedir(), '.codex');
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    const walk = async (dir: string, depth: number): Promise<void> => {
+      if (depth > 6) return;
+      let entries;
+      try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) await walk(full, depth + 1);
+        else if (e.name.startsWith('rollout-') && e.name.endsWith('.jsonl')) {
+          try { out.push({ file: full, mtimeMs: (await fs.stat(full)).mtimeMs }); } catch { /* skip */ }
+        }
+      }
+    };
+    await walk(path.join(base, 'sessions'), 0);
+    await walk(path.join(base, 'archived_sessions'), 0);
+    return out;
+  },
+  read: async (file) => parseCodexRollout(file),
+};
+
+// Extract the LATEST session from a Codex rollout file -> narrative + cwd + edited files. Each
+// `session_meta` resets accumulation so only the final session's content remains.
+async function parseCodexRollout(file: string): Promise<CaptureUnit | undefined> {
+  let raw: string;
+  try { raw = await fs.readFile(file, 'utf8'); } catch { return undefined; }
+  let sessionId = '';
+  let cwd: string | undefined;
+  const texts: string[] = [];
+  const edited = new Set<string>();
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let rec: any;
+    try { rec = JSON.parse(t); } catch { continue; }
+    const p = rec?.payload;
+    if (rec?.type === 'session_meta' && p) {
+      sessionId = typeof p.id === 'string' ? p.id : sessionId; // new session starts -> keep only the LATEST
+      cwd = typeof p.cwd === 'string' ? p.cwd : cwd;
+      texts.length = 0;
+      edited.clear();
+    } else if (rec?.type === 'response_item' && p?.type === 'message' && (p.role === 'user' || p.role === 'assistant')) {
+      for (const c of Array.isArray(p.content) ? p.content : []) {
+        if (c && typeof c.text === 'string' && typeof c.type === 'string' && c.type.endsWith('text')) texts.push(c.text);
+      }
+    } else if (rec?.type === 'response_item' && typeof p?.type === 'string') {
+      // apply_patch arrives as a function/tool call; pull edited file paths from its header lines
+      for (const m of JSON.stringify(p).matchAll(/\*\*\* (?:Add|Update|Delete) File: (.+?)(?:\\n|")/g)) {
+        const fp = m[1].trim();
+        if (fp) edited.add(cwd && !path.isAbsolute(fp) ? path.join(cwd, fp) : fp);
+      }
+    }
+  }
+  const body = texts.join('\n').trim();
+  if (!sessionId || body.length < 40) return undefined; // trivial / unparseable
+  return { sessionId, body, editedList: [...edited], projectDir: cwd };
+}
+
+const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource];
+
+// Enumerate the most recent RESUMABLE sessions across EVERY recorded runtime (Claude, Codex, ...),
+// newest activity first. Each source contributes a reader; project inference, anchors and redaction are
+// shared. excludeSessionId guards self-replay. Read-only; never throws on a single bad file.
 export async function listResumableSessions(
   limit: number,
   excludeSessionId?: string,
 ): Promise<ResumableSession[]> {
-  const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
-  let projectDirs: string[];
-  try {
-    projectDirs = await fs.readdir(projectsRoot);
-  } catch {
-    return []; // no Claude Code projects dir at all -> nothing to list
+  const stamped: Array<{ file: string; mtimeMs: number; src: SessionSource }> = [];
+  for (const src of SESSION_SOURCES) {
+    for (const f of await src.list()) stamped.push({ ...f, src });
   }
-  const MIN_ENTRIES = 4; // skip trivial / freshly-cleared sessions (same threshold as pickTranscriptHandoff)
-  const stamped: Array<{ full: string; sessionId: string; mtimeMs: number }> = [];
-  for (const enc of projectDirs) {
-    const dir = path.join(projectsRoot, enc);
-    let files: string[];
-    try {
-      files = (await fs.readdir(dir)).filter((f) => f.endsWith('.jsonl'));
-    } catch {
-      continue; // not a readable dir (or a stray file) -> skip
-    }
-    for (const f of files) {
-      const sessionId = f.replace(/\.jsonl$/, '');
-      // Never list the CURRENTLY-RUNNING session (self-replay guard, same as continue).
-      if (excludeSessionId && sessionId === excludeSessionId) continue;
-      const full = path.join(dir, f);
-      try {
-        stamped.push({ full, sessionId, mtimeMs: (await fs.stat(full)).mtimeMs });
-      } catch {
-        // skip an unstattable file
-      }
-    }
-  }
-  stamped.sort((a, b) => b.mtimeMs - a.mtimeMs); // newest activity first
+  stamped.sort((a, b) => b.mtimeMs - a.mtimeMs); // newest activity first across all tools
   const SCAN_CAP = Math.max(limit * 4, limit + 8); // bound parsing work
   const out: ResumableSession[] = [];
-  for (const { full, sessionId, mtimeMs } of stamped.slice(0, SCAN_CAP)) {
+  for (const { file, mtimeMs, src } of stamped.slice(0, SCAN_CAP)) {
     if (out.length >= limit) break;
-    let raw: string;
-    try {
-      raw = await fs.readFile(full, 'utf8');
-    } catch {
-      continue; // unreadable transcript -> skip
-    }
-    const records = parseTranscript(raw);
-    if (records.length < MIN_ENTRIES) continue; // trivial / freshly-cleared
-    const summary = summarizeTranscript(records);
-    const projectDir = inferProjectDir(summary.editedList); // EDITED files only
-    const anchors = gitAnchors(projectDir ?? path.dirname(full));
+    let unit: CaptureUnit | undefined;
+    try { unit = await src.read(file); } catch { unit = undefined; }
+    if (!unit) continue;
+    if (excludeSessionId && unit.sessionId === excludeSessionId) continue; // no self-replay
+    const projectDir = unit.projectDir ?? inferProjectDir(unit.editedList); // tool-recorded cwd wins; else edits-only
+    const anchors = gitAnchors(projectDir ?? path.dirname(file));
     if (projectDir) {
       if (anchors.headSubject) anchors.headSubject = redactSecretLikeContent(anchors.headSubject);
       if (anchors.branch) anchors.branch = redactSecretLikeContent(anchors.branch);
       if (anchors.repo) anchors.repo = redactSecretLikeContent(anchors.repo);
       if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
     }
-    const body = redactSecretLikeContent(summary.body);
+    const body = redactSecretLikeContent(unit.body);
     const snippet = body.replace(/\s+/g, ' ').trim().slice(0, 160);
     out.push({
-      sessionId,
-      transcriptPath: full,
+      sessionId: unit.sessionId,
+      tool: src.tool,
+      transcriptPath: file,
       projectDir,
       modifiedAt: new Date(mtimeMs).toISOString(),
       anchors: projectDir ? anchors : { isRepo: false },
@@ -161,6 +247,7 @@ export async function listResumableSessions(
 // ---- runtime-neutral handoff packet (the `memory.continue` MCP output) ----
 
 export type HandoffCandidate = {
+  tool: string; // which runtime recorded this session (claude-code | codex | ...)
   project: { path?: string; basename: string; projectId: string };
   confidence: number; // heuristic: edits-inferred project = high; undetermined = low
   why: string;
@@ -207,6 +294,7 @@ export async function buildHandoffPacket(opts: {
     const conflict = anchorConflicts(s.body, s.anchors.isRepo ? s.anchors.head : undefined);
     const basename = s.projectDir ? path.basename(s.projectDir) : 'UNDETERMINED';
     return {
+      tool: s.tool,
       project: { path: s.projectDir, basename, projectId: projectIdFor(s.projectDir) },
       confidence: s.projectDir ? 0.8 : 0.3,
       why: s.projectDir
