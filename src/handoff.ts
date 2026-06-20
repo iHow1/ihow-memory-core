@@ -456,20 +456,24 @@ async function parseHermesSession(file: string): Promise<CaptureUnit | undefined
 // `sessions(id, started_at, ...)` and `messages(session_id, role, content, tool_calls, timestamp)`. Without
 // this source, a runtime's RECENT Hermes work would never surface as resumable. Read-only via node:sqlite
 // (the same engine the FTS index uses); one synthetic "file" per session = `<db-path>#<sessionId>`.
-function openHermesStateDb():
-  | { db: { prepare(sql: string): { all(...p: unknown[]): unknown[] }; close(): void }; path: string }
-  | undefined {
-  const dbPath = path.join(os.homedir(), '.hermes', 'state.db');
+type RoSqlite = { prepare(sql: string): { all(...p: unknown[]): unknown[] }; close(): void };
+
+// Open any SQLite file read-only via node:sqlite (the same engine the FTS index uses). Returns undefined
+// when the file is absent or sqlite is unavailable, so a runtime whose store isn't present simply
+// contributes no sessions. Read-only is safe against a live WAL db another process holds open.
+function openSqliteReadonly(dbPath: string): RoSqlite | undefined {
   try {
     const DatabaseSync = loadDatabaseSync();
-    const db = new DatabaseSync(dbPath, { readOnly: true }) as unknown as {
-      prepare(sql: string): { all(...p: unknown[]): unknown[] };
-      close(): void;
-    };
-    return { db, path: dbPath };
+    return new DatabaseSync(dbPath, { readOnly: true }) as unknown as RoSqlite;
   } catch {
-    return undefined; // no Hermes db / sqlite unavailable -> this source contributes nothing
+    return undefined;
   }
+}
+
+function openHermesStateDb(): { db: RoSqlite; path: string } | undefined {
+  const dbPath = path.join(os.homedir(), '.hermes', 'state.db');
+  const db = openSqliteReadonly(dbPath);
+  return db ? { db, path: dbPath } : undefined;
 }
 
 function parseJsonArray(v: unknown): unknown[] {
@@ -523,7 +527,91 @@ const hermesStateDbSource: SessionSource = {
   read: async (file) => parseHermesStateDbSession(file),
 };
 
-const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource, openclawSource, hermesSource, hermesStateDbSource];
+// OpenCode (SST): ~/.local/share/opencode/opencode.db (SQLite, Drizzle). A `session` row carries the cwd
+// directly in `directory` (exact project — no tool-arg mining), and `parent_id` NULL marks a top-level
+// thread (non-NULL = a subagent run, excluded as noise like WorkBuddy's agent-* files). A message's role
+// is in `message.data` (JSON); its visible text is in linked `part` rows of type "text" (reasoning / tool
+// / step-* parts are skipped — scope lock + no tool output). Read-only via node:sqlite; one file/session.
+function safeJsonObject(v: unknown): Record<string, any> | undefined {
+  if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, any>;
+  if (typeof v !== 'string' || !v.trim()) return undefined;
+  try { const p = JSON.parse(v); return p && typeof p === 'object' && !Array.isArray(p) ? p : undefined; } catch { return undefined; }
+}
+
+const opencodeSource: SessionSource = {
+  tool: 'opencode',
+  list: async () => {
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    const dbPath = path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db');
+    const db = openSqliteReadonly(dbPath);
+    if (!db) return out;
+    try {
+      // top-level sessions only (subagent runs have a parent_id); time_updated is epoch MS already
+      const rows = db
+        .prepare('SELECT id AS sid, time_updated AS ts FROM session WHERE parent_id IS NULL')
+        .all() as Array<{ sid: unknown; ts: unknown }>;
+      for (const r of rows) {
+        const ts = typeof r.ts === 'number' ? r.ts : typeof r.ts === 'string' ? Number(r.ts) : NaN;
+        if (typeof r.sid !== 'string' || !Number.isFinite(ts)) continue;
+        out.push({ file: `${dbPath}#${r.sid}`, mtimeMs: ts });
+      }
+    } catch {
+      /* unreadable schema -> contribute nothing */
+    } finally {
+      try { db.close(); } catch { /* ignore */ }
+    }
+    return out;
+  },
+  read: async (file) => parseOpencodeSession(file),
+};
+
+async function parseOpencodeSession(file: string): Promise<CaptureUnit | undefined> {
+  const hash = file.lastIndexOf('#');
+  if (hash < 0) return undefined;
+  const sessionId = file.slice(hash + 1);
+  const db = openSqliteReadonly(file.slice(0, hash));
+  if (!db) return undefined;
+  try {
+    const srow = db.prepare('SELECT directory FROM session WHERE id = ?').all(sessionId)[0] as { directory?: unknown } | undefined;
+    const projectDir = srow && typeof srow.directory === 'string' && srow.directory ? srow.directory : undefined;
+    // Bucket each message's visible text from its "text" parts (one query, grouped by message_id).
+    const textByMsg = new Map<string, string[]>();
+    const partRows = db
+      .prepare('SELECT message_id AS mid, data FROM part WHERE session_id = ? ORDER BY time_created')
+      .all(sessionId) as Array<{ mid: unknown; data: unknown }>;
+    for (const p of partRows) {
+      if (typeof p.mid !== 'string') continue;
+      const pd = safeJsonObject(p.data);
+      if (pd && pd.type === 'text' && typeof pd.text === 'string' && pd.text.trim()) {
+        const arr = textByMsg.get(p.mid) ?? [];
+        arr.push(pd.text);
+        textByMsg.set(p.mid, arr);
+      }
+    }
+    const msgRows = db
+      .prepare('SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created')
+      .all(sessionId) as Array<{ id: unknown; data: unknown }>;
+    const records: TranscriptRecord[] = [];
+    for (const m of msgRows) {
+      if (typeof m.id !== 'string') continue;
+      const role = safeJsonObject(m.data)?.role;
+      if (role !== 'user' && role !== 'assistant') continue;
+      const text = (textByMsg.get(m.id) ?? []).join('\n').trim();
+      if (text) records.push({ type: role, message: { content: [{ type: 'text', text }] } });
+    }
+    if (records.length < 2) return undefined;
+    const summary = summarizeTranscript(records);
+    if (!summary.body) return undefined;
+    // editedList stays empty: projectDir is the session's recorded cwd, so project mapping doesn't need it.
+    return { sessionId, body: summary.body, editedList: [], projectDir };
+  } catch {
+    return undefined;
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
+}
+
+const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource, openclawSource, hermesSource, hermesStateDbSource, opencodeSource];
 
 // Enumerate the most recent RESUMABLE sessions across EVERY recorded runtime (Claude, Codex, ...),
 // newest activity first. Each source contributes a reader; project inference, anchors and redaction are
