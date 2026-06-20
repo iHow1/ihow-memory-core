@@ -86,16 +86,20 @@ npx ihow-memory@next proof
 
 ## Runtime support
 
-`connect` generates the MCP registration for seven runtimes. Verification depth differs — be aware of what is end-to-end smoke-tested vs. config-generation only:
+`connect` registers the MCP server for eight runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted — this is alpha.
 
-| Runtime | `connect` config | Verified |
-| --- | --- | --- |
-| Claude Code | ✓ (`claude mcp add-json`) | ✓ real-app smoke + ongoing dogfood; skill + auto-capture hooks |
-| Codex | ✓ (`codex mcp add`) | ⚠ config generation + tests; no end-to-end app smoke yet (CLI-only) |
-| Cursor | ✓ (merges `~/.cursor/mcp.json`) | ⚠ config generation + tests; no end-to-end app smoke yet |
-| WorkBuddy / Claude Desktop / OpenCode / Hermes | ✓ | ⚠ config generation + tests; no end-to-end app smoke yet |
+| Runtime | connect | resume reader | Notes |
+| --- | --- | --- | --- |
+| Claude Code | ✓ (`claude mcp add-json`) | ✓ | real-app + ongoing dogfood; skill + auto-capture hooks |
+| Codex | ✓ (`codex mcp add`) | ✓ | single-machine real-app smoke |
+| OpenClaw | ✓ (`~/.openclaw/openclaw.json`) | ✓ | single-machine real-app smoke (memory.continue + git preflight) |
+| Hermes | ✓ (`hermes mcp add`) | ✓ (JSON + `state.db`) | single-machine real-app smoke |
+| OpenCode | ✓ (`~/.config/opencode`) | ✓ (`opencode.db`) | single-machine real-app smoke |
+| WorkBuddy | ✓ (`~/.workbuddy/mcp.json`) | ✓ | single-machine real-app smoke |
+| Cursor | ✓ (merges `~/.cursor/mcp.json`) | ✗ | receiver-only — Cursor keeps chats in a binary IndexedDB, not readable for resume |
+| Claude Desktop | ✓ | ✗ | receiver-only (chat app; no resumable local sessions) |
 
-The MCP tools and governed loop are runtime-agnostic; only the proactive skill + auto-capture hooks are Claude Code-specific today.
+The MCP tools and governed loop are runtime-agnostic. The proactive skill + auto-capture hooks are Claude Code-specific; the resume nudge is auto-injected for the runtimes whose config exposes an instructions file (Claude Code, WorkBuddy, OpenClaw, Hermes, OpenCode).
 
 ## Retrieval engine
 
