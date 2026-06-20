@@ -198,7 +198,61 @@ async function parseCodexRollout(file: string): Promise<CaptureUnit | undefined>
   return { sessionId, body, editedList: [...edited], projectDir: cwd };
 }
 
-const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource];
+// WorkBuddy (Tencent): ~/.workbuddy/projects/<encoded-cwd>/<sessionId>.jsonl, one session per file.
+// Records are {id,timestamp,type,role,content,cwd,sessionId,...}; messages have type "message", a `role`
+// and a TOP-LEVEL `content` list (NOT message.content), with cwd inline (exact project map). agent-*.jsonl
+// are sub-agent noise (excluded). No hooks on this build, so capture is passive transcript-reading.
+const workbuddySource: SessionSource = {
+  tool: 'workbuddy',
+  list: async () => {
+    const root = path.join(os.homedir(), '.workbuddy', 'projects');
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    let dirs: string[];
+    try { dirs = await fs.readdir(root); } catch { return out; }
+    for (const enc of dirs) {
+      let files: string[];
+      try { files = (await fs.readdir(path.join(root, enc))).filter((f) => f.endsWith('.jsonl') && !f.startsWith('agent-')); } catch { continue; }
+      for (const f of files) {
+        const full = path.join(root, enc, f);
+        try { out.push({ file: full, mtimeMs: (await fs.stat(full)).mtimeMs }); } catch { /* skip */ }
+      }
+    }
+    return out;
+  },
+  read: async (file) => parseWorkbuddyThread(file),
+};
+
+async function parseWorkbuddyThread(file: string): Promise<CaptureUnit | undefined> {
+  let raw: string;
+  try { raw = await fs.readFile(file, 'utf8'); } catch { return undefined; }
+  let cwd: string | undefined;
+  let sessionId = path.basename(file).replace(/\.jsonl$/, '');
+  const texts: string[] = [];
+  let msgCount = 0;
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let rec: any;
+    try { rec = JSON.parse(t); } catch { continue; }
+    if (typeof rec?.cwd === 'string') cwd = rec.cwd;
+    if (typeof rec?.sessionId === 'string') sessionId = rec.sessionId;
+    if (rec?.type === 'message' && (rec.role === 'user' || rec.role === 'assistant')) {
+      msgCount += 1;
+      const content = Array.isArray(rec.content) ? rec.content : typeof rec.content === 'string' ? [rec.content] : [];
+      for (const c of content) {
+        if (typeof c === 'string') texts.push(c);
+        else if (c && typeof c.text === 'string') texts.push(c.text);
+      }
+    }
+  }
+  const body = texts.join('\n').trim();
+  if (msgCount < 2 || body.length < 40) return undefined; // trivial
+  // editedList left empty in v1: projectDir comes straight from the inline cwd, so project mapping does
+  // not depend on it. (A v2 can mine file-history-snapshot records for the edited set.)
+  return { sessionId, body, editedList: [], projectDir: cwd };
+}
+
+const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource];
 
 // Enumerate the most recent RESUMABLE sessions across EVERY recorded runtime (Claude, Codex, ...),
 // newest activity first. Each source contributes a reader; project inference, anchors and redaction are
