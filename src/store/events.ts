@@ -5,6 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import type { JsonRecord, Workspace } from '../types.ts';
 import { appendFileAtomic } from './files.ts';
+import { localDay } from '../time.ts';
 
 export type MemoryEvent = {
   id: string;
@@ -33,7 +34,10 @@ export async function readEvents(workspace: Workspace, opts: { since?: string } 
   }
   const events: MemoryEvent[] = [];
   for (const file of files) {
-    if (opts.since && file.slice(0, 10) < opts.since) continue;
+    // No filename-based --since prefilter: file names are LOCAL-day post-fix but UTC-day for logs written
+    // by older code, so the two bases disagree at the cutover. Filter authoritatively per-event by
+    // localDay(event.at) below — one basis, no transition inconsistency. (Audit is not a hot path; the
+    // ndjson logs are small, so reading all of them and filtering per-line is fine.)
     let raw: string;
     try {
       raw = await fs.readFile(path.join(workspace.eventsDir, file), 'utf8');
@@ -44,7 +48,12 @@ export async function readEvents(workspace: Workspace, opts: { since?: string } 
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line) as MemoryEvent;
-        if (opts.since && typeof event.at === 'string' && event.at.slice(0, 10) < opts.since) continue;
+        if (opts.since && typeof event.at === 'string') {
+          const at = new Date(event.at);
+          // Compare on the LOCAL calendar day (same basis as the file names / --since), not the UTC
+          // prefix of the instant — otherwise an evening event filters inconsistently with its file.
+          if (!Number.isNaN(at.getTime()) && localDay(at) < opts.since) continue;
+        }
         events.push(event);
       } catch {
         // skip malformed line
@@ -81,7 +90,7 @@ export async function appendEvent(workspace: Workspace, event: Omit<MemoryEvent,
     at: new Date().toISOString(),
     ...event,
   };
-  const day = fullEvent.at.slice(0, 10);
+  const day = localDay(new Date(fullEvent.at)); // LOCAL calendar day for the log file name (see time.ts)
   const logPath = path.join(workspace.eventsDir, `${day}.ndjson`);
   await appendFileAtomic(logPath, `${JSON.stringify(fullEvent)}\n`);
   return fullEvent;
