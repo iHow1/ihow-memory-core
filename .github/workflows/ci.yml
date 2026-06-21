@@ -47,3 +47,12 @@ jobs:
             exit 1
           fi
           echo "secret scan clean"
+          # No machine-local backup / agent config may ever be tracked in this public repo
+          # (a .claude/settings.local.json.ihow-bak-* reached history this way once).
+          FORBIDDEN=$(git ls-files | grep -E '(^|/)\.claude/|\.ihow-bak-' || true)
+          if [ -n "$FORBIDDEN" ]; then
+            echo "Forbidden tracked paths (machine-local backup / .claude):"
+            echo "$FORBIDDEN"
+            exit 1
+          fi
+          echo "path scan clean"
