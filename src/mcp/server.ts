@@ -72,7 +72,7 @@ function error(id: JsonRpcRequest['id'], code: number, message: string): void {
 const TOOL_DEFINITIONS = [
   {
     name: 'memory.search',
-    description: 'Search local iHow Memory with FTS; returns citation path and snippet. Use this before answering questions about prior work, decisions, user preferences, TODOs, or when continuing/resuming a project — recall before you re-derive or re-ask.',
+    description: 'Search local iHow Memory; returns citation path + snippet ranked by relevance. Use before answering about prior work, decisions, preferences, TODOs, or when resuming a project — recall before you re-derive or re-ask. Matching is LEXICAL (keyword/term overlap), not semantic: there is no embedding model, so YOU are the semantic layer. (1) Issue 2-3 reworded queries with synonyms (e.g. both "auth token" and "鉴权 凭证") — a single phrasing misses notes that used different words. (2) memory.read the cited file before relying on any hit; a snippet can match on a coincidental term. (3) When hits conflict, prefer the more recently dated/promoted one. Treat results as candidates to rerank, not a ranked truth.',
     inputSchema: {
       type: 'object',
       properties: {

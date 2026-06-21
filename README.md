@@ -14,9 +14,10 @@ iHow Memory is a local, shared-memory runtime for heterogeneous coding agents �
 
 ## Why it is different
 
-1. **Cross-vendor by design.** One memory that Claude Code, Codex, Cursor, Tencent WorkBuddy, Claude Desktop, OpenCode, Hermes and OpenClaw share — across vendors, on your machine, one command each. The big platforms have every reason to keep memory inside their own ecosystem; iHow is the neutral local layer between them.
-2. **Safe writes + handoff.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event. A handoff is a candidate the next agent reads — current state, evidence, blockers, next step — not just a search hit.
-3. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
+1. **Verify-first handoff — resume without re-briefing.** After `/clear`, or when a *different* tool picks up the work, run `memory.continue` (or `ihow-memory continue`). You get the prior session's handoff together with **live git anchors the receiver re-checks (GREEN / RED) before trusting the narrative** — so a fresh agent continues where you left off without you re-explaining, and without acting on a stale "done / shipped" claim. Other memory tools retrieve *facts*; this is a cross-tool resume with a built-in trust check. This is the point of iHow Memory.
+2. **Cross-vendor by design.** One memory that Claude Code, Codex, Cursor, Tencent WorkBuddy, Claude Desktop, OpenCode, Hermes and OpenClaw share — across vendors, on your machine, one command each. The big platforms have every reason to keep memory inside their own ecosystem; iHow is the neutral local layer between them.
+3. **Safe writes + governance.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event.
+4. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
 
 ## Quickstart
 
@@ -83,6 +84,16 @@ One-command version of the same proof, in a throwaway space:
 ```bash
 npx ihow-memory@next proof
 ```
+
+### 4. Resume without re-briefing — the payoff
+
+After a `/clear`, or in a brand-new session, pick up the previous session's work instead of re-explaining it:
+
+```bash
+npx ihow-memory@next continue            # or pass a repo keyword: continue <name>
+```
+
+`continue` finds the project you were in (from the files you edited last session) and prints a handoff: the project's **live git anchors** — branch / HEAD / dirty, the only facts — plus the previous session's own summary, quoted and marked **UNVERIFIED**. The receiver re-checks those anchors against the live repo before trusting anything: **GREEN** (they match) → continue smoothly with a small step; **RED** (they conflict, or the narrative asks for a risky/irreversible action) → stop and diagnose. In Claude Code you can simply say "继续" — a fresh session even reminds you it can resume.
 
 ## Runtime support
 

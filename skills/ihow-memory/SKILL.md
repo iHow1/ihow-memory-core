@@ -5,9 +5,11 @@ description: Recall and record project memory with iHow Memory (local, governed)
 
 # Using iHow Memory well
 
-iHow Memory is a local-first memory layer exposed over MCP. It does **not** auto-capture
-anything — memory exists only because you call its tools. This skill is the discipline for
-when to do that, so a future session (or a different agent) can pick up where you left off.
+iHow Memory is a local-first memory layer exposed over MCP. It does **not** silently capture your
+whole session in the background as a substitute for recording — the memory you can rely on exists
+because you (or, at session end, a cooperative hook prompt) call its tools. (A low-weight automatic
+floor exists as a backstop, but it ranks below everything you record.) This skill is the discipline
+for when to call those tools, so a future session — or a different agent — can pick up where you left off.
 
 The tools: `memory.search`, `memory.read`, `memory.write_candidate`, `memory.promote`,
 `memory.durable_promote`, `memory.status`. Writes are governed: `write_candidate` only
