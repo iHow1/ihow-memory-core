@@ -68,7 +68,7 @@ function openDatabase(workspace: Workspace, opts: { initialize?: boolean } = {})
     db.exec('PRAGMA synchronous = NORMAL;');
     db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
-      USING fts5(path UNINDEXED, content, tokenize = 'unicode61');
+      USING fts5(path UNINDEXED, content, orig UNINDEXED, tokenize = 'unicode61');
     `);
   }
   return db;
@@ -83,13 +83,62 @@ function cjkSegment(text: string): string {
   return text.replace(/[㐀-鿿豈-﫿]/g, (char) => ` ${char} `);
 }
 
+// --- CJK bigram tokenization (replaces the old single-char split that made "评价" match "评分") ---
+// node:sqlite exposes no custom-tokenizer hook, so we pre-segment. We index unigrams + overlapping
+// BIGRAMS, and query with bigrams for multi-char runs — so "评价" matches the "评价" 2-gram, never "评分".
+const CJK_RUN = /[㐀-鿿豈-﫿]+/g;
+const LATIN_WORD = /[\p{L}\p{N}_-]+/gu;
+
+// Index side: each CJK run -> its unigrams AND overlapping bigrams (space-separated); Latin passes through.
+function cjkIndexSegment(text: string): string {
+  if (typeof text !== 'string' || !text) return text;
+  return text.replace(CJK_RUN, (run) => {
+    const toks: string[] = [];
+    for (let i = 0; i < run.length; i++) {
+      toks.push(run[i]); // unigram: keeps a 1-char query matching inside words
+      if (i + 1 < run.length) toks.push(run[i] + run[i + 1]); // bigram: the precision win
+    }
+    return ` ${toks.join(' ')} `;
+  });
+}
+
+// Query side: CJK run >= 2 chars -> overlapping bigrams (precise); lone CJK char -> unigram; Latin words
+// pass through. OR-joined (generous recall; the calling agent reranks), but each token is a meaningful
+// 2-gram, so the character-soup false matches are gone.
 function queryToFts(query: string): string {
-  const terms = cjkSegment(query).match(/[\p{L}\p{N}_-]+/gu) || [];
-  if (terms.length === 0) return '""';
-  return terms
-    .slice(0, 12)
-    .map((term) => `"${term.replace(/"/g, '""')}"`)
-    .join(' OR ');
+  if (typeof query !== 'string' || !query) return '""';
+  const tokens: string[] = [];
+  for (const m of query.matchAll(CJK_RUN)) {
+    const run = m[0];
+    if (run.length === 1) tokens.push(run);
+    else for (let i = 0; i + 1 < run.length; i++) tokens.push(run[i] + run[i + 1]);
+  }
+  for (const w of query.replace(CJK_RUN, ' ').match(LATIN_WORD) || []) tokens.push(w);
+  if (tokens.length === 0) return '""';
+  return tokens.slice(0, 32).map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+}
+
+// Readable snippet from the ORIGINAL text (the indexed column is bigram-segmented and renders garbled).
+// Center a ~160-char window on the earliest query-term hit.
+function buildSnippet(orig: string, query: string): string {
+  let body = typeof orig === 'string' ? orig : '';
+  // drop a leading YAML frontmatter block so the snippet is CONTENT, not metadata (candidate_id, timestamps)
+  body = body.replace(/^﻿?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+  const flat = body.replace(/\s+/g, ' ').trim();
+  if (!flat) return '';
+  const low = flat.toLowerCase();
+  let pos = -1;
+  const consider = (i: number): void => { if (i >= 0 && (pos < 0 || i < pos)) pos = i; };
+  // STRONG needles first: whole CJK runs (>=2 chars, e.g. "评价") and latin words (>=2) — center on the
+  // real phrase hit, not a stray single char that may sit in an unrelated context (评估 / 评分).
+  for (const m of query.matchAll(CJK_RUN)) if (m[0].length >= 2) consider(low.indexOf(m[0].toLowerCase()));
+  for (const w of query.toLowerCase().replace(CJK_RUN, ' ').match(LATIN_WORD) || []) if (w.length >= 2) consider(low.indexOf(w));
+  // WEAK fallback: single CJK chars only when no strong needle was found.
+  if (pos < 0) for (const m of query.matchAll(CJK_RUN)) for (const ch of m[0]) consider(flat.indexOf(ch));
+  if (pos < 0) return flat.slice(0, 160) + (flat.length > 160 ? '…' : '');
+  const start = Math.max(0, pos - 40);
+  const end = Math.min(flat.length, pos + 120);
+  return (start > 0 ? '…' : '') + flat.slice(start, end) + (end < flat.length ? '…' : '');
 }
 
 async function collectDocuments(workspace: Workspace): Promise<IndexDocument[]> {
@@ -110,11 +159,13 @@ async function rebuildFtsIndexUnlocked(workspace: Workspace): Promise<number> {
   const documents = await collectDocuments(workspace);
   const db = openDatabase(workspace);
   try {
+    // DROP+CREATE (not just DELETE) so an old-schema index (pre-bigram, no `orig` column) migrates cleanly.
+    db.exec('DROP TABLE IF EXISTS memory_fts');
+    db.exec("CREATE VIRTUAL TABLE memory_fts USING fts5(path UNINDEXED, content, orig UNINDEXED, tokenize = 'unicode61')");
     db.exec('BEGIN');
-    db.exec('DELETE FROM memory_fts');
-    const insert = db.prepare('INSERT INTO memory_fts(path, content) VALUES (?, ?)');
+    const insert = db.prepare('INSERT INTO memory_fts(path, content, orig) VALUES (?, ?, ?)');
     for (const document of documents) {
-      insert.run(document.path, cjkSegment(document.content));
+      insert.run(document.path, cjkIndexSegment(document.content), document.content);
     }
     db.exec('COMMIT');
   } catch (error) {
@@ -135,7 +186,8 @@ async function hasUsableIndex(workspace: Workspace): Promise<boolean> {
   if (!fs.existsSync(workspace.indexPath)) return false;
   const db = openDatabase(workspace, { initialize: false });
   try {
-    db.prepare('SELECT rowid FROM memory_fts LIMIT 1').all();
+    // selecting `orig` also verifies the current schema — a pre-bigram index lacks it, fails here, rebuilds.
+    db.prepare('SELECT orig FROM memory_fts LIMIT 1').all();
     return true;
   } catch {
     return false;
@@ -173,7 +225,7 @@ export async function searchFts(
       .prepare(`
         SELECT
           path,
-          snippet(memory_fts, 1, '[', ']', '...', 24) AS snippet,
+          orig,
           bm25(memory_fts) AS rank,
           (CASE WHEN path LIKE 'memory/journal/%' OR path LIKE 'memory/_mcp/journal/%' THEN 1 ELSE 0 END) AS is_journal
         FROM memory_fts
@@ -181,17 +233,17 @@ export async function searchFts(
         ORDER BY is_journal ASC, rank
         LIMIT ?
       `)
-      .all(queryToFts(query), limit) as Array<{ path: string; snippet: string; rank: number; is_journal: number }>;
-    return rows.map((row) => ({
-      path: row.path,
-      snippet: row.snippet,
-      score: Number(row.rank),
-      source: 'fts',
-      citation: {
+      .all(queryToFts(query), limit) as Array<{ path: string; orig: string; rank: number; is_journal: number }>;
+    return rows.map((row) => {
+      const snippet = buildSnippet(row.orig, query); // clean window from the ORIGINAL text, not the segmented column
+      return {
         path: row.path,
-        snippet: row.snippet,
-      },
-    }));
+        snippet,
+        score: Number(row.rank),
+        source: 'fts',
+        citation: { path: row.path, snippet },
+      };
+    });
   } finally {
     db.close();
   }
