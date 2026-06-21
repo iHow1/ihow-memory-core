@@ -215,6 +215,19 @@ async function installRuntimeBundle(workspace: Awaited<ReturnType<typeof ensureW
   return target;
 }
 
+// Version stamped into a connected workspace's frozen .runtime bundle (the code the MCP server actually
+// runs), or null if never connected. Compared against packageVersion() to detect upgrade skew: `npm update`
+// refreshes node_modules but NOT this frozen copy, so without `ihow-memory upgrade` a connected runtime
+// keeps running the old server. doctor surfaces the skew; upgrade fixes it.
+async function runtimeBundleVersion(workspace: Awaited<ReturnType<typeof ensureWorkspace>>): Promise<string | null> {
+  try {
+    const raw = await fs.readFile(path.join(workspace.spaceDir, '.runtime', 'package.json'), 'utf8');
+    return (JSON.parse(raw) as { version?: string }).version || null;
+  } catch {
+    return null;
+  }
+}
+
 function commandExists(bin: string): boolean {
   const probe = spawnSync(process.platform === 'win32' ? 'where' : 'which', [bin], { encoding: 'utf8' });
   return probe.status === 0;
@@ -890,6 +903,8 @@ Usage:
   ihow-memory durable-promote <candidate-path> (--dry-run | --real-write) [--scope name] [--title title] [--path path]
   ihow-memory audit [--since YYYY-MM-DD] [--space name]   # list the append-only audit log (candidate / promote / journal / rollback events)
   ihow-memory rollback --event <eventId> [--space name]   # undo one auto-captured journal entry by its audit eventId
+  ihow-memory upgrade [--space name] [--root path]   # re-stamp the connected server bundle after 'npm update' (then restart the runtime)
+  ihow-memory migrate-local-day [--memory-root path] [--apply]   # one-time: re-bucket UTC-named journal/event files to local-day (dry-run unless --apply)
   ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
@@ -1078,6 +1093,20 @@ async function doctor(
     severity: options.runtime ? 'info' : 'warning',
     required: false,
   });
+
+  const installedVersion = packageVersion();
+  const bundleVersion = await runtimeBundleVersion(workspace);
+  if (bundleVersion) {
+    const skewed = bundleVersion !== installedVersion;
+    checks.push({
+      name: 'runtime-bundle',
+      ok: !skewed,
+      detail: skewed ? `connected server v${bundleVersion} < installed v${installedVersion}` : `up to date (v${installedVersion})`,
+      hint: skewed ? 'The connected MCP server is older than the installed package. Run: ihow-memory upgrade  (then restart the runtime).' : undefined,
+      severity: skewed ? 'warning' : 'info',
+      required: false,
+    });
+  }
 
   if (nodeOk && sqliteStatus.ok && writable) {
     try {
@@ -2573,6 +2602,22 @@ async function main(): Promise<void> {
       console.log(`iHow Memory console (read-only): http://${host}:${port}`);
       console.log('Open the URL in a browser. Ctrl+C to stop.');
     });
+    return;
+  }
+
+  if (command === 'upgrade') {
+    // Re-stamp the frozen .runtime bundle from the freshly-installed dist so a connected runtime stops
+    // running the old MCP server. (npm update alone does not refresh .runtime — see runtimeBundleVersion.)
+    const workspace = await ensureWorkspace(resolveWorkspace(options));
+    const before = await runtimeBundleVersion(workspace);
+    await installRuntimeBundle(workspace);
+    const after = packageVersion();
+    if (options.json) {
+      printJson({ ok: true, from: before, to: after, runtimeDir: path.join(workspace.spaceDir, '.runtime') });
+    } else {
+      console.log(before && before !== after ? `upgraded runtime bundle: v${before} → v${after}` : `runtime bundle refreshed (v${after})`);
+      console.log('Restart your connected runtime(s) so they load the new server.');
+    }
     return;
   }
 
