@@ -853,7 +853,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   if (hasClaude) {
     line('    1. Restart Claude Code once → loads the MCP tools + memory skill.');
     line('       (The auto-capture hooks take effect from your next Claude Code session.)');
-    line('    2. Then just work — it captures decisions, results, and blockers for you.');
+    line('    2. Work normally — at session end a hook prompts the agent to save a short handoff (decisions, results, blockers). You can also save anytime via the memory tools.');
     line('    3. After /clear or in a new session, say "继续" (or run: ihow-memory continue) to pick up where you left off — a fresh session even reminds you it can.');
   } else {
     line('    1. Restart your runtime(s) to load the memory tools.');
@@ -1768,7 +1768,6 @@ async function runStopHook(options: ParsedArgs['options']): Promise<void> {
     if ((state.prompts ?? 0) >= MAX_PROMPTS || entries - (state.lastEntries ?? 0) < GROWTH) return;
   }
 
-  await fs.mkdir(markerDir, { recursive: true });
   const nowIso = new Date().toISOString();
   // Record what the hook actually OBSERVED — honest field names (OpenClaw §4.1): hookStartedAt /
   // hookLastAt are when this hook fired (the first / latest turn-end), NOT a true session span; Claude
@@ -1790,7 +1789,15 @@ async function runStopHook(options: ParsedArgs['options']): Promise<void> {
     lastEntries: entries,
     processed: state?.processed ?? false,
   };
-  await fs.writeFile(marker, JSON.stringify(next), 'utf8');
+  try {
+    await fs.mkdir(markerDir, { recursive: true });
+    await fs.writeFile(marker, JSON.stringify(next), 'utf8');
+  } catch {
+    // Could not persist the marker (read-only / full / permission-denied workspace). The hook's
+    // contract is to NEVER throw or disrupt the session, so swallow it and still emit the nudge below.
+    // Worst case the dedup marker is missing and we may re-nudge next turn — recoverable; crashing the
+    // host session (the old unguarded fs.writeFile reaching main().catch with exit 1) is not.
+  }
   hookLog(`stop: re-prompt (decision=block) session=${sessionId} prompt#${next.prompts} entries=${entries}`);
   process.stdout.write(`${JSON.stringify({ decision: 'block', reason: STOP_HOOK_REASON })}\n`);
 }
@@ -2549,12 +2556,13 @@ async function main(): Promise<void> {
   }
 
   if (command === 'console') {
-    const { createConsoleServer } = await import('./http/console.ts');
+    const { createConsoleServer, assertLoopbackBindHost } = await import('./http/console.ts');
     const argv = process.argv.slice(2);
     const hostIdx = argv.indexOf('--host');
     const portIdx = argv.indexOf('--port');
     const host = hostIdx >= 0 && argv[hostIdx + 1] ? argv[hostIdx + 1] : '127.0.0.1';
     const port = portIdx >= 0 && argv[portIdx + 1] ? Number(argv[portIdx + 1]) : 8788;
+    assertLoopbackBindHost(host); // never expose the auth-less read-only console on a non-loopback interface
     const server = await createConsoleServer(options);
     server.listen(port, host, () => {
       console.log('cloud: disabled / local only');
@@ -2650,6 +2658,18 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
+  // Belt-and-suspenders for the never-crash-the-host contract: a hook command (Stop / SessionStart /
+  // UserPromptSubmit) must NEVER exit non-zero or write to stderr — Claude Code surfaces that as a hook
+  // failure on every turn end. If anything at all escapes a hook command, swallow it and exit 0 silently,
+  // so no current or future code path inside a hook can disrupt the host session.
+  // Match the COMMAND word only (argv[2] = the subcommand for `ihow-memory <cmd> …`), never any argv
+  // token — otherwise `ihow-memory search hook-stop` or a candidate body mentioning a hook name would
+  // wrongly swallow a real failure.
+  const HOOK_COMMANDS = new Set(['hook-stop', 'hook-session-start', 'hook-user-prompt-submit']);
+  if (HOOK_COMMANDS.has(process.argv[2])) {
+    process.exitCode = 0;
+    return;
+  }
   const message = error instanceof Error ? error.message : String(error);
   if (message === 'reset_requires_space') {
     console.error('reset requires an explicit demo space: ihow-memory reset --space <id> [--root <dir>]');
