@@ -8,14 +8,16 @@
 
 [简体中文](./README.zh-CN.md)
 
-**Requires Node.js >= 22.12 · macOS / Linux (alpha; Windows via WSL, native Windows experimental).** No account, no API key, no third-party runtime dependencies.
+**Requires Node.js >= 22.12 · macOS / Linux (alpha; Windows via WSL, native Windows experimental).** No account, no API key, no third-party runtime dependencies. (Node >= 22.12 is a hard requirement — the engine uses `node:sqlite`.)
+
+**Who this is for:** best for git-using coding workflows, where the verify-first handoff gets the strongest anchors; usable beyond git too, with file-fingerprint anchors instead (see below).
 
 iHow Memory is a local, shared-memory runtime for heterogeneous coding agents — one human-readable, git-auditable memory that Claude Code, Codex, Cursor and other MCP clients share and hand off through. Memory is plain Markdown on disk that you read, diff and roll back with git. A pre-write check rejects candidates that look like they contain secrets, every promote is an audited event, and agents leave a handoff candidate — current state, evidence, blockers, next step — that the next agent reads. Agents talk to it over a stdio MCP server; you use the same flow from the CLI.
 
 ## Why it is different
 
-1. **Verify-first handoff — resume without re-briefing.** After `/clear`, or when a *different* tool picks up the work, run `memory.continue` (or `ihow-memory continue`). You get the prior session's handoff together with **live git anchors the receiver re-checks (GREEN / RED) before trusting the narrative** — so a fresh agent continues where you left off without you re-explaining, and without acting on a stale "done / shipped" claim. Other memory tools retrieve *facts*; this is a cross-tool resume with a built-in trust check. This is the point of iHow Memory.
-2. **Cross-vendor by design.** One memory that Claude Code, Codex, Cursor, Tencent WorkBuddy, Claude Desktop, OpenCode, Hermes and OpenClaw share — across vendors, on your machine, one command each. The big platforms have every reason to keep memory inside their own ecosystem; iHow is the neutral local layer between them.
+1. **Verify-first handoff — resume without re-briefing.** After `/clear`, or when a *different* tool picks up the work, run `memory.continue` (or `ihow-memory continue`). You get the prior session's handoff together with **live git anchors the receiver re-checks (GREEN / RED) before trusting the narrative** — so a fresh agent continues where you left off without you re-explaining, and without acting on a stale "done / shipped" claim. Other memory tools retrieve *facts*; this is a cross-tool resume with a built-in trust check. This is the point of iHow Memory. In a git repo you get the strongest verify-first anchors (branch / HEAD / dirty). In a non-git project, the handoff still works — you get the prior session's narrative plus file-fingerprint anchors (the receiver re-hashes the touched files to detect drift) — just without git's commit-level GREEN/RED.
+2. **Cross-vendor by design.** One memory that Claude Code, Codex, Cursor, Tencent WorkBuddy, Claude Desktop, OpenCode, Hermes and OpenClaw can share — across vendors, on your machine, one command each. The big platforms have every reason to keep memory inside their own ecosystem; iHow is the neutral local layer between them. In this alpha only Claude Code is dogfooded daily; the others are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they call the tools but cannot resume) — see [Runtime support](#runtime-support).
 3. **Safe writes + governance.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event.
 4. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
 
@@ -95,6 +97,10 @@ npx ihow-memory@next continue            # or pass a repo keyword: continue <nam
 
 `continue` finds the project you were in (from the files you edited last session) and prints a handoff: the project's **live git anchors** — branch / HEAD / dirty, the only facts — plus the previous session's own summary, quoted and marked **UNVERIFIED**. The receiver re-checks those anchors against the live repo before trusting anything: **GREEN** (they match) → continue smoothly with a small step; **RED** (they conflict, or the narrative asks for a risky/irreversible action) → stop and diagnose. In Claude Code you can simply say "继续" — a fresh session even reminds you it can resume.
 
+### Updating
+
+`connect` freezes a runtime copy of the server into the workspace, so `npm update` does **not** refresh the running MCP server by itself. After updating the package, run `npx ihow-memory@next upgrade` (then restart the runtime) to refresh the connected server. `doctor` warns when the connected server is older than the installed package (a "runtime-bundle" check).
+
 ## Runtime support
 
 `connect` registers the MCP server for eight runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted — this is alpha.
@@ -154,6 +160,7 @@ ihow-memory journal <text>   append a low-weight auto-capture entry (searchable,
 ihow-memory audit            list the append-only event log [--since YYYY-MM-DD]
 ihow-memory rollback         undo one auto-captured journal entry (--event <id>)
 ihow-memory reindex          rebuild the SQLite index from Markdown
+ihow-memory upgrade          refresh the workspace's frozen server copy after updating the package (then restart the runtime)
 ihow-memory proof            one-command governed-loop proof in a throwaway space
 ihow-memory feedback         print a prefilled GitHub issue + redacted diagnostics
 ihow-memory reset            remove a managed demo space (requires --space)
@@ -162,6 +169,8 @@ ihow-memory telemetry        on | off | status — anonymous counters, OFF by de
 ```
 
 Defaults: root `~/.ihow-memory`; space derived from the current directory unless `--space` is given. Run `npx ihow-memory@next --help` for full flags.
+
+The `console` is **read-only, loopback-only, and single-user / trusted-machine by design** — there is no auth token yet, so do not run it on a shared or multi-user host.
 
 ## Memory layout and write boundaries
 
@@ -259,7 +268,7 @@ A hosted runtime is not included in this npm package or this repository.
 
 ## Status
 
-Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Validated on macOS and Linux; Windows is not yet a supported lane. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
+Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: only Claude Code is dogfooded daily; the other runtimes are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they can call the tools but cannot resume). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated on macOS and Linux; Windows is not yet a supported lane. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
 
 **Which version has what (dist-tags).** Prereleases publish under the `next` dist-tag; `npm install ihow-memory` resolves `latest`.
 
@@ -275,6 +284,7 @@ To try the floor backstop: `npm install ihow-memory@next`. A plain `npm install 
 - **Floor capture is single-cwd.** The SessionStart floor backs up only its designated workspace/cwd. If you `connect --auto` across multiple projects sharing one workspace, the floor covers one cwd; broad multi-cwd rollout is pending further dogfood.
 - **Default retrieval is lexical, not semantic.** The shipped default is zero-dependency FTS5 lexical search. The vector + lexical hybrid (behind the published recall figures) is an *optional* local provider, not in the out-of-the-box binary.
 - **Auto-capture notes are low-weight and unreviewed**, and the deterministic floor is a backstop, not yet a primary/default-weight path. `recall` (reading memory back into a session) is off by default. Use `promote` / `durable-promote` for trusted long-term memory.
+- **Storage grows without bound (no rotation/compaction/GC yet).** Journals, the audit ndjson log and `*.ihow-bak-*` backups currently accumulate, and every write rebuilds the full FTS index — rotation/compaction/GC is planned but not shipped. Fine for normal use; heavy long-running use will pile up. Manual mitigation: occasional `ihow-memory reindex` and pruning of old backups by hand.
 - **Windows native is experimental** (use WSL); only macOS and Linux are validated lanes.
 
 ## Links
