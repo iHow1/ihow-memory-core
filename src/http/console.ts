@@ -16,7 +16,44 @@ type ConsoleOptions = WorkspaceOptions & {
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 8788;
-const LOCAL_IPS = new Set(['127.0.0.1', '::1', '0.0.0.0']);
+// The console serves the user's ENTIRE memory read-only with no auth, by design. Its safety rests on
+// being reachable ONLY from the local loopback. Two distinct guards are needed:
+//  - bind-time: refuse to listen on a non-loopback interface (no accidental 0.0.0.0 exposure);
+//  - request-time: a loopback Host-header allowlist, because DNS-rebinding lets a remote web page make
+//    the victim's BROWSER issue requests to 127.0.0.1 (which pass any remote-IP check) carrying the
+//    attacker's Host header. Validating Host defeats that.
+const LOOPBACK_REMOTE_IPS = new Set(['127.0.0.1', '::1']);
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1']);
+
+// Normalize a Host/bind value to a bare host name, lowercase. Handles "[::1]:8788" -> "::1",
+// "localhost:8788" -> "localhost", "127.0.0.1:8788" -> "127.0.0.1", and bare IPv6 "::1" -> "::1"
+// (a bare IPv6 has 2+ colons, so it must NOT be treated as host:port).
+function normalizeHostName(host: string): string {
+  const h = host.trim().toLowerCase();
+  if (h.startsWith('[')) {
+    const m = h.match(/^\[([^\]]+)\]/); // [ipv6] or [ipv6]:port
+    return m ? m[1] : h.replace(/^\[/, '').replace(/\].*$/, '');
+  }
+  // strip :port only for a single-colon host:port (IPv4 / hostname); leave bare IPv6 (2+ colons) intact
+  if ((h.match(/:/g) || []).length === 1) return h.replace(/:\d+$/, '');
+  return h;
+}
+
+export function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTNAMES.has(normalizeHostName(host));
+}
+
+// Bind-time guard. Refuses any non-loopback bind host: the console is local-read-only-by-design and has
+// no authentication, so exposing it on a LAN/public interface would publish all memory. (Power users who
+// need remote access should SSH-tunnel to the loopback port instead.)
+export function assertLoopbackBindHost(host: string): void {
+  if (!isLoopbackHost(host)) {
+    throw new Error(
+      `refusing to bind the read-only console to non-loopback host "${host}" — it exposes all memory with no auth. ` +
+        `Use 127.0.0.1 (default) and SSH-tunnel if you need remote access.`,
+    );
+  }
+}
 
 function json(res: http.ServerResponse, status: number, payload: unknown): void {
   const body = `${JSON.stringify(payload, null, 2)}\n`;
@@ -58,7 +95,18 @@ export async function createConsoleServer(options: ConsoleOptions = {}): Promise
     try {
       // local-first guard: only loopback callers, even if someone binds a wider host.
       const ip = remoteIp(req);
-      if (ip && !LOCAL_IPS.has(ip)) return json(res, 403, { ok: false, error: 'local_only' });
+      if (ip && !LOOPBACK_REMOTE_IPS.has(ip)) return json(res, 403, { ok: false, error: 'local_only' });
+      // DNS-rebinding / Host-header defense: a malicious page on a domain that resolves to 127.0.0.1 makes
+      // the victim's browser hit the loopback port (passing the IP check) with its OWN Host header. Only a
+      // loopback Host name may read memory; anything else (incl. a missing Host) is rejected.
+      if (!isLoopbackHost(req.headers.host || '')) return json(res, 403, { ok: false, error: 'bad_host' });
+      // belt-and-suspenders: refuse any non-loopback Origin (a cross-site browser caller).
+      const origin = req.headers.origin;
+      if (origin && origin !== 'null') {
+        let originHost = '';
+        try { originHost = new URL(origin).hostname; } catch { /* malformed → treated as non-loopback below */ }
+        if (!isLoopbackHost(originHost)) return json(res, 403, { ok: false, error: 'bad_origin' });
+      }
       // read-only: refuse anything that is not a GET.
       if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'read_only_console' });
 
@@ -110,6 +158,7 @@ export async function main(): Promise<void> {
   }
   const host = options.host || process.env.IHOW_MEMORY_CONSOLE_HOST || DEFAULT_HOST;
   const port = options.port ?? Number(process.env.IHOW_MEMORY_CONSOLE_PORT || DEFAULT_PORT);
+  assertLoopbackBindHost(host);
   const server = await createConsoleServer(options);
   server.listen(port, host, () => {
     console.log('cloud: disabled / local only');

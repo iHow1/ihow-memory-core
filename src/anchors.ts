@@ -26,11 +26,26 @@ export type GitAnchors = {
   lastCommitRel?: string;
 };
 
-// Run one git subcommand, bounded and non-throwing. Returns trimmed stdout, or null on any
+// SECURITY: anchors are computed against directories mined VERBATIM from OTHER tools' session stores
+// (Codex cwd / WorkBuddy cwd / OpenClaw workspaceDir / OpenCode session.directory). A plain `git status`
+// in an attacker-controlled repo executes that repo's local `.git/config` `core.fsmonitor` command — a
+// remote-code-execution path triggered merely by running `memory.continue`. We neutralize the
+// config-driven command-exec vectors on EVERY invocation: command-line `-c` has the highest precedence,
+// so it overrides any repo-local `core.fsmonitor` / `core.hooksPath`. We also drop optional locks and
+// disable terminal prompts so a hostile/odd repo can't make git hang or block.
+const GIT_HARDENING_ARGS = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'];
+
+// Run one git subcommand, bounded, hardened, and non-throwing. Returns trimmed stdout, or null on any
 // failure (not a repo, git missing, timeout, non-zero exit).
 function git(cwd: string, args: string[]): string | null {
   try {
-    const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 4000, maxBuffer: 10 * 1024 * 1024 });
+    const r = spawnSync('git', [...GIT_HARDENING_ARGS, ...args], {
+      cwd,
+      encoding: 'utf8',
+      timeout: 4000,
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' },
+    });
     if (r.status !== 0 || typeof r.stdout !== 'string') return null;
     return r.stdout.trim();
   } catch {
