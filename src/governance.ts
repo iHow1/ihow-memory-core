@@ -18,6 +18,7 @@ import { absoluteFromMemoryPath, isMcpSandboxPath, relativeToMemory, relativeToS
 import { appendEvent, readEvents } from './store/events.ts';
 import { atomicWriteFile, nowCompact, readMemoryFile, safeFileSlug } from './store/files.ts';
 import { withWorkspaceLock } from './store/lock.ts';
+import { localDay } from './time.ts';
 
 export const DEFAULT_PROTECTED_PATTERNS = [
   'SOUL.md',
@@ -40,8 +41,8 @@ export const DEFAULT_PROTECTED_PATTERNS = [
 // High-precision secret detectors. These match secret *values* (or assignment-style
 // `keyword: value`), not bare keywords, to keep the hard-reject low on false positives.
 // NOTE: prose-style secrets ("the password is hunter2") and generic high-entropy blobs are
-// intentionally NOT matched here — they carry a real false-positive cost and belong on the
-// auto-capture path as a quarantine (not a hard drop), pending a false-positive-tolerance call.
+// intentionally NOT matched HERE (the hard-reject detector) — they carry a real false-positive cost.
+// They ARE quarantined on the auto-capture path: see SECRET_QUARANTINE_PATTERNS + redactSecretLikeContent.
 const SECRET_LIKE_PATTERNS = [
   // assignment-style: keyword followed by : or =
   /\b(api[_-]?key|secret|token|password|passwd|pwd|cookie|authorization|bearer|refresh[_-]?token|access[_-]?token|private[_-]?key|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?access[_-]?key[_-]?id)\b\s*[:=]/i,
@@ -58,6 +59,27 @@ const SECRET_LIKE_PATTERNS = [
   /-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA )?PRIVATE KEY-----/, // PEM private key
   /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i, // email address
   /(?:账号|账户|邮箱|密码|密钥|令牌)\s*[:：=]\s*\S+/i, // CJK account/secret assignment
+  // URL- / connection-string-embedded credentials: scheme://user:pass@host
+  // (covers redis/postgres/mongodb/amqp/https…). Low false-positive, high signal, so it joins the
+  // hard-reject detector — a creds-in-URL almost never appears legitimately in memory text.
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/:@]+@\S+/i,
+];
+
+// EXTRA patterns the auto-capture REDACTOR quarantines but the hard-reject detector does NOT use —
+// they carry a non-trivial false-positive cost ("the token is valid") that is unacceptable for the
+// candidate hard-throw, but fine on the auto-capture path where a false hit merely becomes a [redacted]
+// marker in a low-weight, rollbackable journal. This is the "quarantine, not hard drop" call the
+// SECRET_LIKE_PATTERNS comment deferred.
+//
+// NOTE: a generic high-entropy detector (>=N mixed-class chars) was tried and REMOVED — the base64/url-safe
+// alphabet overlaps file paths and long camelCase identifiers (which include /, _, digits, mixed case), so
+// it shredded ordinary handoff content ("src/Foo_Bar2026Baz.ts" -> "[redacted].ts"), defeating the whole
+// point of a handoff. Real high-entropy secrets almost always appear either branded (sk-/ghp_/AKIA/JWT/PEM,
+// caught by the detector), in a `key=value` assignment (caught), in a URL (caught), or led by a secret
+// keyword (the prose rule below). A safe entropy classifier needs path/identifier-awareness — revisit then.
+const SECRET_QUARANTINE_PATTERNS = [
+  // prose-style secret: "the password is hunter2", "secret: …", "api key = …", "secret was <blob>"
+  /\b(?:pass(?:word|phrase|wd)?|secret|passcode|credential|api[_-]?key|token)s?\s+(?:is|was|are|were|=|:|->)\s+["']?\S{4,}/i,
 ];
 
 function candidateText(payload: WriteCandidatePayload): string {
@@ -89,6 +111,10 @@ export function redactSecretLikeContent(text: string): string {
   out = out.replace(asGlobal(new RegExp(`${assignment.source}\\s*\\S+`, assignment.flags)), '[redacted]');
   // every detector (value-style + the CJK assignment already swallows its value), applied globally
   for (const pattern of SECRET_LIKE_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
+  // plus the auto-capture-only quarantine set (high-entropy blobs, prose secrets) — these are NOT in
+  // the detector, so post-redaction containsSecretLikeContent() is still guaranteed clean (the
+  // redactor is a strict superset of the detector).
+  for (const pattern of SECRET_QUARANTINE_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
   return out;
 }
 
@@ -281,7 +307,7 @@ export async function appendJournal(workspace: Workspace, payload: JournalPayloa
   const title = payload.title?.trim();
   return await withWorkspaceLock(workspace, async () => {
     const at = new Date().toISOString();
-    const day = at.slice(0, 10);
+    const day = localDay(new Date(at)); // LOCAL calendar day — matches the wall clock, not UTC (see time.ts)
     const targetPath = path.join(workspace.journalDir, `${day}.md`);
     const existing = await readFileOrEmpty(targetPath);
     const header = existing ? '' : journalFileHeader(day);
