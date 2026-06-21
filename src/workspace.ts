@@ -72,6 +72,12 @@ export function resolveWorkspace(options: WorkspaceOptions = {}): Workspace {
 }
 
 function resolveExistingMemoryRootWorkspace(options: WorkspaceOptions, memoryRoot: string): Workspace {
+  // CONCURRENCY: in this mode the data (journal/events under memoryDir/_mcp) is SHARED across every
+  // agent that points at the same --memory-root, but spaceDir lives under a per-cwd stateRoot. Anchoring
+  // the lock to spaceDir would give two agents launched from different cwds two DIFFERENT lock files for
+  // the SAME journal file → the whole-file read-modify-write in appendJournal loses updates. Anchor the
+  // lock to mcpDir instead (= memoryDir/_mcp, identical for every cwd sharing the memory root) so all
+  // writers to the same store contend on the same lock.
   const memoryDir = path.resolve(memoryRoot);
   const stateRoot = path.resolve(options.stateRoot || defaultStateRoot());
   const space = resolveSpace({
@@ -94,7 +100,7 @@ function resolveExistingMemoryRootWorkspace(options: WorkspaceOptions, memoryRoo
     journalDir: path.join(mcpDir, 'journal'),
     indexPath: path.join(spaceDir, 'index.sqlite'),
     indexManifestPath: path.join(spaceDir, 'index-manifest.json'),
-    lockPath: path.join(spaceDir, '.lock'),
+    lockPath: path.join(mcpDir, '.lock'),
   };
 }
 
