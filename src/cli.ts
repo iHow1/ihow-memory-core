@@ -18,6 +18,7 @@ import { gitAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
 import { pickTranscriptHandoff, listResumableSessions, type ResumableSession } from './handoff.ts';
+import { migrateLocalDay } from './migrate.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
 
@@ -120,7 +121,9 @@ function workspaceMcpConfigSnippet(memoryRoot: string, stateRoot: string, runtim
   return {
     mcpServers: {
       'ihow-memory': {
-        command: 'node',
+        // Pin the absolute node that ran setup (process.execPath), not bare 'node' (PATH) — node:sqlite
+        // needs >=22.12, and a stale PATH node would silently break the server. npx-run setup => modern node.
+        command: process.execPath,
         args: [
           'mcp/server.js',
           '--memory-root',
@@ -161,7 +164,7 @@ function runtimeLabel(runtime?: string): string {
 
 function codexTomlSnippet(memoryRoot: string, stateRoot: string, runtimeDir: string): string {
   return `[mcp_servers.ihow-memory]
-command = "node"
+command = ${JSON.stringify(process.execPath)}
 args = [
   "mcp/server.js",
   "--memory-root",
@@ -224,7 +227,8 @@ function mcpServerSpec(
 ): { command: string; args: string[] } {
   const serverEntry = path.join(workspace.spaceDir, '.runtime', 'mcp', 'server.js');
   return {
-    command: 'node',
+    // Pin process.execPath (the node that ran setup), not bare 'node' — see workspaceMcpConfigSnippet.
+    command: process.execPath,
     args: [serverEntry, '--memory-root', workspace.memoryDir, '--state-root', workspace.root],
   };
 }
@@ -2569,6 +2573,18 @@ async function main(): Promise<void> {
       console.log(`iHow Memory console (read-only): http://${host}:${port}`);
       console.log('Open the URL in a browser. Ctrl+C to stop.');
     });
+    return;
+  }
+
+  if (command === 'migrate-local-day') {
+    const apply = process.argv.includes('--apply');
+    console.log(apply
+      ? 'migrate-local-day: APPLYING (originals backed up to .premigrate-* per dir)'
+      : 'migrate-local-day: DRY RUN (no changes; pass --apply to write)');
+    const { changed } = await migrateLocalDay(options, apply, (m) => console.log(m), Date.now());
+    if (!changed) console.log('nothing to migrate — all journal/event files already use local-day names.');
+    else if (!apply) console.log('re-run with --apply to perform the migration.');
+    else console.log('done.');
     return;
   }
 

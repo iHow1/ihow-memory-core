@@ -115,6 +115,17 @@ export async function ensureWorkspace(workspace: Workspace): Promise<Workspace> 
   await fs.mkdir(workspace.journalDir, { recursive: true });
   await fs.mkdir(path.dirname(workspace.indexPath), { recursive: true });
   await ensureIndexManifest(workspace);
+  // Restrict the dirs WE own to the current user (0700) so the auto-capture lane + state (which hold
+  // session-derived content) are not world-readable on a shared host, and a co-tenant cannot drop files
+  // into our lanes. We do NOT chmod an existing user-provided --memory-root, only our own subtree.
+  // Best-effort: ignore on platforms/filesystems without POSIX modes (e.g. Windows).
+  for (const dir of new Set([workspace.mcpDir, workspace.spaceDir])) {
+    try {
+      await fs.chmod(dir, 0o700);
+    } catch {
+      // best-effort hardening — never fail workspace setup over a chmod
+    }
+  }
   return workspace;
 }
 
