@@ -10,8 +10,15 @@
 // { isRepo: false } and the envelope simply carries no anchors.
 
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
+
+// Non-git verify-first anchor: a content fingerprint of a file the session edited. When the project is
+// not a git repo, the receiver re-hashes these (same bytes + sha8 = unchanged) to detect drift before
+// trusting the narrative — the git-free equivalent of comparing HEAD.
+export type FileAnchor = { path: string; bytes: number; sha8: string };
 
 export type GitAnchors = {
   isRepo: boolean;
@@ -24,6 +31,7 @@ export type GitAnchors = {
   dirtyCount?: number;
   dirtyFiles?: string[];
   lastCommitRel?: string;
+  files?: FileAnchor[]; // non-git fallback anchors (only set when isRepo is false)
 };
 
 // SECURITY: anchors are computed against directories mined VERBATIM from OTHER tools' session stores
@@ -89,8 +97,35 @@ export function gitAnchors(cwd: string): GitAnchors {
 }
 
 // Render anchors as the deterministic "facts" block of an envelope. No interpretation.
+// Fingerprint up to `limit` of the files the session edited (size + short content hash). Used as the
+// verify-first anchor for NON-git projects. Bounded + non-throwing: missing/unreadable files are skipped,
+// big files are still hashed (source files are small; the cap bounds the count, not the size meaningfully).
+export function fileAnchors(files: string[], limit = 12): FileAnchor[] {
+  const out: FileAnchor[] = [];
+  for (const f of files) {
+    if (out.length >= limit) break;
+    if (!f) continue;
+    const abs = f.startsWith('~/') ? path.join(os.homedir(), f.slice(2)) : f;
+    try {
+      const buf = readFileSync(abs);
+      out.push({ path: f, bytes: buf.length, sha8: crypto.createHash('sha256').update(buf).digest('hex').slice(0, 8) });
+    } catch {
+      // skip files that no longer exist / aren't readable
+    }
+  }
+  return out;
+}
+
 export function renderAnchors(a: GitAnchors): string {
-  if (!a.isRepo) return '(cwd is not a git repository — no machine anchors available)';
+  if (!a.isRepo) {
+    if (a.files && a.files.length) {
+      return [
+        '(not a git repo — file-fingerprint anchors; re-check by re-hashing each file: same bytes + sha8 = unchanged)',
+        ...a.files.map((f) => `  ${f.path} — ${f.bytes} bytes · sha ${f.sha8}`),
+      ].join('\n');
+    }
+    return '(cwd is not a git repository — no machine anchors available)';
+  }
   const lines = [
     `repo: ${a.repo}`,
     `branch: ${a.branch ?? '?'}`,

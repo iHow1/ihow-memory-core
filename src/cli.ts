@@ -14,7 +14,7 @@ import { sqliteRuntimeStatus } from './engine/fts.ts';
 import { readEventsAllLanes } from './store/events.ts';
 import { appendJournal, containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
 import { parseTranscript, summarizeTranscript } from './transcript.ts';
-import { gitAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
+import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
 import { pickTranscriptHandoff, listResumableSessions, type ResumableSession } from './handoff.ts';
@@ -2416,6 +2416,7 @@ async function main(): Promise<void> {
     let transcriptRef: string | undefined;
     let sourceAgeMs: number | undefined; // how old the captured session is (now - transcript mtime) — drives the loud staleness banner
     let sourceTool = 'claude-code'; // the runtime that recorded the resumed session (continue <N> can pick codex/workbuddy)
+    let editedFiles: string[] = []; // the resumed session's edited files — used for non-git file-fingerprint anchors
     // `continue <N>`: a pure-integer arg resumes the Nth row of `continue --list` (1-based) — pick the
     // session you SAW in the picker without retyping a keyword. Indexes the same global list --list shows.
     const pickIndex = hint && /^\d+$/.test(hint) ? Number.parseInt(hint, 10) : undefined;
@@ -2435,6 +2436,7 @@ async function main(): Promise<void> {
       sourceTool = chosen.tool;
       transcriptRef = chosen.transcriptPath;
       sourceAgeMs = Date.now() - Date.parse(chosen.modifiedAt);
+      editedFiles = chosen.editedList;
     } else {
       const picked = await pickTranscriptHandoff(cwd, hint, selfSessionId);
       if (picked) {
@@ -2443,6 +2445,7 @@ async function main(): Promise<void> {
         sourceSessionId = picked.sessionId;
         transcriptRef = picked.transcriptPath;
         sourceAgeMs = Date.now() - picked.mtimeMs;
+        editedFiles = picked.summary.editedList ?? [];
       } else {
         // TRUST BOUNDARY: a Stop-marker transcriptPath is input we wrote ourselves, not user-supplied; a
         // read failure degrades to an empty narrative (anchors still shown).
@@ -2451,6 +2454,7 @@ async function main(): Promise<void> {
           try {
             const summary = summarizeTranscript(parseTranscript(await fs.readFile(fallback.transcriptPath, 'utf8')));
             body = redactSecretLikeContent(summary.body);
+            editedFiles = summary.editedList ?? [];
             projectDir = inferProjectDir(summary.editedList); // edits only — never infer a project from reads
           } catch {
             body = '';
@@ -2468,11 +2472,17 @@ async function main(): Promise<void> {
     // Anchors come from the INFERRED PROJECT (where the work landed on disk), not the session cwd —
     // this keeps the handoff project-aware when every session runs from one terminal dir. The FREE-TEXT
     // anchor fields are redacted like the narrative (a secret in a commit subject must not leak as a fact).
-    const anchors = gitAnchors(projectDir ?? cwd);
+    let anchors = gitAnchors(projectDir ?? cwd);
     if (anchors.headSubject) anchors.headSubject = redactSecretLikeContent(anchors.headSubject);
     if (anchors.branch) anchors.branch = redactSecretLikeContent(anchors.branch);
     if (anchors.repo) anchors.repo = redactSecretLikeContent(anchors.repo);
     if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
+    // Non-git project: fall back to file-fingerprint anchors over the resumed session's edited files,
+    // so a non-git resume still carries verify-first anchors (the receiver re-hashes to detect drift).
+    if (!anchors.isRepo && editedFiles.length) {
+      const files = fileAnchors(editedFiles);
+      if (files.length) anchors = { ...anchors, files };
+    }
     const envelope = assembleEnvelope({
       cwd,
       producerAgent: sourceSessionId ? `${sourceTool}:${sourceSessionId.slice(0, 8)}` : 'ihow-continue',

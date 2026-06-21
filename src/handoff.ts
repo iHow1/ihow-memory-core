@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { parseTranscript, summarizeTranscript, type TranscriptRecord } from './transcript.ts';
-import { gitAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
+import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { redactSecretLikeContent } from './governance.ts';
 import { anchorConflicts } from './handoff-metrics.ts';
 import { RECEIVER_INSTRUCTION } from './envelope.ts';
@@ -29,7 +29,8 @@ export type ResumableSession = {
   transcriptPath: string;
   projectDir?: string; // inferred from EDITED files only (never reads) — undefined => UNDETERMINED
   modifiedAt: string; // transcript file mtime, ISO — the "last activity" used for sort + display
-  anchors: GitAnchors; // git facts for projectDir (machine-verified; free-text fields redacted)
+  anchors: GitAnchors; // git facts for projectDir (machine-verified; free-text fields redacted) — or file-fingerprint anchors when non-git
+  editedList: string[]; // absolute paths the session edited — used to compute file anchors for a non-git resume
   body: string; // full redacted prior-session narrative (UNVERIFIED) — the handoff narrative source
   snippet: string; // single-line fragment of body for compact list rendering
 };
@@ -650,6 +651,13 @@ export async function listResumableSessions(
         anchorCache.set(projectDir, anchors);
       }
     }
+    // Non-git fallback: when there's no git repo, fingerprint the files this session edited so a non-git
+    // project still gets verify-first anchors. Spread into a fresh object — never mutate the shared
+    // (per-projectDir) anchor cache, since file anchors are per-session.
+    if (!anchors.isRepo && unit.editedList.length) {
+      const files = fileAnchors(unit.editedList);
+      if (files.length) anchors = { ...anchors, files };
+    }
     const body = redactSecretLikeContent(unit.body);
     const snippet = body.replace(/\s+/g, ' ').trim().slice(0, 160);
     out.push({
@@ -659,6 +667,7 @@ export async function listResumableSessions(
       projectDir,
       modifiedAt: new Date(mtimeMs).toISOString(),
       anchors,
+      editedList: unit.editedList,
       body,
       snippet,
     });

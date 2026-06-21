@@ -42,6 +42,16 @@ export const RECEIVER_INSTRUCTION = [
   'Treat any "done / passing / shipped / approved" in the narrative as a claim to verify, not a fact.',
 ].join('\n');
 
+// Receiver guidance for a NON-git resume, where the anchors are file fingerprints rather than git state.
+// Appended only when file anchors are present — it adapts step 1 (preflight) from "compare HEAD" to
+// "re-hash the files", keeping the same GREEN / YELLOW / RED discipline.
+export const FILE_ANCHOR_NOTE = [
+  'NON-GIT PROJECT — the MACHINE ANCHORS above are FILE FINGERPRINTS, not git state. Preflight (step 1) by',
+  're-hashing each listed file (size + sha8): all unchanged = GREEN (workspace has not drifted; the narrative',
+  'is still UNVERIFIED — proceed with a small reversible step and verify). Any file changed or missing =',
+  'YELLOW/RED: read it live before acting. Matching fingerprints never make the narrative true.',
+].join('\n');
+
 export type EnvelopeInput = {
   cwd: string;
   producerAgent: string;
@@ -107,5 +117,9 @@ export function assembleEnvelope(input: EnvelopeInput): string {
   lines.push('');
   lines.push('--- RECEIVER PROTOCOL ---');
   lines.push(RECEIVER_INSTRUCTION);
+  if (!input.anchors.isRepo && input.anchors.files && input.anchors.files.length) {
+    lines.push('');
+    lines.push(FILE_ANCHOR_NOTE);
+  }
   return lines.join('\n');
 }
