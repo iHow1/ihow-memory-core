@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { openCore } from './core.ts';
 import { absoluteFromMemoryPath, defaultRoot, ensureWorkspace, isCuratedMemoryPath, resolveWorkspace } from './workspace.ts';
 import { indexWithEngineFallback, resolveEngineConfig } from './engine/retrieval.ts';
@@ -138,7 +139,10 @@ function workspaceMcpConfigSnippet(memoryRoot: string, stateRoot: string, runtim
 }
 
 function packageDir(): string {
-  return path.resolve(new URL('..', import.meta.url).pathname);
+  // Use fileURLToPath, not URL.pathname: on Windows .pathname yields '/C:/...'
+  // (leading slash, %20-encoded), which path.resolve mangles → the package
+  // can't find its own dist. fileURLToPath handles drive letters + decoding.
+  return path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 }
 
 function packageVersion(): string {

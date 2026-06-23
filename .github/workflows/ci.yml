@@ -28,6 +28,32 @@ jobs:
       - name: Pack check
         run: npm pack --dry-run --ignore-scripts
 
+  windows-test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Build
+        run: npm run build
+      - name: Version smoke (guards packageDir Windows path bug)
+        shell: pwsh
+        run: |
+          $v = node bin/ihow-memory.mjs --version
+          Write-Host "version: $v"
+          if ("$v" -match 'unknown' -or -not ("$v" -match '\d')) {
+            Write-Error "packageDir resolution broken on Windows: --version = $v"
+            exit 1
+          }
+      - name: Connect smoke (exercises installRuntimeBundle -> packageDir)
+        run: node bin/ihow-memory.mjs connect --runtime claude-code
+      - name: Tests
+        run: npm test
+
   secret-scan:
     runs-on: ubuntu-latest
     steps:
