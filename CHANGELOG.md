@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
+## [Unreleased] — 0.1.0-alpha.10
+
+### Fixed
+
+- **Windows: `setup` no longer fails to prepare the workspace.** `packageDir()` resolved the
+  package root via `new URL('..', import.meta.url).pathname`, which on Windows yields an invalid
+  `/C:/…` path — so the CLI couldn't find its own `dist` (`setup` reported `could not prepare the
+  workspace`, `connect` threw `runtime_bundle_missing`, `--version` showed `unknown`). Now resolved
+  with `fileURLToPath`. Verified end-to-end on real Windows 11 (ARM64).
+
+### Added
+
+- **Windows CI lane** (`windows-latest`, Node 22 + 24): build + a version smoke that catches the
+  `packageDir` regression + a `connect` smoke + the full test suite, so Windows can't silently break again.
+- **Automatic promotion for qualifying memory.** `memory.write_candidate` is now the one call to
+  remember something: the engine auto-promotes low-risk content that carries provenance (evidence /
+  anchors / command / repo / verified in `metadata`) into durable memory, instead of leaving everything
+  a candidate that must be promoted in a separate step. Pass `autoPromote: false` to only stage a candidate.
+- **An enforced auto-promote floor.** What reaches durable memory is gated by the **engine, not the
+  agent's self-judgment**: secret-like content, standing-rule / policy / access / identity / destructive
+  statements, and content without provenance all stay candidates (with a reason). Auto-promoted memory is
+  tagged `tier: auto-promoted` / `reviewed: false` (audit actor `agent-auto`) so recall and handoffs can
+  label and down-rank machine-judged memory.
+- **Verify-after-connect: `setup` reports a runtime "connected" only once it is actually reachable.**
+  After writing the MCP config it round-trips the configured server (`initialize` + `memory.status`)
+  and, for runtimes with an official CLI, confirms the server is really registered — never on
+  write-success alone. Unverified runtimes are reported `pending` (config written, awaiting first
+  launch; re-run `setup` to verify), and `--json` gains a `pending` list. The Hermes connector now
+  runs `hermes gateway start` so the add takes effect on the live gateway. (Catches the first-user
+  incident where `setup` reported Hermes connected while `mcp list` was empty.)
+
+### Changed
+
+- `memory.promote` is now described as the explicit manual promotion path; `memory.durable_promote`
+  still requires explicit `realWrite: true`.
+- Skill + README guidance: the engine gates promotion — attach provenance to make something durable;
+  high-risk content stays a candidate for human review.
+
 ## [0.1.0-alpha.4] — 2026-06-15 (experimental · Claude Code-first)
 
 > Auto-capture is **experimental and Claude Code-first**. The Stop hook blocks once to request a

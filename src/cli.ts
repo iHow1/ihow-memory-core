@@ -19,6 +19,7 @@ import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anc
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
 import { pickTranscriptHandoff, listResumableSessions, type ResumableSession } from './handoff.ts';
+import { verifyConnection } from './mcp/probe.ts';
 import { migrateLocalDay } from './migrate.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
@@ -399,7 +400,11 @@ function connectViaHermesCli(
   if (add.status !== 0) {
     throw new Error(`hermes_mcp_add_failed: ${(add.stderr || add.stdout || '').slice(0, 300)}`);
   }
-  return { ok: true, runtime: 'hermes', method: 'official-cli:hermes', target: '~/.hermes/config.yaml (hermes mcp add)', replaced: exists };
+  // Refresh the gateway so the add takes effect on the LIVE gateway. First-user incident:
+  // `hermes mcp add` succeeded but `hermes mcp list` stayed empty until `hermes gateway start`
+  // reloaded a stale service definition. Best-effort — verify-after-connect catches the rest.
+  spawnSync('hermes', ['gateway', 'start'], SP);
+  return { ok: true, runtime: 'hermes', method: 'official-cli:hermes', target: '~/.hermes/config.yaml (hermes mcp add + gateway start)', replaced: exists };
 }
 
 async function connectRuntime(
@@ -713,15 +718,25 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   // 2/4 MCP connect each present runtime; a per-runtime failure is downgraded to "skipped", never aborts
   line('');
   line(`2/4  connecting runtimes to workspace ${workspace.space}`);
+  const spec = mcpServerSpec(workspace);
   const connected: string[] = [];
+  const pending: Array<{ runtime: string; detail: string }> = [];
   const skipped: Array<{ runtime: string; error: string }> = [];
   for (const d of present) {
     try {
       const r = await connectRuntime(workspace, d.runtime, { dryRun });
-      if (dryRun) line(`       · ${d.runtime}  [dry-run] would register MCP via ${r.method}`);
-      else {
+      if (dryRun) { line(`       · ${d.runtime}  [dry-run] would register MCP via ${r.method}`); continue; }
+      // Verify-after-connect: only report "connected" once the configured server answers a
+      // real round-trip AND (for CLI runtimes) is actually registered — never on write-success
+      // alone. This is the product's own verify-first principle applied to its installer.
+      const v = await verifyConnection(spec, d.runtime);
+      if (v.reachable) {
         connected.push(d.runtime);
-        line(`       ✓ ${d.runtime}  ${r.replaced ? '(reconnected)' : r.alreadyExists ? '(already connected)' : 'MCP connected'}`);
+        line(`       ✓ ${d.runtime}  ${r.replaced ? '(reconnected, verified)' : r.alreadyExists ? '(already connected, verified)' : 'MCP connected, verified'}`);
+      } else {
+        pending.push({ runtime: d.runtime, detail: v.detail });
+        const hint = v.status === 'pending' ? 'launch the runtime once, then re-run: ihow-memory setup' : 're-run setup or check the runtime config';
+        line(`       ⚠ ${d.runtime}  config written, NOT verified — ${v.detail} (${hint})`);
       }
     } catch (caught) {
       const error = caught instanceof Error ? caught.message : String(caught);
@@ -824,7 +839,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     if (!json) await maybeAskTelemetry(); // the consent nudge is human-only — never pollute --json
   }
 
-  const allFailed = connected.length === 0; // every attempted runtime failed (present.length >= 1 here)
+  const allFailed = connected.length === 0 && pending.length === 0; // nothing verified AND nothing written-pending
   const doctorRed = !!doctorResult && doctorResult.ok === false;
   const installFailed = skill === 'failed' || hook === 'failed' || workbuddyResume === 'failed'; // a helper no-op'd / threw despite being asked
   if (!dryRun && (allFailed || doctorRed || installFailed)) process.exitCode = 1;
@@ -838,6 +853,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
       workspace: workspace.space,
       detected: detectedNames,
       connected,
+      pending,
       skipped,
       skill,
       hook,
@@ -867,7 +883,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   }
   const memOnTools = [hasClaude ? 'Claude Code' : null, hasWorkbuddy && workbuddyResume !== 'failed' ? 'WorkBuddy' : null].filter(Boolean);
   const memOn = memOnTools.length ? ` · memory ON for ${memOnTools.join(' + ')}` : '';
-  line(`✓ iHow Memory is set up.  ${connected.length} runtime${connected.length === 1 ? '' : 's'} connected${memOn}`);
+  line(`✓ iHow Memory is set up.  ${connected.length} runtime${connected.length === 1 ? '' : 's'} connected (verified)${memOn}`);
+  if (pending.length) line(`  ⚠ ${pending.length} written but NOT verified: ${pending.map((p) => p.runtime).join(', ')} — launch each, then re-run: ihow-memory setup`);
   if (skipped.length) line(`  (${skipped.length} skipped: ${skipped.map((s) => s.runtime).join(', ')} — fix its CLI, then re-run; setup is idempotent)`);
   line('');
   line('  Next:');
