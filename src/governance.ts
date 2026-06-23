@@ -398,10 +398,77 @@ export async function writeCandidate(
   });
 }
 
+// ── Auto-promote floor ─────────────────────────────────────────────────────
+// Decides whether a candidate qualifies for AUTOMATIC promotion to durable memory.
+// Conservative by design: the safe failure is "stays a candidate", never "poisons
+// durable memory". (OpenClaw red-team: the most dangerous poisoning is the content
+// that looks like low-risk project state — so agent self-judgment alone never gates;
+// the engine enforces this floor.) Enforced, not prompt-level.
+export type AutoPromoteVerdict =
+  | { allow: true }
+  | { allow: false; reason: string; category: 'secret' | 'governance' | 'no-provenance' };
+
+export type PromoteOptions = {
+  actor?: string;
+  auto?: boolean;
+  provenance?: WriteCandidatePayload['metadata'];
+};
+
+// Standing-rule / policy / access / identity / destructive markers — content that
+// must stay human-gated even when it reads "low risk". Deliberately broad.
+const GOVERNANCE_MARKERS: RegExp[] = [
+  // Standing rules / preferences / policy — a durable directive, not a fact.
+  /\b(always|never|from now on|going forward|by default|as a rule|policy|standing rule|guideline|convention|preference)\b/i,
+  /(以后|从现在起|今后|默认|始终|永远|一律|总是|策略|规则|规范|约定|偏好|方针|准则)/,
+  // Access / security / identity / credentials.
+  /\b(permission|access control|credential|api[\s_-]?key|password|\bsecret\b|\btoken\b|grant|sudo|chmod|\broot\b|identity)\b/i,
+  /(权限|访问控制|凭据|令牌|密钥|密码|身份|授权|提权|管理员)/,
+  // Destructive actions (kept narrow — facts that mention a "deploy"/"release" are fine).
+  /\b(delete|drop\s+table|destroy|wipe|rm\s+-rf|truncate)\b/i,
+  /(删除|清除|销毁|抹除|格式化)/,
+];
+
+function looksLikeGovernanceStatement(text: string): boolean {
+  return GOVERNANCE_MARKERS.some((re) => re.test(text));
+}
+
+// The agent must attach real provenance for content to qualify for the auto lane —
+// evidence/anchors that make the claim verifiable, not just "an agent said so".
+function hasProvenance(payload: WriteCandidatePayload): boolean {
+  const m = payload.metadata;
+  if (!m || typeof m !== 'object') return false;
+  const keys = ['evidence', 'anchors', 'git', 'repo', 'verified', 'provenance', 'command', 'artifact', 'exitCode', 'result'];
+  return keys.some((k) => k in m && (m as Record<string, unknown>)[k] != null);
+}
+
+export function evaluateAutoPromote(payload: WriteCandidatePayload): AutoPromoteVerdict {
+  const text = String(payload.text ?? payload.content ?? '');
+  if (containsSecretLikeContent(text)) {
+    return { allow: false, reason: 'contains secret-like content', category: 'secret' };
+  }
+  if (looksLikeGovernanceStatement(text)) {
+    return {
+      allow: false,
+      reason: 'reads as a standing rule / policy / access / identity / destructive statement — needs human review',
+      category: 'governance',
+    };
+  }
+  if (!hasProvenance(payload)) {
+    return {
+      allow: false,
+      reason: 'no provenance attached (evidence / anchors / verification) — staged as candidate',
+      category: 'no-provenance',
+    };
+  }
+  return { allow: true };
+}
+// ────────────────────────────────────────────────────────────────────────────
+
 export async function promoteCandidate(
   workspace: Workspace,
   candidateRef: string,
   target: PromoteTarget = {},
+  options: PromoteOptions = {},
 ): Promise<PromoteResult> {
   return await withWorkspaceLock(workspace, async () => {
     const candidate = await readMemoryFile(workspace, candidateRef);
@@ -415,10 +482,15 @@ export async function promoteCandidate(
     const targetRelative = relativeToSpace(workspace, targetPath);
     if (isProtectedPath(targetRelative)) throw new Error('protected_core_path');
 
+    // Auto-promoted memory is tagged so recall/continue can label + down-rank it
+    // (machine-judged, not human-reviewed) and tell it apart from confirmed promotions.
+    const autoFrontmatter = options.auto
+      ? `tier: "auto-promoted"\nreviewed: false\npromoted_by: ${JSON.stringify(options.actor || 'agent-auto')}\n`
+      : '';
     const body = candidate.content
       .replace(/^status:\s*"candidate"\s*$/m, 'status: "promoted"')
       .replace(/^type:\s*"memory_candidate"\s*$/m, 'type: "memory"')
-      .replace(/^---\n/, `---\npromoted_at: "${new Date().toISOString()}"\n`);
+      .replace(/^---\n/, `---\npromoted_at: "${new Date().toISOString()}"\n${autoFrontmatter}`);
     await atomicWriteFile(targetPath, body, workspace.memoryDir);
 
     if (workspace.mode === 'existing-memory-root') {
@@ -434,12 +506,15 @@ export async function promoteCandidate(
       type: 'memory.promoted',
       candidatePath: candidate.path,
       targetPath: targetRelative,
-      actor: 'core.promote',
+      actor: options.actor || 'core.promote',
       metadata: {
         candidateId,
         target,
         stagingOnly: workspace.mode === 'existing-memory-root',
         targetMemoryPath: relativeToMemory(workspace, targetPath),
+        auto: options.auto || undefined,
+        reviewed: options.auto ? false : undefined,
+        provenance: options.provenance,
       },
     });
     return {

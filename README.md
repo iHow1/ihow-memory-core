@@ -136,8 +136,8 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 | --- | --- |
 | `memory.search` | Search local memory with FTS. Returns citation path and snippet. |
 | `memory.read` | Read a memory Markdown file by path. Returns exact content plus citation. |
-| `memory.write_candidate` | Write a candidate into the sandbox inbox. Does not write durable memory. |
-| `memory.promote` | Promote a candidate into governed staging, with an audit event. |
+| `memory.write_candidate` | Record a memory. The engine auto-promotes qualifying low-risk content that carries provenance (evidence/anchors); high-risk or unverified content stays a candidate. |
+| `memory.promote` | Explicit manual promote of a candidate into governed staging, with an audit event. |
 | `memory.durable_promote` | Governed durable promote. Requires explicit `dryRun: true` or `realWrite: true`. |
 | `memory.journal` | Append a low-weight, append-only journal entry (auto-capture lane). Searchable but ranked below curated memory. |
 | `memory.status` | Report workspace, retrieval provider, index and sync status. |

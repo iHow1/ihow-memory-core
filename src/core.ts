@@ -18,7 +18,7 @@ import type {
 } from './types.ts';
 import { ensureWorkspace, resolveWorkspace } from './workspace.ts';
 import { readMemoryFile } from './store/files.ts';
-import { appendJournal, durablePromoteCandidate, promoteCandidate, rollbackJournalEvent, writeCandidate } from './governance.ts';
+import { appendJournal, durablePromoteCandidate, evaluateAutoPromote, promoteCandidate, rollbackJournalEvent, writeCandidate } from './governance.ts';
 import type { RollbackResult } from './governance.ts';
 import { readEventsAllLanes, mcpLaneWorkspace } from './store/events.ts';
 import type { MemoryEvent } from './store/events.ts';
@@ -70,8 +70,27 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     },
     async write_candidate(payload) {
       const result = await writeCandidate(workspace, payload);
+      // Auto-promote (default ON): the engine floor decides — qualifying low-risk
+      // content with provenance is promoted automatically; everything else stays a
+      // candidate with a reason. High-risk content never auto-promotes. This makes
+      // "remember this" one call (agents no longer have to remember a second promote
+      // step), while the floor — not the agent — guards what reaches durable memory.
+      let autoPromote: WriteCandidateResult['autoPromote'];
+      if (payload.autoPromote !== false) {
+        const verdict = evaluateAutoPromote(payload);
+        if (verdict.allow) {
+          const promoted = await promoteCandidate(workspace, result.path, {}, {
+            actor: 'agent-auto',
+            auto: true,
+            provenance: payload.metadata,
+          });
+          autoPromote = { promoted: true, path: promoted.path, eventId: promoted.eventId, tier: 'auto-promoted' };
+        } else {
+          autoPromote = { promoted: false, reason: verdict.reason, category: verdict.category };
+        }
+      }
       await indexWithEngineFallback(workspace, engineConfig);
-      return result;
+      return autoPromote ? { ...result, autoPromote } : result;
     },
     async journal(payload) {
       const result = await appendJournal(workspace, payload);

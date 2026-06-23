@@ -95,14 +95,15 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory.write_candidate',
-    description: 'Propose a memory candidate into the sandbox inbox (does NOT write durable memory). Use after a meaningful decision, a verified result, a blocker, a stated user preference, or a handoff summary, so the next session/agent can recall it. Never store secrets, tokens, or credentials.',
+    description: "The one call to remember something — you do NOT need a separate promote step. Use after a verified result, a decision with evidence, a blocker, or a handoff summary. ATTACH PROVENANCE in metadata (e.g. evidence, anchors, command, repo/git, verified): the engine AUTO-PROMOTES qualifying low-risk content that carries provenance into durable memory, and leaves everything else as a candidate with a reason. High-risk content (standing rules/policy, access/identity/credentials, destructive actions) is NEVER auto-promoted — it stays a candidate for human review. Never store secrets/tokens (rejected). Set autoPromote=false to only stage a candidate without promoting.",
     inputSchema: {
       type: 'object',
       properties: {
         text: { type: 'string' },
         title: { type: 'string' },
         sourceAgent: { type: 'string' },
-        metadata: { type: 'object' },
+        metadata: { type: 'object', description: 'Provenance that qualifies content for auto-promotion: evidence, anchors, command, repo/git, verified, result.' },
+        autoPromote: { type: 'boolean', description: 'Default true. Set false to only stage a candidate (no automatic promotion).' },
       },
       required: ['text'],
     },

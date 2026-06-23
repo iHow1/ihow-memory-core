@@ -12,8 +12,10 @@ floor exists as a backstop, but it ranks below everything you record.) This skil
 for when to call those tools, so a future session — or a different agent — can pick up where you left off.
 
 The tools: `memory.search`, `memory.read`, `memory.write_candidate`, `memory.promote`,
-`memory.durable_promote`, `memory.status`. Writes are governed: `write_candidate` only
-*proposes*; `promote` makes it durable.
+`memory.durable_promote`, `memory.status`. Writes are governed: `write_candidate` is the
+**one call to remember** — the engine auto-promotes qualifying low-risk content that carries
+provenance and leaves everything else a candidate. The engine, not your judgment, gates what
+reaches durable memory.
 
 ## To resume after a context boundary — `continue`, don't re-brief
 
@@ -68,6 +70,8 @@ Call `memory.write_candidate` when something durable happens:
 
 Keep each candidate concise and self-contained: one durable fact or decision, with enough
 context to act on it cold. Prefer a few high-value candidates over many noisy ones.
+**Attach provenance** in `metadata` (evidence, anchors, command, repo/git, verified) for
+anything you want remembered durably — that's what lets the engine auto-promote it.
 
 **Link related memory.** Before writing a candidate that refines, extends, or relates to an
 existing decision, `memory.search` for it; if one exists, reference its path in your candidate
@@ -80,10 +84,15 @@ connected instead of drifting into duplicates a future reader can't reconcile.
 - No transient chatter, raw transcripts, or low-value status pings.
 - Don't restate what memory already holds — update intent, don't duplicate.
 
-## Promotion — the governance gate
+## Promotion — the engine gates, not you
 
-- `memory.promote` a candidate once you've confirmed it's correct, non-sensitive, and worth
-  keeping. Don't reflexively promote everything you propose.
+- **You don't need a manual promote step.** `write_candidate` auto-promotes qualifying content
+  for you: low-risk facts that carry **provenance** (evidence / anchors / command / repo /
+  verified in `metadata`) become durable automatically. Attach that provenance.
+- The engine **keeps as a candidate** (and tells you why) anything high-risk — standing
+  rules/policy, access/identity/credentials, destructive actions, or content with no
+  provenance. Those wait for human review; don't try to force them.
+- `memory.promote` remains for an explicit manual promotion when you want one.
 - `memory.durable_promote`: default to `dryRun: true` to preview the plan. Only set
   `realWrite: true` on explicit user confirmation.
 

@@ -88,12 +88,22 @@ export type WriteCandidatePayload = {
   sourceAgent?: string;
   source?: string;
   metadata?: JsonRecord;
+  // When true (the default), the engine evaluates the candidate against the
+  // auto-promote floor and promotes it automatically if it qualifies. Set false
+  // to only stage a candidate. High-risk content never auto-promotes regardless.
+  autoPromote?: boolean;
 };
+
+// Outcome of the engine's auto-promote evaluation, attached to write_candidate.
+export type AutoPromoteOutcome =
+  | { promoted: true; path: string; eventId: string; tier: 'auto-promoted' }
+  | { promoted: false; reason: string; category: 'secret' | 'governance' | 'no-provenance' };
 
 export type WriteCandidateResult = {
   candidateId: string;
   path: string;
   status: 'candidate';
+  autoPromote?: AutoPromoteOutcome;
 };
 
 export type JournalPayload = {

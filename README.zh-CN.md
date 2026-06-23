@@ -119,8 +119,8 @@ stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）
 | --- | --- |
 | `memory.search` | 用 FTS 检索本地记忆，返回引用路径与片段。 |
 | `memory.read` | 按路径读取记忆 Markdown 文件，返回原文与引用。 |
-| `memory.write_candidate` | 向沙箱 inbox 写入 candidate，不写持久记忆。 |
-| `memory.promote` | 把 candidate 升级到受治理的 staging，并记审计事件。 |
+| `memory.write_candidate` | 记一条记忆。引擎会把带 provenance（证据/锚点）的低风险内容自动晋升为持久记忆；高风险或无证据的内容保留为 candidate。 |
+| `memory.promote` | 显式手动把 candidate 升级到受治理的 staging，并记审计事件。 |
 | `memory.durable_promote` | 受治理的持久写入，必须显式传 `dryRun: true` 或 `realWrite: true`。 |
 | `memory.journal` | 向每日 journal 追加一条低权重、只追加（append-only）的条目（自动捕获通道）；可检索，但排序始终低于受治理记忆。 |
 | `memory.status` | 报告 workspace、检索 provider、索引与 sync 状态。 |
