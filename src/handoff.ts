@@ -677,6 +677,17 @@ export async function listResumableSessions(
 
 // ---- runtime-neutral handoff packet (the `memory.continue` MCP output) ----
 
+// Code-computed resume verdict — GREEN only when the live repo genuinely matches the recorded
+// anchors. The narrowness is deliberate (OpenClaw red-team: a confidently-wrong structured GREEN is
+// MORE dangerous than prose). Any uncertainty (no project, can't read git, branch drift, destructive
+// narrative) is YELLOW; an actual anchor mismatch / missing repo is RED. Never a false GREEN.
+export type ContinueVerdict = {
+  state: 'GREEN' | 'YELLOW' | 'RED';
+  reason: string;
+  recordedHead?: string;
+  liveHead?: string;
+};
+
 export type HandoffCandidate = {
   tool: string; // which runtime recorded this session (claude-code | codex | ...)
   project: { path?: string; basename: string; projectId: string };
@@ -687,6 +698,7 @@ export type HandoffCandidate = {
   freshness: { ageMs: number; stale: boolean };
   conflicts: { staleShaRefs: number; referencesCurrentHead: boolean }; // machine-computed: narrative git-claims vs live HEAD
   verifyFirst: string[];
+  verdict: ContinueVerdict; // code-computed live git-anchor verdict — not prose for the agent to maybe-run
 };
 
 export type HandoffPacket = {
@@ -703,6 +715,42 @@ const STALE_HANDOFF_MS = 24 * 60 * 60 * 1000;
 function projectIdFor(p?: string): string {
   if (!p) return 'undetermined';
   return crypto.createHash('sha256').update(path.resolve(p)).digest('hex').slice(0, 12);
+}
+
+// Narrative imperatives that must never be acted on blind — if the prior session text contains these,
+// even a matching-anchor resume is downgraded to YELLOW (verify intent before any destructive action).
+const DESTRUCTIVE_NARRATIVE = /\b(force[\s-]?push|git\s+push\b|reset\s+--hard|rm\s+-rf|drop\s+(?:table|database)|revoke|delete\s+the|deploy\s+to\s+prod)/i;
+
+// Compute the resume verdict by re-reading the project's LIVE git state and comparing it to the anchors
+// recorded when the session was captured. GREEN is narrow on purpose; on a different machine/checkout the
+// recorded path won't match and we degrade to RED/YELLOW rather than a false GREEN.
+export function computeContinueVerdict(recorded: GitAnchors, projectDir: string | undefined, narrative: string): ContinueVerdict {
+  if (!projectDir) {
+    return { state: 'YELLOW', reason: 'project undetermined (no files edited) — confirm which project this resumes before acting' };
+  }
+  const live = gitAnchors(projectDir);
+  if (!recorded.isRepo && !live.isRepo) {
+    return { state: 'YELLOW', reason: 'no git anchors to verify against — read the project state live before relying on the narrative' };
+  }
+  if (recorded.isRepo && !live.isRepo) {
+    return { state: 'RED', reason: `recorded a git project, but ${projectDir} is not a git repo here (wrong checkout / moved / different machine) — do not assume the prior state` };
+  }
+  const rHead = recorded.head;
+  const lHead = live.head;
+  if (rHead && lHead && rHead !== lHead) {
+    return { state: 'RED', reason: `HEAD drifted: recorded ${rHead}, now ${lHead} — someone committed since; read the diff before continuing`, recordedHead: rHead, liveHead: lHead };
+  }
+  if (!rHead || !lHead) {
+    return { state: 'YELLOW', reason: 'could not read HEAD on both sides — verify the project state live', recordedHead: rHead, liveHead: lHead };
+  }
+  if (recorded.branch && live.branch && recorded.branch !== live.branch) {
+    return { state: 'YELLOW', reason: `same HEAD but on a different branch (recorded ${recorded.branch}, now ${live.branch}) — confirm you're where you meant to be`, recordedHead: rHead, liveHead: lHead };
+  }
+  if (DESTRUCTIVE_NARRATIVE.test(narrative)) {
+    return { state: 'YELLOW', reason: `anchors match (HEAD ${lHead}), but the prior narrative mentions a push/force/delete — verify intent before any destructive action`, recordedHead: rHead, liveHead: lHead };
+  }
+  const dirty = live.dirtyCount ? ` · ${live.dirtyCount} uncommitted change(s)` : '';
+  return { state: 'GREEN', reason: `anchors match: HEAD ${lHead}${live.branch ? ` on ${live.branch}` : ''}${dirty} — safe to pick up (the narrative itself is still an unverified claim)`, recordedHead: rHead, liveHead: lHead };
 }
 
 // Assemble the cross-runtime handoff packet: candidate resumable projects, each with machine anchors
@@ -744,6 +792,7 @@ export async function buildHandoffPacket(opts: {
         'check that files/paths the narrative mentions actually exist',
         'treat any "done / passing / shipped / approved" in the narrative as a claim to verify, not a fact',
       ],
+      verdict: computeContinueVerdict(s.anchors, s.projectDir, s.body),
     };
   });
   return {

@@ -158,7 +158,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory.continue',
-    description: 'RESUME after a context boundary (/clear, new thread, switched tool/model). Returns a runtime-neutral handoff PACKET: candidate resumable projects, each with MACHINE ANCHORS (git branch/HEAD/dirty — the only facts), the prior session narrative VERBATIM and UNVERIFIED (never trust it blind), code-computed freshness + anchor-conflict counts, and what to verify first. Call this FIRST when the user says "继续"/"continue"/"resume". The narrative is a claim to verify, not a fact — run the verifyFirst checks before acting. This tool does not itself resume; it hands you an auditable packet.',
+    description: 'RESUME after a context boundary (/clear, new thread, switched tool/model). Returns a runtime-neutral handoff PACKET: candidate resumable projects, each with a code-computed VERDICT (GREEN = live git matches the recorded anchors, safe to pick up · YELLOW = uncertain, verify live · RED = HEAD drifted / wrong checkout, read the diff first — GREEN is narrow and never assumed), MACHINE ANCHORS (git branch/HEAD/dirty — the only facts), the prior session narrative VERBATIM and UNVERIFIED (never trust it blind), and freshness + anchor-conflict counts. Call this FIRST when the user says "继续"/"continue"/"resume". Read the verdict, then treat the narrative as a claim to verify (not a fact). This tool does not itself resume; it hands you an auditable packet.',
     inputSchema: {
       type: 'object',
       properties: {

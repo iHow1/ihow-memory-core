@@ -18,7 +18,7 @@ import { parseTranscript, summarizeTranscript } from './transcript.ts';
 import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
-import { pickTranscriptHandoff, listResumableSessions, type ResumableSession } from './handoff.ts';
+import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, type ResumableSession } from './handoff.ts';
 import { verifyConnection } from './mcp/probe.ts';
 import { migrateLocalDay } from './migrate.ts';
 import type { WorkspaceOptions } from './types.ts';
@@ -2444,6 +2444,7 @@ async function main(): Promise<void> {
     // configured workspace); fall back to a Stop marker for other runtimes/layouts.
     let body = '';
     let projectDir: string | undefined;
+    let recordedAnchors: GitAnchors | undefined; // git anchors captured WHEN the session was recorded — the verdict baseline
     let sourceSessionId: string | undefined;
     let transcriptRef: string | undefined;
     let sourceAgeMs: number | undefined; // how old the captured session is (now - transcript mtime) — drives the loud staleness banner
@@ -2469,6 +2470,7 @@ async function main(): Promise<void> {
       transcriptRef = chosen.transcriptPath;
       sourceAgeMs = Date.now() - Date.parse(chosen.modifiedAt);
       editedFiles = chosen.editedList;
+      recordedAnchors = chosen.anchors; // baseline for the GREEN/YELLOW/RED verdict
     } else {
       const picked = await pickTranscriptHandoff(cwd, hint, selfSessionId);
       if (picked) {
@@ -2515,6 +2517,9 @@ async function main(): Promise<void> {
       const files = fileAnchors(editedFiles);
       if (files.length) anchors = { ...anchors, files };
     }
+    // Code-computed verdict (only when we have the recorded baseline, i.e. continue <N>/keyword):
+    // re-read live git and compare to the anchors captured when the session was recorded.
+    const verdict = recordedAnchors ? computeContinueVerdict(recordedAnchors, projectDir, body) : undefined;
     const envelope = assembleEnvelope({
       cwd,
       producerAgent: sourceSessionId ? `${sourceTool}:${sourceSessionId.slice(0, 8)}` : 'ihow-continue',
@@ -2531,8 +2536,12 @@ async function main(): Promise<void> {
     // fault-tolerant — never throws, never blocks the handoff, never touches the network.
     await recordHandoffMetric({ projectDir, anchors, narrative: body, sourceSessionId, sourceAgeMs });
     if (options.json) {
-      printJson({ cwd, projectDir: projectDir ?? null, anchors, quotedBody: body, transcriptRef: transcriptRef ?? null, sourceSession: sourceSessionId ?? null });
+      printJson({ cwd, projectDir: projectDir ?? null, verdict: verdict ?? null, anchors, quotedBody: body, transcriptRef: transcriptRef ?? null, sourceSession: sourceSessionId ?? null });
     } else {
+      if (verdict) {
+        const icon = verdict.state === 'GREEN' ? '🟢' : verdict.state === 'YELLOW' ? '🟡' : '🔴';
+        console.log(`${icon} ${verdict.state} — ${verdict.reason}\n`);
+      }
       console.log(envelope);
       if (!transcriptRef) {
         console.log(
