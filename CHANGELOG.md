@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
-## [Unreleased] — 0.1.0-alpha.10
+## [0.1.0-alpha.10] — 2026-06-23
 
 ### Fixed
 
@@ -26,16 +26,19 @@ with pre-release tags.
   a candidate that must be promoted in a separate step. Pass `autoPromote: false` to only stage a candidate.
 - **An enforced auto-promote floor.** What reaches durable memory is gated by the **engine, not the
   agent's self-judgment**: secret-like content, standing-rule / policy / access / identity / destructive
-  statements, and content without provenance all stay candidates (with a reason). Auto-promoted memory is
-  tagged `tier: auto-promoted` / `reviewed: false` (audit actor `agent-auto`) so recall and handoffs can
-  label and down-rank machine-judged memory.
+  statements, and content without provenance all stay candidates (with a reason). The floor scans the
+  full candidate — title and metadata included, not just the body. Auto-promoted memory is tagged
+  `tier: auto-promoted` / `reviewed: false` (audit actor `agent-auto`) so it stays distinguishable from
+  human-confirmed memory. (Rank down-weighting of unreviewed entries in recall is a tracked follow-up.)
 - **Verify-after-connect: `setup` reports a runtime "connected" only once it is actually reachable.**
   After writing the MCP config it round-trips the configured server (`initialize` + `memory.status`)
   and, for runtimes with an official CLI, confirms the server is really registered — never on
-  write-success alone. Unverified runtimes are reported `pending` (config written, awaiting first
-  launch; re-run `setup` to verify), and `--json` gains a `pending` list. The Hermes connector now
-  runs `hermes gateway start` so the add takes effect on the live gateway. (Catches the first-user
-  incident where `setup` reported Hermes connected while `mcp list` was empty.)
+  write-success alone. A runtime whose configured server round-trips (including direct-config runtimes
+  that have no CLI) is reported connected; one that fails the round-trip, or whose CLI says it isn't
+  registered, is surfaced as `unverified` (config written but not reachable). `--json` gains an
+  `unverified` list, and `connect --auto` verifies the same way. The Hermes connector now runs
+  `hermes gateway start` so the add takes effect on the live gateway. (Catches the first-user incident
+  where `setup` reported Hermes connected while `mcp list` was empty.)
 
 ### Changed
 
