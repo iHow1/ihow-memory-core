@@ -378,7 +378,11 @@ export async function writeCandidate(
     const title = safeFileSlug(payload.title || candidateId, candidateId);
     const sourceAgent = payload.sourceAgent || payload.source || 'unknown';
     const filePath = path.join(candidateDirForAgent(workspace, sourceAgent), `${nowCompact()}-${title}.md`);
-    await atomicWriteFile(filePath, markdownCandidate(candidateId, payload), workspace.memoryDir);
+    const content = markdownCandidate(candidateId, payload);
+    // Scan the FULL rendered candidate (title + metadata front-matter + body), not just the body
+    // text candidateText() already checks — otherwise a secret tucked into title/metadata slips in.
+    assertNoSecretLikeContent(content);
+    await atomicWriteFile(filePath, content, workspace.memoryDir);
     const relativePath = relativeToSpace(workspace, filePath);
     await appendEvent(workspace, {
       type: 'candidate.created',
@@ -414,39 +418,63 @@ export type PromoteOptions = {
   provenance?: WriteCandidatePayload['metadata'];
 };
 
-// Standing-rule / policy / access / identity / destructive markers — content that
-// must stay human-gated even when it reads "low risk". Deliberately broad.
+// Standing-rule / policy / access / identity / destructive markers — content that must stay
+// human-gated even when it reads "low risk". A denylist can be evaded, so this is one of THREE
+// gates (secret-clean + not-governance + has-provenance) and the safe failure is "stays a
+// candidate". Kept off the noisiest factual verbs (a fact that mentions "deploy"/"disabled X"
+// is fine) but covers the clear high-signal directives.
 const GOVERNANCE_MARKERS: RegExp[] = [
-  // Standing rules / preferences / policy — a durable directive, not a fact.
-  /\b(always|never|from now on|going forward|by default|as a rule|policy|standing rule|guideline|convention|preference)\b/i,
-  /(以后|从现在起|今后|默认|始终|永远|一律|总是|策略|规则|规范|约定|偏好|方针|准则)/,
+  // Standing rules / preferences / policy / imperatives — a durable directive, not a fact.
+  /\b(always|never|from now on|going forward|by default|as a rule|policy|standing rule|guideline|convention|preference|make sure to|remember to|prefer\b.{0,24}\bover\b|auto[-\s]?approve)\b/i,
+  /(以后|从现在起|今后|默认|始终|永远|一律|总是|策略|规则|规范|约定|偏好|方针|准则|务必|记住要|不要再)/,
   // Access / security / identity / credentials.
-  /\b(permission|access control|credential|api[\s_-]?key|password|\bsecret\b|\btoken\b|grant|sudo|chmod|\broot\b|identity)\b/i,
-  /(权限|访问控制|凭据|令牌|密钥|密码|身份|授权|提权|管理员)/,
-  // Destructive actions (kept narrow — facts that mention a "deploy"/"release" are fine).
-  /\b(delete|drop\s+table|destroy|wipe|rm\s+-rf|truncate)\b/i,
-  /(删除|清除|销毁|抹除|格式化)/,
+  /\b(permission|access control|credential|api[\s_-]?key|password|\bsecret\b|\btoken\b|grant|revoke|sudo|chmod|chown|\broot\b|identity|impersonate|whitelist|allowlist|2fa|mfa|bypass\s+(?:auth|review|checks?)|skip\s+(?:review|code\s*review|checks?))\b/i,
+  /(权限|访问控制|凭据|令牌|密钥|密码|身份|授权|提权|管理员|吊销|跳过审核|免审|放行)/,
+  // Destructive / high-blast-radius actions.
+  /\b(delete|drop\s+(?:table|database)|destroy|wipe|rm\s+-rf|truncate|force[\s-]?push|reset\s+--hard|terraform\s+destroy|kubectl\s+delete)\b/i,
+  /(删除|清除|销毁|抹除|格式化|覆盖线上|回滚|下线|停服)/,
 ];
 
 function looksLikeGovernanceStatement(text: string): boolean {
   return GOVERNANCE_MARKERS.some((re) => re.test(text));
 }
 
-// The agent must attach real provenance for content to qualify for the auto lane —
-// evidence/anchors that make the claim verifiable, not just "an agent said so".
+// Everything that will land on disk if promoted — body text + title + metadata values — so the
+// floor scans what actually gets stored, not just the body. A secret or a standing rule tucked
+// into title/metadata must not slip past.
+function fullScanText(payload: WriteCandidatePayload): string {
+  const parts: string[] = [payload.title || '', String(payload.text ?? payload.content ?? '')];
+  const m = payload.metadata;
+  if (m && typeof m === 'object') {
+    for (const v of Object.values(m)) parts.push(typeof v === 'string' ? v : JSON.stringify(v));
+  }
+  return parts.join('\n');
+}
+
+// The agent must attach MEANINGFUL provenance to qualify for the auto lane — evidence/anchors
+// that make the claim verifiable, not just a present-but-empty key (verified:false, result:'').
 function hasProvenance(payload: WriteCandidatePayload): boolean {
   const m = payload.metadata;
   if (!m || typeof m !== 'object') return false;
+  const meaningful = (v: unknown): boolean => {
+    if (v == null) return false;
+    if (typeof v === 'string') return v.trim().length > 0;
+    if (typeof v === 'boolean') return v === true; // verified:false is not provenance
+    if (typeof v === 'number') return Number.isFinite(v); // exitCode:0 is meaningful (success)
+    if (Array.isArray(v)) return v.length > 0;
+    if (typeof v === 'object') return Object.keys(v as object).length > 0;
+    return false;
+  };
   const keys = ['evidence', 'anchors', 'git', 'repo', 'verified', 'provenance', 'command', 'artifact', 'exitCode', 'result'];
-  return keys.some((k) => k in m && (m as Record<string, unknown>)[k] != null);
+  return keys.some((k) => k in m && meaningful((m as Record<string, unknown>)[k]));
 }
 
 export function evaluateAutoPromote(payload: WriteCandidatePayload): AutoPromoteVerdict {
-  const text = String(payload.text ?? payload.content ?? '');
-  if (containsSecretLikeContent(text)) {
-    return { allow: false, reason: 'contains secret-like content', category: 'secret' };
+  const scan = fullScanText(payload); // title + body + metadata — everything that gets stored
+  if (containsSecretLikeContent(scan)) {
+    return { allow: false, reason: 'contains secret-like content (text/title/metadata)', category: 'secret' };
   }
-  if (looksLikeGovernanceStatement(text)) {
+  if (looksLikeGovernanceStatement(scan)) {
     return {
       allow: false,
       reason: 'reads as a standing rule / policy / access / identity / destructive statement — needs human review',
@@ -456,7 +484,7 @@ export function evaluateAutoPromote(payload: WriteCandidatePayload): AutoPromote
   if (!hasProvenance(payload)) {
     return {
       allow: false,
-      reason: 'no provenance attached (evidence / anchors / verification) — staged as candidate',
+      reason: 'no meaningful provenance attached (evidence / anchors / verification) — staged as candidate',
       category: 'no-provenance',
     };
   }
@@ -482,8 +510,9 @@ export async function promoteCandidate(
     const targetRelative = relativeToSpace(workspace, targetPath);
     if (isProtectedPath(targetRelative)) throw new Error('protected_core_path');
 
-    // Auto-promoted memory is tagged so recall/continue can label + down-rank it
-    // (machine-judged, not human-reviewed) and tell it apart from confirmed promotions.
+    // Auto-promoted memory is tagged (tier/reviewed) so it can be told apart from human-confirmed
+    // promotions and treated as machine-judged. (Recall strips these tags from injected snippets;
+    // bm25 rank down-weighting of unreviewed entries is a tracked follow-up, not yet wired.)
     const autoFrontmatter = options.auto
       ? `tier: "auto-promoted"\nreviewed: false\npromoted_by: ${JSON.stringify(options.actor || 'agent-auto')}\n`
       : '';
@@ -491,6 +520,9 @@ export async function promoteCandidate(
       .replace(/^status:\s*"candidate"\s*$/m, 'status: "promoted"')
       .replace(/^type:\s*"memory_candidate"\s*$/m, 'type: "memory"')
       .replace(/^---\n/, `---\npromoted_at: "${new Date().toISOString()}"\n${autoFrontmatter}`);
+    // Auto-promote happens without a human gate, so it must clear the same durable secret check
+    // as durable_promote — a backstop on the full file content (title + metadata + body).
+    if (options.auto) assertNoSecretLikeDurableCandidate(body);
     await atomicWriteFile(targetPath, body, workspace.memoryDir);
 
     if (workspace.mode === 'existing-memory-root') {

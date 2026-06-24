@@ -1,8 +1,10 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { stripTypeScriptTypes } from 'node:module';
 
-const packageDir = path.resolve(new URL('..', import.meta.url).pathname);
+// fileURLToPath, not URL.pathname: on Windows .pathname yields '/C:/...' which path.resolve mangles.
+const packageDir = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const sourceDir = path.join(packageDir, 'src');
 const outputDir = path.join(packageDir, 'dist');
 

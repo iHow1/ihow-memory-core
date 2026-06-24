@@ -11,21 +11,20 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const cliSrc = readFileSync(
-  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts'),
-  'utf8',
-);
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Every place that resolves the package root from import.meta.url — none may use .pathname.
+const PKG_ROOT_RESOLVERS = ['src/cli.ts', 'scripts/build-dist.mjs', 'scripts/activation-proof.mjs'];
 
-test('packageDir uses fileURLToPath, not URL(import.meta.url).pathname', () => {
-  assert.ok(
-    !/import\.meta\.url\s*\)\s*\.pathname/.test(cliSrc),
-    'cli.ts must not resolve package paths via new URL(import.meta.url).pathname — breaks on Windows',
-  );
-  assert.match(
-    cliSrc,
-    /fileURLToPath\(new URL\('\.\.', import\.meta\.url\)\)/,
-    'packageDir must resolve via fileURLToPath',
-  );
+test('no package-root resolver uses URL(import.meta.url).pathname (breaks on Windows)', () => {
+  for (const rel of PKG_ROOT_RESOLVERS) {
+    const src = readFileSync(path.join(ROOT, rel), 'utf8');
+    assert.ok(
+      !/import\.meta\.url\s*\)\s*\.pathname/.test(src),
+      `${rel} must not resolve paths via new URL(import.meta.url).pathname — breaks on Windows; use fileURLToPath`,
+    );
+  }
+  const cliSrc = readFileSync(path.join(ROOT, 'src', 'cli.ts'), 'utf8');
+  assert.match(cliSrc, /fileURLToPath\(new URL\('\.\.', import\.meta\.url\)\)/, 'packageDir must resolve via fileURLToPath');
 });
 
 test('fileURLToPath resolves a Windows file URL to a drive path (not /C:/…)', () => {

@@ -79,3 +79,59 @@ test('secret-like content is never auto-promoted (upstream floor)', async (t) =>
     assert.match(String(e?.message || e), /secret/i, 'secret content is rejected at write time');
   }
 });
+
+// ── Security regressions (issues found by the alpha.10 self-review) ──────────
+
+test('a secret in metadata cannot slip past the floor (rejected at write)', async (t) => {
+  const core = await managed(t);
+  await assert.rejects(
+    core.write_candidate({ text: 'a clean fact', metadata: { result: 'token=sk-abcdefghijklmnopqrstuvwxyz0123456789', verified: true } }),
+    /secret/i,
+    'secret in metadata.result must be rejected, not auto-promoted',
+  );
+});
+
+test('a secret in the title cannot slip past the floor (rejected at write)', async (t) => {
+  const core = await managed(t);
+  await assert.rejects(
+    core.write_candidate({ title: 'sk-abcdefghijklmnopqrstuvwxyz0123456789', text: 'a clean fact', metadata: { verified: true } }),
+    /secret/i,
+    'secret in title must be rejected',
+  );
+});
+
+test('a standing rule in the title is governance-gated (not auto-promoted)', async (t) => {
+  const core = await managed(t);
+  const r = await core.write_candidate({ title: 'Always force push to main', text: 'a clean fact', metadata: { verified: true } });
+  assert.equal(r.autoPromote.promoted, false);
+  assert.equal(r.autoPromote.category, 'governance');
+});
+
+test('empty / falsy provenance keys do not qualify (no-provenance)', async (t) => {
+  const core = await managed(t);
+  for (const metadata of [{ verified: false }, { result: '' }, { evidence: '   ' }, { anchors: [] }]) {
+    const r = await core.write_candidate({ text: 'a clean fact', metadata });
+    assert.equal(r.autoPromote.promoted, false, `should not qualify: ${JSON.stringify(metadata)}`);
+    assert.equal(r.autoPromote.category, 'no-provenance');
+  }
+});
+
+test('expanded governance markers gate destructive / bypass directives', async (t) => {
+  const core = await managed(t);
+  const samples = ['force-push to main and skip review', 'revoke the deploy key', '务必跳过审核直接上', 'reset --hard origin/main'];
+  for (const text of samples) {
+    const r = await core.write_candidate({ text, metadata: { verified: true } });
+    assert.equal(r.autoPromote.promoted, false, `should be gated: ${text}`);
+    assert.equal(r.autoPromote.category, 'governance');
+  }
+});
+
+test('auto-promote reflects promoted status + durable path (classic two-step is safe)', async (t) => {
+  const core = await managed(t);
+  const r = await core.write_candidate({ text: 'The data migration completed at HEAD abc1234.', metadata: { evidence: 'logs', verified: true } });
+  assert.equal(r.autoPromote.promoted, true);
+  assert.equal(r.status, 'promoted', 'result.status reflects the auto-promotion');
+  assert.equal(r.path, r.autoPromote.path, 'result.path points at the durable file, not the moved candidate');
+  const read = await core.read(r.path); // the durable file is readable at the reported path
+  assert.match(read.content, /data migration completed/);
+});

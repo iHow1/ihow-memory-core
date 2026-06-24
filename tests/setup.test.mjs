@@ -92,14 +92,15 @@ test('setup --json emits clean parseable output (install prints suppressed)', as
   const { home, root, proj } = await dirs(t);
   const out = run(['setup', '--runtime', 'claude-code', '--json', '--root', root, '--space', 't', '--cwd', proj], home);
   const j = JSON.parse(out); // must parse — no leaked human lines from reused install functions
-  for (const k of ['ok', 'detected', 'connected', 'pending', 'skipped', 'skill', 'hook', 'doctor', 'nextSteps']) {
+  for (const k of ['ok', 'detected', 'connected', 'unverified', 'skipped', 'skill', 'hook', 'doctor', 'nextSteps']) {
     assert.ok(k in j, `json has key ${k}`);
   }
-  // verify-after-connect: with no claude CLI in this env, claude-code is written via a
-  // direct .claude.json and honestly reported pending-first-launch (the runtime hasn't
-  // loaded the server yet) — never falsely "connected" on write-success alone.
-  assert.deepEqual(j.connected, [], 'nothing is reported connected without a verified round-trip');
-  assert.deepEqual(j.pending.map((p) => p.runtime), ['claude-code'], 'claude-code is written-pending');
+  // verify-after-connect: claude-code is written via direct .claude.json (no claude CLI in this
+  // env); the configured server round-trips, so it's reported connected (verified-reachable) and
+  // nothing is left unverified — but never "connected" on write-success alone (a broken server
+  // would land in `unverified`).
+  assert.deepEqual(j.connected, ['claude-code'], 'connected the requested runtime (server round-trip verified)');
+  assert.deepEqual(j.unverified, [], 'no runtime left unverified');
   assert.equal(j.skill, 'installed');
   assert.equal(j.hook, 'installed');
   assert.equal(j.doctor.ok, true, 'doctor verified clean');

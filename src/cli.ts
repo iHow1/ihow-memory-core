@@ -6,7 +6,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openCore } from './core.ts';
 import { absoluteFromMemoryPath, defaultRoot, ensureWorkspace, isCuratedMemoryPath, resolveWorkspace } from './workspace.ts';
@@ -402,8 +402,10 @@ function connectViaHermesCli(
   }
   // Refresh the gateway so the add takes effect on the LIVE gateway. First-user incident:
   // `hermes mcp add` succeeded but `hermes mcp list` stayed empty until `hermes gateway start`
-  // reloaded a stale service definition. Best-effort — verify-after-connect catches the rest.
-  spawnSync('hermes', ['gateway', 'start'], SP);
+  // reloaded a stale service definition. Fire-and-forget (detached + unref) so a foreground
+  // `gateway start` can't block setup for the full timeout and then get killed; verify-after-
+  // connect catches whether it actually took effect.
+  try { spawn('hermes', ['gateway', 'start'], { detached: true, stdio: 'ignore' }).unref(); } catch { /* best-effort */ }
   return { ok: true, runtime: 'hermes', method: 'official-cli:hermes', target: '~/.hermes/config.yaml (hermes mcp add + gateway start)', replaced: exists };
 }
 
@@ -539,14 +541,23 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
   // CLI, unsupported platform) is downgraded to "skipped" so one bad runtime never aborts the sweep.
   const workspace = await ensureWorkspace(resolveWorkspace(options));
   await installRuntimeBundle(workspace);
+  const spec = mcpServerSpec(workspace);
   const connected: string[] = [];
+  const unverified: Array<{ runtime: string; detail: string }> = [];
   const skipped: Array<{ runtime: string; error: string }> = [];
   console.log(`\nconnecting ${present.length} runtime(s) to workspace ${workspace.space}...`);
   for (const d of present) {
     try {
       await connectRuntime(workspace, d.runtime, { dryRun: false });
-      connected.push(d.runtime);
-      console.log(`  ✓ ${d.runtime}`);
+      // Same verify-after-connect contract as setup: connected means reachable, not just written.
+      const v = await verifyConnection(spec, d.runtime);
+      if (v.reachable) {
+        connected.push(d.runtime);
+        console.log(`  ✓ ${d.runtime}  (verified)`);
+      } else {
+        unverified.push({ runtime: d.runtime, detail: v.detail });
+        console.log(`  ⚠ ${d.runtime}  config written but NOT reachable — ${v.detail}`);
+      }
     } catch (caught) {
       const error = caught instanceof Error ? caught.message : String(caught);
       skipped.push({ runtime: d.runtime, error });
@@ -554,8 +565,8 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
     }
   }
   if (connected.length) await telemetry.track('connect', { runtime: `auto:${connected.length}` });
-  if (options.json) printJson({ connected, skipped });
-  console.log(`\nconnected ${connected.length}, skipped ${skipped.length}. Restart each runtime to load the memory tools.`);
+  if (options.json) printJson({ connected, unverified, skipped });
+  console.log(`\nconnected ${connected.length}, unverified ${unverified.length}, skipped ${skipped.length}. Restart each runtime to load the memory tools.`);
 }
 
 // WorkBuddy resume wiring (the analog of Claude's skill/hook): WorkBuddy has no lifecycle hook, but it
@@ -720,7 +731,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   line(`2/4  connecting runtimes to workspace ${workspace.space}`);
   const spec = mcpServerSpec(workspace);
   const connected: string[] = [];
-  const pending: Array<{ runtime: string; detail: string }> = [];
+  const unverified: Array<{ runtime: string; detail: string }> = [];
   const skipped: Array<{ runtime: string; error: string }> = [];
   for (const d of present) {
     try {
@@ -734,9 +745,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
         connected.push(d.runtime);
         line(`       ✓ ${d.runtime}  ${r.replaced ? '(reconnected, verified)' : r.alreadyExists ? '(already connected, verified)' : 'MCP connected, verified'}`);
       } else {
-        pending.push({ runtime: d.runtime, detail: v.detail });
-        const hint = v.status === 'pending' ? 'launch the runtime once, then re-run: ihow-memory setup' : 're-run setup or check the runtime config';
-        line(`       ⚠ ${d.runtime}  config written, NOT verified — ${v.detail} (${hint})`);
+        unverified.push({ runtime: d.runtime, detail: v.detail });
+        line(`       ⚠ ${d.runtime}  config written but NOT reachable — ${v.detail} (check the runtime config, then re-run: ihow-memory setup)`);
       }
     } catch (caught) {
       const error = caught instanceof Error ? caught.message : String(caught);
@@ -839,7 +849,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     if (!json) await maybeAskTelemetry(); // the consent nudge is human-only — never pollute --json
   }
 
-  const allFailed = connected.length === 0 && pending.length === 0; // nothing verified AND nothing written-pending
+  const allFailed = connected.length === 0; // nothing reachable-verified (direct-write + server round-trip counts)
   const doctorRed = !!doctorResult && doctorResult.ok === false;
   const installFailed = skill === 'failed' || hook === 'failed' || workbuddyResume === 'failed'; // a helper no-op'd / threw despite being asked
   if (!dryRun && (allFailed || doctorRed || installFailed)) process.exitCode = 1;
@@ -853,7 +863,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
       workspace: workspace.space,
       detected: detectedNames,
       connected,
-      pending,
+      unverified,
       skipped,
       skill,
       hook,
@@ -884,7 +894,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   const memOnTools = [hasClaude ? 'Claude Code' : null, hasWorkbuddy && workbuddyResume !== 'failed' ? 'WorkBuddy' : null].filter(Boolean);
   const memOn = memOnTools.length ? ` · memory ON for ${memOnTools.join(' + ')}` : '';
   line(`✓ iHow Memory is set up.  ${connected.length} runtime${connected.length === 1 ? '' : 's'} connected (verified)${memOn}`);
-  if (pending.length) line(`  ⚠ ${pending.length} written but NOT verified: ${pending.map((p) => p.runtime).join(', ')} — launch each, then re-run: ihow-memory setup`);
+  if (unverified.length) line(`  ⚠ ${unverified.length} written but NOT reachable: ${unverified.map((p) => p.runtime).join(', ')} — check each runtime's config, then re-run: ihow-memory setup`);
   if (skipped.length) line(`  (${skipped.length} skipped: ${skipped.map((s) => s.runtime).join(', ')} — fix its CLI, then re-run; setup is idempotent)`);
   line('');
   line('  Next:');
@@ -1317,6 +1327,7 @@ async function runProof(options: WorkspaceOptions & { json?: boolean }): Promise
     title: 'agent-a-proof-memory',
     text: `Agent A proof memory marker ${marker}. Local-only citation and audit demo.`,
     sourceAgent: 'agent-a',
+    autoPromote: false, // this proof demonstrates the explicit write→promote two-step
     metadata: {
       proof: 'ToC-1B',
       cloud: false,
@@ -2210,7 +2221,7 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
       String(h.snippet ?? '')
         .replace(/[[\]]/g, '') // FTS highlight delimiters
         .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, '') // frontmatter UUIDs (candidate_id) — noise, not content
-        .replace(/\b(candidate_id|status|type|source_agent|created_at|promoted_at|day|weight|entryAt):\s*"?[^"\n]*"?/gi, '') // stray frontmatter key:value
+        .replace(/\b(candidate_id|status|type|source_agent|created_at|promoted_at|promoted_by|reviewed|tier|day|weight|entryAt):\s*"?[^"\n]*"?/gi, '') // stray frontmatter key:value (incl. auto-promote tags)
         .replace(/\s+/g, ' ')
         .trim(),
     ).slice(0, RECALL_SNIPPET_CAP);

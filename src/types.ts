@@ -102,7 +102,9 @@ export type AutoPromoteOutcome =
 export type WriteCandidateResult = {
   candidateId: string;
   path: string;
-  status: 'candidate';
+  // 'promoted' when the engine auto-promoted on write — `path` then points at the durable file,
+  // not the (now-moved) candidate. Callers doing a manual second promote must check this.
+  status: 'candidate' | 'promoted';
   autoPromote?: AutoPromoteOutcome;
 };
 

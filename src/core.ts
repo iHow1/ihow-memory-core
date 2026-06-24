@@ -90,6 +90,11 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
         }
       }
       await indexWithEngineFallback(workspace, engineConfig);
+      // When auto-promoted, the candidate file has been moved — reflect the durable state so a
+      // caller that does the classic write→promote(result.path) two-step doesn't hit ENOENT.
+      if (autoPromote?.promoted) {
+        return { ...result, status: 'promoted', path: autoPromote.path, autoPromote };
+      }
       return autoPromote ? { ...result, autoPromote } : result;
     },
     async journal(payload) {

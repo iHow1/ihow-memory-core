@@ -19,7 +19,7 @@ export function probeMcpServer(
   spec: { command: string; args: string[] },
   opts: { timeoutMs?: number } = {},
 ): Promise<ProbeResult> {
-  const timeoutMs = opts.timeoutMs ?? 6000;
+  const timeoutMs = opts.timeoutMs ?? 12000;
   return new Promise<ProbeResult>((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
@@ -69,6 +69,12 @@ export function probeMcpServer(
 // For runtimes with an official MCP CLI, confirm ihow-memory is actually registered.
 // 'n/a' = no CLI (config was written directly; verify on the runtime's first launch).
 export function verifyRuntimeRegistration(runtime: string): { registered: boolean | 'n/a'; detail: string } {
+  // On Windows the runtime CLIs are .cmd/.ps1 shims that Node's spawnSync can't exec by bare name
+  // (ENOENT) — and connectRuntime already direct-writes config there. So there is no CLI to confirm
+  // registration; treat as n/a and rely on the server round-trip instead of an ENOENT false-negative.
+  if (process.platform === 'win32') {
+    return { registered: 'n/a', detail: 'Windows: config written directly (no CLI registration check)' };
+  }
   const run = (cmd: string, args: string[]): string | null => {
     const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: 8000 });
     if (r.error || (typeof r.stdout !== 'string' && typeof r.stderr !== 'string')) return null;
@@ -112,10 +118,11 @@ export async function verifyConnection(
   }
   const reg = verifyRuntimeRegistration(runtime);
   if (reg.registered === false) {
+    // CLI explicitly says ihow-memory isn't registered — the real "written but not connected"
+    // false-positive (the first-user Hermes incident). This is a genuine failure to surface.
     return { status: 'written', reachable: false, detail: `server runs, but ${reg.detail}` };
   }
-  if (reg.registered === 'n/a') {
-    return { status: 'pending', reachable: false, detail: `server verified; ${reg.detail}` };
-  }
+  // registered === true OR 'n/a' (direct-write / Windows / no CLI): the server round-trips AND the
+  // config is written — the best verification possible at install time. Restart the runtime to load.
   return { status: 'reachable', reachable: true, detail: `${probe.detail}; ${reg.detail}` };
 }

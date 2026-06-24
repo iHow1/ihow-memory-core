@@ -2,8 +2,10 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const packageDir = path.resolve(new URL('..', import.meta.url).pathname);
+// fileURLToPath, not URL.pathname: on Windows .pathname yields '/C:/...' which path.resolve mangles.
+const packageDir = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const cli = path.join(packageDir, 'bin', 'ihow-memory.mjs');
 
 function assert(condition, message) {
