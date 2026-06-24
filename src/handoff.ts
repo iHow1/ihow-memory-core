@@ -717,6 +717,16 @@ function projectIdFor(p?: string): string {
   return crypto.createHash('sha256').update(path.resolve(p)).digest('hex').slice(0, 12);
 }
 
+// Pull a git SHA referenced near a HEAD/baseline marker out of a hand-written STATE doc — the verdict
+// baseline for the first-run handoff (C1). Anchored on a marker so a random hex blob (a uuid fragment,
+// a hash in prose) isn't mistaken for the project's HEAD.
+export function referencedHead(text: string): string | undefined {
+  // No \b around the marker: JS \b is ASCII-only, so a CJK marker like 基线 never gets a boundary.
+  // The SHA itself is ASCII hex, so \b bounds it fine.
+  const m = text.match(/(?:HEAD|baseline|基线|commit|@)[^\n]{0,40}?\b([0-9a-f]{7,40})\b/i);
+  return m ? m[1].slice(0, 7) : undefined;
+}
+
 // Narrative imperatives that must never be acted on blind — if the prior session text contains these,
 // even a matching-anchor resume is downgraded to YELLOW (verify intent before any destructive action).
 const DESTRUCTIVE_NARRATIVE = /\b(force[\s-]?push|git\s+push\b|reset\s+--hard|rm\s+-rf|drop\s+(?:table|database)|revoke|delete\s+the|deploy\s+to\s+prod)/i;

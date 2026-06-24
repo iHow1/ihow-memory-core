@@ -9,7 +9,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { computeContinueVerdict } from '../src/handoff.ts';
+import { computeContinueVerdict, referencedHead } from '../src/handoff.ts';
 import { gitAnchors } from '../src/anchors.ts';
 
 async function tmpRepo(t) {
@@ -58,4 +58,22 @@ test('YELLOW when anchors match but the narrative mentions a destructive action'
   const recorded = gitAnchors(dir);
   const v = computeContinueVerdict(recorded, dir, 'next step: force push to main and reset --hard');
   assert.equal(v.state, 'YELLOW', v.reason);
+});
+
+// ── C1: first-run handoff from a hand-written STATE doc ──────────────────────
+
+test('referencedHead extracts a SHA near a HEAD/baseline marker (not a random hex blob)', () => {
+  assert.equal(referencedHead('current baseline: HEAD d7fadb3 on main'), 'd7fadb3');
+  assert.equal(referencedHead('基线 8797eb7c9f0a, 下一步: ...'), '8797eb7');
+  assert.equal(referencedHead('no sha here at all'), undefined);
+  assert.equal(referencedHead('a uuid 1a2b3c4d-5e6f unrelated to git'), undefined);
+});
+
+test('C1: a STATE doc referencing the live HEAD yields a GREEN first-run verdict', async (t) => {
+  const { dir } = await tmpRepo(t);
+  const live = gitAnchors(dir);
+  const stateDoc = `# project state\nbaseline: HEAD ${live.head}\nnext: ship it`;
+  const recorded = { isRepo: true, head: referencedHead(stateDoc) };
+  const v = computeContinueVerdict(recorded, dir, stateDoc);
+  assert.equal(v.state, 'GREEN', v.reason);
 });

@@ -18,7 +18,7 @@ import { parseTranscript, summarizeTranscript } from './transcript.ts';
 import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
-import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, type ResumableSession } from './handoff.ts';
+import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, referencedHead, type ResumableSession } from './handoff.ts';
 import { verifyConnection } from './mcp/probe.ts';
 import { migrateLocalDay } from './migrate.ts';
 import type { WorkspaceOptions } from './types.ts';
@@ -2503,6 +2503,26 @@ async function main(): Promise<void> {
         }
       }
     }
+    // FIRST-RUN fallback (C1): no prior agent session, but the project has a hand-written STATE doc.
+    // Use it as the narrative + live git so even a brand-new user gets a verified handoff for their OWN
+    // project on the first `continue` — the onboarding "aha". A git SHA referenced near HEAD/baseline in
+    // the doc becomes the verdict baseline (live HEAD matches it → GREEN; drifted → RED).
+    let fromStateDoc: string | undefined;
+    if (!body) {
+      const projDir = projectDir ?? cwd;
+      for (const name of ['PROJECT_STATE.md', 'PROJECT_SUSPEND_MEMO.md', 'STATE.md', '.ihow/STATE.md', 'README.md']) {
+        try {
+          const raw = await fs.readFile(path.join(projDir, name), 'utf8');
+          if (!raw.trim()) continue;
+          body = redactSecretLikeContent(raw.slice(0, 4000));
+          projectDir = projDir;
+          fromStateDoc = name;
+          const rh = referencedHead(body);
+          if (rh) recordedAnchors = { isRepo: true, head: rh };
+          break;
+        } catch { /* not present — try the next candidate */ }
+      }
+    }
     // Anchors come from the INFERRED PROJECT (where the work landed on disk), not the session cwd —
     // this keeps the handoff project-aware when every session runs from one terminal dir. The FREE-TEXT
     // anchor fields are redacted like the narrative (a secret in a commit subject must not leak as a fact).
@@ -2543,7 +2563,9 @@ async function main(): Promise<void> {
         console.log(`${icon} ${verdict.state} — ${verdict.reason}\n`);
       }
       console.log(envelope);
-      if (!transcriptRef) {
+      if (!transcriptRef && fromStateDoc) {
+        console.log(`\n(handoff built from ${fromStateDoc} + live git — no prior agent session recorded yet. Work normally; future sessions leave their own handoff.)`);
+      } else if (!transcriptRef) {
         console.log(
           hint
             ? `\n(no recent session matching "${hint}" found. Try \`ihow-memory continue\` with no keyword, or a different one.)`
