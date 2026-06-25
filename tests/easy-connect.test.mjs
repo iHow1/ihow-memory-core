@@ -20,11 +20,13 @@ async function mkdtempReal(prefix) {
   return await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
 }
 
-// Minimal `claude` stub: `mcp get` -> not found (exit 1); everything else (add-json/remove) -> ok.
+// Minimal `claude` stub modeling a SUCCESSFUL registration: `mcp get` -> not found (exit 1, pre-add);
+// `mcp list` -> shows ihow-memory (so verify-after-connect's registration cross-check passes — this is
+// what a real claude reports after add-json); everything else (add-json/remove) -> ok.
 async function makeClaudeShim() {
   const bin = await mkdtempReal('ihow-bin-');
   const shim = path.join(bin, 'claude');
-  await fs.writeFile(shim, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 1; fi\nexit 0\n', 'utf8');
+  await fs.writeFile(shim, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory: connected"; exit 0; fi\nexit 0\n', 'utf8');
   await fs.chmod(shim, 0o755);
   return bin;
 }

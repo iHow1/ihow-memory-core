@@ -2371,8 +2371,14 @@ async function main(): Promise<void> {
     const workspace = await ensureWorkspace(resolveWorkspace(options));
     if (!options.dryRun) await installRuntimeBundle(workspace); // dry-run: don't materialize the bundle
     const result = await connectRuntime(workspace, options.runtime, { dryRun: options.dryRun });
-    if (options.json) printJson(result);
-    else {
+    // Verify-after-connect on the single-runtime path too — README's "1. Connect a single runtime" points
+    // here, so a bare "✓ connected" on write-success alone is the false-green this product exists to kill
+    // (go/no-go #1). Round-trip the configured server (and, for CLI runtimes, confirm registration) and
+    // report honestly: verified / reachable-pending / not-reachable. Same contract as setup + connect --auto.
+    const verification = result.dryRun ? null : await verifyConnection(mcpServerSpec(workspace), options.runtime);
+    if (options.json) {
+      printJson(verification ? { ...result, reachable: verification.reachable, verified: verification.verified, detail: verification.detail } : result);
+    } else {
       console.log('cloud: disabled / local only');
       if (result.dryRun) {
         const where = result.method === 'direct-json'
@@ -2380,12 +2386,16 @@ async function main(): Promise<void> {
           : `${result.method} (already present: ${result.alreadyExists})`;
         console.log(`[dry-run] would register mcpServers.ihow-memory via ${where}`);
       } else {
-        console.log(`✓ connected ${runtimeLabel(options.runtime)} → iHow Memory`);
+        const v = verification!;
+        if (v.verified) console.log(`✓ connected ${runtimeLabel(options.runtime)} → iHow Memory (verified)`);
+        else if (v.reachable) console.log(`✓ ${runtimeLabel(options.runtime)} → iHow Memory — config written + server reachable; verify on first launch`);
+        else console.log(`⚠ ${runtimeLabel(options.runtime)} → iHow Memory: config written but NOT reachable — ${v.detail}`);
         console.log(`method: ${result.method}`);
         if (result.target) console.log(`target: ${result.target}`);
         if (result.backup) console.log(`backup: ${result.backup}`);
         if (result.replaced) console.log('(replaced an existing ihow-memory entry)');
         console.log(`Restart ${runtimeLabel(options.runtime)} to load the memory tools.`);
+        if (!v.reachable) process.exitCode = 1;
         if (options.runtime === 'claude-code') {
           await maybeInstallClaudeSkill(options);
           await maybeInstallStopHook(options);
