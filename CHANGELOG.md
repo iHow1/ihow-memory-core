@@ -63,6 +63,25 @@ engine enforcing the check rather than asking an agent (or a reader) to trust a 
 - **Windows CI exercises the round-trip**, and the README's Windows wording is consistent (native Windows
   is experimental; WSL is the supported path) instead of also claiming "not yet a supported lane".
 
+### Hardened (post pre-launch re-audit)
+
+An adversarial re-audit of the above closures found four residual holes — three of them introduced by the
+fixes themselves — all now closed with regression tests:
+
+- **`continue`: a blank cwd is no longer a GREEN bypass.** The receiver-context gate was guarded on the
+  truthiness of `cwd`, so an MCP client sending `{"cwd":""}` skipped it straight to a confident GREEN (more
+  dangerous than omitting cwd, which correctly fell back). The gate now triggers on any *provided* cwd and
+  treats a blank one as unverifiable (YELLOW); the MCP server normalizes a blank cwd to the launch dir.
+- **`rollback` is idempotent.** Replaying a stale auto-promote rollback id — after its candidate had been
+  re-promoted by a human at the same target — blind-deleted the now human-confirmed file, silently reversing
+  a deliberate promotion. Rolling the same event back twice is now refused (`rollback_already_rolled_back`).
+- **Recall's unreviewed-exclusion is case- and quote-tolerant.** The filter matched only the engine's exact
+  `reviewed: false` / `tier: "auto-promoted"`; in a shared multi-agent vault an entry serialized as
+  `reviewed: "false"` / `Reviewed: False` / `tier: 'auto-promoted'` slipped back in. Now recognized.
+- **`connect` exits non-zero when unreachable, including `--json` and `--auto`.** The exit-code contract
+  only held on the text path; `--json` and `--auto --write` returned 0 even when nothing reached — exactly
+  the scripted callers the `--json` fields are for.
+
 ## [0.1.0-alpha.11] — 2026-06-25
 
 ### Fixed

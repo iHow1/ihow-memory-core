@@ -110,6 +110,17 @@ test('GREEN preserved when the caller cwd IS the recorded project', async (t) =>
   assert.equal(v.state, 'GREEN', v.reason);
 });
 
+test('a BLANK cwd is not a falsy-bypass — "" cannot skip the gate into a confident GREEN', async (t) => {
+  const { dir } = await tmpRepo(t);
+  const recorded = gitAnchors(dir);
+  // An empty-string cwd ("I don't know where I am") used to be falsy and skip the receiver-context gate,
+  // letting an MCP client send {"cwd":""} and get a confident GREEN for a project they're not in.
+  assert.equal(computeContinueVerdict(recorded, dir, 'clean', { cwd: '' }).state, 'YELLOW', 'blank cwd → YELLOW');
+  assert.equal(computeContinueVerdict(recorded, dir, 'clean', { cwd: '   ' }).state, 'YELLOW', 'whitespace cwd → YELLOW');
+  // Omitting cwd entirely keeps the back-compat path (direct callers / tests) able to reach GREEN.
+  assert.equal(computeContinueVerdict(recorded, dir, 'clean').state, 'GREEN', 'omitted cwd stays GREEN-able');
+});
+
 test('YELLOW when matching anchors but the narrative asks for an outward-facing / irreversible action', async (t) => {
   const { dir } = await tmpRepo(t);
   const recorded = gitAnchors(dir);

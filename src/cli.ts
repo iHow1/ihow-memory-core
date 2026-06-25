@@ -568,6 +568,9 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
     }
   }
   if (connected.length) await telemetry.track('connect', { runtime: `auto:${connected.length}` });
+  // Non-zero exit when something we tried to connect isn't reachable (a written-but-unreachable runtime),
+  // or when nothing reached at all — so a script can't read a green exit over a failed auto-connect.
+  if (unverified.length > 0 || (present.length > 0 && connected.length === 0)) process.exitCode = 1;
   if (options.json) printJson({ connected, unverified, skipped });
   const verifiedN = connected.filter((c) => c.verified).length;
   console.log(`\nconnected ${connected.length} (${verifiedN} verified, ${connected.length - verifiedN} pending first-launch), unverified ${unverified.length}, skipped ${skipped.length}. Restart each runtime to load the memory tools.`);
@@ -2200,7 +2203,10 @@ function isUnreviewedAutoPromoted(workspace: Awaited<ReturnType<typeof openCore>
     const head = readFileSync(absoluteFromMemoryPath(workspace, relPath), 'utf8').slice(0, 1024);
     const fm = head.match(/^---\n([\s\S]*?)\n---/);
     const front = fm ? fm[1] : head;
-    return /^\s*reviewed:\s*false\b/m.test(front) || /^\s*tier:\s*"?auto-promoted"?/m.test(front);
+    // Case-insensitive + quote-tolerant: a shared multi-agent vault means an entry can be written by
+    // ANY runtime / by hand, so `reviewed: "false"` / `Reviewed: False` / `tier: 'auto-promoted'` must
+    // all be recognized as unreviewed — not just the engine's exact `reviewed: false` / `tier: "auto-promoted"`.
+    return /^\s*reviewed:\s*["']?false\b/im.test(front) || /^\s*tier:\s*["']?auto-promoted\b/im.test(front);
   } catch {
     return false; // unreadable -> don't over-exclude; the redaction / secret gates still apply downstream
   }
@@ -2402,6 +2408,9 @@ async function main(): Promise<void> {
     // (go/no-go #1). Round-trip the configured server (and, for CLI runtimes, confirm registration) and
     // report honestly: verified / reachable-pending / not-reachable. Same contract as setup + connect --auto.
     const verification = result.dryRun ? null : await verifyConnection(mcpServerSpec(workspace), options.runtime);
+    // Non-zero exit when the configured server isn't reachable — the same contract the text path honors,
+    // and what CHANGELOG promises to --json callers (who are exactly the scripts that check exit codes).
+    if (verification && !verification.reachable) process.exitCode = 1;
     if (options.json) {
       printJson(verification ? { ...result, reachable: verification.reachable, verified: verification.verified, detail: verification.detail } : result);
     } else {

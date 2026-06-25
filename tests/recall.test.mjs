@@ -66,6 +66,32 @@ test('recall: NEVER injects an unreviewed auto-promoted entry (machine-judged, n
   assert.ok(!/auto-kappa/.test(ctx), 'the auto-promoted file path is not injected either');
 });
 
+test('recall: variant YAML for unreviewed auto-promoted is STILL excluded (case/quote-tolerant)', async (t) => {
+  const root = await mkdtempReal('ihow-recall-var-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  // a HUMAN-reviewed promoted decision — must still be recalled
+  const cand = JSON.parse(cli(['write-candidate', 'Decision: adopt omegaframework for billing, approved by the team.'], root, space)).path;
+  cli(['promote', cand, '--scope', 'team', '--title', 'omegaframework decision'], root, space);
+  // unreviewed auto-promoted entries written with NON-standard YAML (a different runtime or a human editor
+  // could serialize them this way) — all must be excluded, not just the engine's exact form.
+  const dir = path.join(root, space, 'memory', 'scopes', 'general');
+  await fs.mkdir(dir, { recursive: true });
+  const variants = { 'v0.md': 'reviewed: "false"', 'v1.md': 'Reviewed: False', 'v2.md': "tier: 'auto-promoted'", 'v3.md': 'Tier: Auto-Promoted' };
+  let i = 0;
+  for (const [name, line] of Object.entries(variants)) {
+    await fs.writeFile(path.join(dir, name), ['---', `candidate_id: "v${i}"`, 'status: "promoted"', 'type: "memory"', line, '---', '', `omegaframework migration step machine-note-${i} completed.`, ''].join('\n'), 'utf8');
+    i++;
+  }
+  cli(['reindex'], root, space);
+
+  const out = recall('what did we decide about the omegaframework billing migration', root, space);
+  assert.equal(out.status, 0);
+  const ctx = out.stdout.trim() ? JSON.parse(out.stdout).hookSpecificOutput.additionalContext : '';
+  assert.match(ctx, /omegaframework/, 'the human-reviewed decision IS recalled');
+  assert.ok(!/machine-note/i.test(ctx), 'no variant-YAML unreviewed auto-promoted entry is injected');
+});
+
 test('recall: injects ONLY curated memory, never the low-weight journal/floor lane', async (t) => {
   const root = await mkdtempReal('ihow-recall-');
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });

@@ -353,8 +353,16 @@ function removeJournalEntry(content: string, entryAt: string): { content: string
 //    candidate already archived to history. Human-CONFIRMED promotions are intentional and stay out of
 //    scope (refused). Always emits a memory.rolledback audit event.
 export async function rollbackEvent(workspace: Workspace, eventId: string): Promise<RollbackResult> {
-  const target = (await readEvents(workspace)).find((event) => event.id === eventId);
+  const events = await readEvents(workspace);
+  const target = events.find((event) => event.id === eventId);
   if (!target) throw new Error('rollback_event_not_found');
+  // Replay guard: the event log is append-only, so a rolled-back event's id lives forever. Rolling the
+  // SAME id back twice must be refused — otherwise replaying a stale auto-promote rollback id (after its
+  // candidate was re-promoted by a human at the same target) would blind-delete the now human-confirmed
+  // durable file, silently reversing a deliberate promotion. Idempotent at the engine, not the caller.
+  if (events.some((e) => e.type === 'memory.rolledback' && e.metadata?.rolledBackEventId === eventId)) {
+    throw new Error('rollback_already_rolled_back');
+  }
   if (target.type === 'memory.journal.appended') return rollbackJournalAppend(workspace, target, eventId);
   if (target.type === 'memory.promoted') return rollbackAutoPromote(workspace, target, eventId);
   throw new Error('rollback_unsupported_event_type');

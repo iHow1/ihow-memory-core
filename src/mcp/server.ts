@@ -162,7 +162,7 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object',
       properties: {
-        cwd: { type: 'string', description: 'your current working dir (informational; discovery is global across recorded projects)' },
+        cwd: { type: 'string', description: 'your current working directory — used to verify you are standing in the checkout being resumed (a candidate only earns GREEN when your cwd is the same git repo as its recorded project). Discovery of candidates is global; this cwd gates the per-candidate verdict.' },
         projectHint: { type: 'string', description: 'optional keyword to filter candidates to a project' },
         limit: { type: 'number', description: 'max candidate projects to return (default 5)' },
         excludeSessionId: { type: 'string', description: 'your own session id, to avoid listing the live session as a candidate' },
@@ -223,7 +223,9 @@ async function main(): Promise<void> {
           payload = await core.status();
         } else if (name === 'memory.continue') {
           payload = await buildHandoffPacket({
-            cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
+            // Normalize a blank/whitespace cwd to the launch dir — never pass "" through, or the
+            // receiver-context gate (which proves you're in the recorded checkout) is bypassed to GREEN.
+            cwd: typeof args.cwd === 'string' && args.cwd.trim() ? args.cwd : process.cwd(),
             projectHint: typeof args.projectHint === 'string' ? args.projectHint : undefined,
             limit: Number.isFinite(args.limit as number) ? Number(args.limit) : undefined,
             excludeSessionId: typeof args.excludeSessionId === 'string' ? args.excludeSessionId : undefined,

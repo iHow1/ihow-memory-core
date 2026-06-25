@@ -769,9 +769,13 @@ export function computeContinueVerdict(
   // DIFFERENT git repo (or to no repo at all), we cannot vouch this is the same checkout, so we never hand
   // back a confident GREEN — a receiver that trusts the verdict could act in the wrong working tree. The
   // anchor match against projectDir may still hold, hence YELLOW (verify you're in the right place), not RED.
-  if (opts.cwd && live.isRepo) {
+  // NOTE: gate on `opts.cwd !== undefined`, NOT on truthiness — an explicitly-provided but BLANK cwd
+  // ("") is "I don't know where I am", which must NOT earn GREEN. (A falsy `&& opts.cwd` check let an
+  // MCP client send {"cwd":""} and skip the gate straight to a confident GREEN.) An omitted cwd
+  // (undefined) keeps the back-compat path for direct callers/tests that don't use the receiver gate.
+  if (opts.cwd !== undefined && live.isRepo) {
     const projRoot = repoRoot(projectDir);
-    const cwdRoot = repoRoot(opts.cwd);
+    const cwdRoot = opts.cwd.trim() ? repoRoot(opts.cwd) : null; // blank cwd → unverifiable → mismatch
     if (projRoot && cwdRoot !== projRoot) {
       return {
         state: 'YELLOW',

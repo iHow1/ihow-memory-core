@@ -106,6 +106,30 @@ test('rollback undoes an AUTO-promoted durable memory and logs it (go/no-go #6)'
   assert.ok((await core.audit()).some((e) => e.type === 'memory.rolledback' && e.metadata?.auto === true), 'auto rollback is logged');
 });
 
+test('rollback is idempotent: replaying a stale auto id cannot delete a later human-confirmed promote', async (t) => {
+  const core = await managed(t);
+  const w = await core.write_candidate({ title: 'replay-fact', text: 'a verified fact used for the replay test', sourceAgent: 't', metadata: { command: 'npm test', exitCode: 0 } });
+  assert.equal(w.autoPromote?.promoted, true);
+  const autoId = w.autoPromote.eventId;
+  const promotedEv = (await core.audit()).find((e) => e.id === autoId);
+  const candidatePath = promotedEv.candidatePath; // the candidate that will be restored to the inbox
+
+  // 1) roll the auto-promote back → the candidate returns to the inbox for review
+  assert.equal((await core.rollback(autoId)).removed, true);
+
+  // 2) a human deliberately re-promotes the restored candidate (same slug/target), NOT auto
+  await core.promote(candidatePath);
+  const humanEv = (await core.audit()).find((e) => e.type === 'memory.promoted' && !e.metadata?.auto);
+  assert.ok(humanEv, 'a human (non-auto) promote event exists');
+  const humanAbs = path.join(core.workspace.memoryDir, humanEv.metadata.targetMemoryPath);
+  assert.equal(await exists(humanAbs), true, 'the human-confirmed durable file exists');
+
+  // 3) replaying the STALE auto id (still in the append-only log) must be REFUSED — it must not
+  //    blind-delete the now human-confirmed file at the same target (silently reversing a deliberate promote)
+  await assert.rejects(core.rollback(autoId), /rollback_already_rolled_back/);
+  assert.equal(await exists(humanAbs), true, 'the deliberate human promote survives the replayed rollback');
+});
+
 test('rollback REFUSES a human-confirmed promotion (governance moat preserved)', async (t) => {
   const core = await managed(t);
   const c = await core.write_candidate({ title: 'manual-fact', text: 'a fact promoted by a human on purpose', sourceAgent: 't', autoPromote: false });
