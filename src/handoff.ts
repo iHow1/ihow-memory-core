@@ -721,9 +721,11 @@ function projectIdFor(p?: string): string {
 // baseline for the first-run handoff (C1). Anchored on a marker so a random hex blob (a uuid fragment,
 // a hash in prose) isn't mistaken for the project's HEAD.
 export function referencedHead(text: string): string | undefined {
-  // No \b around the marker: JS \b is ASCII-only, so a CJK marker like 基线 never gets a boundary.
-  // The SHA itself is ASCII hex, so \b bounds it fine.
-  const m = text.match(/(?:HEAD|baseline|基线|commit|@)[^\n]{0,40}?\b([0-9a-f]{7,40})\b/i);
+  // ASCII markers get \b (so HEAD doesn't match inside "ahead"/"forehead", commit inside "precommit");
+  // the CJK 基线 can't take a \b (JS \b is ASCII-only) but is distinctive on its own. The negative
+  // lookbehind keeps us off a sha256:/longer-hex tail (a docker digest is not a git commit). No bare
+  // `@` — it matched emails / npm versions / digests and fabricated bogus baselines.
+  const m = text.match(/(?:\bHEAD\b|\bbaseline\b|基线|\bcommit\b|\brev\b)[^\n]{0,24}?(?<![0-9a-f:])([0-9a-f]{7,40})\b/i);
   return m ? m[1].slice(0, 7) : undefined;
 }
 
@@ -734,7 +736,19 @@ const DESTRUCTIVE_NARRATIVE = /\b(force[\s-]?push|git\s+push\b|reset\s+--hard|rm
 // Compute the resume verdict by re-reading the project's LIVE git state and comparing it to the anchors
 // recorded when the session was captured. GREEN is narrow on purpose; on a different machine/checkout the
 // recorded path won't match and we degrade to RED/YELLOW rather than a false GREEN.
-export function computeContinueVerdict(recorded: GitAnchors, projectDir: string | undefined, narrative: string): ContinueVerdict {
+export function computeContinueVerdict(
+  recorded: GitAnchors,
+  projectDir: string | undefined,
+  narrative: string,
+  opts: { inferred?: boolean } = {},
+): ContinueVerdict {
+  // `inferred` = the baseline was guessed from a STATE doc (C1), not captured from a real session.
+  // A doc-grepped hash is NOT a recorded snapshot, so it can never earn a confident GREEN or a hard
+  // RED — cap it at YELLOW so the verdict's trust isn't architected away.
+  const cap = (v: ContinueVerdict): ContinueVerdict =>
+    opts.inferred && v.state !== 'YELLOW'
+      ? { ...v, state: 'YELLOW', reason: `baseline inferred from a STATE doc, not a recorded session — ${v.reason}` }
+      : v;
   if (!projectDir) {
     return { state: 'YELLOW', reason: 'project undetermined (no files edited) — confirm which project this resumes before acting' };
   }
@@ -743,12 +757,15 @@ export function computeContinueVerdict(recorded: GitAnchors, projectDir: string 
     return { state: 'YELLOW', reason: 'no git anchors to verify against — read the project state live before relying on the narrative' };
   }
   if (recorded.isRepo && !live.isRepo) {
-    return { state: 'RED', reason: `recorded a git project, but ${projectDir} is not a git repo here (wrong checkout / moved / different machine) — do not assume the prior state` };
+    return cap({ state: 'RED', reason: `recorded a git project, but ${projectDir} is not a git repo here (wrong checkout / moved / different machine) — do not assume the prior state` });
   }
   const rHead = recorded.head;
   const lHead = live.head;
-  if (rHead && lHead && rHead !== lHead) {
-    return { state: 'RED', reason: `HEAD drifted: recorded ${rHead}, now ${lHead} — someone committed since; read the diff before continuing`, recordedHead: rHead, liveHead: lHead };
+  // Prefix-aware: git short-hashes can differ in length (git lengthens them in big repos to disambiguate),
+  // so compare by common prefix, not ===, or the SAME commit reads as drift.
+  const headMatch = !!rHead && !!lHead && (rHead.startsWith(lHead) || lHead.startsWith(rHead));
+  if (rHead && lHead && !headMatch) {
+    return cap({ state: 'RED', reason: `HEAD drifted: recorded ${rHead}, now ${lHead} — someone committed since; read the diff before continuing`, recordedHead: rHead, liveHead: lHead });
   }
   if (!rHead || !lHead) {
     return { state: 'YELLOW', reason: 'could not read HEAD on both sides — verify the project state live', recordedHead: rHead, liveHead: lHead };
@@ -760,7 +777,7 @@ export function computeContinueVerdict(recorded: GitAnchors, projectDir: string 
     return { state: 'YELLOW', reason: `anchors match (HEAD ${lHead}), but the prior narrative mentions a push/force/delete — verify intent before any destructive action`, recordedHead: rHead, liveHead: lHead };
   }
   const dirty = live.dirtyCount ? ` · ${live.dirtyCount} uncommitted change(s)` : '';
-  return { state: 'GREEN', reason: `anchors match: HEAD ${lHead}${live.branch ? ` on ${live.branch}` : ''}${dirty} — safe to pick up (the narrative itself is still an unverified claim)`, recordedHead: rHead, liveHead: lHead };
+  return cap({ state: 'GREEN', reason: `anchors match: HEAD ${lHead}${live.branch ? ` on ${live.branch}` : ''}${dirty} — safe to pick up (the narrative itself is still an unverified claim)`, recordedHead: rHead, liveHead: lHead });
 }
 
 // Assemble the cross-runtime handoff packet: candidate resumable projects, each with machine anchors

@@ -62,18 +62,31 @@ test('YELLOW when anchors match but the narrative mentions a destructive action'
 
 // ── C1: first-run handoff from a hand-written STATE doc ──────────────────────
 
-test('referencedHead extracts a SHA near a HEAD/baseline marker (not a random hex blob)', () => {
+test('referencedHead extracts a SHA near a git marker, not from emails / digests / ahead-words', () => {
   assert.equal(referencedHead('current baseline: HEAD d7fadb3 on main'), 'd7fadb3');
   assert.equal(referencedHead('基线 8797eb7c9f0a, 下一步: ...'), '8797eb7');
+  assert.equal(referencedHead('commit abc1234 fixed it'), 'abc1234');
   assert.equal(referencedHead('no sha here at all'), undefined);
-  assert.equal(referencedHead('a uuid 1a2b3c4d-5e6f unrelated to git'), undefined);
+  // NOT a git baseline — these used to fabricate bogus anchors:
+  assert.equal(referencedHead('email support@deadbeef0 thanks'), undefined, 'bare @ removed');
+  assert.equal(referencedHead('pull image@sha256:abc1234def5 now'), undefined, 'docker digest excluded');
+  assert.equal(referencedHead('look ahead to deadbee1 plans'), undefined, 'HEAD inside "ahead" needs \\b');
+  assert.equal(referencedHead('a uuid 1a2b3c4d-5e6f unrelated'), undefined);
 });
 
-test('C1: a STATE doc referencing the live HEAD yields a GREEN first-run verdict', async (t) => {
+test('C1: an inferred (STATE-doc) baseline is capped at YELLOW, never a confident GREEN', async (t) => {
   const { dir } = await tmpRepo(t);
   const live = gitAnchors(dir);
   const stateDoc = `# project state\nbaseline: HEAD ${live.head}\nnext: ship it`;
   const recorded = { isRepo: true, head: referencedHead(stateDoc) };
-  const v = computeContinueVerdict(recorded, dir, stateDoc);
+  assert.equal(computeContinueVerdict(recorded, dir, stateDoc).state, 'GREEN', 'a real matching baseline is GREEN by default');
+  assert.equal(computeContinueVerdict(recorded, dir, stateDoc, { inferred: true }).state, 'YELLOW', 'a doc-inferred baseline is never a confident GREEN');
+});
+
+test('HEAD comparison is prefix-aware (a shorter recorded SHA still matches the same commit)', async (t) => {
+  const { dir } = await tmpRepo(t);
+  const live = gitAnchors(dir);
+  const recorded = { isRepo: true, head: live.head.slice(0, 6), branch: live.branch };
+  const v = computeContinueVerdict(recorded, dir, 'clean'); // 6-char prefix of live head → match, not drift
   assert.equal(v.state, 'GREEN', v.reason);
 });
