@@ -97,7 +97,7 @@ export type WriteCandidatePayload = {
 // Outcome of the engine's auto-promote evaluation, attached to write_candidate.
 export type AutoPromoteOutcome =
   | { promoted: true; path: string; eventId: string; tier: 'auto-promoted' }
-  | { promoted: false; reason: string; category: 'secret' | 'governance' | 'no-provenance' };
+  | { promoted: false; reason: string; category: 'secret' | 'governance' | 'no-provenance' | 'conflict' };
 
 export type WriteCandidateResult = {
   candidateId: string;

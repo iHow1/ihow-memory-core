@@ -76,8 +76,11 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
       // "remember this" one call (agents no longer have to remember a second promote
       // step), while the floor — not the agent — guards what reaches durable memory.
       let autoPromote: WriteCandidateResult['autoPromote'];
-      if (payload.autoPromote !== false) {
-        const verdict = evaluateAutoPromote(payload);
+      // Global kill switch: IHOW_AUTO_PROMOTE=0 forces every write to stay a candidate (full human gate),
+      // for deployments that want zero machine-judged durable writes. The engine floor (engine-verified
+      // provenance, not agent self-judgment) gates the rest.
+      if (payload.autoPromote !== false && process.env.IHOW_AUTO_PROMOTE !== '0') {
+        const verdict = evaluateAutoPromote(payload, { cwd: process.cwd() });
         if (verdict.allow) {
           const promoted = await promoteCandidate(workspace, result.path, {}, {
             actor: 'agent-auto',

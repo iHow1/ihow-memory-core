@@ -14,6 +14,7 @@ import type {
   WriteCandidatePayload,
   WriteCandidateResult,
 } from './types.ts';
+import { gitAnchors } from './anchors.ts';
 import { absoluteFromMemoryPath, isMcpSandboxPath, relativeToMemory, relativeToSpace } from './workspace.ts';
 import { appendEvent, readEvents, type MemoryEvent } from './store/events.ts';
 import { atomicWriteFile, nowCompact, readMemoryFile, safeFileSlug } from './store/files.ts';
@@ -453,7 +454,7 @@ export async function writeCandidate(
 // the engine enforces this floor.) Enforced, not prompt-level.
 export type AutoPromoteVerdict =
   | { allow: true }
-  | { allow: false; reason: string; category: 'secret' | 'governance' | 'no-provenance' };
+  | { allow: false; reason: string; category: 'secret' | 'governance' | 'no-provenance' | 'conflict' };
 
 export type PromoteOptions = {
   actor?: string;
@@ -494,25 +495,74 @@ function fullScanText(payload: WriteCandidatePayload): string {
   return parts.join('\n');
 }
 
-// The agent must attach MEANINGFUL provenance to qualify for the auto lane — evidence/anchors
-// that make the claim verifiable, not just a present-but-empty key (verified:false, result:'').
-function hasProvenance(payload: WriteCandidatePayload): boolean {
-  const m = payload.metadata;
-  if (!m || typeof m !== 'object') return false;
-  const meaningful = (v: unknown): boolean => {
-    if (v == null) return false;
-    if (typeof v === 'string') return v.trim().length > 0;
-    if (typeof v === 'boolean') return v === true; // verified:false is not provenance
-    if (typeof v === 'number') return Number.isFinite(v); // exitCode:0 is meaningful (success)
-    if (Array.isArray(v)) return v.length > 0;
-    if (typeof v === 'object') return Object.keys(v as object).length > 0;
-    return false;
-  };
-  const keys = ['evidence', 'anchors', 'git', 'repo', 'verified', 'provenance', 'command', 'artifact', 'exitCode', 'result'];
-  return keys.some((k) => k in m && meaningful((m as Record<string, unknown>)[k]));
+// A git SHA shape: hex, short-hash (7) to full (40). Tighter than "any hex" so a uuid fragment / digest
+// tail isn't mistaken for a commit.
+const GIT_SHA = /\b[0-9a-f]{7,40}\b/i;
+
+// Pull a claimed HEAD sha out of metadata — metadata.head, or a HEAD-ish entry in metadata.anchors
+// (e.g. "HEAD=abc1234" or a bare sha). Returns the normalized sha or undefined.
+function claimedHead(m: Record<string, unknown>): string | undefined {
+  if (typeof m.head === 'string') { const mm = m.head.match(GIT_SHA); if (mm) return mm[0].toLowerCase(); }
+  const anchors = m.anchors;
+  const arr = Array.isArray(anchors) ? anchors : typeof anchors === 'string' ? [anchors] : [];
+  for (const a of arr) {
+    if (typeof a === 'string') { const mm = a.match(GIT_SHA); if (mm) return mm[0].toLowerCase(); }
+  }
+  return undefined;
 }
 
-export function evaluateAutoPromote(payload: WriteCandidatePayload): AutoPromoteVerdict {
+// Which repo dir an anchor claims to describe. An EXPLICIT absolute path (repoPath/projectDir/repoDir, or
+// an absolute metadata.repo) is authoritative — a mismatch there is a fabricated/stale anchor we reject.
+// The caller cwd is a best-effort fallback only (a mismatch there just fails to qualify, never hard-rejects,
+// since we can't be sure the agent meant cwd). A bare label like repo:"anything" is NOT a path → ignored.
+function claimedRepoDir(m: Record<string, unknown>, cwd?: string): { dir: string; explicit: boolean } | undefined {
+  for (const k of ['repoPath', 'projectDir', 'repoDir', 'repo']) {
+    const v = m[k];
+    if (typeof v === 'string' && path.isAbsolute(v)) return { dir: v, explicit: true };
+  }
+  if (cwd) return { dir: cwd, explicit: false };
+  return undefined;
+}
+
+// ENGINE-VERIFIED provenance — the gate that keeps auto-promote off agent self-judgment (OpenClaw: the
+// engine, not the agent, decides; "verified:true" is the agent grading its own homework). A present-but-
+// self-asserted key (verified:true, evidence:"I ran it", a lone exitCode) NO LONGER qualifies. Two
+// structured, falsifiable forms do:
+//   (1) command + exitCode together — "ran <command>, got exit <code>": machine-shaped evidence.
+//   (2) a git anchor the engine CHECKS against live git — a claimed HEAD that matches a resolvable repo's
+//       live HEAD. A HEAD that is claimed for an EXPLICIT repo path but does not match is rejected
+//       outright (a fabricated/stale anchor — exactly the "looks-low-risk" poisoning OpenClaw flagged).
+// Returns ok:true to qualify, or ok:false with a `conflict` category to reject outright.
+function verifyProvenance(payload: WriteCandidatePayload, cwd?: string): { ok: boolean; reason?: string; conflict?: boolean } {
+  const m = payload.metadata;
+  if (!m || typeof m !== 'object') return { ok: false };
+  const meta = m as Record<string, unknown>;
+
+  // (1) structured command-execution evidence: a real command string AND a finite exit code.
+  const command = typeof meta.command === 'string' ? meta.command.trim() : '';
+  const hasExit = typeof meta.exitCode === 'number' && Number.isFinite(meta.exitCode as number);
+  if (command.length > 0 && hasExit) return { ok: true };
+
+  // (2) a git anchor the engine verifies against live git.
+  const head = claimedHead(meta);
+  if (head) {
+    const resolved = claimedRepoDir(meta, cwd);
+    if (resolved) {
+      const live = gitAnchors(resolved.dir);
+      if (live.isRepo && live.head) {
+        const lHead = live.head.toLowerCase();
+        if (lHead.startsWith(head) || head.startsWith(lHead)) return { ok: true };
+        if (resolved.explicit) {
+          return { ok: false, conflict: true, reason: `claimed git anchor ${head} does not match the live HEAD ${live.head} in ${resolved.dir} — refusing to auto-promote a fabricated or stale anchor` };
+        }
+      }
+    }
+    // A sha-shaped anchor with no resolvable/matching repo can't be engine-verified → does not qualify.
+  }
+  return { ok: false };
+}
+
+export function evaluateAutoPromote(payload: WriteCandidatePayload, opts: { cwd?: string } = {}): AutoPromoteVerdict {
   const scan = fullScanText(payload); // title + body + metadata — everything that gets stored
   if (containsSecretLikeContent(scan)) {
     return { allow: false, reason: 'contains secret-like content (text/title/metadata)', category: 'secret' };
@@ -524,10 +574,14 @@ export function evaluateAutoPromote(payload: WriteCandidatePayload): AutoPromote
       category: 'governance',
     };
   }
-  if (!hasProvenance(payload)) {
+  const prov = verifyProvenance(payload, opts.cwd);
+  if (prov.conflict) {
+    return { allow: false, reason: prov.reason ?? 'claimed anchor conflicts with live state', category: 'conflict' };
+  }
+  if (!prov.ok) {
     return {
       allow: false,
-      reason: 'no meaningful provenance attached (evidence / anchors / verification) — staged as candidate',
+      reason: 'no engine-verifiable provenance — needs command+exitCode, or a git anchor that matches live HEAD (a self-asserted verified:true / free-text evidence does not qualify) — staged as candidate',
       category: 'no-provenance',
     };
   }
