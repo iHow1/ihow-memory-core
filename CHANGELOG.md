@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
+## [0.1.0-alpha.12] — 2026-06-25
+
+A **trust-hardening** release. A pre-launch adversarial audit found that, while alpha.11 fixed the two
+real first-user incidents (Windows `setup` crash, Hermes false-positive connect), it had in several
+places shipped a *confident green that wasn't actually verified* — the exact trust-without-verify this
+project exists to remove. Every fix below closes one of those, with a regression test, and each is the
+engine enforcing the check rather than asking an agent (or a reader) to trust a claim.
+
+### Fixed
+
+- **`continue`: a GREEN now requires the receiver's own checkout.** The resume verdict trusted the
+  project inferred from a session's edited files without checking where the receiver actually is —
+  `continue --cwd /other-repo` against a session from repo A printed 🟢 "safe to pick up" while sitting
+  in an unrelated repo B. The verdict now takes the caller's cwd and degrades to YELLOW when it resolves
+  to a different git repo (CLI + MCP). The destructive-narrative downgrade was realigned with the
+  envelope's GREEN-lane prohibition set, so `npm publish` / `gh release` / "send a message to the
+  customer" / "rotate the credential" / "change the default" no longer reach a confident GREEN; and a
+  recorded HEAD anchor shorter than 7 chars (which prefix-matched almost any live HEAD) is treated as
+  unverifiable.
+- **`connect` / `setup`: stop printing "verified" for runtimes only round-tripped.** A passing round-trip
+  proves IHOW's own server starts — not that the receiving runtime (Cursor, WorkBuddy, OpenCode, Claude
+  Desktop, OpenClaw) loaded it. Those are now reported `reachable` but not `verified` ("verify on first
+  launch"); only a runtime whose own CLI confirms registration is `verified`. `connected[]` carries a
+  per-runtime `verified` flag in `--json`.
+- **`connect --runtime <x>` verifies too.** The single-runtime path (the README's first-recommended
+  command) reported connected on write-success alone; it now runs the same verify-after-connect
+  round-trip as `setup` and reports verified / reachable-pending / not-reachable (+ non-zero exit when
+  unreachable). `--json` gains `reachable` / `verified` / `detail`.
+- **`doctor --runtime <x>` verifies MCP reachability as a REQUIRED check.** doctor previously checked only
+  the local store plus "a runtime flag was passed", so `doctor: ok` could mean healthy while the runtime's
+  `mcp list` was empty. It now round-trips the configured server (+ CLI registration) as a required check.
+- **`upgrade` re-handshakes; bundle skew is a required error.** The frozen-bundle skew check was a soft
+  warning, so a connected runtime could keep running an old server after `npm update` with doctor still
+  green — it is now a required error. `upgrade` probes a fresh server after re-stamping to confirm the new
+  bundle round-trips (and still tells you to restart the runtime).
+- **Auto-promoted durable memory is reversible.** `rollback` hard-coded "only journal entries", so an
+  auto-promoted (machine-judged, no human gate) durable write could not be undone via the engine. It can
+  now (`rollback` removes the promoted file and restores the candidate for review); a **human-confirmed**
+  promotion stays out of scope and is refused.
+- **`--json` output is no longer corrupted by the telemetry notice.** In non-interactive mode the one-time
+  telemetry prompt printed to stdout, breaking any script parsing a `--json` payload; it now goes to stderr.
+
+### Changed
+
+- **Auto-promote provenance is engine-verified, not self-asserted.** The floor accepted any present
+  provenance key, so `verified: true`, a free-text `evidence`, a lone `exitCode`, or a fabricated git
+  anchor all auto-promoted into durable memory. It now requires structured, falsifiable evidence —
+  `command` + `exitCode`, or a git anchor the engine checks against live HEAD (a HEAD claimed for an
+  explicit repo path that doesn't match is rejected as a fabricated/stale anchor). `IHOW_AUTO_PROMOTE=0`
+  globally forces every write to stay a candidate (full human gate). The one-call "remember this" UX is
+  preserved for content that carries real evidence.
+- **Recall injects only human-reviewed memory.** Unreviewed auto-promoted entries (`tier: auto-promoted`
+  / `reviewed: false`) live under the curated paths, so the path allowlist alone would inject them as if
+  vetted; recall now excludes them. (Recall remains default-off.)
+- **Windows CI exercises the round-trip**, and the README's Windows wording is consistent (native Windows
+  is experimental; WSL is the supported path) instead of also claiming "not yet a supported lane".
+
 ## [0.1.0-alpha.11] — 2026-06-25
 
 ### Fixed
