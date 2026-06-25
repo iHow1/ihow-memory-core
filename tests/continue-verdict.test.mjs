@@ -83,10 +83,53 @@ test('C1: an inferred (STATE-doc) baseline is capped at YELLOW, never a confiden
   assert.equal(computeContinueVerdict(recorded, dir, stateDoc, { inferred: true }).state, 'YELLOW', 'a doc-inferred baseline is never a confident GREEN');
 });
 
-test('HEAD comparison is prefix-aware (a shorter recorded SHA still matches the same commit)', async (t) => {
-  const { dir } = await tmpRepo(t);
-  const live = gitAnchors(dir);
-  const recorded = { isRepo: true, head: live.head.slice(0, 6), branch: live.branch };
-  const v = computeContinueVerdict(recorded, dir, 'clean'); // 6-char prefix of live head → match, not drift
+test('HEAD comparison is prefix-aware (a full recorded SHA still matches the short live HEAD)', async (t) => {
+  const { dir, g } = await tmpRepo(t);
+  const live = gitAnchors(dir); // live.head is the 7-char `--short` form
+  const full = g('rev-parse', 'HEAD').toString().trim(); // 40-char form, as a bigger repo / different git might record
+  const recorded = { isRepo: true, head: full, branch: live.branch };
+  const v = computeContinueVerdict(recorded, dir, 'clean'); // short live HEAD is a prefix of the full recorded → match, not drift
   assert.equal(v.state, 'GREEN', v.reason);
+});
+
+// ── go/no-go #4: a confident GREEN must mean the receiver is in the SAME checkout ──────────────────
+
+test('YELLOW when the caller cwd is a DIFFERENT repo than the recorded project (no cross-repo false GREEN)', async (t) => {
+  const a = await tmpRepo(t);
+  const b = await tmpRepo(t); // an unrelated repo the receiver happens to be sitting in
+  const recorded = gitAnchors(a.dir);
+  const v = computeContinueVerdict(recorded, a.dir, 'fixed the parser, tests pass', { cwd: b.dir });
+  assert.equal(v.state, 'YELLOW', v.reason);
+  assert.match(v.reason, /different checkout|cd there|re-verify/i);
+});
+
+test('GREEN preserved when the caller cwd IS the recorded project', async (t) => {
+  const { dir } = await tmpRepo(t);
+  const recorded = gitAnchors(dir);
+  const v = computeContinueVerdict(recorded, dir, 'fixed the parser, tests pass', { cwd: dir });
+  assert.equal(v.state, 'GREEN', v.reason);
+});
+
+test('YELLOW when matching anchors but the narrative asks for an outward-facing / irreversible action', async (t) => {
+  const { dir } = await tmpRepo(t);
+  const recorded = gitAnchors(dir);
+  // Each of these used to slip past the narrow destructive regex into a confident GREEN.
+  for (const narrative of [
+    'all done — next: npm publish',
+    'next step: publish the release with gh release create',
+    'send a message to the customer about the fix',
+    'rotate the API credential and move on',
+    'change the default timeout for everyone',
+  ]) {
+    const v = computeContinueVerdict(recorded, dir, narrative);
+    assert.equal(v.state, 'YELLOW', `expected YELLOW for: ${narrative} (got ${v.state}: ${v.reason})`);
+  }
+});
+
+test('YELLOW (not GREEN, not RED) when the recorded HEAD anchor is too short to verify', async (t) => {
+  const { dir } = await tmpRepo(t);
+  const recorded = { isRepo: true, head: '6', branch: 'main' }; // a 1-char "anchor" prefix-matches almost anything
+  const v = computeContinueVerdict(recorded, dir, 'clean');
+  assert.equal(v.state, 'YELLOW', v.reason);
+  assert.match(v.reason, /too short/i);
 });

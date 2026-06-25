@@ -2541,7 +2541,7 @@ async function main(): Promise<void> {
     // re-read live git and compare to the anchors captured when the session was recorded.
     // fromStateDoc → the baseline was grepped from a doc, not a recorded session: mark it inferred so
     // the verdict caps at YELLOW (a doc hash must never produce a confident GREEN).
-    const verdict = recordedAnchors ? computeContinueVerdict(recordedAnchors, projectDir, body, { inferred: !!fromStateDoc }) : undefined;
+    const verdict = recordedAnchors ? computeContinueVerdict(recordedAnchors, projectDir, body, { inferred: !!fromStateDoc, cwd }) : undefined;
     const envelope = assembleEnvelope({
       cwd,
       producerAgent: sourceSessionId ? `${sourceTool}:${sourceSessionId.slice(0, 8)}` : 'ihow-continue',

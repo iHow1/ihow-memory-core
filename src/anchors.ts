@@ -96,6 +96,15 @@ export function gitAnchors(cwd: string): GitAnchors {
   };
 }
 
+// Resolve the git repo root containing `dir` (the `--show-toplevel`), or null when `dir` is not inside a
+// repo. Hardened + non-throwing like the rest of this module. Used to prove that a receiver's cwd and the
+// session's INFERRED project are the SAME checkout before a resume can earn a confident GREEN — different
+// repo (or no repo) means we cannot vouch the receiver is sitting where the work landed.
+export function repoRoot(dir: string): string | null {
+  const top = git(dir, ['rev-parse', '--show-toplevel']);
+  return top ? path.resolve(top) : null;
+}
+
 // Render anchors as the deterministic "facts" block of an envelope. No interpretation.
 // Fingerprint up to `limit` of the files the session edited (size + short content hash). Used as the
 // verify-first anchor for NON-git projects. Bounded + non-throwing: missing/unreadable files are skipped,

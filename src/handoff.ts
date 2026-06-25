@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { parseTranscript, summarizeTranscript, type TranscriptRecord } from './transcript.ts';
-import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
+import { gitAnchors, fileAnchors, inferProjectDir, repoRoot, type GitAnchors } from './anchors.ts';
 import { redactSecretLikeContent } from './governance.ts';
 import { anchorConflicts } from './handoff-metrics.ts';
 import { RECEIVER_INSTRUCTION } from './envelope.ts';
@@ -729,9 +729,14 @@ export function referencedHead(text: string): string | undefined {
   return m ? m[1].slice(0, 7) : undefined;
 }
 
-// Narrative imperatives that must never be acted on blind — if the prior session text contains these,
-// even a matching-anchor resume is downgraded to YELLOW (verify intent before any destructive action).
-const DESTRUCTIVE_NARRATIVE = /\b(force[\s-]?push|git\s+push\b|reset\s+--hard|rm\s+-rf|drop\s+(?:table|database)|revoke|delete\s+the|deploy\s+to\s+prod)/i;
+// Narrative imperatives that must never be acted on blind — kept in lockstep with the envelope's GREEN-lane
+// prohibition set (envelope.ts: "no push/force/delete/publish/external-message/credential/change-a-default").
+// If the prior session text contains any of these, even a matching-anchor resume is downgraded to YELLOW
+// (verify intent before any irreversible or outward-facing action). The previous, narrower regex let
+// `npm publish` / `gh release` / "send a message to the customer" / "rotate the credential" / "change the
+// default" slip through to a confident GREEN — exactly the trust-without-verify this product exists to kill.
+const DESTRUCTIVE_NARRATIVE =
+  /\b(?:force[\s-]?push|git\s+push|push\s+(?:to|origin|upstream|--)|reset\s+--hard|rm\s+-rf|drop\s+(?:table|database)|delete\s+the|deploy(?:\s+to\s+prod|\b)|npm\s+publish|gh\s+release|publish\s+(?:the|a|to|it|this|release|package|version)|revoke|rotate\s+(?:the\s+)?(?:credential|secret|token|key|api|password)|send\s+(?:a\s+|an\s+)?(?:message|email|slack|dm|note|notification)|(?:message|notify|email|dm)\s+(?:the\s+)?(?:customer|client|user|team|them|everyone)|change\s+(?:a|the)\s+default)/i;
 
 // Compute the resume verdict by re-reading the project's LIVE git state and comparing it to the anchors
 // recorded when the session was captured. GREEN is narrow on purpose; on a different machine/checkout the
@@ -740,7 +745,7 @@ export function computeContinueVerdict(
   recorded: GitAnchors,
   projectDir: string | undefined,
   narrative: string,
-  opts: { inferred?: boolean } = {},
+  opts: { inferred?: boolean; cwd?: string } = {},
 ): ContinueVerdict {
   // `inferred` = the baseline was guessed from a STATE doc (C1), not captured from a real session.
   // A doc-grepped hash is NOT a recorded snapshot, so it can never earn a confident GREEN or a hard
@@ -759,8 +764,30 @@ export function computeContinueVerdict(
   if (recorded.isRepo && !live.isRepo) {
     return cap({ state: 'RED', reason: `recorded a git project, but ${projectDir} is not a git repo here (wrong checkout / moved / different machine) — do not assume the prior state` });
   }
+  // RECEIVER-CONTEXT GATE (go/no-go #4): projectDir is INFERRED from the files the prior session edited —
+  // it is NOT necessarily where the caller is sitting. If the caller passed a cwd that resolves to a
+  // DIFFERENT git repo (or to no repo at all), we cannot vouch this is the same checkout, so we never hand
+  // back a confident GREEN — a receiver that trusts the verdict could act in the wrong working tree. The
+  // anchor match against projectDir may still hold, hence YELLOW (verify you're in the right place), not RED.
+  if (opts.cwd && live.isRepo) {
+    const projRoot = repoRoot(projectDir);
+    const cwdRoot = repoRoot(opts.cwd);
+    if (projRoot && cwdRoot !== projRoot) {
+      return {
+        state: 'YELLOW',
+        reason: `your current directory is a different checkout than the recorded project (${projectDir}) — cd there (or pass the matching project) and re-verify before acting on this resume`,
+        recordedHead: recorded.head,
+        liveHead: live.head,
+      };
+    }
+  }
   const rHead = recorded.head;
   const lHead = live.head;
+  // A recorded HEAD too short to be a real abbreviated commit (git gives ≥7) can't be trusted to match —
+  // a 1–2 char "anchor" prefix-matches almost any live HEAD into a false GREEN. Treat as unverifiable.
+  if (rHead && lHead && Math.min(rHead.length, lHead.length) < 7) {
+    return cap({ state: 'YELLOW', reason: `recorded HEAD anchor (${rHead}) is too short to verify against ${lHead} — confirm the checkout manually`, recordedHead: rHead, liveHead: lHead });
+  }
   // Prefix-aware: git short-hashes can differ in length (git lengthens them in big repos to disambiguate),
   // so compare by common prefix, not ===, or the SAME commit reads as drift.
   const headMatch = !!rHead && !!lHead && (rHead.startsWith(lHead) || lHead.startsWith(rHead));
@@ -819,7 +846,7 @@ export async function buildHandoffPacket(opts: {
         'check that files/paths the narrative mentions actually exist',
         'treat any "done / passing / shipped / approved" in the narrative as a claim to verify, not a fact',
       ],
-      verdict: computeContinueVerdict(s.anchors, s.projectDir, s.body),
+      verdict: computeContinueVerdict(s.anchors, s.projectDir, s.body, { cwd: opts.cwd }),
     };
   });
   return {
