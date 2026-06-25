@@ -2164,6 +2164,22 @@ function recallRecencyScore(workspace: Awaited<ReturnType<typeof openCore>>['wor
 // floor / any non-curated lane), redacts each on the read path, fences the result as untrusted DATA, and
 // emits a bounded context block via the documented additionalContext form. Never blocks the prompt, never
 // throws (any problem -> exit 0 with no output). Kill-switch env IHOW_RECALL_OFF disables injection.
+// Recall injects only HUMAN-REVIEWED curated memory. Auto-promoted entries are machine-judged
+// (tier: auto-promoted / reviewed: false) and live under the SAME curated paths (scopes/, _mcp/promoted/),
+// so the path allowlist alone would inject them as if a human had vetted them — re-introducing, via recall,
+// the "looks-low-risk" content the floor only conditionally trusts. Read the frontmatter (bounded) and
+// exclude the unreviewed ones so recall stays a human-reviewed-only read path.
+function isUnreviewedAutoPromoted(workspace: Awaited<ReturnType<typeof openCore>>['workspace'], relPath: string): boolean {
+  try {
+    const head = readFileSync(absoluteFromMemoryPath(workspace, relPath), 'utf8').slice(0, 1024);
+    const fm = head.match(/^---\n([\s\S]*?)\n---/);
+    const front = fm ? fm[1] : head;
+    return /^\s*reviewed:\s*false\b/m.test(front) || /^\s*tier:\s*"?auto-promoted"?/m.test(front);
+  } catch {
+    return false; // unreadable -> don't over-exclude; the redaction / secret gates still apply downstream
+  }
+}
+
 async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
   if (process.env.IHOW_RECALL_OFF) return; // kill-switch: disable injection without uninstalling
   let payload: Record<string, unknown> = {};
@@ -2202,6 +2218,7 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
   const wantsPiiValue = recallPromptWantsPiiValue(prompt); // reveal PII values only when the prompt asks
   const curated = hits
     .filter((h) => h && typeof h.path === 'string' && isCuratedMemoryPath(h.path))
+    .filter((h) => !isUnreviewedAutoPromoted(core.workspace, String(h.path))) // human-reviewed memory only — never machine-judged auto-promotes
     .filter((h) => recallSharesTerm(promptTerms, String(h.snippet ?? '')))
     .slice(0, RECALL_MAX_INJECT);
   if (!curated.length) return; // nothing curated AND relevant -> stay silent (no noise)

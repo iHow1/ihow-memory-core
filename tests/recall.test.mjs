@@ -39,6 +39,33 @@ async function seed(root, space) {
   cli(['journal', 'passing aside: someone mentioned zetaframework once, unverified low-weight note.', '--actor', 'claude-code-hook'], root, space);
 }
 
+test('recall: NEVER injects an unreviewed auto-promoted entry (machine-judged, not human-reviewed)', async (t) => {
+  const root = await mkdtempReal('ihow-recall-auto-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  // a HUMAN-reviewed promoted decision (the trusted lane) — must still be recalled
+  const cand = JSON.parse(cli(['write-candidate', 'Decision: adopt zetaframework for the dashboard, approved by the team.'], root, space)).path;
+  cli(['promote', cand, '--scope', 'team', '--title', 'zetaframework decision'], root, space);
+  // an AUTO-promoted entry (tier: auto-promoted / reviewed: false) written straight into the curated lane,
+  // exactly as the engine floor writes it — same path allowlist, but machine-judged, never human-vetted.
+  const autoDir = path.join(root, space, 'memory', 'scopes', 'general');
+  await fs.mkdir(autoDir, { recursive: true });
+  await fs.writeFile(path.join(autoDir, 'auto-kappa.md'), [
+    '---', 'candidate_id: "auto-kappa"', 'status: "promoted"', 'type: "memory"',
+    'source_agent: "agent-auto"', 'promoted_at: "2026-06-25T00:00:00Z"',
+    'tier: "auto-promoted"', 'reviewed: false', 'promoted_by: "agent-auto"', '---', '',
+    'The kappaframework migration finished and all the checks passed.', '',
+  ].join('\n'), 'utf8');
+  cli(['reindex'], root, space);
+
+  const out = recall('remind me about the zetaframework and kappaframework decisions', root, space);
+  assert.equal(out.status, 0, 'never blocks');
+  const ctx = out.stdout.trim() ? JSON.parse(out.stdout).hookSpecificOutput.additionalContext : '';
+  assert.match(ctx, /zetaframework/, 'the human-reviewed promoted decision IS recalled');
+  assert.ok(!/kappaframework/i.test(ctx), 'the unreviewed auto-promoted entry is NEVER injected (it lives only in scopes/general/auto-kappa)');
+  assert.ok(!/auto-kappa/.test(ctx), 'the auto-promoted file path is not injected either');
+});
+
 test('recall: injects ONLY curated memory, never the low-weight journal/floor lane', async (t) => {
   const root = await mkdtempReal('ihow-recall-');
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
