@@ -1425,7 +1425,9 @@ async function runProof(options: WorkspaceOptions & { json?: boolean }): Promise
 async function maybeAskTelemetry(): Promise<void> {
   if (await telemetry.hasAsked()) return;
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
-    console.log('(Want to help anonymously? Run `ihow-memory telemetry on` — usage only, never memory content.)');
+    // Non-interactive: emit the one-time notice on STDERR, never stdout — stdout may be a `--json`
+    // payload a script (or our own Windows CI `connect --json | ConvertFrom-Json`) is parsing.
+    console.error('(Want to help anonymously? Run `ihow-memory telemetry on` — usage only, never memory content.)');
     await telemetry.markAsked();
     return;
   }

@@ -228,7 +228,7 @@ Hosted runtime 不包含在本 npm 包与本仓库中。
 
 ## 状态
 
-Alpha 预发布（`0.1.0-alpha` 系列——上方 npm 徽章即最新发布版本；详见 [CHANGELOG.md](./CHANGELOG.md)）。成熟度为 **alpha + 单机真机 smoke**：只有 Claude Code 在每日 dogfood，其余 runtime 都是单机真机 smoke，而 Cursor 与 Claude Desktop 只能接收（能调用工具，但无法 resume）。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 上验证；Windows 暂不在支持范围。npm 包内含编译后的 CLI、stdio MCP server 与只读本地 console；TypeScript 源码就在本仓库。alpha 版本间可能有破坏性变更。
+Alpha 预发布（`0.1.0-alpha` 系列——上方 npm 徽章即最新发布版本；详见 [CHANGELOG.md](./CHANGELOG.md)）。成熟度为 **alpha + 单机真机 smoke**：只有 Claude Code 在每日 dogfood，其余 runtime 都是单机真机 smoke，而 Cursor 与 Claude Desktop 只能接收（能调用工具，但无法 resume）。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 上每日验证；原生 Windows 为**实验性**——`packageDir` 路径 bug 已修，并有 `windows-latest` CI lane 覆盖构建 + connect/doctor 可达性 smoke + 全量测试，受支持路径为 WSL。npm 包内含编译后的 CLI、stdio MCP server 与只读本地 console；TypeScript 源码就在本仓库。alpha 版本间可能有破坏性变更。
 
 **哪个版本有什么（dist-tag）。** 预发布版发布在 `next` dist-tag 下；`npm install ihow-memory` 解析到 `latest`。
 

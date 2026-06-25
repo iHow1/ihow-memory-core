@@ -49,8 +49,14 @@ jobs:
             Write-Error "packageDir resolution broken on Windows: --version = $v"
             exit 1
           }
-      - name: Connect smoke (exercises installRuntimeBundle -> packageDir)
-        run: node bin/ihow-memory.mjs connect --runtime claude-code
+      - name: Connect + verify smoke (packageDir -> installRuntimeBundle -> server round-trip)
+        shell: pwsh
+        run: |
+          $out = node bin/ihow-memory.mjs connect --runtime claude-code --json | ConvertFrom-Json
+          Write-Host "reachable: $($out.reachable)  verified: $($out.verified)"
+          if (-not $out.reachable) { Write-Error "configured MCP server did NOT round-trip on Windows"; exit 1 }
+      - name: Doctor runtime-reachability smoke (required check, B3)
+        run: node bin/ihow-memory.mjs doctor --runtime claude-code
       - name: Tests
         run: npm test
 
