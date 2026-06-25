@@ -19,7 +19,7 @@ import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anc
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
 import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, referencedHead, type ResumableSession } from './handoff.ts';
-import { verifyConnection } from './mcp/probe.ts';
+import { probeMcpServer, verifyConnection } from './mcp/probe.ts';
 import { migrateLocalDay } from './migrate.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
@@ -1126,28 +1126,52 @@ async function doctor(
     severity: writable ? 'info' : 'error',
     required: true,
   });
-  checks.push({
-    name: 'runtime',
-    ok: Boolean(options.runtime),
-    detail: options.runtime ? `${runtimeLabel(options.runtime)} selected` : 'not selected',
-    hint: options.runtime
-      ? `Run ihow-memory init --runtime ${options.runtime} and paste the snippet into ${runtimeLabel(options.runtime)} after backing up existing config.`
-      : 'Run ihow-memory init --runtime claude-code, --runtime codex, or --runtime cursor to print a ready-to-paste MCP snippet.',
-    severity: options.runtime ? 'info' : 'warning',
-    required: false,
-  });
+  // B3 (go/no-go #2): when a runtime is named, doctor must VERIFY its MCP is actually reachable — not just
+  // echo that a flag was passed. Round-trip the configured server (+ CLI registration for CLI runtimes),
+  // the same verify-after-connect contract setup uses, and make it a REQUIRED check so `doctor: ok` can't
+  // mean "healthy" while the runtime's mcp list is empty (the first-user Hermes incident).
+  if (options.runtime) {
+    const v = await verifyConnection(mcpServerSpec(workspace), options.runtime);
+    checks.push({
+      name: 'runtime',
+      ok: v.reachable,
+      detail: v.reachable
+        ? (v.verified
+          ? `${runtimeLabel(options.runtime)}: MCP reachable + registered (verified)`
+          : `${runtimeLabel(options.runtime)}: MCP server reachable (registration unconfirmed — verify on first launch)`)
+        : `${runtimeLabel(options.runtime)}: configured MCP NOT reachable — ${v.detail}`,
+      hint: v.reachable
+        ? undefined
+        : `The configured MCP server for ${runtimeLabel(options.runtime)} does not round-trip. Re-run: ihow-memory setup (or connect --runtime ${options.runtime}), then restart ${runtimeLabel(options.runtime)}.`,
+      severity: v.reachable ? 'info' : 'error',
+      required: true,
+    });
+  } else {
+    checks.push({
+      name: 'runtime',
+      ok: true,
+      detail: 'no runtime selected — pass --runtime <name> to verify its MCP is reachable',
+      hint: 'Run ihow-memory doctor --runtime claude-code|codex|cursor|… to round-trip that runtime\'s configured MCP server.',
+      severity: 'info',
+      required: false,
+    });
+  }
 
   const installedVersion = packageVersion();
   const bundleVersion = await runtimeBundleVersion(workspace);
   if (bundleVersion) {
     const skewed = bundleVersion !== installedVersion;
+    // B6 (go/no-go #5): a frozen bundle older than the installed package means a connected runtime would
+    // keep running the OLD server after `npm update` until `ihow-memory upgrade` re-stamps it (and the
+    // runtime restarts). A silent warning let that pass with doctor still green; make it REQUIRED so the
+    // skew fails doctor and the upgrade is not optional.
     checks.push({
       name: 'runtime-bundle',
       ok: !skewed,
-      detail: skewed ? `connected server v${bundleVersion} < installed v${installedVersion}` : `up to date (v${installedVersion})`,
-      hint: skewed ? 'The connected MCP server is older than the installed package. Run: ihow-memory upgrade  (then restart the runtime).' : undefined,
-      severity: skewed ? 'warning' : 'info',
-      required: false,
+      detail: skewed ? `frozen server bundle v${bundleVersion} != installed v${installedVersion} (a connected runtime is still running the old server)` : `up to date (v${installedVersion})`,
+      hint: skewed ? 'Run: ihow-memory upgrade  (then restart the runtime so it loads the new server).' : undefined,
+      severity: skewed ? 'error' : 'info',
+      required: true,
     });
   }
 
@@ -2726,12 +2750,19 @@ async function main(): Promise<void> {
     const before = await runtimeBundleVersion(workspace);
     await installRuntimeBundle(workspace);
     const after = packageVersion();
+    // B6 (go/no-go #5): re-handshake after re-stamping. An upgrade that froze a BROKEN bundle would
+    // otherwise report success while a connected runtime fails to load it. Probe a fresh server process
+    // (which loads the new bundle) to confirm it starts and round-trips. An already-running server keeps
+    // running the old code until the runtime restarts — which is exactly why we still say "restart".
+    const probe = await probeMcpServer(mcpServerSpec(workspace));
     if (options.json) {
-      printJson({ ok: true, from: before, to: after, runtimeDir: path.join(workspace.spaceDir, '.runtime') });
+      printJson({ ok: probe.ok, from: before, to: after, runtimeDir: path.join(workspace.spaceDir, '.runtime'), serverReachable: probe.ok, detail: probe.detail });
     } else {
       console.log(before && before !== after ? `upgraded runtime bundle: v${before} → v${after}` : `runtime bundle refreshed (v${after})`);
+      console.log(probe.ok ? `✓ new server bundle round-trips (${probe.detail})` : `⚠ the re-stamped server did NOT round-trip — ${probe.detail}`);
       console.log('Restart your connected runtime(s) so they load the new server.');
     }
+    if (!probe.ok) process.exitCode = 1;
     return;
   }
 
