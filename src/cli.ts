@@ -542,18 +542,21 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
   const workspace = await ensureWorkspace(resolveWorkspace(options));
   await installRuntimeBundle(workspace);
   const spec = mcpServerSpec(workspace);
-  const connected: string[] = [];
+  const connected: Array<{ runtime: string; verified: boolean }> = [];
   const unverified: Array<{ runtime: string; detail: string }> = [];
   const skipped: Array<{ runtime: string; error: string }> = [];
   console.log(`\nconnecting ${present.length} runtime(s) to workspace ${workspace.space}...`);
   for (const d of present) {
     try {
       await connectRuntime(workspace, d.runtime, { dryRun: false });
-      // Same verify-after-connect contract as setup: connected means reachable, not just written.
+      // Same verify-after-connect contract as setup: a runtime is only "verified" when its OWN CLI
+      // confirms registration; a direct-write runtime is reachable but UNVERIFIED until its first launch.
       const v = await verifyConnection(spec, d.runtime);
       if (v.reachable) {
-        connected.push(d.runtime);
-        console.log(`  ✓ ${d.runtime}  (verified)`);
+        connected.push({ runtime: d.runtime, verified: v.verified });
+        console.log(v.verified
+          ? `  ✓ ${d.runtime}  (verified)`
+          : `  ✓ ${d.runtime}  (config written, server reachable — verify on first launch)`);
       } else {
         unverified.push({ runtime: d.runtime, detail: v.detail });
         console.log(`  ⚠ ${d.runtime}  config written but NOT reachable — ${v.detail}`);
@@ -566,7 +569,8 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
   }
   if (connected.length) await telemetry.track('connect', { runtime: `auto:${connected.length}` });
   if (options.json) printJson({ connected, unverified, skipped });
-  console.log(`\nconnected ${connected.length}, unverified ${unverified.length}, skipped ${skipped.length}. Restart each runtime to load the memory tools.`);
+  const verifiedN = connected.filter((c) => c.verified).length;
+  console.log(`\nconnected ${connected.length} (${verifiedN} verified, ${connected.length - verifiedN} pending first-launch), unverified ${unverified.length}, skipped ${skipped.length}. Restart each runtime to load the memory tools.`);
 }
 
 // WorkBuddy resume wiring (the analog of Claude's skill/hook): WorkBuddy has no lifecycle hook, but it
@@ -730,20 +734,25 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   line('');
   line(`2/4  connecting runtimes to workspace ${workspace.space}`);
   const spec = mcpServerSpec(workspace);
-  const connected: string[] = [];
+  const connected: Array<{ runtime: string; verified: boolean }> = [];
   const unverified: Array<{ runtime: string; detail: string }> = [];
   const skipped: Array<{ runtime: string; error: string }> = [];
   for (const d of present) {
     try {
       const r = await connectRuntime(workspace, d.runtime, { dryRun });
       if (dryRun) { line(`       · ${d.runtime}  [dry-run] would register MCP via ${r.method}`); continue; }
-      // Verify-after-connect: only report "connected" once the configured server answers a
-      // real round-trip AND (for CLI runtimes) is actually registered — never on write-success
-      // alone. This is the product's own verify-first principle applied to its installer.
+      // Verify-after-connect: a runtime is "verified" only once the configured server answers a real
+      // round-trip AND its OWN CLI confirms registration. A direct-write runtime (no CLI) is reachable
+      // but UNVERIFIED — never print "verified" for it; say so and let first launch confirm. This is the
+      // product's own verify-first principle applied honestly to its installer (go/no-go #7).
       const v = await verifyConnection(spec, d.runtime);
       if (v.reachable) {
-        connected.push(d.runtime);
-        line(`       ✓ ${d.runtime}  ${r.replaced ? '(reconnected, verified)' : r.alreadyExists ? '(already connected, verified)' : 'MCP connected, verified'}`);
+        connected.push({ runtime: d.runtime, verified: v.verified });
+        if (v.verified) {
+          line(`       ✓ ${d.runtime}  ${r.replaced ? '(reconnected, verified)' : r.alreadyExists ? '(already connected, verified)' : 'MCP connected, verified'}`);
+        } else {
+          line(`       ✓ ${d.runtime}  config written + server reachable — verify on ${d.runtime}'s first launch`);
+        }
       } else {
         unverified.push({ runtime: d.runtime, detail: v.detail });
         line(`       ⚠ ${d.runtime}  config written but NOT reachable — ${v.detail} (check the runtime config, then re-run: ihow-memory setup)`);
@@ -835,7 +844,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   if (!dryRun) {
     line('');
     line('4/4  verifying (doctor)');
-    const primary = (hasClaude ? 'claude-code' : connected[0] || present[0].runtime) as ParsedArgs['options']['runtime'];
+    const primary = (hasClaude ? 'claude-code' : connected[0]?.runtime || present[0].runtime) as ParsedArgs['options']['runtime'];
     doctorResult = await doctor({ ...options, runtime: primary });
     for (const c of doctorResult.checks) {
       const label = c.ok ? 'ok' : c.required === false ? 'action' : 'fail';
@@ -893,7 +902,10 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   }
   const memOnTools = [hasClaude ? 'Claude Code' : null, hasWorkbuddy && workbuddyResume !== 'failed' ? 'WorkBuddy' : null].filter(Boolean);
   const memOn = memOnTools.length ? ` · memory ON for ${memOnTools.join(' + ')}` : '';
-  line(`✓ iHow Memory is set up.  ${connected.length} runtime${connected.length === 1 ? '' : 's'} connected (verified)${memOn}`);
+  const verifiedRt = connected.filter((c) => c.verified).map((c) => c.runtime);
+  const pendingRt = connected.filter((c) => !c.verified).map((c) => c.runtime);
+  line(`✓ iHow Memory is set up.  ${verifiedRt.length} runtime${verifiedRt.length === 1 ? '' : 's'} connected & verified${memOn}`);
+  if (pendingRt.length) line(`  • ${pendingRt.length} configured, server reachable — verify on first launch: ${pendingRt.join(', ')} (restart the runtime, then run: ihow-memory continue)`);
   if (unverified.length) line(`  ⚠ ${unverified.length} written but NOT reachable: ${unverified.map((p) => p.runtime).join(', ')} — check each runtime's config, then re-run: ihow-memory setup`);
   if (skipped.length) line(`  (${skipped.length} skipped: ${skipped.map((s) => s.runtime).join(', ')} — fix its CLI, then re-run; setup is idempotent)`);
   line('');

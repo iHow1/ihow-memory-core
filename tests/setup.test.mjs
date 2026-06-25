@@ -95,12 +95,16 @@ test('setup --json emits clean parseable output (install prints suppressed)', as
   for (const k of ['ok', 'detected', 'connected', 'unverified', 'skipped', 'skill', 'hook', 'doctor', 'nextSteps']) {
     assert.ok(k in j, `json has key ${k}`);
   }
-  // verify-after-connect: claude-code is written via direct .claude.json (no claude CLI in this
-  // env); the configured server round-trips, so it's reported connected (verified-reachable) and
-  // nothing is left unverified — but never "connected" on write-success alone (a broken server
-  // would land in `unverified`).
-  assert.deepEqual(j.connected, ['claude-code'], 'connected the requested runtime (server round-trip verified)');
-  assert.deepEqual(j.unverified, [], 'no runtime left unverified');
+  // verify-after-connect: the configured server round-trips, so claude-code is reachable (connected) and
+  // nothing is left unverified — never "connected" on write-success alone (a broken server would land in
+  // `unverified`). Each connected entry now carries a `verified` provenance flag: true only when the
+  // runtime's OWN CLI cross-confirms registration, false for a reachable-but-unconfirmed direct write
+  // (go/no-go #7). We don't pin the flag's value here — it depends on whether a claude CLI is present in
+  // the env — but we lock that the provenance flag exists and the runtime is the requested one.
+  assert.equal(j.connected.length, 1, 'one runtime connected');
+  assert.equal(j.connected[0].runtime, 'claude-code', 'connected the requested runtime');
+  assert.equal(typeof j.connected[0].verified, 'boolean', 'connected entries carry a verified provenance flag');
+  assert.deepEqual(j.unverified, [], 'no runtime left unreachable');
   assert.equal(j.skill, 'installed');
   assert.equal(j.hook, 'installed');
   assert.equal(j.doctor.ok, true, 'doctor verified clean');

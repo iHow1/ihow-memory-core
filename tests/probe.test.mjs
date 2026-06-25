@@ -36,13 +36,15 @@ test('probeMcpServer on a bad spec is not reachable (no false green)', async () 
   assert.equal(r.ok, false);
 });
 
-test('verifyConnection: a no-CLI runtime with a working server is reachable (config written + round-trip)', async (t) => {
+test('verifyConnection: a no-CLI runtime is reachable but NOT verified (no false "verified")', async (t) => {
   const root = await mkRoot(t, 'probe2');
   const core = await openCore({ root, space: 'ptest2' });
   const v = await verifyConnection(specFor(root, core.workspace.memoryDir), 'cursor', { timeoutMs: 12000 });
-  // Direct-write runtime: no CLI to confirm registration, but the server round-trips and the config
-  // is written — the best install-time verification. Reported reachable, not stuck pending forever.
+  // Direct-write runtime: the server round-trips (reachable) so it's not stuck pending — but the
+  // round-trip only proves IHOW's own server starts, NOT that Cursor loaded it. With no CLI to confirm
+  // registration we must NOT claim "verified" (go/no-go #7). reachable: yes; verified: no.
   assert.equal(v.reachable, true);
+  assert.equal(v.verified, false, 'a direct-write runtime is never independently verified at install time');
   assert.equal(v.status, 'reachable');
 });
 

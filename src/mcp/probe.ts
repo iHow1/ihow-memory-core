@@ -104,25 +104,37 @@ export function verifyRuntimeRegistration(runtime: string): { registered: boolea
   return { registered: 'n/a', detail: 'no official CLI — written directly, verify on first launch' };
 }
 
-export type ConnectionStatus = 'reachable' | 'written' | 'pending';
+export type ConnectionStatus = 'verified' | 'reachable' | 'written' | 'pending';
 
 // Combine both checks into one honest verdict per runtime.
+//
+// `verified` vs `reachable` is the distinction that keeps us off our own trust-without-verify trap
+// (go/no-go #7): a passing round-trip only proves IHOW's OWN server starts and answers `memory.status`
+// from this command line — it says NOTHING about whether the RECEIVER runtime (Cursor, WorkBuddy, …) has
+// actually loaded that MCP. Only a runtime whose own CLI confirms registration (`registered === true`) is
+// independently `verified`. A direct-write runtime with no CLI (`'n/a'`) is `reachable` but UNVERIFIED —
+// its config is written and the server is launchable, but the runtime must be started before we can claim
+// it really connected. Callers must not print "verified" for the latter.
 export async function verifyConnection(
   spec: { command: string; args: string[] },
   runtime: string,
   opts: { timeoutMs?: number } = {},
-): Promise<{ status: ConnectionStatus; reachable: boolean; detail: string }> {
+): Promise<{ status: ConnectionStatus; reachable: boolean; verified: boolean; detail: string }> {
   const probe = await probeMcpServer(spec, opts);
   if (!probe.ok) {
-    return { status: 'written', reachable: false, detail: `configured server unreachable — ${probe.detail}` };
+    return { status: 'written', reachable: false, verified: false, detail: `configured server unreachable — ${probe.detail}` };
   }
   const reg = verifyRuntimeRegistration(runtime);
   if (reg.registered === false) {
     // CLI explicitly says ihow-memory isn't registered — the real "written but not connected"
     // false-positive (the first-user Hermes incident). This is a genuine failure to surface.
-    return { status: 'written', reachable: false, detail: `server runs, but ${reg.detail}` };
+    return { status: 'written', reachable: false, verified: false, detail: `server runs, but ${reg.detail}` };
   }
-  // registered === true OR 'n/a' (direct-write / Windows / no CLI): the server round-trips AND the
-  // config is written — the best verification possible at install time. Restart the runtime to load.
-  return { status: 'reachable', reachable: true, detail: `${probe.detail}; ${reg.detail}` };
+  if (reg.registered === true) {
+    // The runtime's OWN config lists ihow-memory AND the server round-trips — independently verified.
+    return { status: 'verified', reachable: true, verified: true, detail: `${probe.detail}; ${reg.detail}` };
+  }
+  // registered === 'n/a' (direct-write / Windows / no CLI): the server is launchable and the config is
+  // written, but we have NO independent confirmation the runtime loaded it — reachable, NOT verified.
+  return { status: 'reachable', reachable: true, verified: false, detail: `${probe.detail}; ${reg.detail} (verify on first launch)` };
 }
