@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
-## [0.1.0-alpha.10] — 2026-06-23
+## [0.1.0-alpha.11] — 2026-06-25
 
 ### Fixed
 
@@ -39,6 +39,20 @@ with pre-release tags.
   `unverified` list, and `connect --auto` verifies the same way. The Hermes connector now runs
   `hermes gateway start` so the add takes effect on the live gateway. (Catches the first-user incident
   where `setup` reported Hermes connected while `mcp list` was empty.)
+- **Resume verdict on `continue`: a GREEN / YELLOW / RED handoff signal you can trust.** When an agent
+  resumes via `memory.continue` (MCP) or `ihow-memory continue` (CLI), the engine now re-reads the
+  **live git state** of the project and compares it against the anchors recorded at handoff time, then
+  reports a verdict instead of asking you to trust the packet blind. **GREEN is deliberately narrow** —
+  same repo, HEAD reachable and matching the recorded anchor; a different machine, a moved working
+  directory, or a HEAD that has moved on yields **YELLOW** (resume with care) or **RED** (the recorded
+  baseline is not what you're sitting on). It compares HEAD by prefix so a short recorded SHA against a
+  longer live one is not mistaken for a mismatch, and it **never reports a fabricated GREEN**.
+- **First-run handoff from a project STATE doc.** `continue` no longer comes up empty on a project that
+  has no recorded session yet: if the project carries a `PROJECT_STATE.md`, the engine reads it as the
+  resume narrative, cross-checks it against live git, and attaches the same verdict. A baseline *inferred*
+  from a STATE doc (e.g. a `referencedHead` parsed out of prose) is **capped at YELLOW — never a false
+  GREEN** — even when the parsed SHA happens to match the live HEAD, so an inferred baseline can never
+  masquerade as a verified one.
 
 ### Changed
 
