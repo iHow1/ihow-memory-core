@@ -18,7 +18,7 @@ import type {
 } from './types.ts';
 import { ensureWorkspace, resolveWorkspace } from './workspace.ts';
 import { readMemoryFile } from './store/files.ts';
-import { appendJournal, durablePromoteCandidate, evaluateAutoPromote, promoteCandidate, rollbackJournalEvent, writeCandidate } from './governance.ts';
+import { appendJournal, durablePromoteCandidate, evaluateAutoPromote, promoteCandidate, rollbackEvent, writeCandidate } from './governance.ts';
 import type { RollbackResult } from './governance.ts';
 import { readEventsAllLanes, mcpLaneWorkspace } from './store/events.ts';
 import type { MemoryEvent } from './store/events.ts';
@@ -150,13 +150,13 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     async rollback(eventId) {
       let result: RollbackResult;
       try {
-        result = await rollbackJournalEvent(workspace, eventId);
+        result = await rollbackEvent(workspace, eventId);
       } catch (caught) {
         // Auto-captured entries live in the _mcp lane; if the id isn't on the main lane, retry there
         // (managed store only — an existing-memory-root workspace already targets the _mcp lane).
         if (workspace.mode === 'managed-space' && caught instanceof Error && caught.message === 'rollback_event_not_found') {
           // Auto-captured ids live on the _mcp lane; retry there (the same lane the MCP server writes to).
-          result = await rollbackJournalEvent(mcpLaneWorkspace(workspace), eventId);
+          result = await rollbackEvent(mcpLaneWorkspace(workspace), eventId);
         } else {
           throw caught;
         }

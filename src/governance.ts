@@ -15,7 +15,7 @@ import type {
   WriteCandidateResult,
 } from './types.ts';
 import { absoluteFromMemoryPath, isMcpSandboxPath, relativeToMemory, relativeToSpace } from './workspace.ts';
-import { appendEvent, readEvents } from './store/events.ts';
+import { appendEvent, readEvents, type MemoryEvent } from './store/events.ts';
 import { atomicWriteFile, nowCompact, readMemoryFile, safeFileSlug } from './store/files.ts';
 import { withWorkspaceLock } from './store/lock.ts';
 import { localDay } from './time.ts';
@@ -344,13 +344,22 @@ function removeJournalEntry(content: string, entryAt: string): { content: string
   return { content: rebuilt, removed: true };
 }
 
-// Rollback a single auto-captured journal entry by its audit eventId — the auto-write lane's undo.
-// Only journal entries are reversible this way; durable/promote writes are human-gated (not
-// auto-written), so they are out of scope. Emits a memory.rolledback audit event either way.
-export async function rollbackJournalEvent(workspace: Workspace, eventId: string): Promise<RollbackResult> {
+// Rollback a single REVERSIBLE event by its audit eventId — the engine's undo. Two kinds are reversible:
+//  • memory.journal.appended — the low-weight auto-capture lane.
+//  • memory.promoted with metadata.auto — an AUTO-promoted durable memory. Auto-promote happens without a
+//    human gate (engine floor only), so it MUST be undoable (go/no-go #6): without this, a wrong machine
+//    judgment is stuck in durable memory with no engine recourse — only a manual file delete, with the
+//    candidate already archived to history. Human-CONFIRMED promotions are intentional and stay out of
+//    scope (refused). Always emits a memory.rolledback audit event.
+export async function rollbackEvent(workspace: Workspace, eventId: string): Promise<RollbackResult> {
   const target = (await readEvents(workspace)).find((event) => event.id === eventId);
   if (!target) throw new Error('rollback_event_not_found');
-  if (target.type !== 'memory.journal.appended') throw new Error('rollback_unsupported_event_type');
+  if (target.type === 'memory.journal.appended') return rollbackJournalAppend(workspace, target, eventId);
+  if (target.type === 'memory.promoted') return rollbackAutoPromote(workspace, target, eventId);
+  throw new Error('rollback_unsupported_event_type');
+}
+
+async function rollbackJournalAppend(workspace: Workspace, target: MemoryEvent, eventId: string): Promise<RollbackResult> {
   const entryAt = typeof target.metadata?.entryAt === 'string' ? target.metadata.entryAt : '';
   const relativePath = target.path;
   if (!entryAt || !relativePath) throw new Error('rollback_missing_entry_metadata');
@@ -366,6 +375,40 @@ export async function rollbackJournalEvent(workspace: Workspace, eventId: string
       metadata: { rolledBackEventId: eventId, entryAt, removed },
     });
     return { eventId, type: target.type, path: relativePath, removed, rolledbackEventId: event.id };
+  });
+}
+
+// Undo an AUTO-promoted durable memory: delete the promoted file and (managed mode) restore the candidate
+// to the inbox so the rolled-back item returns to pending review instead of vanishing. Refuses a
+// human-confirmed promotion — those are deliberate and not the engine's to silently reverse.
+async function rollbackAutoPromote(workspace: Workspace, target: MemoryEvent, eventId: string): Promise<RollbackResult> {
+  if (!target.metadata?.auto) throw new Error('rollback_human_promote_out_of_scope');
+  // The promoted FILE is addressed memory-relative via metadata.targetMemoryPath; the top-level
+  // event.targetPath is space-relative and must NOT be used for filesystem ops.
+  const memoryRelative = typeof target.metadata?.targetMemoryPath === 'string' ? target.metadata.targetMemoryPath : '';
+  if (!memoryRelative) throw new Error('rollback_missing_target_metadata');
+  return await withWorkspaceLock(workspace, async () => {
+    const absolute = absoluteFromMemoryPath(workspace, memoryRelative);
+    let removed = false;
+    try { await fs.rm(absolute, { force: true }); removed = true; } catch { /* already gone */ }
+    // Best-effort: return the candidate to the inbox. Managed mode archived it under history at promote
+    // time; existing-memory-root mode rm'd it (stagingOnly), so there is nothing to restore there.
+    let restoredCandidate = false;
+    const candidatePath = target.candidatePath;
+    if (!target.metadata?.stagingOnly && candidatePath) {
+      const historyPath = path.join(workspace.historyDir, 'promoted-candidates', path.basename(candidatePath));
+      try {
+        await fs.rename(historyPath, absoluteFromMemoryPath(workspace, candidatePath));
+        restoredCandidate = true;
+      } catch { /* history entry missing — leave the removal standing */ }
+    }
+    const event = await appendEvent(workspace, {
+      type: 'memory.rolledback',
+      path: memoryRelative,
+      actor: 'core.rollback',
+      metadata: { rolledBackEventId: eventId, removed, restoredCandidate, auto: true },
+    });
+    return { eventId, type: target.type, path: memoryRelative, removed, rolledbackEventId: event.id };
   });
 }
 

@@ -2,8 +2,9 @@
 // Copyright (c) 2026 iHow Memory
 //
 // alpha.4 audit + rollback: `audit` lists the append-only event log; `rollback --event <id>` is the
-// auto-write lane's undo — it removes exactly the one journal entry an event recorded and logs a
-// memory.rolledback event. Durable/promote events are human-gated and out of scope for rollback.
+// engine's undo. It removes exactly the one journal entry an event recorded, OR — as of go/no-go #6 —
+// an AUTO-promoted durable memory (machine-judged, no human gate, so it MUST be reversible). A
+// human-CONFIRMED promotion is deliberate and stays out of scope (refused). Logs a memory.rolledback event.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -14,6 +15,7 @@ import { openCore } from '../src/core.ts';
 async function mkdtempReal(prefix) {
   return await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
 }
+const exists = async (p) => { try { await fs.access(p); return true; } catch { return false; } };
 async function managed(t) {
   const root = await mkdtempReal('ihow-audit-');
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
@@ -74,6 +76,44 @@ test('managed-space audit + rollback span the MCP auto-capture (_mcp) lane', asy
   assert.ok(after.some((e) => e.type === 'memory.rolledback'), 'cross-lane rollback is logged');
   const abs = path.join(cli.workspace.memoryDir, '_mcp', 'journal', `${j.day}.md`);
   assert.doesNotMatch(await fs.readFile(abs, 'utf8'), /auto-captured note in the _mcp lane/);
+});
+
+test('rollback undoes an AUTO-promoted durable memory and logs it (go/no-go #6)', async (t) => {
+  const core = await managed(t);
+  // Provenance (verified + command + exitCode + repo) clears the floor → auto-promoted, no human gate.
+  const w = await core.write_candidate({
+    title: 'build-passed',
+    text: 'the build passed and the tests are green on this commit',
+    sourceAgent: 't',
+    metadata: { verified: true, command: 'npm test', exitCode: 0, repo: 'demo' },
+  });
+  assert.equal(w.autoPromote?.promoted, true, `should auto-promote with provenance: ${JSON.stringify(w.autoPromote)}`);
+  const eventId = w.autoPromote.eventId;
+
+  // the auto-promoted durable file is on disk before rollback
+  const promotedEv = (await core.audit()).find((e) => e.id === eventId);
+  assert.ok(promotedEv && promotedEv.type === 'memory.promoted', 'promoted event present in audit');
+  const rel = promotedEv.metadata?.targetMemoryPath;
+  assert.ok(rel, 'promoted event carries targetMemoryPath');
+  const abs = path.join(core.workspace.memoryDir, rel);
+  assert.equal(await exists(abs), true, 'auto-promoted file exists before rollback');
+
+  // rollback removes the durable file and logs a memory.rolledback (auto) event — no longer
+  // rollback_unsupported_event_type (the regression the audit caught)
+  const r = await core.rollback(eventId);
+  assert.equal(r.removed, true);
+  assert.equal(await exists(abs), false, 'auto-promoted durable file is gone after rollback');
+  assert.ok((await core.audit()).some((e) => e.type === 'memory.rolledback' && e.metadata?.auto === true), 'auto rollback is logged');
+});
+
+test('rollback REFUSES a human-confirmed promotion (governance moat preserved)', async (t) => {
+  const core = await managed(t);
+  const c = await core.write_candidate({ title: 'manual-fact', text: 'a fact promoted by a human on purpose', sourceAgent: 't', autoPromote: false });
+  assert.equal(c.autoPromote, undefined, 'autoPromote:false leaves it a candidate, not auto-promoted');
+  await core.promote(c.path); // explicit, human-gated promote → memory.promoted WITHOUT metadata.auto
+  const ev = (await core.audit()).find((e) => e.type === 'memory.promoted' && !e.metadata?.auto);
+  assert.ok(ev, 'a human (non-auto) promote event exists');
+  await assert.rejects(core.rollback(ev.id), /rollback_human_promote_out_of_scope/, 'deliberate promotes are not silently reversible');
 });
 
 test('audit --since filter is honored', async (t) => {
