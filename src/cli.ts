@@ -939,6 +939,7 @@ Usage:
   ihow-memory continue [project-keyword] [--cwd path] [--json]   # resume after a context boundary (/clear, new session, out of context): prints a verify-first handoff for the project you were working on — auto-detected from the files you EDITED, with that project's git anchors + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. Pass a keyword to choose which project; works even if you launch every session from one dir. (alias: handoff)
   ihow-memory continue --list [--limit n] [--json]   # list the most recent resumable sessions across all recorded projects (inferred project, git branch+HEAD, last activity, summary snippet; newest first); resume one by its number with: ihow-memory continue <N>
   ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw] [--share-diagnostics] [--json]
+  ihow-memory verify [--runtime name] [--cwd path] [--json]   # print a REPRODUCIBLE self-proof receipt: local store + each runtime's MCP reachability + this checkout's GREEN/YELLOW/RED resume verdict, each line with the exact command to re-run yourself (no trust required, local-only). Exit non-zero if anything fails to round-trip.
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
   ihow-memory search <query> [--limit n]
@@ -2649,6 +2650,85 @@ async function main(): Promise<void> {
         );
       }
     }
+    return;
+  }
+
+  if (command === 'verify') {
+    // B5 — a REPRODUCIBLE self-proof receipt. The differentiator (alpha.13 calibration) is not "trust our
+    // green check"; it is "here is the exact command — re-run it yourself and get the same result." No
+    // trust, no cloud, local. Every line carries a `↻ reproduce` you can paste. It composes already-verified
+    // pieces: doctor (local store), verifyConnection (runtime reachability), and the continue GREEN/YELLOW/RED
+    // verdict (the one atom no competitor does locally) — it asserts nothing new of its own.
+    const workspace = await ensureWorkspace(resolveWorkspace(options));
+    const spec = mcpServerSpec(workspace);
+    const bundleInstalled = existsSync(spec.args[0]); // verify reads the ACTUAL configured server; never silently (re)installs it
+    const runtimes = options.runtime
+      ? [String(options.runtime)]
+      : detectRuntimes().filter((d) => d.present).map((d) => d.runtime);
+
+    const local = await doctor({ ...options, runtime: undefined }); // local-store half only
+
+    const runtimeResults: Array<{ runtime: string; reachable: boolean; verified: boolean; detail: string }> = [];
+    for (const rt of runtimes) {
+      if (!bundleInstalled) {
+        runtimeResults.push({ runtime: rt, reachable: false, verified: false, detail: 'runtime bundle not installed for this workspace — run: ihow-memory setup' });
+        continue;
+      }
+      const v = await verifyConnection(spec, rt);
+      runtimeResults.push({ runtime: rt, reachable: v.reachable, verified: v.verified, detail: v.detail });
+    }
+
+    const cwd = path.resolve(options.cwd || process.cwd());
+    let verdict: Awaited<ReturnType<typeof buildHandoffPacket>>['candidates'][number]['verdict'] | null = null;
+    try {
+      const packet = await buildHandoffPacket({ cwd, limit: 1 });
+      verdict = packet.candidates[0]?.verdict ?? null;
+    } catch { /* no recorded session for this project yet — verdict stays null */ }
+
+    const ok = local.ok && runtimeResults.every((r) => r.reachable);
+
+    if (options.json) {
+      printJson({
+        ok,
+        local: { ok: local.ok, checks: local.checks },
+        runtimes: runtimeResults,
+        verdict,
+        reproduce: { local: 'ihow-memory doctor --json', runtime: 'ihow-memory doctor --runtime <name> --json', verdict: 'ihow-memory continue --json' },
+      });
+      process.exitCode = ok ? 0 : 1;
+      return;
+    }
+
+    const sep = '─'.repeat(64);
+    console.log('iHow Memory — verify receipt   (no trust required: every line is reproducible)');
+    console.log(sep);
+    console.log(`LOCAL STORE   ${local.ok ? '✓ ok' : '✗ problem'}`);
+    for (const c of local.checks.filter((c) => !c.ok || c.required !== false)) {
+      console.log(`  ${c.ok ? '✓' : '✗'} ${c.name}: ${c.detail}`);
+    }
+    console.log('  ↻ reproduce:  ihow-memory doctor');
+    if (runtimeResults.length) {
+      console.log('');
+      console.log('RUNTIME MCP REACHABILITY');
+      for (const r of runtimeResults) {
+        const mark = r.verified ? '✓ verified' : r.reachable ? '• reachable (verify on first launch)' : '✗ NOT reachable';
+        console.log(`  ${runtimeLabel(r.runtime as ParsedArgs['options']['runtime'])}: ${mark} — ${r.detail}`);
+        console.log(`    ↻ reproduce:  ihow-memory doctor --runtime ${r.runtime}`);
+      }
+    }
+    console.log('');
+    if (verdict) {
+      const icon = verdict.state === 'GREEN' ? '🟢' : verdict.state === 'YELLOW' ? '🟡' : '🔴';
+      console.log(`RESUME VERDICT (this checkout)   ${icon} ${verdict.state}`);
+      console.log(`  ${verdict.reason}`);
+      console.log('    ↻ reproduce:  ihow-memory continue   (re-reads live git, recomputes the verdict — no stored result is trusted)');
+    } else {
+      console.log('RESUME VERDICT (this checkout)   — no recorded session for this project yet');
+      console.log('    ↻ reproduce:  ihow-memory continue');
+    }
+    console.log(sep);
+    console.log(`OVERALL   ${ok ? '✓ trustworthy — every check above round-trips here, now' : '✗ something does not round-trip — fix the ✗ lines, then re-run: ihow-memory verify'}`);
+    process.exitCode = ok ? 0 : 1;
     return;
   }
 
