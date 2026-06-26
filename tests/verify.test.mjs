@@ -18,6 +18,11 @@ const run = (args, root) => {
   try { return execFileSync(process.execPath, [CLI, ...args, '--root', root, '--space', 's'], { encoding: 'utf8' }); }
   catch (e) { return e.stdout ?? ''; }
 };
+// run with a custom env (isolated HOME / restricted PATH), capturing stdout + exit code even on failure.
+const runEnv = (args, env) => {
+  try { return { out: execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env }), code: 0 }; }
+  catch (e) { return { out: e.stdout ?? '', code: e.status ?? 1 }; }
+};
 
 test('verify: reproducible receipt — local store + runtime reachability + resume verdict, each with a reproduce line', async (t) => {
   const root = await mkdtempReal('ihow-verify-');
@@ -44,7 +49,32 @@ test('verify --json: clean structured receipt with a reproduce map; ok reflects 
   assert.equal(j.runtimes[0].runtime, 'cursor');
   assert.equal(typeof j.runtimes[0].reachable, 'boolean');
   assert.ok(j.reproduce.local && j.reproduce.runtime && j.reproduce.verdict, 'every section carries a reproduce command');
-  assert.equal(j.ok, j.local.ok && j.runtimes.every((r) => r.reachable), 'overall ok = local ok AND every runtime reachable');
+  assert.equal(j.ok, j.local.ok && j.runtimes.length > 0 && j.runtimes.every((r) => r.reachable), 'overall ok = local ok AND ≥1 runtime AND every runtime reachable');
+});
+
+test('verify verdict path is a LIVE call, not a dead (swallowed) reference — cli.ts imports buildHandoffPacket', async () => {
+  // Regression guard for the headline differentiator. buildHandoffPacket was referenced in the verify
+  // command but never imported in cli.ts; the transform-only build (stripTypeScriptTypes) does NO
+  // identifier check, so the broken reference shipped — at runtime it threw and the catch{} silently
+  // degraded verify to "no recorded session", killing the three-color verdict. The systemic fix is a
+  // type-check in CI (tracked); this locks the specific regression deterministically (no fragile session
+  // fixture — buildHandoffPacket discovers sessions via os.homedir(), verified end-to-end on a real one).
+  const src = await fs.readFile(CLI, 'utf8');
+  if (/\bbuildHandoffPacket\s*\(/.test(src)) {
+    assert.match(src, /import\s*\{[^}]*\bbuildHandoffPacket\b[^}]*\}\s*from\s*'\.\/handoff\.ts'/, 'buildHandoffPacket is CALLED in cli.ts but not imported from ./handoff.ts — the verify verdict would throw and be swallowed');
+  }
+});
+
+test('verify with NO runtime connected is not trustworthy (no vacuous every([]) green)', async (t) => {
+  const root = await mkdtempReal('ihow-verify-nort-');
+  const home = await mkdtempReal('ihow-verify-northome-');
+  t.after(async () => { for (const d of [root, home]) await fs.rm(d, { recursive: true, force: true }); });
+  run(['upgrade'], root); // local store ok + bundle materialized
+  // empty HOME + a PATH without any runtime CLI → detectRuntimes finds nothing → runtimes:[]
+  const { out, code } = runEnv(['verify', '--root', root, '--space', 's'], { ...process.env, HOME: home, PATH: '/usr/bin:/bin' });
+  assert.match(out, /no runtime connected/i, 'an empty runtime set is surfaced, never silently hidden');
+  assert.doesNotMatch(out, /OVERALL\s+✓ trustworthy/, 'a machine that verified nothing must not self-certify trustworthy');
+  assert.notEqual(code, 0, 'exits non-zero when there is nothing connected to verify');
 });
 
 test('verify: honest when not set up — a missing runtime bundle points at setup, never a raw crash', async (t) => {

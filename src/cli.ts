@@ -18,7 +18,7 @@ import { parseTranscript, summarizeTranscript } from './transcript.ts';
 import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
-import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, referencedHead, type ResumableSession } from './handoff.ts';
+import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, referencedHead, buildHandoffPacket, type ResumableSession } from './handoff.ts';
 import { probeMcpServer, verifyConnection } from './mcp/probe.ts';
 import { migrateLocalDay } from './migrate.ts';
 import type { WorkspaceOptions } from './types.ts';
@@ -2659,7 +2659,7 @@ async function main(): Promise<void> {
     // trust, no cloud, local. Every line carries a `↻ reproduce` you can paste. It composes already-verified
     // pieces: doctor (local store), verifyConnection (runtime reachability), and the continue GREEN/YELLOW/RED
     // verdict (the one atom no competitor does locally) — it asserts nothing new of its own.
-    const workspace = await ensureWorkspace(resolveWorkspace(options));
+    const workspace = resolveWorkspace(options); // read-only: never mkdir/create — verify inspects an existing setup (avoids a bare EACCES; doctor reports an unwritable memory-root cleanly)
     const spec = mcpServerSpec(workspace);
     const bundleInstalled = existsSync(spec.args[0]); // verify reads the ACTUAL configured server; never silently (re)installs it
     const runtimes = options.runtime
@@ -2685,13 +2685,17 @@ async function main(): Promise<void> {
       verdict = packet.candidates[0]?.verdict ?? null;
     } catch { /* no recorded session for this project yet — verdict stays null */ }
 
-    const ok = local.ok && runtimeResults.every((r) => r.reachable);
+    // A machine that has verified NOTHING must not self-certify trustworthy. An empty runtime set means
+    // nothing is connected to prove — so OVERALL is a fail, NOT a vacuous every([])===true green.
+    const noRuntimeToCheck = runtimeResults.length === 0;
+    const ok = local.ok && !noRuntimeToCheck && runtimeResults.every((r) => r.reachable);
 
     if (options.json) {
       printJson({
         ok,
         local: { ok: local.ok, checks: local.checks },
         runtimes: runtimeResults,
+        noRuntimeConnected: noRuntimeToCheck,
         verdict,
         reproduce: { local: 'ihow-memory doctor --json', runtime: 'ihow-memory doctor --runtime <name> --json', verdict: 'ihow-memory continue --json' },
       });
@@ -2707,9 +2711,11 @@ async function main(): Promise<void> {
       console.log(`  ${c.ok ? '✓' : '✗'} ${c.name}: ${c.detail}`);
     }
     console.log('  ↻ reproduce:  ihow-memory doctor');
-    if (runtimeResults.length) {
-      console.log('');
-      console.log('RUNTIME MCP REACHABILITY');
+    console.log('');
+    console.log('RUNTIME MCP REACHABILITY');
+    if (noRuntimeToCheck) {
+      console.log('  ✗ no runtime connected — nothing to verify. Run: ihow-memory setup   (or: ihow-memory verify --runtime <name>)');
+    } else {
       for (const r of runtimeResults) {
         const mark = r.verified ? '✓ verified' : r.reachable ? '• reachable (verify on first launch)' : '✗ NOT reachable';
         console.log(`  ${runtimeLabel(r.runtime as ParsedArgs['options']['runtime'])}: ${mark} — ${r.detail}`);
@@ -2727,7 +2733,12 @@ async function main(): Promise<void> {
       console.log('    ↻ reproduce:  ihow-memory continue');
     }
     console.log(sep);
-    console.log(`OVERALL   ${ok ? '✓ trustworthy — every check above round-trips here, now' : '✗ something does not round-trip — fix the ✗ lines, then re-run: ihow-memory verify'}`);
+    const overall = ok
+      ? '✓ trustworthy — every check above round-trips here, now'
+      : noRuntimeToCheck && local.ok
+        ? '✗ no runtime connected — run setup first, then re-run: ihow-memory verify'
+        : '✗ not trustworthy — fix the ✗ lines above, then re-run: ihow-memory verify';
+    console.log(`OVERALL   ${overall}`);
     process.exitCode = ok ? 0 : 1;
     return;
   }
