@@ -2683,7 +2683,13 @@ async function main(): Promise<void> {
     try {
       const packet = await buildHandoffPacket({ cwd, limit: 1 });
       verdict = packet.candidates[0]?.verdict ?? null;
-    } catch { /* no recorded session for this project yet — verdict stays null */ }
+    } catch (e) {
+      // An empty project returns NO candidates WITHOUT throwing, so a throw here is an UNEXPECTED fault
+      // (a regression, an fs error) — surface it on stderr instead of letting it masquerade as "no
+      // recorded session". That masquerade is exactly how a dead buildHandoffPacket import hid for a whole
+      // release: the verdict (verify's headline) silently degraded and every test stayed green.
+      console.error(`verify: resume verdict unavailable — ${e instanceof Error ? e.message : String(e)}`);
+    }
 
     // A machine that has verified NOTHING must not self-certify trustworthy. An empty runtime set means
     // nothing is connected to prove — so OVERALL is a fail, NOT a vacuous every([])===true green.

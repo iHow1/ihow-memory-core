@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
@@ -63,6 +63,18 @@ test('verify verdict path is a LIVE call, not a dead (swallowed) reference — c
   if (/\bbuildHandoffPacket\s*\(/.test(src)) {
     assert.match(src, /import\s*\{[^}]*\bbuildHandoffPacket\b[^}]*\}\s*from\s*'\.\/handoff\.ts'/, 'buildHandoffPacket is CALLED in cli.ts but not imported from ./handoff.ts — the verify verdict would throw and be swallowed');
   }
+});
+
+test('verify surfaces an unexpected verdict fault on stderr — it never masquerades as "no session"', async (t) => {
+  const root = await mkdtempReal('ihow-verify-stderr-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  run(['upgrade'], root);
+  const r = spawnSync(process.execPath, [CLI, 'verify', '--runtime', 'cursor', '--root', root, '--space', 's'], { encoding: 'utf8' });
+  // A normal run computes the verdict cleanly. If the verdict machinery ever throws again (a re-introduced
+  // dead import, an fs fault), the narrowed catch prints "resume verdict unavailable" to stderr instead of
+  // silently degrading to "no recorded session" — so the regression is visible, not hidden behind a test that
+  // only checks the key exists.
+  assert.doesNotMatch(r.stderr || '', /resume verdict unavailable/, 'no unexpected verdict fault on a normal run');
 });
 
 test('verify with NO runtime connected is not trustworthy (no vacuous every([]) green)', async (t) => {
