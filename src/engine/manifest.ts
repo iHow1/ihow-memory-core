@@ -74,8 +74,10 @@ export async function writeProviderManifest(workspace: Workspace, manifest: Prov
     workspace.indexManifestPath,
     `${JSON.stringify(
       {
-        createdAt: existing?.createdAt || manifest.createdAt || new Date().toISOString(),
         ...manifest,
+        // createdAt AFTER the spread so it isn't overwritten: preserve the original creation time across
+        // rewrites (was a real latent bug — the spread clobbered this line; the tsc gate surfaced it).
+        createdAt: existing?.createdAt || manifest.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       },
       null,

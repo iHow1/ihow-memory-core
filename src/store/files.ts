@@ -90,13 +90,12 @@ export async function readMemoryFile(workspace: Workspace, ref: string): Promise
 export async function listMarkdownFiles(root: string): Promise<string[]> {
   const results: string[] = [];
   async function visit(dir: string): Promise<void> {
-    let entries: Awaited<ReturnType<typeof fs.readdir>>;
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    // No explicit `Awaited<ReturnType<typeof fs.readdir>>` annotation: that picks the wrong (Buffer)
+    // overload, so entry.name typed as a Buffer. Inferring from the call resolves the string overload.
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
       throw error;
-    }
+    });
     for (const entry of entries) {
       const absolute = path.join(dir, entry.name);
       if (entry.isDirectory()) {

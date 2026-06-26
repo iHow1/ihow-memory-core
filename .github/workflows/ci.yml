@@ -16,8 +16,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+      - name: Install dev deps (typescript for the typecheck gate)
+        run: npm install --no-audit --no-fund
       - name: Build
         run: npm run build
+      - name: Typecheck (catches used-but-not-imported / unresolved-identifier bugs the transform-only build can't)
+        run: npm run typecheck
       - name: CLI smoke
         run: node bin/ihow-memory.mjs --version
       - name: Tests

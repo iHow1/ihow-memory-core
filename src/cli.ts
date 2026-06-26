@@ -88,7 +88,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--vector-timeout-ms') options.vectorTimeoutMs = Number(tail[++index]);
     else if (arg === '--runtime') {
       const runtime = tail[++index];
-      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw'].includes(runtime)) options.runtime = runtime;
+      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw'].includes(runtime)) options.runtime = runtime as ParsedArgs['options']['runtime'];
       else throw new Error('unsupported_runtime: use claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw');
     }
     else if (arg === '--share-diagnostics') options.shareDiagnostics = true;
@@ -1091,7 +1091,7 @@ function nodeVersionAtLeast(actual: string, expected: string): boolean {
 }
 
 async function doctor(
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' },
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' },
 ): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
   const workspace = resolveWorkspace(options);
@@ -1267,7 +1267,7 @@ async function packageInfo(): Promise<{ name: string; version: string }> {
 
 async function diagnosticReport(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' } = {},
 ): Promise<Record<string, unknown>> {
   const sanitized = sanitizeDoctorResult(result, options);
   const info = await packageInfo();
@@ -1315,7 +1315,7 @@ function githubIssueUrl(body: string): string {
 
 async function feedbackTemplate(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' } = {},
 ): Promise<{ body: string; url: string }> {
   const report = await diagnosticReport(result, options);
   const body = `## What happened
@@ -2811,7 +2811,7 @@ async function main(): Promise<void> {
     else {
       console.log('iHow Memory 10-second proof');
       console.log('cloud: disabled / local only');
-      console.log(`workspace: ${result.workspace.path}`);
+      console.log(`workspace: ${(result.workspace as { path: string }).path}`);
       console.log(
         `agent A wrote candidate: ${(result.agentA as Record<string, Record<string, string>>).candidate.path}`,
       );
