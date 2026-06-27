@@ -66,6 +66,40 @@ test('recall: NEVER injects an unreviewed auto-promoted entry (machine-judged, n
   assert.ok(!/auto-kappa/.test(ctx), 'the auto-promoted file path is not injected either');
 });
 
+test('recall: opt-in attributed auto tier — IHOW_RECALL_INCLUDE_AUTO surfaces auto entries tagged 🟡 with provenance', async (t) => {
+  const root = await mkdtempReal('ihow-recall-tier-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  // a HUMAN-reviewed promoted decision (🟢) and an AUTO-promoted entry carrying its provenance in frontmatter (🟡).
+  const cand = JSON.parse(cli(['write-candidate', 'Decision: adopt zetaframework for the dashboard, approved by the team.'], root, space)).path;
+  cli(['promote', cand, '--scope', 'team', '--title', 'zetaframework decision'], root, space);
+  const autoDir = path.join(root, space, 'memory', 'scopes', 'general');
+  await fs.mkdir(autoDir, { recursive: true });
+  await fs.writeFile(path.join(autoDir, 'auto-kappa.md'), [
+    '---', 'candidate_id: "auto-kappa"', 'status: "promoted"', 'type: "memory"', 'source_agent: "agent-auto"',
+    'promoted_at: "2026-06-25T00:00:00Z"', 'tier: "auto-promoted"', 'reviewed: false',
+    'command: "npm test"', 'exitCode: 0', '---', '',
+    'The kappaframework migration finished and all the checks passed.', '',
+  ].join('\n'), 'utf8');
+  cli(['reindex'], root, space);
+  const prompt = 'remind me about the zetaframework and kappaframework decisions';
+
+  // DEFAULT (no opt-in): auto entry excluded (the OpenClaw guard), reviewed entry tagged 🟢.
+  const off = recall(prompt, root, space);
+  const offCtx = off.stdout.trim() ? JSON.parse(off.stdout).hookSpecificOutput.additionalContext : '';
+  assert.match(offCtx, /🟢 reviewed/, 'reviewed entry carries the green tag');
+  assert.match(offCtx, /zetaframework/, 'reviewed entry is recalled');
+  assert.ok(!/kappaframework/i.test(offCtx), 'by default the auto entry is still excluded');
+
+  // OPT-IN: auto entry surfaces, tagged 🟡 with its provenance basis; reviewed stays 🟢.
+  const on = recall(prompt, root, space, { IHOW_RECALL_INCLUDE_AUTO: '1' });
+  const onCtx = on.stdout.trim() ? JSON.parse(on.stdout).hookSpecificOutput.additionalContext : '';
+  assert.match(onCtx, /kappaframework/i, 'with opt-in the auto entry IS surfaced');
+  assert.match(onCtx, /🟡 auto/, 'auto entry carries the yellow tier tag');
+  assert.match(onCtx, /cites `npm test` exit 0/, 'auto entry shows its provenance basis');
+  assert.match(onCtx, /🟢 reviewed/, 'the reviewed entry stays green-tagged alongside');
+});
+
 test('recall: variant YAML for unreviewed auto-promoted is STILL excluded (case/quote-tolerant)', async (t) => {
   const root = await mkdtempReal('ihow-recall-var-');
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
