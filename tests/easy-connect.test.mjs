@@ -97,17 +97,25 @@ test('--easy --no-install-hook respects the explicit opt-out (skill yes, hook no
   assert.equal(await exists(path.join(proj, '.claude', 'settings.local.json')), false, 'hook opt-out respected');
 });
 
-test('connect --easy --recall does NOT wire recall (recall is install-hook-only; default-off invariant)', async (t) => {
-  // recall-safety review 2026-06-17: --recall flowing through connect would break the "recall reachable
-  // only via install-hook --recall" guarantee the OpenClaw gate depends on. parseArgs scopes --recall to
-  // install-hook, so connect --recall must wire the capture hook but NOT the UserPromptSubmit recall hook.
+test('connect --easy wires recall by default (reviewed tier); --no-recall opts out', async (t) => {
+  // 2026-06-26 recall-quality eval (reviewed ~88% signal / 0 harmful) relaxed the 2026-06-17 default-off
+  // guard: recall (UserPromptSubmit, reviewed tier only) now installs by default on the easy path, and
+  // --no-recall skips it. The machine-judged auto tier still stays opt-in (IHOW_RECALL_INCLUDE_AUTO=1).
   const proj = await mkdtempReal('ihow-proj-');
   const home = await mkdtempReal('ihow-home-');
   const bin = await makeClaudeShim();
   t.after(async () => { for (const d of [proj, home, bin]) await fs.rm(d, { recursive: true, force: true }); });
 
-  runConnect({ cwd: proj, home, bin, args: ['--easy', '--recall'] });
-  const settings = JSON.parse(await fs.readFile(path.join(proj, '.claude', 'settings.local.json'), 'utf8'));
-  assert.ok(stopCommands(settings).some((c) => c.includes('hook-stop')), 'capture hook still wired by --easy');
-  assert.equal((settings.hooks?.UserPromptSubmit ?? []).length, 0, 'connect --easy --recall does NOT wire the recall hook');
+  runConnect({ cwd: proj, home, bin, args: ['--easy'] });
+  let settings = JSON.parse(await fs.readFile(path.join(proj, '.claude', 'settings.local.json'), 'utf8'));
+  assert.ok(stopCommands(settings).some((c) => c.includes('hook-stop')), 'capture hook wired by --easy');
+  const recallCmds = (settings.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
+  assert.ok(recallCmds.some((c) => c.includes('hook-user-prompt-submit')), 'connect --easy wires the recall hook by default');
+
+  const proj2 = await mkdtempReal('ihow-proj-');
+  t.after(async () => { await fs.rm(proj2, { recursive: true, force: true }); });
+  runConnect({ cwd: proj2, home, bin, args: ['--easy', '--no-recall'] });
+  settings = JSON.parse(await fs.readFile(path.join(proj2, '.claude', 'settings.local.json'), 'utf8'));
+  assert.ok(stopCommands(settings).some((c) => c.includes('hook-stop')), '--no-recall still wires the capture hook');
+  assert.equal((settings.hooks?.UserPromptSubmit ?? []).length, 0, 'connect --easy --no-recall skips the recall hook');
 });

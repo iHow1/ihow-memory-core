@@ -103,10 +103,14 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--install-hook') options.installHook = true;
     else if (arg === '--no-install-hook') options.installHook = false;
     else if (arg === '--global-hook') options.globalHook = true;
-    // --recall (opt-in recall hook) is honored ONLY for install-hook — never for connect/--easy/--auto, so
-    // recall can never be wired by a default/connect path (recall-safety review 2026-06-17: connect --recall
-    // must not enable recall). Scoped here at the single parse point so it cannot leak into another command.
-    else if (arg === '--recall') { if (command === 'install-hook') options.recall = true; }
+    // RECALL (the read path) now installs by DEFAULT (reviewed-tier only) — `--no-recall` opts out.
+    // This relaxes the 2026-06-17 default-off guard: a recall-quality eval (2026-06-26) measured the
+    // reviewed tier at ~88% signal / 0 harmful across a labeled corpus (off-topic prompts inject
+    // nothing; stale/contradicted entries are dropped). The machine-judged AUTO tier stays opt-in
+    // (IHOW_RECALL_INCLUDE_AUTO=1) because that eval put it at ~25% signal (mostly harmless clutter).
+    // Kill-switch IHOW_RECALL_OFF=1 disables injection at runtime without uninstalling.
+    else if (arg === '--recall') options.recall = true;
+    else if (arg === '--no-recall') options.recall = false;
     else if (arg === '--easy' || arg === '--yes') options.easy = true;
     else if (arg === '--auto') options.auto = true;
     else if (arg === '--write') options.write = true;
@@ -790,7 +794,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     line('       · (no Claude Code detected — skill + auto-capture hook are Claude Code only)');
   } else if (dryRun) {
     line('       · would install memory skill → ~/.claude/skills/ihow-memory/');
-    line(`       · would install Stop + SessionStart auto-capture hook ${options.globalHook ? '[all Claude Code projects]' : '[this project only]'}`);
+    line(`       · would install Stop + SessionStart auto-capture hook${options.recall === false ? '' : ' + UserPromptSubmit recall (🟢 reviewed-only)'} ${options.globalHook ? '[all Claude Code projects]' : '[this project only]'}`);
     skill = 'dry-run'; hook = 'dry-run';
   } else {
     // The install helpers can no-op (unparseable settings, unreadable bundle) or throw on an fs error;
@@ -800,7 +804,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     let hookThrew = false;
     try { await silently(() => maybeInstallClaudeSkill({ ...options, installSkill: options.installSkill !== false })); } catch { skillThrew = true; }
     try { await silently(() => maybeInstallStopHook({ ...options, installHook: options.installHook !== false })); } catch { hookThrew = true; }
-    line('       · recall stays OFF (never reads your prompts; opt in later: install-hook --recall)');
+    line(`       · recall ${options.recall === false ? 'OFF (--no-recall)' : 'ON — injects only 🟢 reviewed memory, relevant-only, tagged + bounded (off: --no-recall / IHOW_RECALL_OFF=1)'}`);
     if (options.installSkill === false) skill = 'skipped';
     else {
       const present = await fs.access(path.join(os.homedir(), '.claude', 'skills', 'ihow-memory', 'SKILL.md')).then(() => true, () => false);
@@ -936,7 +940,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     line('    2. Resume after a context boundary with:  ihow-memory continue');
   }
   line('');
-  line('  Local only: no cloud, nothing uploaded, recall off by default.');
+  line('  Local only: no cloud, nothing uploaded. Recall injects only 🟢 reviewed memory, relevant-only (off: --no-recall).');
   line('  Re-check anytime: ihow-memory doctor   ·   re-running setup is safe (idempotent).');
 }
 
@@ -997,9 +1001,9 @@ Usage:
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Claude Code Stop-hook handler (reads hook JSON on stdin; wired by the plugin) — emits a session-end capture instruction
   ihow-memory hook-session-start          # Claude Code SessionStart-hook handler (reads hook JSON on stdin; wired by the plugin) — floors the previous session deterministically if it ended without a cooperative journal
-  ihow-memory hook-user-prompt-submit     # Claude Code UserPromptSubmit-hook handler (recall — experimental, opt-in) — injects relevant curated memory into a new prompt
+  ihow-memory hook-user-prompt-submit     # Claude Code UserPromptSubmit-hook handler (recall) — injects relevant 🟢 reviewed curated memory into a new prompt (relevant-only, tagged, bounded)
   ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
-  ihow-memory install-hook [--global-hook] [--recall] [--no-install-hook]   # add the auto-capture hooks: Stop (session-end nudge) + SessionStart (next-session floor); --recall also adds experimental UserPromptSubmit recall (default OFF). (default: this project's .claude/settings.local.json; --global-hook: ~/.claude/settings.json)
+  ihow-memory install-hook [--global-hook] [--no-recall] [--no-install-hook]   # add the hooks: Stop (session-end nudge) + SessionStart (next-session floor) + UserPromptSubmit recall (ON by default, injects only 🟢 reviewed memory; --no-recall to skip; 🟡 auto tier opt-in via IHOW_RECALL_INCLUDE_AUTO=1). (default: this project's .claude/settings.local.json; --global-hook: ~/.claude/settings.json)
 
 Defaults:
   root: ${defaultRoot()}
@@ -1664,12 +1668,14 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
   // deterministically if it ended without one (the backstop). Both bind the same workspace.
   const addedStop = ensureHook('Stop', 'hook-stop', stopHookCommand(options));
   const addedStart = ensureHook('SessionStart', 'hook-session-start', sessionStartHookCommand(options));
-  // RECALL (read path) is OpenClaw-GATED and DEFAULT-OFF — wired ONLY when the operator explicitly passes
-  // --recall, never by connect / --easy / a plain install-hook. It reads curated memory back into a new
-  // prompt; see runRecallHook for the safety guards (curated-only, bounded, never-block).
-  const addedRecall = options.recall ? ensureHook('UserPromptSubmit', 'hook-user-prompt-submit', recallHookCommand(options)) : false;
+  // RECALL (read path) now installs by DEFAULT (reviewed tier only); `--no-recall` opts out. It reads
+  // curated memory back into a new prompt — see runRecallHook for the safety guards: curated allowlist,
+  // reviewed-only by default (machine-judged AUTO tier stays behind IHOW_RECALL_INCLUDE_AUTO=1), relevance-
+  // gated (off-topic -> silent), recency-deduped, redacted, bounded, fenced as untrusted, never blocks.
+  // Basis for defaulting on: the 2026-06-26 recall-quality eval (reviewed ~88% signal / 0 harmful).
+  const addedRecall = options.recall !== false ? ensureHook('UserPromptSubmit', 'hook-user-prompt-submit', recallHookCommand(options)) : false;
   if (!addedStop && !addedStart && !addedRecall) {
-    console.log(`✓ ${options.recall ? 'auto-capture + recall hooks' : 'auto-capture hooks'} already present in ${dest}`);
+    console.log(`✓ ${options.recall !== false ? 'auto-capture + recall hooks' : 'auto-capture hooks'} already present in ${dest}`);
     return;
   }
   settings.hooks = hooks;
@@ -1686,11 +1692,11 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
   const added = [
     addedStop ? 'Stop (session-end nudge)' : null,
     addedStart ? 'SessionStart (next-session floor)' : null,
-    addedRecall ? 'UserPromptSubmit (recall — experimental, reads curated memory back)' : null,
+    addedRecall ? 'UserPromptSubmit (recall — reads reviewed memory back into new prompts)' : null,
   ].filter(Boolean).join(' + ');
   console.log(`✓ installed ${added} [${scopeLabel}] → ${dest} (restart Claude Code to load them)`);
   if (addedRecall) {
-    console.log('  recall is experimental + opt-in: it injects ONLY curated/promoted memory (never low-weight auto-capture), bounded, never blocks. Disable anytime with IHOW_RECALL_OFF=1 or by removing the UserPromptSubmit hook.');
+    console.log('  recall is ON: it injects ONLY human-reviewed curated memory, relevant-only (off-topic prompts get nothing), bounded, tagged 🟢 reviewed, never blocks. Turn off with --no-recall (or IHOW_RECALL_OFF=1 at runtime). The machine-judged 🟡 auto tier stays opt-in: IHOW_RECALL_INCLUDE_AUTO=1.');
   }
 }
 

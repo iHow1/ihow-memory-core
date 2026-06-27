@@ -196,22 +196,26 @@ test('recall: bounded — at most 3 curated entries injected, within the char bu
   assert.ok(ctx.length <= 1200, 'within the char budget');
 });
 
-test('install: recall is DEFAULT-OFF — plain install-hook adds no UserPromptSubmit hook; --recall adds it', async (t) => {
+test('install: recall is DEFAULT-ON (reviewed tier) — plain install-hook adds it; --no-recall skips it', async (t) => {
+  const userPromptHooks = (s) => (s.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
+
+  // default: recall hook IS installed (reviewed tier; basis = 2026-06-26 recall-quality eval, ~88% signal / 0 harmful)
   const proj = await mkdtempReal('ihow-proj-');
   t.after(async () => { await fs.rm(proj, { recursive: true, force: true }); });
   const dest = path.join(proj, '.claude', 'settings.local.json');
-  const userPromptHooks = (s) => (s.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
-
-  // default: NO recall hook
   execFileSync(process.execPath, [CLI, 'install-hook'], { cwd: proj, encoding: 'utf8', env: { ...process.env } });
   let settings = JSON.parse(await fs.readFile(dest, 'utf8'));
   assert.ok((settings.hooks?.Stop ?? []).length > 0, 'Stop hook installed by default');
-  assert.equal(userPromptHooks(settings).length, 0, 'NO UserPromptSubmit recall hook by default (OpenClaw: recall off)');
+  assert.ok(userPromptHooks(settings).some((c) => c.includes('hook-user-prompt-submit')), 'recall hook installed by default');
 
-  // opt-in: --recall adds it
-  execFileSync(process.execPath, [CLI, 'install-hook', '--recall'], { cwd: proj, encoding: 'utf8', env: { ...process.env } });
-  settings = JSON.parse(await fs.readFile(dest, 'utf8'));
-  assert.ok(userPromptHooks(settings).some((c) => c.includes('hook-user-prompt-submit')), '--recall adds the UserPromptSubmit recall hook');
+  // opt-out: --no-recall skips the recall hook (capture hooks still installed)
+  const proj2 = await mkdtempReal('ihow-proj-');
+  t.after(async () => { await fs.rm(proj2, { recursive: true, force: true }); });
+  const dest2 = path.join(proj2, '.claude', 'settings.local.json');
+  execFileSync(process.execPath, [CLI, 'install-hook', '--no-recall'], { cwd: proj2, encoding: 'utf8', env: { ...process.env } });
+  settings = JSON.parse(await fs.readFile(dest2, 'utf8'));
+  assert.ok((settings.hooks?.Stop ?? []).length > 0, '--no-recall still installs the capture hooks');
+  assert.equal(userPromptHooks(settings).length, 0, '--no-recall skips the UserPromptSubmit recall hook');
 });
 
 // --- regression tests from the 2026-06-17 recall-safety review (all reproduced as real leaks) ---

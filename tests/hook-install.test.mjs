@@ -45,8 +45,9 @@ test('install-hook defaults to this project (.claude/settings.local.json), wirin
   const settings = await readJson(path.join(proj, '.claude', 'settings.local.json'));
   assert.ok(stopCommands(settings).some((c) => c.includes('hook-stop') && c.includes('ihow-memory')), 'project-local Stop hook present');
   assert.ok(sessionStartCommands(settings).some((c) => c.includes('hook-session-start') && c.includes('ihow-memory')), 'project-local SessionStart floor hook present');
-  // recall (UserPromptSubmit) is DEFAULT-OFF — not wired without --recall
-  assert.ok(!(settings.hooks?.UserPromptSubmit ?? []).length, 'no recall hook by default');
+  // recall (UserPromptSubmit, reviewed tier) is now wired by DEFAULT (2026-06-26 recall-quality eval); --no-recall opts out
+  const recallCmds = (settings.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
+  assert.ok(recallCmds.some((c) => c.includes('hook-user-prompt-submit') && c.includes('ihow-memory')), 'recall hook wired by default');
 });
 
 test('install-hook --global-hook targets ~/.claude/settings.json and not the project', async (t) => {

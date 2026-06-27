@@ -72,7 +72,7 @@ test('setup is idempotent — re-running changes nothing and adds no new backups
   const out2 = run(args, home); // second run
   // The skill + hook are content-idempotent: a re-run re-affirms them in place, no duplicate install.
   assert.match(out2, /memory skill already current/, 'skill re-affirmed, not reinstalled');
-  assert.match(out2, /auto-capture hooks already present/, 'hooks re-affirmed, not duplicated');
+  assert.match(out2, /hooks already present/, 'hooks re-affirmed, not duplicated');
   assert.match(out2, /✓ iHow Memory is set up/, 'still succeeds on re-run');
 });
 
