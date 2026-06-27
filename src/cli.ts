@@ -21,6 +21,8 @@ import { recordHandoffMetric } from './handoff-metrics.ts';
 import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, referencedHead, buildHandoffPacket, type ResumableSession } from './handoff.ts';
 import { probeMcpServer, verifyConnection } from './mcp/probe.ts';
 import { migrateLocalDay } from './migrate.ts';
+import { planImport, applyImport, collectExistingImports, type ImportPlan } from './import.ts';
+import { mcpLaneWorkspace } from './store/events.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
 
@@ -52,6 +54,10 @@ type ParsedArgs = {
     easy?: boolean;
     auto?: boolean;
     write?: boolean;
+    apply?: boolean;
+    update?: boolean;
+    from?: string;
+    importSource?: 'claude-code' | 'markdown';
   };
   rest: string[];
 };
@@ -110,6 +116,13 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--real-write') options.realWrite = true;
     else if (arg === '--actor') options.actor = tail[++index];
+    else if (arg === '--apply') options.apply = true;
+    else if (arg === '--update') options.update = true;
+    else if (arg === '--from') options.from = tail[++index];
+    else if (arg === '--source') {
+      const src = tail[++index];
+      if (src === 'claude-code' || src === 'markdown') options.importSource = src;
+    }
     else rest.push(arg);
   }
   return { command, options, rest };
@@ -927,6 +940,29 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   line('  Re-check anytime: ihow-memory doctor   ·   re-running setup is safe (idempotent).');
 }
 
+// Auto-detect Claude Code's native auto-memory directories (~/.claude/projects/<slug>/memory with a
+// MEMORY.md index). Used by `import` with no --from. Read-only, best-effort: a missing ~/.claude or an
+// unreadable dir just yields fewer candidates — never throws.
+async function detectClaudeMemoryDirs(): Promise<string[]> {
+  const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+  const found: string[] = [];
+  let projects: string[];
+  try {
+    projects = await fs.readdir(projectsRoot);
+  } catch {
+    return found;
+  }
+  for (const proj of projects) {
+    const memoryDir = path.join(projectsRoot, proj, 'memory');
+    try {
+      if ((await fs.stat(path.join(memoryDir, 'MEMORY.md'))).isFile()) found.push(memoryDir);
+    } catch {
+      // no MEMORY.md here — skip
+    }
+  }
+  return found.sort();
+}
+
 function help(): void {
   console.log(`iHow Memory Core v${packageVersion()}
 
@@ -946,6 +982,7 @@ Usage:
   ihow-memory read <memory/path.md>
   ihow-memory write-candidate <text> [--space name]
   ihow-memory journal <text> [--title t] [--actor name] [--space name]   # append a low-weight auto-capture entry (searchable but ranked below curated memory)
+  ihow-memory import [--from path] [--source claude-code|markdown] [--apply] [--update] [--json]   # import EXISTING memory you wrote elsewhere (Claude Code native MEMORY.md = biggest stock source, ai-memory markdown, any folder of .md notes) into the searchable journal lane. Dry-run unless --apply; auto-detects Claude Code memory when --from is omitted; reversible per item; proves the import by searching one item back out. Re-import is idempotent (unchanged items skipped); an EDITED fact is reported as changed and refreshed only with --update (replaces the stale copy).
   ihow-memory promote <candidate-path> [--scope name] [--title title]
   ihow-memory durable-promote <candidate-path> (--dry-run | --real-write) [--scope name] [--title title] [--path path]
   ihow-memory audit [--since YYYY-MM-DD] [--space name]   # list the append-only audit log (candidate / promote / journal / rollback events)
@@ -2883,6 +2920,174 @@ async function main(): Promise<void> {
     if (!changed) console.log('nothing to migrate — all journal/event files already use local-day names.');
     else if (!apply) console.log('re-run with --apply to perform the migration.');
     else console.log('done.');
+    return;
+  }
+
+  if (command === 'import') {
+    const apply = options.apply === true;
+    const json = options.json === true;
+
+    // Resolve WHAT to import. Explicit --from wins. Otherwise auto-detect Claude Code's native
+    // auto-memory dirs (~/.claude/projects/*/memory with a MEMORY.md): use the single one if there's
+    // exactly one, but NEVER guess when there are several — list them and ask for --from. No magic
+    // that could silently import the wrong project's memory.
+    let from = options.from;
+    if (!from) {
+      const detected = await detectClaudeMemoryDirs();
+      if (detected.length === 1) {
+        from = detected[0];
+        if (!json) console.log(`(no --from given; auto-detected Claude Code memory: ${from})\n`);
+      } else if (detected.length > 1) {
+        if (json) printJson({ ok: false, reason: 'ambiguous_source', candidates: detected });
+        else {
+          console.error('import: found several Claude Code memory dirs — pick one with --from <path>:');
+          for (const d of detected) console.error(`  --from ${d}`);
+        }
+        process.exitCode = 1;
+        return;
+      } else {
+        if (json) printJson({ ok: false, reason: 'no_source', hint: 'pass --from <path-to-MEMORY.md-or-dir> (Claude Code memory, ai-memory markdown, or any folder of .md notes)' });
+        else {
+          console.error('import: nothing to import — no source given and no Claude Code memory auto-detected.');
+          console.error('  Point it at memory you already have:');
+          console.error('    ihow-memory import --from ~/.claude/projects/<project>/memory   # Claude Code native (biggest stock source)');
+          console.error('    ihow-memory import --from ./MEMORY.md                            # a single index/file');
+          console.error('    ihow-memory import --from ./notes --source markdown             # any folder of .md notes / ai-memory handoffs');
+        }
+        process.exitCode = 1;
+        return;
+      }
+    }
+
+    let plan: ImportPlan;
+    try {
+      plan = await planImport({ from: from!, source: options.importSource });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (json) printJson({ ok: false, reason: 'plan_failed', detail: msg });
+      else console.error(`import: could not read source at ${from} — ${msg}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    // Empty source is an honest RED + non-zero exit — never a vacuous "✓ done" over zero items
+    // (the B5 every([])-green lesson, applied to import).
+    if (plan.items.length === 0) {
+      if (json) printJson({ ok: false, source: plan.source, from: plan.from, scanned: plan.scanned, items: [], skipped: plan.skipped });
+      else {
+        console.error(`import: found 0 importable items at ${plan.from} (source: ${plan.source}).`);
+        if (plan.scanned.length) console.error(`  scanned ${plan.scanned.length} file(s); ${plan.skipped.length} skipped.`);
+        for (const s of plan.skipped.slice(0, 10)) console.error(`    • ${path.basename(s.file)} — ${s.reason}`);
+        console.error('  Is this a Claude Code memory dir (MEMORY.md + *.md) or a folder of markdown notes?');
+      }
+      process.exitCode = 1;
+      return;
+    }
+
+    const sep = '─'.repeat(64);
+
+    // ── DRY RUN (default): print the plan, write nothing ───────────────────────────────────────
+    if (!apply) {
+      if (json) {
+        printJson({ ok: true, mode: 'dry-run', source: plan.source, from: plan.from, scannedCount: plan.scanned.length, items: plan.items.map((i) => ({ title: i.title, sourceFile: i.sourceFile, tags: i.tags, chars: i.text.length })), skipped: plan.skipped });
+        return;
+      }
+      console.log('iHow Memory — import plan   (DRY RUN — nothing written; re-run with --apply)');
+      console.log(sep);
+      console.log(`SOURCE   ${plan.source}   ${plan.from}`);
+      console.log(`  scanned ${plan.scanned.length} file(s) → ${plan.items.length} importable item(s)${plan.skipped.length ? `, ${plan.skipped.length} skipped` : ''}`);
+      console.log('');
+      console.log(`WOULD IMPORT ${plan.items.length} item(s) → journal lane (searchable, low-weight, reversible)`);
+      for (const item of plan.items.slice(0, 30)) console.log(`  • ${item.title}   (${path.basename(item.sourceFile)})`);
+      if (plan.items.length > 30) console.log(`  … and ${plan.items.length - 30} more`);
+      for (const s of plan.skipped.slice(0, 10)) console.log(`  ✗ skipped ${path.basename(s.file)} — ${s.reason}`);
+      console.log(sep);
+      console.log(`Next:  ihow-memory import --from ${plan.from}${options.importSource ? ` --source ${options.importSource}` : ''} --apply`);
+      return;
+    }
+
+    // ── APPLY: write into the journal lane, reindex once, then PROVE it round-trips ─────────────
+    const core = await openCore(options);
+    const journalDirs = core.workspace.mode === 'managed-space'
+      ? [core.workspace.journalDir, mcpLaneWorkspace(core.workspace).journalDir]
+      : [core.workspace.journalDir];
+    const existing = await collectExistingImports(journalDirs);
+    const applied = await applyImport(core.workspace, plan.items, { existing, journalDirs, update: options.update });
+    const landed = applied.filter((a) => a.status === 'written' || a.status === 'updated'); // wrote to disk
+    if (landed.length) await core.rebuild(); // index ONCE after the whole batch, not per item
+
+    // Verify-first proof: round-trip a landed item back out by its UNIQUE content marker (a clean 12-hex
+    // token), matched on the EXACT journal path. Probing by the marker (not a title word) is what makes
+    // this honest: it cannot be saturated past the search limit by curated docs, and it cannot false-match
+    // a same-basename curated daily file — the two failure modes a title-word probe had. If a landed item
+    // cannot be found at its own path, the import did NOT round-trip (RED, non-zero) — no false green.
+    let verified: { ok: boolean; marker: string; ref?: string } | null = null;
+    if (landed.length) {
+      const probe = landed[0];
+      const hits = await core.search(probe.contentMarker, { limit: 25 });
+      const hit = hits.find((h) => h.path === probe.path);
+      verified = { ok: !!hit, marker: probe.contentMarker, ref: hit?.path };
+    }
+
+    const counts = {
+      written: applied.filter((a) => a.status === 'written').length,
+      updated: applied.filter((a) => a.status === 'updated').length,
+      duplicate: applied.filter((a) => a.status === 'skipped-duplicate').length,
+      changed: applied.filter((a) => a.status === 'skipped-changed').length,
+      secret: applied.filter((a) => a.status === 'skipped-secret').length,
+      error: applied.filter((a) => a.status === 'skipped-error').length,
+    };
+    // OK iff: at least one item landed AND it round-tripped; OR nothing landed but it was a legitimate
+    // no-op (all already-imported, and/or edited facts deliberately left for --update) with nothing
+    // refused for cause. Landed-but-unverifiable, or "wrote nothing because items were REFUSED
+    // (secret-like) / errored", is NOT ok — that must surface honestly, never read as success.
+    const refusedForCause = counts.secret > 0 || counts.error > 0;
+    const ok = landed.length > 0
+      ? verified?.ok === true
+      : !refusedForCause && (counts.duplicate > 0 || counts.changed > 0);
+
+    if (json) {
+      printJson({ ok, source: plan.source, from: plan.from, counts, verified, applied: applied.map((a) => ({ title: a.title, status: a.status, path: a.path ?? null, eventId: a.eventId ?? null, superseded: a.supersededCount ?? null, reason: a.reason ?? null })), reproduce: { search: `ihow-memory search "${verified?.marker ?? ''}"`, undo: 'ihow-memory rollback --event <id>', audit: 'ihow-memory audit' } });
+      process.exitCode = ok ? 0 : 1;
+      return;
+    }
+
+    console.log('iHow Memory — import receipt   (no trust required: every line is reproducible)');
+    console.log(sep);
+    console.log(`SOURCE   ${plan.source}   ${plan.from}`);
+    console.log(`  scanned ${plan.scanned.length} file(s)`);
+    console.log('');
+    console.log(`WROTE    ${landed.length} item(s) → journal lane (searchable, low-weight, reversible)${counts.updated ? `   (${counts.written} new, ${counts.updated} updated)` : ''}`);
+    for (const a of landed.slice(0, 30)) console.log(`  • ${a.title}   → ${a.path}${a.status === 'updated' ? `   (replaced ${a.supersededCount ?? 0} stale)` : ''}`);
+    if (landed.length > 30) console.log(`  … and ${landed.length - 30} more`);
+    if (counts.duplicate) console.log(`  ↺ ${counts.duplicate} already imported (unchanged) — skipped, not duplicated`);
+    if (counts.changed) console.log(`  ↻ ${counts.changed} changed since last import — NOT re-imported (re-run with --update to refresh; old version kept)`);
+    if (counts.secret) console.log(`  🔒 ${counts.secret} skipped — secret-like content refused at write (never stored)`);
+    if (counts.error) console.log(`  ✗ ${counts.error} skipped — see --json for the error`);
+    console.log(`  ↻ reproduce:  ihow-memory import --from ${plan.from} ${options.importSource ? `--source ${options.importSource} ` : ''}    (dry-run; re-lists the plan)`);
+    console.log('');
+    if (verified) {
+      console.log(`VERIFY   round-trip a landed item by its unique marker   ${verified.ok ? '✓ found at its journal path' : '✗ NOT found'}`);
+      console.log(`  ↻ reproduce:  ihow-memory search "${verified.marker}"   ${verified.ok ? '(returns exactly the imported entry)' : '(should return it — it did not; the import did not land)'}`);
+    } else if (counts.duplicate || counts.changed) {
+      console.log('VERIFY   nothing new written — every item was already imported (unchanged or pending --update)');
+    }
+    console.log(sep);
+    let overall: string;
+    if (landed.length > 0 && verified?.ok) {
+      overall = `✓ ${landed.length} item(s) imported and searchable${counts.changed ? ` · ${counts.changed} changed left for --update` : ''} — undo any with: ihow-memory rollback --event <id>  (ids: ihow-memory audit)`;
+    } else if (landed.length > 0) {
+      overall = '✗ import did not round-trip — a written item could not be searched back out; re-run: ihow-memory reindex && ihow-memory search';
+    } else if (refusedForCause) {
+      const parts = [counts.secret ? `${counts.secret} refused (secret-like)` : '', counts.error ? `${counts.error} errored` : '', counts.duplicate ? `${counts.duplicate} already present` : ''].filter(Boolean);
+      overall = `✗ nothing imported — ${parts.join(', ')}. See the lines above.`;
+    } else if (counts.changed) {
+      overall = `↻ ${counts.changed} changed since last import — re-run with --update to refresh (nothing written; old versions kept)`;
+    } else {
+      overall = '✓ already up to date — every item was imported before';
+    }
+    console.log(`OVERALL  ${overall}`);
+    process.exitCode = ok ? 0 : 1;
     return;
   }
 
