@@ -128,11 +128,14 @@ stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）
 ## CLI 速查
 
 ```text
+ihow-memory setup            零配置:检测 runtime → 接 MCP + skill + 自动捕获/recall hooks → 自检（推荐;幂等、本地）[--dry-run] [--json]
 ihow-memory init             创建受管 workspace，打印 MCP 配置片段
 ihow-memory connect          自动配置 runtime（claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes）[--dry-run]
+ihow-memory continue         上下文边界后接班——verify-first 交接 + live git 锚点（GREEN/YELLOW/RED）[关键词] [--list] [--json]
 ihow-memory install-skill    安装 Claude Code 记忆 skill 到 ~/.claude/skills
-ihow-memory install-hook     安装自动捕获 hooks——Stop（协作式提示）+ SessionStart（确定式 floor）（默认 project-local；--global-hook 用户级）
+ihow-memory install-hook     安装 hooks——Stop（协作提示）+ SessionStart（确定式 floor）+ UserPromptSubmit recall（🟢 reviewed、默认开;--no-recall 跳过）（默认 project-local；--global-hook 用户级）
 ihow-memory doctor           环境与配置检查 [--share-diagnostics 输出脱敏报告]
+ihow-memory verify           可复现自证回执:本地存储 + 各 runtime 可达性 + 本 checkout 的接班裁决,每行可自己重跑 [--runtime name] [--json]
 ihow-memory status           workspace、引擎、索引与 sync 状态 [--json]
 ihow-memory search <query>   带引用的本地检索 [--limit n]
 ihow-memory read <path>      读取单个记忆文件（带引用）
@@ -140,11 +143,14 @@ ihow-memory write-candidate  提出记忆 candidate（进入沙箱 inbox）
 ihow-memory promote          升级 candidate（显式、留审计）
 ihow-memory durable-promote  持久写入——必须传 --dry-run 或 --real-write
 ihow-memory journal          追加一条低权重 journal 条目（自动捕获通道）
+ihow-memory import           导入你在别处写的记忆（Claude Code MEMORY.md、ai-memory markdown、任意 .md 目录）进可搜索 journal 通道 [--from path] [--apply] [--update]
 ihow-memory audit            列出只追加的审计事件日志 [--since]
 ihow-memory rollback         撤销一条自动捕获的 journal 条目（--event <id>）
 ihow-memory reindex          从 Markdown 重建 SQLite 索引
+ihow-memory migrate-local-day 一次性:把 UTC 命名的 journal/event 文件重新归到本地日（不传 --apply 为干跑）
 ihow-memory upgrade          更新包后刷新 workspace 里冻结的 server 副本（然后重启 runtime）
 ihow-memory proof            在一次性 space 中跑完整治理闭环证明
+ihow-memory benchmark        verify-first 保证的确定性本地证明（三色裁决会判别;地板挡垃圾）——可重跑得同结果
 ihow-memory feedback         打印预填的 GitHub issue 与脱敏诊断
 ihow-memory reset            删除受管 demo space（必须传 --space）
 ihow-memory console          只读本地 Web UI [--port 8788]

@@ -145,11 +145,14 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 ## CLI reference
 
 ```text
+ihow-memory setup            zero-config: detect runtimes -> wire MCP + skill + auto-capture/recall hooks -> verify (recommended; idempotent, local-only) [--dry-run] [--json]
 ihow-memory init             create a managed workspace, print the MCP config snippet
 ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes) [--dry-run]
+ihow-memory continue         resume after a context boundary — verify-first handoff with live git anchors (GREEN/YELLOW/RED) [project-keyword] [--list] [--json]
 ihow-memory install-skill    copy the Claude Code proactive-memory skill into ~/.claude/skills/
 ihow-memory install-hook     add the hooks — Stop (cooperative nudge) + SessionStart (deterministic floor) + UserPromptSubmit recall (🟢 reviewed, on by default; --no-recall to skip) (Claude Code; --global-hook for user-wide)
 ihow-memory doctor           environment + setup checks [--share-diagnostics for a redacted report]
+ihow-memory verify           reproducible self-proof receipt: local store + each runtime's reachability + this checkout's resume verdict, every line re-runnable [--runtime name] [--json]
 ihow-memory status           workspace, engine, index and sync state [--json]
 ihow-memory search <query>   citation-bearing local search [--limit n]
 ihow-memory read <path>      read one memory file with citation
@@ -161,6 +164,7 @@ ihow-memory import           import existing memory you wrote elsewhere (Claude 
 ihow-memory audit            list the append-only event log [--since YYYY-MM-DD]
 ihow-memory rollback         undo one auto-captured journal entry (--event <id>)
 ihow-memory reindex          rebuild the SQLite index from Markdown
+ihow-memory migrate-local-day  one-time: re-bucket UTC-named journal/event files to local-day (dry-run unless --apply)
 ihow-memory upgrade          refresh the workspace's frozen server copy after updating the package (then restart the runtime)
 ihow-memory proof            one-command governed-loop proof in a throwaway space
 ihow-memory benchmark        deterministic local proof of the verify-first guarantees (the three-color verdict discriminates; the floor blocks junk) — re-run for the same result
