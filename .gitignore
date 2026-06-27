@@ -6,3 +6,7 @@ node_modules/
 tmp-floor-quality/
 *.ihow-bak-*
 .claude/settings.local.json
+# Internal, non-public strategy material — kept LOCAL only, never committed to this public repo.
+docs/external-validation-kit.md
+docs/verify-benchmark.md
+docs/release-runbook.md
