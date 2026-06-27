@@ -198,10 +198,16 @@ test('an EDITED fact is not silently doubled; --update supersedes the stale copy
   // with --update: supersedes the stale entry and writes the new one
   applied = await applyImport(core.workspace, plan.items, { existing: await collectExistingImports(jdirs), journalDirs: jdirs, update: true });
   assert.equal(applied[0].status, 'updated');
-  assert.ok((applied[0].supersededCount ?? 0) >= 1, 'stale entry removed');
+  assert.ok((applied[0].supersededCount ?? 0) >= 1, 'stale entry superseded');
   await core.rebuild();
-  assert.equal((await core.search('30s', { limit: 10 })).length, 0, 'stale version gone');
+  assert.equal((await core.search('30s', { limit: 10 })).length, 0, 'stale version no longer searchable');
   assert.ok((await core.search('90s', { limit: 10 })).length >= 1, 'new version searchable');
+
+  // keep-history (borrowed from ai-memory, adapted): the stale version is ARCHIVED to historyDir
+  // (outside the index), preserved for audit but never searchable/recalled — not destroyed.
+  const hist = await fs.readFile(path.join(core.workspace.historyDir, 'superseded-import.md'), 'utf8');
+  assert.match(hist, /30s/, 'stale version preserved in off-index history');
+  assert.match(hist, /NOT indexed/, 'history entry marked non-indexed');
 });
 
 test('binary / non-UTF8 .md is skipped with a reason, not ingested', async (t) => {

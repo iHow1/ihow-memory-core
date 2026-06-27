@@ -3058,7 +3058,7 @@ async function main(): Promise<void> {
     console.log(`  scanned ${plan.scanned.length} file(s)`);
     console.log('');
     console.log(`WROTE    ${landed.length} item(s) → journal lane (searchable, low-weight, reversible)${counts.updated ? `   (${counts.written} new, ${counts.updated} updated)` : ''}`);
-    for (const a of landed.slice(0, 30)) console.log(`  • ${a.title}   → ${a.path}${a.status === 'updated' ? `   (replaced ${a.supersededCount ?? 0} stale)` : ''}`);
+    for (const a of landed.slice(0, 30)) console.log(`  • ${a.title}   → ${a.path}${a.status === 'updated' ? `   (archived ${a.supersededCount ?? 0} prior version → history, off-index)` : ''}`);
     if (landed.length > 30) console.log(`  … and ${landed.length - 30} more`);
     if (counts.duplicate) console.log(`  ↺ ${counts.duplicate} already imported (unchanged) — skipped, not duplicated`);
     if (counts.changed) console.log(`  ↻ ${counts.changed} changed since last import — NOT re-imported (re-run with --update to refresh; old version kept)`);

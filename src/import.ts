@@ -25,7 +25,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import type { Workspace } from './types.ts';
 import { appendJournal, containsSecretLikeContent } from './governance.ts';
-import { atomicWriteFile } from './store/files.ts';
+import { atomicWriteFile, appendFileAtomic } from './store/files.ts';
 import { withWorkspaceLock } from './store/lock.ts';
 
 export type ImportSourceKind = 'claude-code' | 'markdown';
@@ -319,13 +319,19 @@ export async function collectExistingImports(journalDirs: string[]): Promise<Exi
   return { content, identity };
 }
 
-// Remove every journal entry carrying a given identity marker, across all lanes, lock-safe and atomic.
-// Used by --update to retire the stale copy of an edited fact before writing the new one (so the two
-// contradictory versions never coexist). Returns how many entries were removed.
+// Retire every journal entry carrying a given identity marker, across all lanes, lock-safe and atomic.
+// Used by --update to supersede the stale copy of an edited fact before writing the new one — so the
+// two contradictory versions never coexist in the SEARCHABLE journal lane. The stale entry is not
+// destroyed: it is ARCHIVED to historyDir (which lives outside memoryDir, so it is never indexed,
+// searched, or recalled), preserving an audit trail of what a fact used to say without it surfacing as
+// a live, contradictory answer. (Borrowed from ai-memory's keep-history supersession, adapted to our
+// per-FILE-indexed markdown model where keeping the old block in place would re-expose it to search.)
+// Returns how many entries were archived.
 async function supersedeByIdentity(workspace: Workspace, journalDirs: string[], im: string): Promise<number> {
   const marker = `iid:${im}`;
   return await withWorkspaceLock(workspace, async () => {
-    let removed = 0;
+    let archivedCount = 0;
+    const archivedBlocks: string[] = [];
     for (const dir of journalDirs) {
       let files: string[] = [];
       try {
@@ -342,17 +348,28 @@ async function supersedeByIdentity(workspace: Workspace, journalDirs: string[], 
           continue;
         }
         if (!raw.includes(marker)) continue;
-        // Entries are delimited by "\n## "; keep the preamble + every entry NOT carrying this identity.
+        // Entries are delimited by "\n## "; keep the preamble + every entry NOT carrying this identity,
+        // and set the matching entries aside to archive.
         const [preamble, ...entries] = raw.split('\n## ');
-        const kept = entries.filter((e) => !e.includes(marker));
+        const kept: string[] = [];
+        for (const entry of entries) {
+          if (entry.includes(marker)) archivedBlocks.push(`## ${entry.replace(/\s*$/, '')}`);
+          else kept.push(entry);
+        }
         const dropped = entries.length - kept.length;
         if (!dropped) continue;
         const rebuilt = kept.length ? `${preamble}\n## ${kept.join('\n## ')}` : preamble;
         await atomicWriteFile(p, rebuilt, workspace.memoryDir);
-        removed += dropped;
+        archivedCount += dropped;
       }
     }
-    return removed;
+    if (archivedBlocks.length) {
+      // historyDir is OUTSIDE memoryDir -> never indexed/searched/recalled. Append-only audit trail.
+      const histPath = path.join(workspace.historyDir, 'superseded-import.md');
+      const header = `\n<!-- superseded by import --update at ${new Date().toISOString()} · identity ${im} · kept for audit, NOT indexed/searchable -->\n`;
+      await appendFileAtomic(histPath, `${header}${archivedBlocks.join('\n')}\n`);
+    }
+    return archivedCount;
   });
 }
 
