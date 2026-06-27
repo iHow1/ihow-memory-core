@@ -148,7 +148,7 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 ihow-memory init             create a managed workspace, print the MCP config snippet
 ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes) [--dry-run]
 ihow-memory install-skill    copy the Claude Code proactive-memory skill into ~/.claude/skills/
-ihow-memory install-hook     add the auto-capture hooks — Stop (cooperative nudge) + SessionStart (deterministic floor) (Claude Code; --global-hook for user-wide)
+ihow-memory install-hook     add the hooks — Stop (cooperative nudge) + SessionStart (deterministic floor) + UserPromptSubmit recall (🟢 reviewed, on by default; --no-recall to skip) (Claude Code; --global-hook for user-wide)
 ihow-memory doctor           environment + setup checks [--share-diagnostics for a redacted report]
 ihow-memory status           workspace, engine, index and sync state [--json]
 ihow-memory search <query>   citation-bearing local search [--limit n]
@@ -157,11 +157,13 @@ ihow-memory write-candidate  propose a memory candidate (sandbox inbox)
 ihow-memory promote          promote a candidate (explicit, audited)
 ihow-memory durable-promote  durable write — requires --dry-run or --real-write
 ihow-memory journal <text>   append a low-weight auto-capture entry (searchable, ranked below curated)
+ihow-memory import           import existing memory you wrote elsewhere (Claude Code MEMORY.md, ai-memory markdown, any .md folder) into the searchable journal lane [--from path] [--apply] [--update]
 ihow-memory audit            list the append-only event log [--since YYYY-MM-DD]
 ihow-memory rollback         undo one auto-captured journal entry (--event <id>)
 ihow-memory reindex          rebuild the SQLite index from Markdown
 ihow-memory upgrade          refresh the workspace's frozen server copy after updating the package (then restart the runtime)
 ihow-memory proof            one-command governed-loop proof in a throwaway space
+ihow-memory benchmark        deterministic local proof of the verify-first guarantees (the three-color verdict discriminates; the floor blocks junk) — re-run for the same result
 ihow-memory feedback         print a prefilled GitHub issue + redacted diagnostics
 ihow-memory reset            remove a managed demo space (requires --space)
 ihow-memory console          read-only local web UI [--port 8788]
@@ -241,7 +243,7 @@ adds two layers to raise that on Claude Code:
   last-substantive-segment summary within a **locked scope** (assistant text + file paths + command binary
   names + first prompt — never tool output, never raw shell), redacts it, and writes a low-weight,
   auditable, rollback-able journal entry. It is the safety net under the cooperative nudge: **single-cwd**,
-  silent (never injects context — recall stays off), and never throws. Offline evaluation on 22 real
+  silent (it only captures — the floor itself injects nothing), and never throws. Offline evaluation on 22 real
   historical transcripts passed the backstop quality gate; live *natural* floor hits remain under dogfood
   because cooperative capture currently covers all observed sessions.
 
@@ -250,7 +252,7 @@ adds two layers to raise that on Claude Code:
 > backstop (`next` only) that captures the prior session when the nudge was not honored. Both write
 > **low-weight, unreviewed** notes — use `promote` / `durable-promote` for trusted long-term memory. The
 > floor is offline-validated as a backstop; it is not yet promoted to a primary/default-weight path, and
-> `recall` (reading memory back into a new session) stays **off** by default.
+> `recall` (reading reviewed memory back into a new session) is **on** by default — it injects only 🟢 reviewed, human-promoted memory, relevance-gated (off-topic prompts get nothing) and tagged; the machine-judged 🟡 auto tier is opt-in (`IHOW_RECALL_INCLUDE_AUTO=1`). Disable with `--no-recall` or `IHOW_RECALL_OFF=1`.
 
 ## Examples
 
@@ -275,7 +277,7 @@ Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest pu
 | dist-tag | auto-capture |
 | --- | --- |
 | `latest` | cooperative Stop-hook nudge only (depends on the agent honoring it) |
-| `next` | adds the **deterministic SessionStart floor** backstop (single-cwd, low-weight, offline-validated); `recall` still off |
+| `next` | adds the **deterministic SessionStart floor** backstop (single-cwd, low-weight, offline-validated) and turns **recall on** (🟢 reviewed-only, relevance-gated, tagged; 🟡 auto tier opt-in) |
 
 To try the floor backstop: `npm install ihow-memory@next`. A plain `npm install ihow-memory` stays on the conservative `latest`.
 
@@ -283,7 +285,7 @@ To try the floor backstop: `npm install ihow-memory@next`. A plain `npm install 
 
 - **Floor capture is single-cwd.** The SessionStart floor backs up only its designated workspace/cwd. If you `connect --auto` across multiple projects sharing one workspace, the floor covers one cwd; broad multi-cwd rollout is pending further dogfood.
 - **Default retrieval is lexical, not semantic.** The shipped default is zero-dependency FTS5 lexical search. The vector + lexical hybrid (behind the published recall figures) is an *optional* local provider, not in the out-of-the-box binary.
-- **Auto-capture notes are low-weight and unreviewed**, and the deterministic floor is a backstop, not yet a primary/default-weight path. `recall` (reading memory back into a session) is off by default. Use `promote` / `durable-promote` for trusted long-term memory.
+- **Auto-capture notes are low-weight and unreviewed**, and the deterministic floor is a backstop, not yet a primary/default-weight path. `recall` injects only 🟢 **reviewed** memory by default — the unreviewed auto-capture / journal lanes are never auto-injected; the machine-judged 🟡 auto tier is opt-in (`IHOW_RECALL_INCLUDE_AUTO=1`). Use `promote` / `durable-promote` for trusted long-term memory.
 - **Storage grows without bound (no rotation/compaction/GC yet).** Journals, the audit ndjson log and `*.ihow-bak-*` backups currently accumulate, and every write rebuilds the full FTS index — rotation/compaction/GC is planned but not shipped. Fine for normal use; heavy long-running use will pile up. Manual mitigation: occasional `ihow-memory reindex` and pruning of old backups by hand.
 - **Windows native is experimental** (use WSL); only macOS and Linux are validated lanes.
 

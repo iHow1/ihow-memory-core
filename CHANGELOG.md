@@ -6,6 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
+## [0.1.0-alpha.13] — 2026-06-27
+
+The **verify-first wedge + import** release: a reproducible local proof of the trust guarantees, one
+command to seed memory you already wrote elsewhere, and recall turned on by default — but only for
+human-reviewed memory, with every injected item tagged by trust tier.
+
+### Added
+
+- **`verify` — a reproducible self-proof receipt.** Local store + each runtime's MCP reachability + this
+  checkout's GREEN/YELLOW/RED resume verdict, every line carrying the exact command to re-run yourself.
+  Exit non-zero if anything fails to round-trip. No trust required, local-only.
+- **`benchmark` — a deterministic local proof of the verify-first guarantees.** Asserts, against
+  adversarial scenarios, that the three-color resume verdict actually discriminates (GREEN only on a
+  matching checkout; HEAD drift → RED; uncertainty → YELLOW) and that the no-false-green floor blocks
+  unverified / secret / standing-rule / fabricated-anchor content from durable memory. Re-run for the
+  same result; exit non-zero if any guarantee fails — it cannot false-green about itself.
+- **`import` — bring existing memory into the searchable store.** One command imports memory you wrote
+  elsewhere (Claude Code's native `MEMORY.md` + fact files, ai-memory markdown, or any folder of `.md`
+  notes) into the low-weight journal lane: dry-run by default, `--apply` to write, reversible per entry,
+  secret-refusing (body **and** title), and proven by searching a written item back out. `--update`
+  supersedes an edited fact, archiving the stale copy to off-index history rather than leaving two
+  contradictory versions searchable.
+
+### Changed
+
+- **`recall` is now ON by default — reviewed tier only.** A new prompt now recalls relevant prior memory
+  by default, but injects only 🟢 **reviewed** (human-promoted) memory, relevance-gated (off-topic prompts
+  inject nothing) and bounded. Each injected item is tagged by trust tier — 🟢 reviewed vs 🟡 auto
+  (machine-gated by provenance, shown with its basis, e.g. "cites npm test exit 0"). The machine-judged
+  🟡 auto tier stays opt-in (`IHOW_RECALL_INCLUDE_AUTO=1`). Disable with `--no-recall`, or `IHOW_RECALL_OFF=1`
+  at runtime. Basis: a labeled recall-quality evaluation measured the reviewed tier at ~88% useful / 0
+  harmful (off-topic prompts injected nothing; stale entries dropped); the auto tier at ~25%, hence opt-in.
+- **A `tsc --noEmit` typecheck gate** is wired into the build and CI — it catches the "used-but-not-imported"
+  dead-reference class that a transpile-only build would otherwise ship silently.
+
 ## [0.1.0-alpha.12] — 2026-06-25
 
 A **trust-hardening** release. A pre-launch adversarial audit found that, while alpha.11 fixed the two
