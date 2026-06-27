@@ -22,6 +22,7 @@ import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, r
 import { probeMcpServer, verifyConnection } from './mcp/probe.ts';
 import { migrateLocalDay } from './migrate.ts';
 import { planImport, applyImport, collectExistingImports, type ImportPlan } from './import.ts';
+import { runBenchmark } from './benchmark.ts';
 import { mcpLaneWorkspace } from './store/events.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
@@ -981,6 +982,7 @@ Usage:
   ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw] [--share-diagnostics] [--json]
   ihow-memory verify [--runtime name] [--cwd path] [--json]   # print a REPRODUCIBLE self-proof receipt: local store + each runtime's MCP reachability + this checkout's GREEN/YELLOW/RED resume verdict, each line with the exact command to re-run yourself (no trust required, local-only). Exit non-zero if anything fails to round-trip.
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
+  ihow-memory benchmark [--json]   # deterministic LOCAL proof of the verify-first guarantees: the three-color resume verdict discriminates (GREEN narrow · drift→RED · uncertainty→YELLOW) and the no-false-green floor blocks unverified/secret/standing-rule/fabricated-anchor content. Re-run for the same result; exit non-zero if any guarantee fails.
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
   ihow-memory search <query> [--limit n]
   ihow-memory read <memory/path.md>
@@ -2901,6 +2903,37 @@ async function main(): Promise<void> {
       console.log(`audit event: ${event?.type || 'missing'} ${event?.id || ''}`);
       console.log('PASS proof: A write -> promote -> B search/read with citation and audit');
     }
+    return;
+  }
+
+  if (command === 'benchmark') {
+    // A deterministic, local, reproducible proof of the verify-first DIFFERENTIATORS: the three-color
+    // resume verdict discriminates (GREEN is narrow; drift->RED, uncertainty->YELLOW), and the floor
+    // blocks unverified/secret/standing-rule/fabricated-anchor content from durable memory. Exit non-zero
+    // if any guarantee fails — the benchmark cannot false-green about itself.
+    const result = runBenchmark();
+    if (options.json) {
+      printJson(result);
+      process.exitCode = result.ok ? 0 : 1;
+      return;
+    }
+    const sep = '─'.repeat(72);
+    console.log('iHow Memory — verify-first benchmark   (deterministic · local · no cloud · re-run for the same result)');
+    console.log(sep);
+    if (!result.gitAvailable) console.log('(git not found — the verdict battery was skipped; install git to run it)\n');
+    const battery = (key: 'verdict' | 'floor', title: string) => {
+      const rows = result.scenarios.filter((s) => s.battery === key);
+      if (!rows.length) return;
+      console.log(title);
+      for (const s of rows) console.log(`  ${s.pass ? '✓' : '✗'} ${s.id}  ${s.claim}   → [${s.actual}]`);
+      console.log('');
+    };
+    battery('verdict', 'THREE-COLOR RESUME VERDICT discriminates — GREEN is narrow; drift → RED, uncertainty → YELLOW');
+    battery('floor', 'NO-FALSE-GREEN floor — blocks junk from durable memory, lets engine-verified provenance through');
+    console.log(sep);
+    console.log(`${result.ok ? '✓ PASS' : '✗ FAIL'}  ${result.passed}/${result.total} verify-first guarantees held — no trust required.`);
+    console.log('  ↻ reproduce:  ihow-memory benchmark   (deterministic; the scenarios are auditable in src/benchmark.ts)');
+    process.exitCode = result.ok ? 0 : 1;
     return;
   }
 
