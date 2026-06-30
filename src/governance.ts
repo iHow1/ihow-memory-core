@@ -151,7 +151,11 @@ function candidateText(payload: WriteCandidatePayload): string {
 }
 
 export function containsSecretLikeContent(text: string): boolean {
-  return SECRET_LIKE_PATTERNS.some((pattern) => pattern.test(text));
+  // Hard-reject the credential-SHAPED Bearer/Authorization values too (red-team r2 Blocker 2): the strict
+  // 12+ SECRET_LIKE Bearer detector misses `Bearer <8-11 token-ish>`, which the precheck DOES match. These
+  // are mirrored into redactSecretLikeContent below so detector and redactor never drift.
+  return SECRET_LIKE_PATTERNS.some((pattern) => pattern.test(text))
+    || REAL_SECRET_PRECHECK_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 // SAME-SOURCE redactor for the auto-capture path (OpenClaw signing condition for automation v2):
@@ -170,6 +174,9 @@ export function redactSecretLikeContent(text: string): string {
   out = out.replace(asGlobal(new RegExp(`${assignment.source}\\s*\\S+`, assignment.flags)), '[redacted]');
   // every detector (value-style + the CJK assignment already swallows its value), applied globally
   for (const pattern of SECRET_LIKE_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
+  // the credential-shaped Bearer/Authorization prechecks the strict 12+ detector misses — kept in lockstep
+  // with containsSecretLikeContent (which now flags these), so the redactor stays a superset of the detector.
+  for (const pattern of REAL_SECRET_PRECHECK_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
   // plus the auto-capture-only quarantine set (high-entropy blobs, prose secrets) — these are NOT in
   // the detector, so post-redaction containsSecretLikeContent() is still guaranteed clean (the
   // redactor is a strict superset of the detector).
@@ -249,6 +256,26 @@ function safeAuditTarget(target: PromoteTarget): PromoteTarget {
   // If a real secret made the redactor a no-op, drop the title entirely rather than log the value.
   const safeTitle = containsSecretLikeContent(redacted) ? undefined : redacted;
   return { ...target, title: safeTitle };
+}
+
+// Deep-sanitize a provenance/metadata object before it lands in an audit EVENT (red-team r2 Blocker 1):
+// raw payload.metadata (e.g. { contact: 'carol@example.net' }) flowed verbatim into _events/*.ndjson — a
+// persistence surface (backed up, grep-able, surfaced by audit/diagnostic reads). Recursively redact every
+// string value with the full-set redactor; a value still detector-dirty after redaction (a real secret) is
+// dropped to [redacted], never logged. Only the AUDIT copy is sanitized — the gate logic still sees the raw
+// provenance (it must, to verify git anchors / command exit codes).
+function safeAuditMetadata<T>(value: T): T {
+  if (typeof value === 'string') {
+    const redacted = redactSecretLikeContent(value);
+    return (containsSecretLikeContent(redacted) ? '[redacted]' : redacted) as unknown as T;
+  }
+  if (Array.isArray(value)) return value.map((entry) => safeAuditMetadata(entry)) as unknown as T;
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) out[key] = safeAuditMetadata(entry);
+    return out as unknown as T;
+  }
+  return value;
 }
 
 function safeActorId(raw: string | undefined): string {
@@ -1088,7 +1115,7 @@ export async function promoteCandidate(
         provenanceKind: options.provenanceKind,
         flagReason: options.flagReason,
         reviewed: options.auto ? false : undefined,
-        provenance: options.provenance,
+        provenance: safeAuditMetadata(options.provenance), // r2 Blocker 1: no raw PII/secret in the audit log
       },
     });
     return {
