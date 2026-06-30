@@ -209,3 +209,20 @@ test('durable-tree sweeps do not over-redact a benign scope path', async (t) => 
   const res = await pendingFlaggedReview(core.workspace, 5);
   assert.ok(res.sample.some((p) => p.includes('work-notes')), 'a benign scope path is preserved');
 });
+
+// --- r6 systemic gate: the FTS index must not store an out-of-band PII/secret durable path ---
+
+test('FTS index never stores an out-of-band PII-named durable path, and normal memory stays searchable', async (t) => {
+  const { root, core } = await managed(t, 'ftsidx');
+  const PII = 'ftsvictim@example.test';
+  const dir = path.join(core.workspace.memoryDir, 'scopes', PII);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'note.md'), `---\ntype: "memory"\nstatus: "promoted"\n---\n# note\n\nzebra searchable content\n`);
+  const c = await core.write_candidate({ text: 'zebra legit durable body', sourceAgent: 'unit', autoPromote: false });
+  await core.durable_promote(c.path, { realWrite: true, actor: 'unit', target: { scope: 'general', title: 'ok' } });
+  const hits = await core.search('zebra');
+  assert.ok(hits.length > 0, 'a normally-promoted memory is still indexed + searchable');
+  assert.ok(hits.every((h) => !(h.path || '').includes(PII)), 'the out-of-band PII-named file is not surfaced in results');
+  const idxBytes = await fs.readFile(path.join(root, 'r4', 'index.sqlite')).catch(() => Buffer.alloc(0));
+  assert.equal(idxBytes.includes(Buffer.from(PII)), false, 'raw PII path must not be stored in index.sqlite');
+});

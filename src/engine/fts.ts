@@ -9,6 +9,7 @@ import { listMarkdownFiles } from '../store/files.ts';
 import { withWorkspaceLock } from '../store/lock.ts';
 import { relativeToSpace } from '../workspace.ts';
 import { defaultFtsManifest, writeProviderManifest } from './manifest.ts';
+import { containsSecretLikeContent } from '../governance.ts';
 
 type IndexDocument = {
   path: string;
@@ -170,6 +171,14 @@ async function collectDocuments(workspace: Workspace): Promise<IndexDocument[]> 
     if (relative.startsWith('memory/candidate/')) continue;
     if (relative.startsWith('memory/_mcp/_events/')) continue;
     if (relative.startsWith('memory/_mcp/history/')) continue;
+    // r6 systemic gate: never index an OUT-OF-BAND file whose PATH is secret-like — its raw path would land
+    // in the index.sqlite `path` column (then surface in search results). Engine-written durable memory is
+    // always slug-safe, so this only skips files planted directly in the tree; a normally-promoted memory
+    // never trips it. The read-boundary chokepoint that keeps foreign PII/secret paths out of the search
+    // index (companion to safeAuditPath, which redacts the same class on the sweep audit surfaces). PATH-only
+    // by design: a content check could silently drop a legit memory whose body trips the detector, and durable
+    // content is already write-time-gated clean, so path is the safe + sufficient discriminator.
+    if (containsSecretLikeContent(relative)) continue;
     const content = await fsp.readFile(filePath, 'utf8');
     documents.push({ path: relative, content, flagged: frontmatterIsFlagged(content), unreviewed: frontmatterIsUnreviewed(content) });
   }
