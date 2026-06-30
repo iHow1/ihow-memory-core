@@ -56,7 +56,7 @@ npx ihow-memory@next doctor --runtime claude-code
 
 ```bash
 npx ihow-memory@next init --space demo
-CAND=$(npx ihow-memory@next write-candidate "Decision: ship weekly release notes." --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
+CAND=$(npx ihow-memory@next write-candidate "Decision: ship weekly release notes." --no-auto-promote --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
 PROMOTED=$(npx ihow-memory@next promote "$CAND" --scope team --title "Release notes cadence" --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
 npx ihow-memory@next search "release notes" --space demo
 npx ihow-memory@next read "$PROMOTED" --space demo
@@ -64,7 +64,7 @@ npx ihow-memory@next read "$PROMOTED" --space demo
 
 你应该看到：
 
-- `write-candidate` 返回 `memory/candidate/inbox/` 下的 candidate 路径——只是提案，尚未持久；
+- `write-candidate` 返回 `memory/candidate/inbox/` 下的 candidate 路径——只是提案，尚未持久。`--no-auto-promote` 把**两步治理门显式化**好让你看清；**不加它时，干净内容会一步自动晋升**（引擎 floor 决定 yellow 子档），`write-candidate` 直接返回已持久的路径；
 - `promote` 返回 `memory/scopes/team/` 下的已升级路径，外加一个 `eventId`——审计事件；
 - `search` 与 `read` 返回的 JSON 带 `citation` 字段，指向答案背后那个确切的 Markdown 文件。
 

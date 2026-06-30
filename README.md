@@ -63,7 +63,7 @@ This is the same flow agents use over MCP, run from your shell. The block is cop
 
 ```bash
 npx ihow-memory@next init --space demo
-CAND=$(npx ihow-memory@next write-candidate "Decision: ship weekly release notes." --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
+CAND=$(npx ihow-memory@next write-candidate "Decision: ship weekly release notes." --no-auto-promote --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
 PROMOTED=$(npx ihow-memory@next promote "$CAND" --scope team --title "Release notes cadence" --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
 npx ihow-memory@next search "release notes" --space demo
 npx ihow-memory@next read "$PROMOTED" --space demo
@@ -71,7 +71,7 @@ npx ihow-memory@next read "$PROMOTED" --space demo
 
 What you should see:
 
-- `write-candidate` returns a candidate path under `memory/candidate/inbox/` — proposed, not yet durable;
+- `write-candidate` returns a candidate path under `memory/candidate/inbox/` — proposed, not yet durable. The `--no-auto-promote` flag makes the **two-step gate explicit** so you can see it; **without it, clean writes auto-promote in one step** (the engine floor picks the yellow sub-tier), and `write-candidate` then returns the already-durable path directly;
 - `promote` returns the promoted path under `memory/scopes/team/` plus an `eventId` — the audit event;
 - `search` and `read` return JSON whose `citation` field points at the exact Markdown file behind the answer.
 

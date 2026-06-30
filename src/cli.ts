@@ -2571,6 +2571,9 @@ async function main(): Promise<void> {
       console.log(`runtime bundle: ${runtimeDir}`);
       console.log(`backup first: ${result.backupBeforeWrite}`);
       printRuntimeSnippet(snippet, options.runtime);
+      console.log('');
+      console.log('  Next — the governed loop: write-candidate (propose) → promote (human gate) → search / read.');
+      console.log('    Copy-paste demo: README §"The governed loop in 60 seconds", or one command: ihow-memory proof');
     }
     return;
   }
@@ -2663,6 +2666,11 @@ async function main(): Promise<void> {
       console.log(`index: ${status.index.status}, documents=${status.index.documents}`);
       console.log(`index path: ${status.index.path}`);
       console.log(`sync: enabled=${status.sync.enabled}`);
+      console.log(
+        process.env.IHOW_AUTO_PROMOTE === '0'
+          ? 'auto-promote: off (IHOW_AUTO_PROMOTE=0 — every write stays a candidate; full human gate)'
+          : 'auto-promote: on (default — clean writes promote to yellow tiers; pass --no-auto-promote per write to gate)',
+      );
     }
     return;
   }
@@ -3303,7 +3311,16 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'read') {
-    printJson(await core.read(rest[0]));
+    // Guard an empty/missing path BEFORE core.read: an empty ref resolves to the memory ROOT dir and
+    // fs.readFile() on it throws a cryptic `EISDIR`. New users hit this when a shell var that was meant
+    // to hold a path comes back empty (e.g. a piped `promote` that failed) and they run `read "$VAR"`.
+    const ref = rest[0];
+    if (!ref || !ref.trim()) {
+      console.error('read: missing memory path. Usage: ihow-memory read <path>  (use a path from `search`, `promote`, or `write-candidate`)');
+      process.exitCode = 1;
+      return;
+    }
+    printJson(await core.read(ref));
     return;
   }
   if (command === 'write-candidate') {
