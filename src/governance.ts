@@ -39,6 +39,13 @@ export const DEFAULT_PROTECTED_PATTERNS = [
   'active-topics.md',
 ];
 
+// An email address. PII, not a credential — so on the INGEST path (write_candidate / journal) it is
+// REDACTED-IN-PLACE rather than used to reject the whole entry (see REDACT_IN_PLACE_INGEST_PATTERNS and
+// redactIngestBenign). It is STILL a member of the detector/redactor set below so that (a) the floor's
+// redaction-before-persist invariant keeps stripping it and (b) post-redaction containsSecretLikeContent()
+// stays clean. The split is "reject vs redact", NOT "detect vs ignore" — the value never lands on disk.
+const EMAIL_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+
 // High-precision secret detectors. These match secret *values* (or assignment-style
 // `keyword: value`), not bare keywords, to keep the hard-reject low on false positives.
 // NOTE: prose-style secrets ("the password is hunter2") and generic high-entropy blobs are
@@ -58,13 +65,35 @@ const SECRET_LIKE_PATTERNS = [
   /\bSK[0-9a-f]{32}\b/, // Twilio
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/, // JWT
   /-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA )?PRIVATE KEY-----/, // PEM private key
-  /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i, // email address
+  EMAIL_PATTERN, // email address (PII) — detected + redacted, but REDACT-IN-PLACE (not reject) on ingest
   /(?:账号|账户|邮箱|密码|密钥|令牌)\s*[:：=]\s*\S+/i, // CJK account/secret assignment
   // URL- / connection-string-embedded credentials: scheme://user:pass@host
   // (covers redis/postgres/mongodb/amqp/https…). Low false-positive, high signal, so it joins the
   // hard-reject detector — a creds-in-URL almost never appears legitimately in memory text.
   /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/:@]+@\S+/i,
 ];
+
+// Patterns that, on the candidate/journal INGEST path, degrade to a [redacted] marker instead of
+// hard-rejecting the whole entry. These are PII / friction matches (an email in a legitimate handoff),
+// NOT credentials — a false hard-reject here pushes a clean handoff back to a manual gate (the P0-C
+// friction bug). Every member is ALSO in SECRET_LIKE_PATTERNS, so after redactIngestBenign() the hard
+// detector is guaranteed clean for them. The invariant is "real secret → reject; PII → redact-in-place".
+const REDACT_IN_PLACE_INGEST_PATTERNS = [
+  EMAIL_PATTERN,
+];
+
+// The REAL-secret detectors — the hard-reject set MINUS the redact-in-place (PII) set. A match here means
+// a credential is present and the WHOLE entry must hard-reject; a match only in the PII set is redacted in
+// place. This split is what makes "redact email, but never let an email-shaped redaction mask a real
+// secret" safe: redactIngestBenign refuses to run when a real secret is present (see below). Email is the
+// dangerous overlap — its broad `local@host.tld` shape also matches the `pass@host` tail of a URL-embedded
+// credential (redis://u:p@h) and the body of a Bearer/JWT token; redacting that tail would erase the very
+// `@`/structure the URL-cred / Bearer detectors key on and silently downgrade a real secret to "clean".
+const REAL_SECRET_PATTERNS = SECRET_LIKE_PATTERNS.filter((p) => !REDACT_IN_PLACE_INGEST_PATTERNS.includes(p));
+
+function containsRealSecret(text: string): boolean {
+  return REAL_SECRET_PATTERNS.some((pattern) => pattern.test(text));
+}
 
 // EXTRA patterns the auto-capture REDACTOR quarantines but the hard-reject detector does NOT use —
 // they carry a non-trivial false-positive cost ("the token is valid") that is unacceptable for the
@@ -88,8 +117,12 @@ function candidateText(payload: WriteCandidatePayload): string {
   if (typeof text !== 'string' || !text.trim()) {
     throw new Error('candidate_text_required');
   }
-  assertNoSecretLikeContent(text);
-  return text.trim();
+  // Redact-in-place the "redact, don't reject" set (email/PII) BEFORE the hard check, so a legitimate
+  // handoff that mentions an email lands as [redacted] instead of being rejected (P0-C). A REAL secret is
+  // untouched by this pass and still trips assertNoSecretLikeContent below — reject-vs-redact, never ignore.
+  const redacted = redactIngestBenign(text);
+  assertNoSecretLikeContent(redacted);
+  return redacted.trim();
 }
 
 export function containsSecretLikeContent(text: string): boolean {
@@ -116,6 +149,26 @@ export function redactSecretLikeContent(text: string): string {
   // the detector, so post-redaction containsSecretLikeContent() is still guaranteed clean (the
   // redactor is a strict superset of the detector).
   for (const pattern of SECRET_QUARANTINE_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
+  return out;
+}
+
+// INGEST-path redaction-before-persist for the "redact, don't reject" set (currently: email). Strips ONLY
+// REDACT_IN_PLACE_INGEST_PATTERNS to a [redacted] marker. This is the P0-C friction fix: a legitimate
+// write_candidate / journal body that mentions an email lands as [redacted] instead of being bounced to a
+// manual gate. Built from the SAME EMAIL_PATTERN the detector uses (no drift), so containsSecretLikeContent()
+// is clean for the redacted matches afterwards. NOT a substitute for redactSecretLikeContent (full set).
+//
+// HARD SAFETY GUARD (red-team blocker): if the text contains a REAL secret, this is a NO-OP — the entry is
+// left untouched so the hard-reject gate still fires. Without this, the broad email regex would rewrite the
+// `pass@host.tld` tail of a URL-embedded credential (redis://u:p@h) or a Bearer/JWT body to [redacted],
+// erasing the `@`/structure the URL-cred / Bearer detectors rely on and DOWNGRADING a real secret to
+// "clean" — a silent weakening of the real-secret hard-reject. Email-in-place redaction is only applied to
+// text that carries NO real secret, so it can never mask one.
+export function redactIngestBenign(text: string): string {
+  if (containsRealSecret(text)) return text; // a real secret is present → never redact-mask it; let it reject
+  const asGlobal = (p: RegExp): RegExp => (p.flags.includes('g') ? p : new RegExp(p.source, `${p.flags}g`));
+  let out = text;
+  for (const pattern of REDACT_IN_PLACE_INGEST_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
   return out;
 }
 
@@ -284,6 +337,17 @@ function journalFileHeader(day: string): string {
   return `${frontMatter({ type: 'memory_journal', weight: 'low', date: day })}\n# Journal ${day}\n\n> Auto-captured, append-only, low-weight. Searchable but ranked below curated memory.\n`;
 }
 
+// Content-addressed idempotency id for a journal entry: sha256 over the entry body as written to disk.
+// This DERIVES a stable, replay-convergent handle that disambiguates two appends sharing the same ISO
+// `entryAt` (same-millisecond writes), which the timestamp alone cannot — so a rollback removes EXACTLY
+// the intended entry instead of over-removing every same-timestamp block (a latent replay/idempotency
+// bug). The body is hashed verbatim (post-redaction, post-trim) so it is reproducible from on-disk text
+// at rollback time, with NO change to the on-disk heading format and NO impact on the floor's composite
+// (runtime, sessionId) dedup, which stays the sole capture-floor idempotency key.
+function journalEntryHash(body: string): string {
+  return crypto.createHash('sha256').update(body, 'utf8').digest('hex').slice(0, 16);
+}
+
 async function readFileOrEmpty(targetPath: string): Promise<string> {
   try {
     return await fs.readFile(targetPath, 'utf8');
@@ -299,10 +363,13 @@ async function readFileOrEmpty(targetPath: string): Promise<string> {
 // entries are indexed and searchable, yet demoted below curated memory at query time (see
 // engine/fts.ts), so automatic capture can never pollute high-weight retrieval.
 export async function appendJournal(workspace: Workspace, payload: JournalPayload): Promise<JournalResult> {
-  const text = payload.text ?? payload.content;
-  if (typeof text !== 'string' || !text.trim()) {
+  const raw = payload.text ?? payload.content;
+  if (typeof raw !== 'string' || !raw.trim()) {
     throw new Error('journal_text_required');
   }
+  // Redact-in-place benign PII (email) BEFORE the hard gate, same as the candidate path (P0-C). A real
+  // secret is untouched here and still hard-rejects below; only an email/PII match degrades to [redacted].
+  const text = redactIngestBenign(raw);
   assertNoSecretLikeContent(text);
   const sourceAgent = payload.sourceAgent || payload.source || 'unknown';
   const title = payload.title?.trim();
@@ -312,14 +379,16 @@ export async function appendJournal(workspace: Workspace, payload: JournalPayloa
     const targetPath = path.join(workspace.journalDir, `${day}.md`);
     const existing = await readFileOrEmpty(targetPath);
     const header = existing ? '' : journalFileHeader(day);
-    const entry = `\n## ${at} · ${sourceAgent}${title ? ` · ${title}` : ''}\n\n${text.trim()}\n`;
+    const body = text.trim();
+    const entryHash = journalEntryHash(body); // content-addressed handle for precise rollback (replay-safe)
+    const entry = `\n## ${at} · ${sourceAgent}${title ? ` · ${title}` : ''}\n\n${body}\n`;
     await atomicWriteFile(targetPath, `${header}${existing}${entry}`, workspace.memoryDir);
     const relativePath = relativeToSpace(workspace, targetPath);
     const event = await appendEvent(workspace, {
       type: 'memory.journal.appended',
       path: relativePath,
       actor: sourceAgent,
-      metadata: { day, weight: 'low', auto: true, entryAt: at },
+      metadata: { day, weight: 'low', auto: true, entryAt: at, entryHash },
     });
     return { path: relativePath, status: 'journaled', eventId: event.id, day };
   });
@@ -366,15 +435,17 @@ export async function appendFloorJournalOnce(
     // Audit FIRST (the dedup key), THEN the body. A crash between the two under-captures (the session is
     // marked floored but has no body — recoverable via a later cooperative journal / explicit continue)
     // instead of orphaning a body with no key that every future sweep would re-floor.
+    const body = text.trim();
+    const entryHash = journalEntryHash(body); // content-addressed handle for precise rollback (replay-safe)
     const event = await appendEvent(workspace, {
       type: 'memory.journal.appended',
       path: relativePath,
       actor,
-      metadata: { floor: true, sessionId: payload.sessionId, floorRuntime: payload.runtime, day, weight: 'low', auto: true, entryAt: at },
+      metadata: { floor: true, sessionId: payload.sessionId, floorRuntime: payload.runtime, day, weight: 'low', auto: true, entryAt: at, entryHash },
     });
     const existing = await readFileOrEmpty(targetPath);
     const header = existing ? '' : journalFileHeader(day);
-    const entry = `\n## ${at} · ${actor}${title ? ` · ${title}` : ''}\n\n${text.trim()}\n`;
+    const entry = `\n## ${at} · ${actor}${title ? ` · ${title}` : ''}\n\n${body}\n`;
     await atomicWriteFile(targetPath, `${header}${existing}${entry}`, workspace.memoryDir);
     return { status: 'journaled' as const, path: relativePath, eventId: event.id, day };
   });
@@ -388,14 +459,38 @@ export type RollbackResult = {
   rolledbackEventId: string;
 };
 
-// Remove one journal entry (identified by its ISO heading timestamp) from a daily journal file.
-// Entries are delimited by "\n## <ISO> · ..."; the preamble and other entries are preserved.
-function removeJournalEntry(content: string, entryAt: string): { content: string; removed: boolean } {
+// The body of an on-disk journal block (the text after the "## <heading>" line, before the trailing
+// newline) — reconstructed so journalEntryHash() over it reproduces the hash stored at append time.
+function journalBlockBody(block: string): string {
+  const nl = block.indexOf('\n');
+  if (nl === -1) return '';
+  // block = "<heading>\n\n<body>\n" → after the heading line a blank line precedes the body.
+  return block.slice(nl + 1).replace(/^\n/, '').replace(/\n$/, '');
+}
+
+// Remove ONE journal entry from a daily journal file. Entries are delimited by "\n## <ISO> · ...".
+// Removal is keyed by the content-addressed `entryHash` when present (precise even when two entries share
+// the same ISO `entryAt` — same-millisecond appends), and FALLS BACK to the ISO timestamp for legacy
+// entries written before the hash existed (backward compatible). Matching by hash removes exactly the one
+// intended block; the timestamp fallback preserves the prior behavior for un-hashed entries.
+function removeJournalEntry(content: string, entryAt: string, entryHash?: string): { content: string; removed: boolean } {
   const parts = content.split('\n## ');
   if (parts.length < 2) return { content, removed: false };
   const [preamble, ...entries] = parts;
-  const kept = entries.filter((entry) => !entry.startsWith(`${entryAt} `));
-  if (kept.length === entries.length) return { content, removed: false };
+  let dropped = false;
+  const kept = entries.filter((entry) => {
+    if (dropped) return true; // remove at most ONE block, even on a hash/timestamp tie
+    const sameStamp = entry.startsWith(`${entryAt} `);
+    if (entryHash) {
+      // Precise: only the block whose body hashes to entryHash AND carries the right timestamp is removed.
+      if (sameStamp && journalEntryHash(journalBlockBody(entry)) === entryHash) { dropped = true; return false; }
+      return true;
+    }
+    // Legacy fallback: timestamp-only match (pre-hash entries) — removes the first same-timestamp block.
+    if (sameStamp) { dropped = true; return false; }
+    return true;
+  });
+  if (!dropped) return { content, removed: false };
   const rebuilt = kept.length ? `${preamble}\n## ${kept.join('\n## ')}` : preamble;
   return { content: rebuilt, removed: true };
 }
@@ -425,18 +520,21 @@ export async function rollbackEvent(workspace: Workspace, eventId: string): Prom
 
 async function rollbackJournalAppend(workspace: Workspace, target: MemoryEvent, eventId: string): Promise<RollbackResult> {
   const entryAt = typeof target.metadata?.entryAt === 'string' ? target.metadata.entryAt : '';
+  // Content-addressed handle (when the entry was written by hash-aware code) → removes EXACTLY this block
+  // even if another append shares its ISO timestamp. Absent (legacy entry) → timestamp-only fallback.
+  const entryHash = typeof target.metadata?.entryHash === 'string' ? target.metadata.entryHash : undefined;
   const relativePath = target.path;
   if (!entryAt || !relativePath) throw new Error('rollback_missing_entry_metadata');
   return await withWorkspaceLock(workspace, async () => {
     const absolute = absoluteFromMemoryPath(workspace, relativePath);
     const existing = await readFileOrEmpty(absolute);
-    const { content, removed } = removeJournalEntry(existing, entryAt);
+    const { content, removed } = removeJournalEntry(existing, entryAt, entryHash);
     if (removed) await atomicWriteFile(absolute, content, workspace.memoryDir);
     const event = await appendEvent(workspace, {
       type: 'memory.rolledback',
       path: relativePath,
       actor: 'core.rollback',
-      metadata: { rolledBackEventId: eventId, entryAt, removed },
+      metadata: { rolledBackEventId: eventId, entryAt, entryHash, removed },
     });
     return { eventId, type: target.type, path: relativePath, removed, rolledbackEventId: event.id };
   });
@@ -485,9 +583,13 @@ export async function writeCandidate(
     const title = safeFileSlug(payload.title || candidateId, candidateId);
     const sourceAgent = payload.sourceAgent || payload.source || 'unknown';
     const filePath = path.join(candidateDirForAgent(workspace, sourceAgent), `${nowCompact()}-${title}.md`);
-    const content = markdownCandidate(candidateId, payload);
+    // markdownCandidate's body is already benign-redacted via candidateText(); redact-in-place the FULL
+    // rendered candidate so an email tucked into the title/metadata also degrades to [redacted] rather
+    // than rejecting the entry (P0-C), and the redacted form is what we persist.
+    const content = redactIngestBenign(markdownCandidate(candidateId, payload));
     // Scan the FULL rendered candidate (title + metadata front-matter + body), not just the body
-    // text candidateText() already checks — otherwise a secret tucked into title/metadata slips in.
+    // text candidateText() already checks — otherwise a REAL secret tucked into title/metadata slips in.
+    // (Benign PII is already [redacted] above; only real-secret patterns can still trip this.)
     assertNoSecretLikeContent(content);
     await atomicWriteFile(filePath, content, workspace.memoryDir);
     const relativePath = relativeToSpace(workspace, filePath);
@@ -653,7 +755,11 @@ function verifyProvenance(payload: WriteCandidatePayload, cwd?: string): { ok: b
 }
 
 export function evaluateAutoPromote(payload: WriteCandidatePayload, opts: { cwd?: string } = {}): AutoPromoteVerdict {
-  const scan = fullScanText(payload); // title + body + metadata — everything that gets stored
+  // Scan the benign-redacted view (email/PII already → [redacted], matching what writeCandidate persists),
+  // so the secret gate fires ONLY on a REAL credential — an email no longer mislabels a clean handoff as a
+  // hard 'secret' rejection (P0-C). redactIngestBenign leaves real secrets untouched, so the gate below is
+  // exactly as strict for them as before; this only stops email from masquerading as a hard secret here.
+  const scan = redactIngestBenign(fullScanText(payload)); // title + body + metadata — everything that gets stored
   if (containsSecretLikeContent(scan)) {
     return { allow: false, reason: 'contains secret-like content (text/title/metadata)', category: 'secret' };
   }
