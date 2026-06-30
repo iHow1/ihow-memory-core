@@ -24,6 +24,7 @@ import { migrateLocalDay } from './migrate.ts';
 import { planImport, applyImport, collectExistingImports, type ImportPlan } from './import.ts';
 import { runBenchmark } from './benchmark.ts';
 import { mcpLaneWorkspace } from './store/events.ts';
+import { elapsedDays, isDecayExempt, lastVerificationMs, timeSinceVerificationPenalty } from './decay.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
 
@@ -47,7 +48,7 @@ type ParsedArgs = {
     dryRun?: boolean;
     realWrite?: boolean;
     actor?: string;
-    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw';
+    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini';
     shareDiagnostics?: boolean;
     installSkill?: boolean;
     installHook?: boolean;
@@ -97,8 +98,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--vector-timeout-ms') options.vectorTimeoutMs = Number(tail[++index]);
     else if (arg === '--runtime') {
       const runtime = tail[++index];
-      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw'].includes(runtime)) options.runtime = runtime as ParsedArgs['options']['runtime'];
-      else throw new Error('unsupported_runtime: use claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw');
+      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw', 'vscode', 'gemini'].includes(runtime)) options.runtime = runtime as ParsedArgs['options']['runtime'];
+      else throw new Error('unsupported_runtime: use claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini');
     }
     else if (arg === '--share-diagnostics') options.shareDiagnostics = true;
     else if (arg === '--install-skill') options.installSkill = true;
@@ -186,6 +187,8 @@ function runtimeLabel(runtime?: string): string {
   if (runtime === 'opencode') return 'OpenCode';
   if (runtime === 'hermes') return 'Hermes';
   if (runtime === 'openclaw') return 'OpenClaw';
+  if (runtime === 'vscode') return 'VS Code (Copilot)';
+  if (runtime === 'gemini') return 'Gemini CLI';
   return 'generic MCP client';
 }
 
@@ -224,6 +227,8 @@ function initBackupGuidance(runtime?: string): string {
   if (runtime === 'claude-desktop') return 'Before editing Claude Desktop config, copy claude_desktop_config.json; connect also backs it up.';
   if (runtime === 'opencode') return 'Before editing OpenCode config, copy ~/.config/opencode/opencode.json; connect also backs it up.';
   if (runtime === 'openclaw') return 'Before editing OpenClaw config, copy ~/.openclaw/openclaw.json; connect also backs it up.';
+  if (runtime === 'vscode') return 'Before editing VS Code MCP config, copy the user mcp.json (macOS: ~/Library/Application Support/Code/User/mcp.json); connect also backs it up.';
+  if (runtime === 'gemini') return 'Before editing Gemini CLI config, copy ~/.gemini/settings.json; connect also backs it up.';
   return 'Before writing this snippet into any runtime config, back up the existing config file.';
 }
 
@@ -506,6 +511,34 @@ async function connectRuntime(
       buildEntry: (s) => ({ command: s.command, args: s.args }),
     });
   }
+  if (runtime === 'vscode') {
+    // VS Code (GitHub Copilot agent mode) reads a USER-level mcp.json whose container key is `servers`
+    // (NOT `mcpServers` — that's Cursor/Claude Desktop) and whose stdio entry carries an explicit
+    // `type: "stdio"`. The user-data dir follows the standard Electron layout: macOS keeps it under
+    // ~/Library/Application Support/Code/User/, Windows under %APPDATA%\Code\User\, Linux under
+    // ~/.config/Code/User/. Absolute node path because the GUI app does not inherit the shell PATH.
+    const cfgPath = process.platform === 'darwin'
+      ? path.join(home, 'Library', 'Application Support', 'Code', 'User', 'mcp.json')
+      : process.platform === 'win32'
+        ? path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'Code', 'User', 'mcp.json')
+        : path.join(home, '.config', 'Code', 'User', 'mcp.json');
+    const vscodeSpec = { command: process.execPath, args: spec.args };
+    return writeJsonMcpConfig(cfgPath, runtime, vscodeSpec, options, {
+      containerKey: 'servers',
+      buildEntry: (s) => ({ type: 'stdio', command: s.command, args: s.args }),
+    });
+  }
+  if (runtime === 'gemini') {
+    // Gemini CLI (google-gemini/gemini-cli) reads ~/.gemini/settings.json; MCP servers live under the
+    // standard `mcpServers` key with an implicit-stdio entry { command, args } (the command alone starts
+    // the server; no `type` field). `gemini mcp add` exists on newer builds but is not universally present,
+    // so the safe cross-version path is the same atomic direct-write used for Cursor. Absolute node path
+    // keeps it launchable regardless of the shell PATH gemini was started from.
+    const geminiSpec = { command: process.execPath, args: spec.args };
+    return writeJsonMcpConfig(path.join(home, '.gemini', 'settings.json'), runtime, geminiSpec, options, {
+      buildEntry: (s) => ({ command: s.command, args: s.args }),
+    });
+  }
   throw new Error(`connect_unsupported_runtime: ${runtime}`);
 }
 
@@ -527,6 +560,13 @@ function runtimeDetectors(home: string): Array<{ runtime: string; cli?: string; 
     ] },
     { runtime: 'opencode', paths: [path.join(home, '.config', 'opencode')] },
     { runtime: 'openclaw', paths: [path.join(home, '.openclaw', 'openclaw.json'), path.join(home, '.openclaw')] },
+    // VS Code: the `code` CLI confirms an install; the user-data dir is the receiver-only fallback signal.
+    { runtime: 'vscode', cli: 'code', paths: [
+      path.join(home, 'Library', 'Application Support', 'Code', 'User'),
+      path.join(home, '.config', 'Code', 'User'),
+      path.join(appdata, 'Code', 'User'),
+    ] },
+    { runtime: 'gemini', cli: 'gemini', paths: [path.join(home, '.gemini')] },
   ];
 }
 
@@ -863,6 +903,15 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   if (present.some((d) => d.runtime === 'cursor')) {
     line('       · Cursor: memory.continue available; add a User Rule to call it on resume (no global rules file to auto-write)');
   }
+  // VS Code Copilot + Gemini CLI are receiver-only (no readable local session store to resume FROM, and
+  // their always-on instruction surfaces are app/project-managed). Surface the nudge instead of fabricating
+  // a global rules file — same treatment as Cursor.
+  if (present.some((d) => d.runtime === 'vscode')) {
+    line('       · VS Code (Copilot): memory.continue available; add it to .github/copilot-instructions.md to call on resume (no global rules file to auto-write)');
+  }
+  if (present.some((d) => d.runtime === 'gemini')) {
+    line('       · Gemini CLI: memory.continue available; add it to GEMINI.md to call on resume (no global rules file to auto-write)');
+  }
 
   // 4/4 verify with doctor (pass the primary runtime so its runtime check is green, not a warning)
   let doctorResult: Awaited<ReturnType<typeof doctor>> | null = null;
@@ -979,11 +1028,11 @@ New here? One command does everything:  ihow-memory setup
 
 Usage:
   ihow-memory setup [--runtime name] [--global-hook] [--dry-run] [--json]   # zero-config: detect your AI runtimes → wire MCP + memory skill + auto-capture hook → verify. No prompts, idempotent (safe to re-run), local only.
-  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw]
+  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
   ihow-memory continue [project-keyword] [--cwd path] [--json]   # resume after a context boundary (/clear, new session, out of context): prints a verify-first handoff for the project you were working on — auto-detected from the files you EDITED, with that project's git anchors + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. Pass a keyword to choose which project; works even if you launch every session from one dir. (alias: handoff)
   ihow-memory continue --list [--limit n] [--json]   # list the most recent resumable sessions across all recorded projects (inferred project, git branch+HEAD, last activity, summary snippet; newest first); resume one by its number with: ihow-memory continue <N>
-  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw] [--share-diagnostics] [--json]
+  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini] [--share-diagnostics] [--json]
   ihow-memory verify [--runtime name] [--cwd path] [--json]   # print a REPRODUCIBLE self-proof receipt: local store + each runtime's MCP reachability + this checkout's GREEN/YELLOW/RED resume verdict, each line with the exact command to re-run yourself (no trust required, local-only). Exit non-zero if anything fails to round-trip.
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory benchmark [--json]   # deterministic LOCAL proof of the verify-first guarantees: the three-color resume verdict discriminates (GREEN narrow · drift→RED · uncertainty→YELLOW) and the no-false-green floor isolates unverified/standing-rule content while blocking secret/fabricated-anchor content. Re-run for the same result; exit non-zero if any guarantee fails.
@@ -999,10 +1048,10 @@ Usage:
   ihow-memory rollback --event <eventId> [--space name]   # undo one auto-captured journal entry by its audit eventId
   ihow-memory upgrade [--space name] [--root path]   # re-stamp the connected server bundle after 'npm update' (then restart the runtime)
   ihow-memory migrate-local-day [--memory-root path] [--apply]   # one-time: re-bucket UTC-named journal/event files to local-day (dry-run unless --apply)
-  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw]
+  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
-  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the skill + a project-local auto-capture hook, no prompts
+  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the skill + a project-local auto-capture hook, no prompts
   ihow-memory connect --auto [--write] [--json]   # detect installed runtimes; default reports only, --write connects them all to one shared workspace
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Claude Code Stop-hook handler (reads hook JSON on stdin; wired by the plugin) — emits a session-end capture instruction
@@ -1138,7 +1187,7 @@ function nodeVersionAtLeast(actual: string, expected: string): boolean {
 }
 
 async function doctor(
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' },
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' },
 ): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
   const workspace = resolveWorkspace(options);
@@ -1314,7 +1363,7 @@ async function packageInfo(): Promise<{ name: string; version: string }> {
 
 async function diagnosticReport(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' } = {},
 ): Promise<Record<string, unknown>> {
   const sanitized = sanitizeDoctorResult(result, options);
   const info = await packageInfo();
@@ -1362,7 +1411,7 @@ function githubIssueUrl(body: string): string {
 
 async function feedbackTemplate(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' } = {},
 ): Promise<{ body: string; url: string }> {
   const report = await diagnosticReport(result, options);
   const body = `## What happened
@@ -2242,6 +2291,12 @@ function redactRecallPII(text: string): string {
 // entry as the corrected/current one in a topic pair; combined with promote time it scores recency so the
 // CURRENT entry beats a superseded/contradicted one even when both were promoted in the same second.
 const RECALL_CURRENCY = /supersed|correction|corrected|updated|update:|deprecat|do not use|no longer|outdated|migrated to|raised to|lowered to|changed to|as of \d{4}|replaces|revoked|valid until/i;
+// Phase-4 time dimension: the maximum freshness "discount", expressed in the same MILLISECOND basis the
+// recency score uses, that a long-unverified NON-pinned curated fact can lose. Bounded to a small window
+// (7 days) so the penalty can only ever break ties / reorder PEERS of comparable recency — a genuinely
+// newer entry (minutes/hours/days newer) still wins, and a currency-marked correction (worth ~1e15) is
+// untouchable. This keeps the signal a strict reorder, never an eligibility change.
+const VERIFICATION_FRESHNESS_MAX_DISCOUNT_MS = 7 * 24 * 60 * 60 * 1000;
 function recallRecencyScore(workspace: Awaited<ReturnType<typeof openCore>>['workspace'], relPath: string, snippet: string): { score: number; terms: Set<string> } {
   let content = snippet;
   try {
@@ -2249,13 +2304,29 @@ function recallRecencyScore(workspace: Awaited<ReturnType<typeof openCore>>['wor
   } catch {
     // unreadable -> fall back to the snippet for terms; score stays low
   }
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+  const front = fmMatch ? fmMatch[1] : '';
   const promotedAt = content.match(/promoted_at:\s*"?([^"\n]+)"?/);
   const ms = promotedAt ? Date.parse(promotedAt[1]) : NaN;
   // Topic terms + currency marker from the BODY only — frontmatter keys (team/scope/candidate_id/...) are
   // shared across ALL promoted entries, so including them would make every pair look "same topic" and
   // collapse recall to a single entry. Strip the leading YAML frontmatter first.
   const body = content.replace(/^---[\s\S]*?\n---\n?/, '');
-  const score = (RECALL_CURRENCY.test(body) ? 1e15 : 0) + (Number.isNaN(ms) ? 0 : ms);
+  // TIME-SINCE-VERIFICATION freshness penalty (Phase 4, NON-GIT verify-first extension). A non-pinned
+  // curated fact (a preference/decision with no machine-judged markers... wait: see isDecayExempt) erodes
+  // in freshness as time since its last (re)verification grows. PINNED (verified/flagged) entries are
+  // EXEMPT — isDecayExempt short-circuits them to zero penalty, so the moat's hardest facts never decay.
+  // The discount is bounded to a 7-day-equivalent window: it only ever reorders comparable-recency peers,
+  // never changes what is eligible (this function feeds the sort only). Deterministic, model-free.
+  let freshnessDiscount = 0;
+  if (!isDecayExempt(front)) {
+    const verifiedMs = lastVerificationMs(front);
+    if (verifiedMs !== null) {
+      const penalty = timeSinceVerificationPenalty({ ageDaysSinceVerification: elapsedDays(verifiedMs, Date.now()) });
+      freshnessDiscount = penalty * VERIFICATION_FRESHNESS_MAX_DISCOUNT_MS; // [0, 7d-in-ms]
+    }
+  }
+  const score = (RECALL_CURRENCY.test(body) ? 1e15 : 0) + (Number.isNaN(ms) ? 0 : ms) - freshnessDiscount;
   return { score, terms: recallTerms(body) };
 }
 
@@ -2515,7 +2586,7 @@ async function main(): Promise<void> {
       return;
     }
     if (!options.runtime) {
-      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw (or --auto to detect installed runtimes)');
+      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini (or --auto to detect installed runtimes)');
       process.exitCode = 1;
       return;
     }

@@ -202,6 +202,14 @@ export type CoreStatus = {
     fallbackFrom?: string;
     requested?: RetrievalEngineStatus;
   };
+  // Honest, current capability surface. `lexical` is always true (FTS5/BM25 is the mandatory floor).
+  // `semantic` is true ONLY when an opt-in semantic provider is actually constructed AND ready — so a
+  // default zero-dependency binary, or a requested-but-unreachable sidecar (fallback to FTS), both
+  // report semantic:false. This is the field a caller checks before trusting reworded-query recall.
+  capabilities: {
+    lexical: true;
+    semantic: boolean;
+  };
   sync: {
     enabled: false;
   };

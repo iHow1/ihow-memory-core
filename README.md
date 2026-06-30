@@ -34,7 +34,7 @@ npx ihow-memory@next setup
 ### 1. Connect a single runtime
 
 ```bash
-npx ihow-memory@next connect --runtime claude-code   # or: codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw
+npx ihow-memory@next connect --runtime claude-code   # or: codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw | vscode | gemini
 ```
 
 `connect` provisions a managed workspace under `~/.ihow-memory` (space name derived from the current directory unless you pass `--space`) and registers the `ihow-memory` MCP server with the selected runtime:
@@ -103,7 +103,7 @@ npx ihow-memory@next continue            # or pass a repo keyword: continue <nam
 
 ## Runtime support
 
-`connect` registers the MCP server for eight runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted — this is alpha.
+`connect` registers the MCP server for ten runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted — this is alpha.
 
 | Runtime | connect | resume reader | Notes |
 | --- | --- | --- | --- |
@@ -115,8 +115,21 @@ npx ihow-memory@next continue            # or pass a repo keyword: continue <nam
 | WorkBuddy | ✓ (`~/.workbuddy/mcp.json`) | ✓ | single-machine real-app smoke |
 | Cursor | ✓ (merges `~/.cursor/mcp.json`) | ✗ | receiver-only — Cursor keeps chats in a binary IndexedDB, not readable for resume |
 | Claude Desktop | ✓ | ✗ | receiver-only (chat app; no resumable local sessions) |
+| VS Code (Copilot) | ✓ (user `mcp.json`, `servers` key) | ✗ | receiver-only — reaches `memory.search`/`read`/`continue`; no readable local session store to resume from |
+| Gemini CLI | ✓ (`~/.gemini/settings.json`) | ✗ | receiver-only — reaches `memory.search`/`read`/`continue`; no readable local session store to resume from |
 
 The MCP tools and governed loop are runtime-agnostic. The proactive skill + auto-capture hooks are Claude Code-specific; the resume nudge is auto-injected for the runtimes whose config exposes an instructions file (Claude Code, WorkBuddy, OpenClaw, Hermes, OpenCode).
+
+### Receiver-only runtimes (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
+
+These four runtimes do not expose a readable local session store, so iHow cannot capture *their* past sessions for resume. They are wired as **receivers**: `connect` registers the shared MCP server so the agent can call `memory.search` / `memory.read` / `memory.continue` and pull a [verify-first handoff packet](./docs/handoff-schema.md) (query + GREEN/YELLOW/RED verdict + verbatim-unverified narrative) recorded by any *capture* runtime (Claude Code, Codex, …). That gives cross-tool resume — e.g. pick up in VS Code work that Claude Code left off — without any session reading on the receiver side. Because their always-on instruction surface is app- or project-managed, iHow does not auto-write a global rules file for them; add the resume nudge yourself once:
+
+- **Cursor** — `npx ihow-memory@next connect --runtime cursor` (merges `~/.cursor/mcp.json`, backed up; never clobbers an unparseable file). Add a User Rule like: *"On resume / when I say 继续, call the `memory.continue` MCP tool first; treat its narrative as UNVERIFIED and run its git preflight before acting."*
+- **Claude Desktop** — `npx ihow-memory@next connect --runtime claude-desktop` (writes `claude_desktop_config.json`; macOS `~/Library/Application Support/Claude/`, Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude\`). Restart the app to load the tools.
+- **VS Code (Copilot)** — `npx ihow-memory@next connect --runtime vscode` writes the **user** `mcp.json` (macOS `~/Library/Application Support/Code/User/mcp.json`, Linux `~/.config/Code/User/mcp.json`, Windows `%APPDATA%\Code\User\mcp.json`) under the `servers` key with a `type: "stdio"` entry, backed up; an unparseable file is never overwritten. Reload the window, then enable the server in Copilot agent mode. Add a line to `.github/copilot-instructions.md`: *"On resume, call the `memory.continue` MCP tool first and verify its anchors before acting."*
+- **Gemini CLI** — `npx ihow-memory@next connect --runtime gemini` adds an `mcpServers` entry to `~/.gemini/settings.json` (backed up; unparseable file left untouched). Restart `gemini`, confirm with `/mcp list`. Add the same nudge to your `GEMINI.md`.
+
+For any of these, `npx ihow-memory@next init --runtime <name>` prints the exact snippet to paste by hand instead of writing it, and `npx ihow-memory@next doctor --runtime <name>` round-trips the configured server to confirm it is reachable.
 
 ## Retrieval engine
 
@@ -124,7 +137,16 @@ The default retrieval engine is zero-dependency local full-text search — Node 
 
 ### Retrieval-quality evidence
 
-As honest evidence of retrieval quality — not the product's differentiator — we publish one LongMemEval_S retrieval-stage result: recall_all@10 = 1.0 across all 470 effective samples (500 raw; ndcg_any@10 0.946). Three boundaries: (1) this is retrieval-layer recall, not end-to-end LLM-judged answer accuracy — not directly comparable to the 90%+ figures reported by other vendors, which measure a different layer; (2) the score was produced on our experimental vector + lexical hybrid lane, while this published package defaults to zero-dependency FTS5 lexical search (with an optional local vector provider); (3) a one-command reproduction harness is WIP — until it lands, the public evidence manifest (metric definitions, run artifacts, full @5 disclosure incl. structural ceilings) is the auditable reference.
+As honest evidence of retrieval quality — not the product's differentiator — we publish two figures **side by side**: the **default shipped FTS5 engine** (what you actually run out of the box) and the **experimental vector + lexical hybrid lane** (not in the published binary).
+
+| Lane | Dataset | R@5 | R@10 | MRR | tokens/query | Reproduce |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Default FTS5** (shipped, zero-dependency) | in-repo representative fixture (20 docs / 20 queries — **not** LongMemEval_S) | 0.85 | 0.85 | 0.85 | ~5.7 | `node scripts/retrieval-bench.mjs` |
+| **Experimental hybrid** (vector + lexical, opt-in) | LongMemEval_S retrieval stage (470 effective / 500 raw) | — | recall_all@10 = 1.0 (ndcg_any@10 0.946) | — | evidence manifest below |
+
+The default-FTS5 row is a **deterministic, stranger-reproducible** harness: `node scripts/retrieval-bench.mjs` seeds a labeled fixture through the same `write → promote → search` path the product uses and scores R@5/R@10/MRR + tokens-per-query, with no cloud, no LLM and no third-party deps. The honest shape it shows: keyword and partial-keyword queries recall well (15/15 here), while **paraphrase / synonym queries that share no surface tokens miss** (2/5 here) — that gap is exactly the floor the optional semantic provider is meant to lift.
+
+Three boundaries (unchanged): (1) both are retrieval-layer recall, not end-to-end LLM-judged answer accuracy — not directly comparable to the 90%+ figures reported by other vendors, which measure a different layer; (2) the recall_all@10 = 1.0 figure was produced on the **experimental** vector + lexical hybrid lane, while this published package defaults to zero-dependency FTS5 lexical search (the default-FTS5 row above is the number you get out of the box, on an in-repo fixture, **not** LongMemEval_S); (3) the default-FTS5 number is one-command reproducible today (`node scripts/retrieval-bench.mjs`); a stranger-reproducible harness over the **full LongMemEval_S** hybrid lane is still WIP — until it lands, the public evidence manifest (metric definitions, run artifacts, full @5 disclosure incl. structural ceilings) is the auditable reference for that row.
 
 Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md).
 
@@ -147,7 +169,7 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 ```text
 ihow-memory setup            zero-config: detect runtimes -> wire MCP + skill + auto-capture/recall hooks -> verify (recommended; idempotent, local-only) [--dry-run] [--json]
 ihow-memory init             create a managed workspace, print the MCP config snippet
-ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes) [--dry-run]
+ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw | vscode | gemini) [--dry-run]
 ihow-memory continue         resume after a context boundary — verify-first handoff with live git anchors (GREEN/YELLOW/RED) [project-keyword] [--list] [--json]
 ihow-memory install-skill    copy the Claude Code proactive-memory skill into ~/.claude/skills/
 ihow-memory install-hook     add the hooks — Stop (cooperative nudge) + SessionStart (deterministic floor) + UserPromptSubmit recall (🟢 reviewed, on by default; --no-recall to skip) (Claude Code; --global-hook for user-wide)

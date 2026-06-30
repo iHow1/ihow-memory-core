@@ -66,6 +66,25 @@ test('governance / standing-rule statements auto-promote as flagged durable yell
   }
 });
 
+// P0-C end-to-end: a legitimate handoff that mentions an email is NOT a secret-category rejection — it
+// redacts-in-place and still flows through the floor (here: auto-promoted, with the email [redacted] on
+// the durable file). A REAL credential in the same text would still be rejected (covered above).
+test('P0-C: a legitimate email auto-promotes with the email redacted (not a secret rejection)', async (t) => {
+  const core = await managed(t);
+  const r = await core.write_candidate({
+    text: 'Handoff: synced with alice@example.com on the cutover; 178 of 178 tests green.',
+    sourceAgent: 'tester',
+    metadata: { command: 'npm test', exitCode: 0 },
+  });
+  assert.ok(r.autoPromote, 'an email-bearing candidate produces a verdict, not a hard reject');
+  assert.notEqual(r.autoPromote.category, 'secret', 'an email must NOT be classified as a secret rejection');
+  assert.equal(r.autoPromote.promoted, true, 'the redacted handoff flows through the floor');
+  const read = await core.read(r.path);
+  assert.ok(!read.content.includes('alice@example.com'), 'the email VALUE is not on the durable file');
+  assert.match(read.content, /\[redacted\]/, 'the email degraded to [redacted]');
+  assert.match(read.content, /178 of 178/, 'surrounding useful content survived');
+});
+
 test('autoPromote:false stages a candidate without evaluation', async (t) => {
   const core = await managed(t);
   const r = await core.write_candidate({ text: 'a verified fact', metadata: { evidence: 'x' }, autoPromote: false });

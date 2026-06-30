@@ -53,6 +53,48 @@ test('journal hard-rejects secret-like content (auto path keeps the reject gate)
   );
 });
 
+// P0-C friction fix: a legitimate handoff that mentions an email must REDACT-IN-PLACE (email value ->
+// [redacted], surrounding content preserved) instead of being rejected back to a manual gate.
+test('P0-C: write_candidate with a legitimate email redacts-in-place, never rejected', async (t) => {
+  const core = await managed(t);
+  const cand = await core.write_candidate({
+    text: 'Handoff: contacted alice@example.com about the deploy window; next step is to confirm the rollback plan.',
+    sourceAgent: 'tester',
+    title: 'deploy-handoff',
+    autoPromote: false,
+  });
+  assert.equal(cand.status, 'candidate', 'a legitimate-email candidate is accepted, not rejected');
+  const file = path.join(core.workspace.memoryDir, cand.path.replace(/^memory\//, ''));
+  const content = await fs.readFile(file, 'utf8');
+  assert.ok(!content.includes('alice@example.com'), 'the email VALUE must not land on disk');
+  assert.match(content, /\[redacted\]/, 'the email is replaced with a [redacted] marker');
+  assert.match(content, /deploy window/, 'surrounding useful content is preserved');
+  assert.match(content, /rollback plan/, 'surrounding useful content is preserved');
+});
+
+test('P0-C: write_candidate STILL hard-rejects a real secret (reject-vs-redact, never ignore)', async (t) => {
+  const core = await managed(t);
+  await assert.rejects(
+    core.write_candidate({ text: 'token rotation note: api_key: ABCDEF0123456789 must be rotated', sourceAgent: 'tester', title: 'rot' }),
+    /secret/,
+    'a real credential is rejected even though a benign email would only be redacted',
+  );
+});
+
+test('P0-C: journal with a legitimate email redacts-in-place and the on-disk file is detector-clean', async (t) => {
+  const core = await managed(t);
+  const r = await core.journal({ text: 'pinged bob@example.org re: the flaky retry path; will follow up tomorrow.', sourceAgent: 'tester' });
+  assert.equal(r.status, 'journaled');
+  const abs = path.join(core.workspace.memoryDir, 'journal', `${r.day}.md`);
+  const content = await fs.readFile(abs, 'utf8');
+  assert.ok(!content.includes('bob@example.org'), 'the email VALUE must not land on disk');
+  assert.match(content, /\[redacted\]/, 'the email degraded to a [redacted] marker');
+  assert.match(content, /flaky retry path/, 'surrounding useful content is preserved');
+  // The persisted body must be hard-detector clean for the redacted email (containsSecretLikeContent floor).
+  const { containsSecretLikeContent } = await import('../src/governance.ts');
+  assert.equal(containsSecretLikeContent(content), false, 'post-redaction on-disk journal is detector zero-hit for the email');
+});
+
 test('journal entries are searchable but ranked below curated memory', async (t) => {
   const core = await managed(t);
   // auto-captured journal entry matching the query

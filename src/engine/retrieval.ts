@@ -11,6 +11,17 @@ import type {
 } from '../types.ts';
 import { countIndexedDocuments, ftsEngine } from './fts.ts';
 import { readProviderManifest, writeProviderManifest } from './manifest.ts';
+import { containsSecretLikeContent } from '../governance.ts';
+
+// A search RESULT must never surface a secret-like path — and not only on the FTS lane (gated at
+// collectDocuments). An OPT-IN vector provider can return a hit for an out-of-band PII/secret-named file the
+// FTS index gate never saw, and RRF would fuse it into the result list (red-team r7). This is the result-
+// boundary chokepoint applied to EVERY lane/return of searchWithEngineFallback, so MCP / CLI / HTTP / recall
+// (all of which go through core.search → here) can never echo a foreign secret-like path. Engine-written
+// durable paths are always slug-safe, so a normal hit is never dropped.
+function gateSearchHits(hits: SearchResult[]): SearchResult[] {
+  return hits.filter((hit) => hit && typeof hit.path === 'string' && !containsSecretLikeContent(hit.path));
+}
 
 type EngineConfig = {
   requestedId: string;
@@ -282,36 +293,80 @@ export async function indexWithEngineFallback(workspace: Workspace, config: Engi
   }
 }
 
+// Reciprocal Rank Fusion (RRF). Vector hits JOIN the same ranked list as FTS; neither lane can
+// add a result the other rejected as INELIGIBLE — fusion only re-orders the UNION of what each lane
+// already surfaced. RRF is rank-based (not score-based), so the two incomparable score scales
+// (bm25 distance vs cosine similarity) never need normalizing, and a single lane's outlier score
+// cannot dominate. k=60 is the canonical RRF constant. The FTS lane is always present and seeded
+// first, so its citation/snippet/source (the audited lexical record) wins ties on identical paths.
+const RRF_K = 60;
+
+export function fuseRrf(ftsHits: SearchResult[], vectorHits: SearchResult[], limit: number): SearchResult[] {
+  const acc = new Map<string, { hit: SearchResult; score: number }>();
+  const fold = (hits: SearchResult[], prefer: boolean): void => {
+    hits.forEach((hit, rank) => {
+      if (!hit || typeof hit.path !== 'string') return;
+      const contribution = 1 / (RRF_K + rank + 1);
+      const existing = acc.get(hit.path);
+      if (existing) {
+        existing.score += contribution;
+        // keep the FTS-lane representation (citation/snippet/source) as the canonical one when present
+        if (prefer) existing.hit = { ...hit, score: existing.score };
+      } else {
+        acc.set(hit.path, { hit, score: contribution });
+      }
+    });
+  };
+  // FTS folded FIRST (prefer=true): the always-on lexical lane owns the canonical hit shape.
+  fold(ftsHits, true);
+  fold(vectorHits, false);
+  return [...acc.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    // RRF score replaces the lane-local score; downstream consumers (recall) re-gate by path, not score,
+    // so this rewrite only affects ORDER, never eligibility.
+    .map((entry) => ({ ...entry.hit, score: entry.score }));
+}
+
 export async function searchWithEngineFallback(
   workspace: Workspace,
   config: EngineConfig,
   query: string,
   opts: SearchOptions = {},
 ): Promise<EngineSearchResult> {
+  // FTS5/BM25 is the MANDATORY lexical floor — always run, always present. When no semantic provider
+  // is requested, it is the only lane (default zero-dependency binary). `capabilities.semantic` stays
+  // false in this path because no semantic engine was even constructed.
+  const ftsHits = await ftsEngine.search(workspace, query, opts);
   if (!isVectorRequested(config)) {
-    return { hits: await ftsEngine.search(workspace, query, opts) };
+    return { hits: gateSearchHits(ftsHits) };
   }
 
+  // Semantic lane is OPT-IN. Run it ALONGSIDE FTS (not instead of) and RRF-fuse: vector hits re-order
+  // the list but ride the same FTS floor. If the sidecar/provider is unreachable or not ready, we fall
+  // back to the FTS hits we already have — semantic is additive, never load-bearing for availability.
   const requested = vectorEngine(config);
   try {
     const status = await requested.status(workspace);
     if (!status.ready) throw new Error(status.lastError || 'vector_provider_not_ready');
-    const hits = await requested.search(workspace, query, opts);
+    // Pull a deeper vector slice than the caller's limit so fusion has rank signal to work with.
+    const vectorLimit = Math.max(Number(opts.limit || 5), 10);
+    const vectorHits = await requested.search(workspace, query, { ...opts, limit: vectorLimit });
     await writeReadyManifest(workspace, status);
-    return { hits };
+    const limit = Math.max(1, Math.min(Number(opts.limit || 5), 25));
+    return { hits: gateSearchHits(fuseRrf(ftsHits, vectorHits, limit)) };
   } catch (error) {
     const fallback = {
       from: requested.id,
       to: 'fts' as const,
       reason: safeErrorMessage(error),
     };
-    const hits = await ftsEngine.search(workspace, query, opts);
     await writeFallbackManifest(workspace, fallback);
     return {
-      hits: hits.map((hit) => ({
+      hits: gateSearchHits(ftsHits.map((hit) => ({
         ...hit,
         fallback,
-      })),
+      }))),
       fallback,
     };
   }

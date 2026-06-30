@@ -9,11 +9,13 @@ import { listMarkdownFiles } from '../store/files.ts';
 import { withWorkspaceLock } from '../store/lock.ts';
 import { relativeToSpace } from '../workspace.ts';
 import { defaultFtsManifest, writeProviderManifest } from './manifest.ts';
+import { containsSecretLikeContent } from '../governance.ts';
 
 type IndexDocument = {
   path: string;
   content: string;
   flagged: boolean;
+  unreviewed: boolean;
 };
 
 const BUSY_TIMEOUT_MS = 10000;
@@ -69,7 +71,7 @@ function openDatabase(workspace: Workspace, opts: { initialize?: boolean } = {})
     db.exec('PRAGMA synchronous = NORMAL;');
     db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
-      USING fts5(path UNINDEXED, content, orig UNINDEXED, flagged UNINDEXED, tokenize = 'unicode61');
+      USING fts5(path UNINDEXED, content, orig UNINDEXED, flagged UNINDEXED, reviewed UNINDEXED, tokenize = 'unicode61');
     `);
   }
   return db;
@@ -127,6 +129,19 @@ function frontmatterIsFlagged(content: string): boolean {
   return /^\s*flagged:\s*["']?true\b/im.test(fm[1]);
 }
 
+// RED-TEAM-NEEDED (governance.ts:839 follow-up): wires the long-tracked "down-weight unreviewed
+// entries in bm25 rank". An entry is UNREVIEWED when the engine auto-promoted it WITHOUT a human
+// review — frontmatter `reviewed: false` or `tier: auto-promoted` (machine-judged). This is RANKING
+// ONLY: an unreviewed entry stays fully searchable and fully recall-eligible exactly as before; we
+// only nudge it DOWN the bm25 order so a human-reviewed entry of comparable lexical match ranks
+// first. The same case/quote-tolerant matchers recall uses (cli.ts recallTier) are mirrored here so
+// the two cannot disagree on what "unreviewed" means.
+function frontmatterIsUnreviewed(content: string): boolean {
+  const fm = content.match(/^﻿?\s*---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fm) return false;
+  return /^\s*reviewed:\s*["']?false\b/im.test(fm[1]) || /^\s*tier:\s*["']?auto-promoted\b/im.test(fm[1]);
+}
+
 function buildSnippet(orig: string, query: string): string {
   let body = typeof orig === 'string' ? orig : '';
   // drop a leading YAML frontmatter block so the snippet is CONTENT, not metadata (candidate_id, timestamps)
@@ -156,8 +171,16 @@ async function collectDocuments(workspace: Workspace): Promise<IndexDocument[]> 
     if (relative.startsWith('memory/candidate/')) continue;
     if (relative.startsWith('memory/_mcp/_events/')) continue;
     if (relative.startsWith('memory/_mcp/history/')) continue;
+    // r6 systemic gate: never index an OUT-OF-BAND file whose PATH is secret-like — its raw path would land
+    // in the index.sqlite `path` column (then surface in search results). Engine-written durable memory is
+    // always slug-safe, so this only skips files planted directly in the tree; a normally-promoted memory
+    // never trips it. The read-boundary chokepoint that keeps foreign PII/secret paths out of the search
+    // index (companion to safeAuditPath, which redacts the same class on the sweep audit surfaces). PATH-only
+    // by design: a content check could silently drop a legit memory whose body trips the detector, and durable
+    // content is already write-time-gated clean, so path is the safe + sufficient discriminator.
+    if (containsSecretLikeContent(relative)) continue;
     const content = await fsp.readFile(filePath, 'utf8');
-    documents.push({ path: relative, content, flagged: frontmatterIsFlagged(content) });
+    documents.push({ path: relative, content, flagged: frontmatterIsFlagged(content), unreviewed: frontmatterIsUnreviewed(content) });
   }
   return documents;
 }
@@ -166,13 +189,14 @@ async function rebuildFtsIndexUnlocked(workspace: Workspace): Promise<number> {
   const documents = await collectDocuments(workspace);
   const db = openDatabase(workspace);
   try {
-    // DROP+CREATE (not just DELETE) so an old-schema index (pre-bigram, no `orig` column) migrates cleanly.
+    // DROP+CREATE (not just DELETE) so an old-schema index (pre-bigram/pre-`reviewed`) migrates cleanly.
     db.exec('DROP TABLE IF EXISTS memory_fts');
-    db.exec("CREATE VIRTUAL TABLE memory_fts USING fts5(path UNINDEXED, content, orig UNINDEXED, flagged UNINDEXED, tokenize = 'unicode61')");
+    db.exec("CREATE VIRTUAL TABLE memory_fts USING fts5(path UNINDEXED, content, orig UNINDEXED, flagged UNINDEXED, reviewed UNINDEXED, tokenize = 'unicode61')");
     db.exec('BEGIN');
-    const insert = db.prepare('INSERT INTO memory_fts(path, content, orig, flagged) VALUES (?, ?, ?, ?)');
+    const insert = db.prepare('INSERT INTO memory_fts(path, content, orig, flagged, reviewed) VALUES (?, ?, ?, ?, ?)');
     for (const document of documents) {
-      insert.run(document.path, cjkIndexSegment(document.content), document.content, document.flagged ? 1 : 0);
+      // reviewed=1 when human-reviewed/plain; reviewed=0 when machine auto-promoted (down-weighted at rank time).
+      insert.run(document.path, cjkIndexSegment(document.content), document.content, document.flagged ? 1 : 0, document.unreviewed ? 0 : 1);
     }
     db.exec('COMMIT');
   } catch (error) {
@@ -193,8 +217,9 @@ async function hasUsableIndex(workspace: Workspace): Promise<boolean> {
   if (!fs.existsSync(workspace.indexPath)) return false;
   const db = openDatabase(workspace, { initialize: false });
   try {
-    // selecting `orig` also verifies the current schema — a pre-bigram index lacks it, fails here, rebuilds.
-    db.prepare('SELECT orig, flagged FROM memory_fts LIMIT 1').all();
+    // selecting `orig`+`reviewed` also verifies the current schema — a pre-bigram / pre-reviewed index
+    // lacks one of these columns, fails here, and is rebuilt with the current schema.
+    db.prepare('SELECT orig, flagged, reviewed FROM memory_fts LIMIT 1').all();
     return true;
   } catch {
     return false;
@@ -234,13 +259,27 @@ export async function searchFts(
           path,
           orig,
           bm25(memory_fts) AS rank,
-          (CASE WHEN path LIKE 'memory/journal/%' OR path LIKE 'memory/_mcp/journal/%' THEN 1 ELSE 0 END) AS is_journal
+          (CASE WHEN path LIKE 'memory/journal/%' OR path LIKE 'memory/_mcp/journal/%' THEN 1 ELSE 0 END) AS is_journal,
+          -- RED-TEAM-NEEDED (governance.ts:839): bm25 is NEGATIVE (more-negative = better). Adding a small
+          -- positive penalty to UNREVIEWED (machine auto-promoted) rows pushes them DOWN the order so a
+          -- human-reviewed entry of comparable lexical match wins. Ranking only — eligibility is untouched
+          -- (the row is still returned and still recall-gated downstream by the event log, not by rank).
+          (CASE WHEN reviewed = 0 THEN 1.0 ELSE 0 END) AS rank_penalty,
+          -- Phase-4 DETERMINISTIC SALIENCE DECAY for the SOFT (journal/floor) lane. Journal/floor files are
+          -- day-named (memory/journal/YYYY-MM-DD.md); the date is a deterministic, model-free salience proxy
+          -- — an older note has lower salience and sorts BELOW a newer one of equal lexical match. This is a
+          -- TIEBREAKER applied ONLY among journal rows (is_journal=1): it orders newest-day first (DESC) so
+          -- a stale low-weight note sinks. ARCHIVE/RANKING ONLY — same WHERE clause, same eligibility, never
+          -- a delete; verified/flagged (the PINNED governance tiers) are not in the journal lane at all, so
+          -- this can never touch them. Non-journal rows get '' here and are unaffected (constant key).
+          (CASE WHEN path LIKE 'memory/journal/%' OR path LIKE 'memory/_mcp/journal/%'
+                THEN substr(path, length(path) - 12, 10) ELSE '' END) AS journal_day
         FROM memory_fts
         WHERE memory_fts MATCH ? AND (? = 1 OR flagged != 1)
-        ORDER BY is_journal ASC, rank
+        ORDER BY is_journal ASC, (rank + rank_penalty), journal_day DESC
         LIMIT ?
       `)
-      .all(queryToFts(query), opts.includeFlagged === true ? 1 : 0, limit) as Array<{ path: string; orig: string; rank: number; is_journal: number }>;
+      .all(queryToFts(query), opts.includeFlagged === true ? 1 : 0, limit) as Array<{ path: string; orig: string; rank: number; is_journal: number; rank_penalty: number; journal_day: string }>;
     return rows.map((row) => {
       const snippet = buildSnippet(row.orig, query); // clean window from the ORIGINAL text, not the segmented column
       return {

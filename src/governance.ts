@@ -39,6 +39,13 @@ export const DEFAULT_PROTECTED_PATTERNS = [
   'active-topics.md',
 ];
 
+// An email address. PII, not a credential — so on the INGEST path (write_candidate / journal) it is
+// REDACTED-IN-PLACE rather than used to reject the whole entry (see REDACT_IN_PLACE_INGEST_PATTERNS and
+// redactIngestBenign). It is STILL a member of the detector/redactor set below so that (a) the floor's
+// redaction-before-persist invariant keeps stripping it and (b) post-redaction containsSecretLikeContent()
+// stays clean. The split is "reject vs redact", NOT "detect vs ignore" — the value never lands on disk.
+const EMAIL_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+
 // High-precision secret detectors. These match secret *values* (or assignment-style
 // `keyword: value`), not bare keywords, to keep the hard-reject low on false positives.
 // NOTE: prose-style secrets ("the password is hunter2") and generic high-entropy blobs are
@@ -58,13 +65,65 @@ const SECRET_LIKE_PATTERNS = [
   /\bSK[0-9a-f]{32}\b/, // Twilio
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/, // JWT
   /-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA )?PRIVATE KEY-----/, // PEM private key
-  /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i, // email address
+  EMAIL_PATTERN, // email address (PII) — detected + redacted, but REDACT-IN-PLACE (not reject) on ingest
   /(?:账号|账户|邮箱|密码|密钥|令牌)\s*[:：=]\s*\S+/i, // CJK account/secret assignment
   // URL- / connection-string-embedded credentials: scheme://user:pass@host
   // (covers redis/postgres/mongodb/amqp/https…). Low false-positive, high signal, so it joins the
   // hard-reject detector — a creds-in-URL almost never appears legitimately in memory text.
   /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/:@]+@\S+/i,
 ];
+
+// Patterns that, on the candidate/journal INGEST path, degrade to a [redacted] marker instead of
+// hard-rejecting the whole entry. These are PII / friction matches (an email in a legitimate handoff),
+// NOT credentials — a false hard-reject here pushes a clean handoff back to a manual gate (the P0-C
+// friction bug). Every member is ALSO in SECRET_LIKE_PATTERNS, so after redactIngestBenign() the hard
+// detector is guaranteed clean for them. The invariant is "real secret → reject; PII → redact-in-place".
+const REDACT_IN_PLACE_INGEST_PATTERNS = [
+  EMAIL_PATTERN,
+];
+
+// The REAL-secret detectors — the hard-reject set MINUS the redact-in-place (PII) set. A match here means
+// a credential is present and the WHOLE entry must hard-reject; a match only in the PII set is redacted in
+// place. This split is what makes "redact email, but never let an email-shaped redaction mask a real
+// secret" safe: redactIngestBenign refuses to run when a real secret is present (see below). Email is the
+// dangerous overlap — its broad `local@host.tld` shape also matches the `pass@host` tail of a URL-embedded
+// credential (redis://u:p@h) and the body of a Bearer/JWT token; redacting that tail would erase the very
+// `@`/structure the URL-cred / Bearer detectors key on and silently downgrade a real secret to "clean".
+const REAL_SECRET_PATTERNS = SECRET_LIKE_PATTERNS.filter((p) => !REDACT_IN_PLACE_INGEST_PATTERNS.includes(p));
+
+// WIDE, low-false-positive prechecks for the redact-in-place NO-OP guard (red-team Blocker 3). The narrow
+// `Bearer [A-Za-z0-9._~+/=-]{12,}` detector keys on a STRICT RFC token alphabet, so an adversarial
+// `Bearer xxx@yyy.com` (a credential-shaped value whose body is also email-shaped) misses the Bearer
+// detector, matches ONLY EMAIL_PATTERN, and would be silently downgraded to `Bearer [redacted]` → clean by
+// redactIngestBenign. These guards make redactIngestBenign a NO-OP on such inputs so the value survives to
+// the hard gate instead of being masked. Kept separate from the strict SECRET_LIKE_PATTERNS Bearer detector
+// so the hard-reject detector's false-positive profile is unchanged — these gate ONLY the redact no-op.
+//
+// FALSE-POSITIVE TUNING (do not widen to a bare `Bearer \S+`): English prose contains "the bearer of bad
+// news" — `Bearer \S+` would match `bearer of`, no-op the redactor, and bounce a LEGITIMATE email-bearing
+// handoff to a hard reject (breaks the P0-C friction-fix invariant). So:
+//  • `Authorization: Bearer <anything non-empty>` — the `Authorization:` prefix essentially never appears in
+//    prose, so a bare `\S+` value is safe here and catches the full header form.
+//  • bare `Bearer <value>` ONLY when the value is credential-SHAPED: it contains an `@` (the email-shaped
+//    adversarial case + creds-in-URL tails) OR it is a ≥8-char token from the RFC Bearer alphabet that is
+//    NOT a plain alphabetic word (so `Bearer of`/`Bearer bad` do not match, but `Bearer xxx@yyy.com`,
+//    `Bearer ey....`, `Bearer a1b2c3d4e5` do). This keeps the email-shaped downgrade closed without
+//    swallowing ordinary prose that uses the word "bearer".
+const REAL_SECRET_PRECHECK_PATTERNS = [
+  /\bAuthorization\s*:\s*Bearer\s+\S+/i, // `Authorization: Bearer <anything non-empty>`
+  /\bBearer\s+\S*@\S+/i, // `Bearer <…@…>` — email-shaped / creds-in-URL value (the named adversarial case)
+  // ≥8-char token, not a plain word. The right boundary is "not another Bearer-alphabet char" (a negative
+  // lookahead) — NOT \b: a token ending in `- ~ + / =` (RFC 6750 / base64url tails) has no word boundary after
+  // it, so the old \b silently missed `Bearer abc1234-` and the redactor (which shares this pattern) drifted
+  // with it (red-team r3 Blocker 1). `Bearer of`/`Bearer marched` still don't match (need ≥8 chars AND a
+  // non-alpha char via the second lookahead), so ordinary prose using "bearer" stays unflagged.
+  /\bBearer\s+(?=[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-]))(?=\S*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])/i,
+];
+
+function containsRealSecret(text: string): boolean {
+  if (REAL_SECRET_PRECHECK_PATTERNS.some((pattern) => pattern.test(text))) return true;
+  return REAL_SECRET_PATTERNS.some((pattern) => pattern.test(text));
+}
 
 // EXTRA patterns the auto-capture REDACTOR quarantines but the hard-reject detector does NOT use —
 // they carry a non-trivial false-positive cost ("the token is valid") that is unacceptable for the
@@ -88,12 +147,20 @@ function candidateText(payload: WriteCandidatePayload): string {
   if (typeof text !== 'string' || !text.trim()) {
     throw new Error('candidate_text_required');
   }
-  assertNoSecretLikeContent(text);
-  return text.trim();
+  // Redact-in-place the "redact, don't reject" set (email/PII) BEFORE the hard check, so a legitimate
+  // handoff that mentions an email lands as [redacted] instead of being rejected (P0-C). A REAL secret is
+  // untouched by this pass and still trips assertNoSecretLikeContent below — reject-vs-redact, never ignore.
+  const redacted = redactIngestBenign(text);
+  assertNoSecretLikeContent(redacted);
+  return redacted.trim();
 }
 
 export function containsSecretLikeContent(text: string): boolean {
-  return SECRET_LIKE_PATTERNS.some((pattern) => pattern.test(text));
+  // Hard-reject the credential-SHAPED Bearer/Authorization values too (red-team r2 Blocker 2): the strict
+  // 12+ SECRET_LIKE Bearer detector misses `Bearer <8-11 token-ish>`, which the precheck DOES match. These
+  // are mirrored into redactSecretLikeContent below so detector and redactor never drift.
+  return SECRET_LIKE_PATTERNS.some((pattern) => pattern.test(text))
+    || REAL_SECRET_PRECHECK_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 // SAME-SOURCE redactor for the auto-capture path (OpenClaw signing condition for automation v2):
@@ -112,6 +179,9 @@ export function redactSecretLikeContent(text: string): string {
   out = out.replace(asGlobal(new RegExp(`${assignment.source}\\s*\\S+`, assignment.flags)), '[redacted]');
   // every detector (value-style + the CJK assignment already swallows its value), applied globally
   for (const pattern of SECRET_LIKE_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
+  // the credential-shaped Bearer/Authorization prechecks the strict 12+ detector misses — kept in lockstep
+  // with containsSecretLikeContent (which now flags these), so the redactor stays a superset of the detector.
+  for (const pattern of REAL_SECRET_PRECHECK_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
   // plus the auto-capture-only quarantine set (high-entropy blobs, prose secrets) — these are NOT in
   // the detector, so post-redaction containsSecretLikeContent() is still guaranteed clean (the
   // redactor is a strict superset of the detector).
@@ -119,10 +189,129 @@ export function redactSecretLikeContent(text: string): string {
   return out;
 }
 
+// INGEST-path redaction-before-persist for the "redact, don't reject" set (currently: email). Strips ONLY
+// REDACT_IN_PLACE_INGEST_PATTERNS to a [redacted] marker. This is the P0-C friction fix: a legitimate
+// write_candidate / journal body that mentions an email lands as [redacted] instead of being bounced to a
+// manual gate. Built from the SAME EMAIL_PATTERN the detector uses (no drift), so containsSecretLikeContent()
+// is clean for the redacted matches afterwards. NOT a substitute for redactSecretLikeContent (full set).
+//
+// HARD SAFETY GUARD (red-team blocker): if the text contains a REAL secret, this is a NO-OP — the entry is
+// left untouched so the hard-reject gate still fires. Without this, the broad email regex would rewrite the
+// `pass@host.tld` tail of a URL-embedded credential (redis://u:p@h) or a Bearer/JWT body to [redacted],
+// erasing the `@`/structure the URL-cred / Bearer detectors rely on and DOWNGRADING a real secret to
+// "clean" — a silent weakening of the real-secret hard-reject. Email-in-place redaction is only applied to
+// text that carries NO real secret, so it can never mask one.
+export function redactIngestBenign(text: string): string {
+  if (containsRealSecret(text)) return text; // a real secret is present → never redact-mask it; let it reject
+  const asGlobal = (p: RegExp): RegExp => (p.flags.includes('g') ? p : new RegExp(p.source, `${p.flags}g`));
+  let out = text;
+  for (const pattern of REDACT_IN_PLACE_INGEST_PATTERNS) out = out.replace(asGlobal(pattern), '[redacted]');
+  return out;
+}
+
 function assertNoSecretLikeContent(text: string): void {
   if (containsSecretLikeContent(text)) {
     throw new Error('candidate_contains_secret_like_content');
   }
+}
+
+// Ingest-safe view of a free-text HEADING field (journal title) that gets persisted into a markdown
+// heading — a derived persistence surface the body redaction did NOT cover (red-team Blocker 2). Runs the
+// SAME redact-in-place (email -> [redacted]) + hard gate as the body: a benign email degrades to
+// [redacted], a real secret throws (so the whole entry rejects rather than leaking a raw secret into the
+// heading). Returns undefined for empty input so the caller can omit the heading segment entirely.
+function safeHeadingTitle(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  const redacted = redactIngestBenign(trimmed);
+  assertNoSecretLikeContent(redacted); // real secret in the title -> reject (never lands in the heading)
+  return redacted;
+}
+
+// Collapse a free-text actor / sourceAgent label down to a SAFE id before it lands in a journal heading or
+// audit actor field (red-team Blocker 2: sourceAgent='alice@example.com' previously wrote the raw email
+// into the heading). Whitelist charset [a-z0-9._-], lowercased, length-capped; anything else is dropped to
+// '-'. An email/secret-shaped sourceAgent therefore cannot carry its value through — `alice@example.com`
+// becomes `alice-example.com` is NOT acceptable here (still leaks local+domain), so we go further: any '@'
+// or run of illegal chars collapses to a single '-' AND if the result is empty we fall back to 'unknown'.
+// This is intentionally stricter than safeFileSlug — a sourceAgent is an identifier, not free text.
+// Derive a filesystem slug from a free-text title WITHOUT letting any PII/secret VALUE reach the path
+// (red-team Blocker 1). safeFileSlug alone is NOT enough: it only swaps illegal chars, so an email title
+// `alice@example.com` becomes the slug `alice-example.com`, leaking local+domain into filename/path/audit.
+// Here we FIRST run the ingest redactor (email -> [redacted]); if the redacted form is STILL detector-dirty
+// (a real secret made redactIngestBenign a no-op) we DROP the title entirely and fall back to candidateId,
+// so a credential can never be slugged into a path either. Result: path/filename derive only from a
+// redacted, detector-clean title (or the opaque candidateId), never from a raw PII/secret value.
+function safeRedactedSlug(title: string | undefined, candidateId: string): string {
+  const trimmed = title?.trim();
+  if (!trimmed) return safeFileSlug(candidateId, candidateId);
+  const redacted = redactIngestBenign(trimmed);
+  if (containsSecretLikeContent(redacted)) return safeFileSlug(candidateId, candidateId);
+  return safeFileSlug(redacted, candidateId);
+}
+
+// A scope becomes a durable DIRECTORY name AND the raw `event.targetPath` in the _events audit log AND an
+// index.sqlite row — none of them redactable after the fact. safeFileSlug alone only swaps illegal chars
+// (scope-pii@corp.example -> scope-pii-corp.example, keeping the email local-part+domain; an sk- key survives
+// byte-intact), so scope must get the SAME redact-before-slug treatment as the title (r4 self-audit round 2:
+// the metadata.target.scope copy was redacted but the sibling targetPath it mirrors was not). Falls back to
+// 'general' on a real secret, mirroring safeRedactedSlug's drop-to-candidateId.
+function safeScopeSlug(scope: string | undefined): string {
+  const trimmed = scope?.trim();
+  if (!trimmed) return safeFileSlug('general', 'general');
+  const redacted = redactIngestBenign(trimmed);
+  if (containsSecretLikeContent(redacted)) return safeFileSlug('general', 'general');
+  return safeFileSlug(redacted, 'general');
+}
+
+// Ingest-safe copy of a PromoteTarget for the AUDIT metadata surface. EVERY user-controlled field
+// (scope / path / title) is free text and is NOT redacted upstream — resolveTargetPath only slugs scope/title
+// into a filename, and an explicit path is rejected (not redacted) at resolve time — so a raw PII/secret in
+// ANY of them would otherwise land verbatim in the _events ndjson audit log. Route the whole target through
+// the recursive full-set audit redactor (proven in lockstep with the detector). r2 covered only title; the
+// r4 self-audit found scope (and path) still passed through raw via the `{ ...target }` spread.
+function safeAuditTarget(target: PromoteTarget): PromoteTarget {
+  return safeAuditMetadata(target);
+}
+
+// Deep-sanitize a provenance/metadata object before it lands in an audit EVENT (red-team r2 Blocker 1):
+// raw payload.metadata (e.g. { contact: 'carol@example.net' }) flowed verbatim into _events/*.ndjson — a
+// persistence surface (backed up, grep-able, surfaced by audit/diagnostic reads). Recursively redact every
+// string value with the full-set redactor; a value still detector-dirty after redaction (a real secret) is
+// dropped to [redacted], never logged. Only the AUDIT copy is sanitized — the gate logic still sees the raw
+// provenance (it must, to verify git anchors / command exit codes).
+function safeAuditMetadata<T>(value: T): T {
+  if (typeof value === 'string') {
+    const redacted = redactSecretLikeContent(value);
+    return (containsSecretLikeContent(redacted) ? '[redacted]' : redacted) as unknown as T;
+  }
+  if (Array.isArray(value)) return value.map((entry) => safeAuditMetadata(entry)) as unknown as T;
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      // Redact KEYS too, not just values: a PII/secret used as an object KEY (e.g. { 'carol@example.net': v })
+      // otherwise lands raw in the _events audit ndjson, while the markdown frontmatter — which redacts the
+      // rendered JSON string — masks it. That asymmetry is a detector/redactor drift (r4 self-audit: key-leak).
+      out[safeAuditMetadata(key) as string] = safeAuditMetadata(entry);
+    }
+    return out as unknown as T;
+  }
+  return value;
+}
+
+function safeActorId(raw: string | undefined): string {
+  const cleaned = (raw ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '')
+    .slice(0, 40);
+  // If after whitelisting the label still parses as an email/secret (e.g. it was 'a.b-example.com' from an
+  // email), null it out — an actor id must never carry an exfiltratable value. The detector catches the
+  // dotted domain tail; on any hit we drop to the neutral fallback.
+  if (!cleaned || containsSecretLikeContent(raw ?? '')) return 'unknown';
+  return cleaned;
 }
 
 function assertNoSecretLikeDurableCandidate(content: string): void {
@@ -170,19 +359,22 @@ function stripMemoryPrefix(ref: string): string {
 
 function resolveTargetPath(workspace: Workspace, candidateId: string, target: PromoteTarget = {}): string {
   if (workspace.mode === 'existing-memory-root') {
-    const title = safeFileSlug(target.title || candidateId, candidateId);
+    const title = safeRedactedSlug(target.title, candidateId); // Blocker 1: no raw PII/secret in path
     return path.join(workspace.promotedDir, `${nowCompact()}-${title}.md`);
   }
 
   const explicit = target.path?.trim();
   if (explicit) {
     if (isProtectedPath(explicit)) throw new Error('protected_core_path');
+    // A PII/secret in an explicit path becomes the durable FILENAME and the raw event.targetPath in the audit
+    // log — neither is redactable after the fact — so reject it at resolve time (r4 self-audit: target.path leak).
+    if (containsSecretLikeContent(normalizeRef(explicit))) throw new Error('target_path_contains_secret_like_content');
     const absolute = absoluteFromMemoryPath(workspace, explicit);
     return absolute;
   }
 
-  const scope = safeFileSlug(target.scope || 'general', 'general');
-  const title = safeFileSlug(target.title || candidateId, candidateId);
+  const scope = safeScopeSlug(target.scope); // r4 self-audit: redact PII/secret BEFORE it becomes a dir name / raw targetPath / sqlite row
+  const title = safeRedactedSlug(target.title, candidateId); // Blocker 1: no raw PII/secret in path
   const relative = path.join('scopes', scope, `${nowCompact()}-${title}.md`);
   if (isProtectedPath(relative)) throw new Error('protected_core_path');
   return path.join(workspace.memoryDir, relative);
@@ -228,6 +420,8 @@ function resolveDurableTargetPath(workspace: Workspace, candidateId: string, tar
   const explicit = target.path?.trim();
   if (explicit) {
     if (isProtectedPath(explicit)) throw new Error('protected_core_path');
+    // PII/secret in an explicit path leaks into the durable filename + the raw audit targetPath (r4 self-audit).
+    if (containsSecretLikeContent(normalizeRef(explicit))) throw new Error('target_path_contains_secret_like_content');
     const normalized = normalizeRef(explicit);
     if (normalized.startsWith('projects/')) {
       const workspaceRoot = workspace.mode === 'existing-memory-root' ? path.dirname(workspace.memoryDir) : workspace.spaceDir;
@@ -236,8 +430,8 @@ function resolveDurableTargetPath(workspace: Workspace, candidateId: string, tar
     return absoluteFromMemoryPath(workspace, normalized);
   }
 
-  const scope = safeFileSlug(target.scope || 'general', 'general');
-  const title = safeFileSlug(target.title || candidateId, candidateId);
+  const scope = safeScopeSlug(target.scope); // r4 self-audit: redact PII/secret BEFORE it becomes a dir name / raw targetPath / sqlite row
+  const title = safeRedactedSlug(target.title, candidateId); // Blocker 1: no raw PII/secret in path
   return path.join(workspace.memoryDir, 'scopes', scope, `${nowCompact()}-${title}.md`);
 }
 
@@ -284,6 +478,17 @@ function journalFileHeader(day: string): string {
   return `${frontMatter({ type: 'memory_journal', weight: 'low', date: day })}\n# Journal ${day}\n\n> Auto-captured, append-only, low-weight. Searchable but ranked below curated memory.\n`;
 }
 
+// Content-addressed idempotency id for a journal entry: sha256 over the entry body as written to disk.
+// This DERIVES a stable, replay-convergent handle that disambiguates two appends sharing the same ISO
+// `entryAt` (same-millisecond writes), which the timestamp alone cannot — so a rollback removes EXACTLY
+// the intended entry instead of over-removing every same-timestamp block (a latent replay/idempotency
+// bug). The body is hashed verbatim (post-redaction, post-trim) so it is reproducible from on-disk text
+// at rollback time, with NO change to the on-disk heading format and NO impact on the floor's composite
+// (runtime, sessionId) dedup, which stays the sole capture-floor idempotency key.
+function journalEntryHash(body: string): string {
+  return crypto.createHash('sha256').update(body, 'utf8').digest('hex').slice(0, 16);
+}
+
 async function readFileOrEmpty(targetPath: string): Promise<string> {
   try {
     return await fs.readFile(targetPath, 'utf8');
@@ -299,27 +504,35 @@ async function readFileOrEmpty(targetPath: string): Promise<string> {
 // entries are indexed and searchable, yet demoted below curated memory at query time (see
 // engine/fts.ts), so automatic capture can never pollute high-weight retrieval.
 export async function appendJournal(workspace: Workspace, payload: JournalPayload): Promise<JournalResult> {
-  const text = payload.text ?? payload.content;
-  if (typeof text !== 'string' || !text.trim()) {
+  const raw = payload.text ?? payload.content;
+  if (typeof raw !== 'string' || !raw.trim()) {
     throw new Error('journal_text_required');
   }
+  // Redact-in-place benign PII (email) BEFORE the hard gate, same as the candidate path (P0-C). A real
+  // secret is untouched here and still hard-rejects below; only an email/PII match degrades to [redacted].
+  const text = redactIngestBenign(raw);
   assertNoSecretLikeContent(text);
-  const sourceAgent = payload.sourceAgent || payload.source || 'unknown';
-  const title = payload.title?.trim();
+  // Heading-derived persistence surfaces (red-team Blocker 2): the title goes through the SAME
+  // redact-in-place + hard gate as the body, and the sourceAgent is collapsed to a safe actor id, so
+  // neither a PII email nor a raw secret can leak through the journal heading or the audit actor field.
+  const sourceAgent = safeActorId(payload.sourceAgent || payload.source || 'unknown');
+  const title = safeHeadingTitle(payload.title);
   return await withWorkspaceLock(workspace, async () => {
     const at = new Date().toISOString();
     const day = localDay(new Date(at)); // LOCAL calendar day — matches the wall clock, not UTC (see time.ts)
     const targetPath = path.join(workspace.journalDir, `${day}.md`);
     const existing = await readFileOrEmpty(targetPath);
     const header = existing ? '' : journalFileHeader(day);
-    const entry = `\n## ${at} · ${sourceAgent}${title ? ` · ${title}` : ''}\n\n${text.trim()}\n`;
+    const body = text.trim();
+    const entryHash = journalEntryHash(body); // content-addressed handle for precise rollback (replay-safe)
+    const entry = `\n## ${at} · ${sourceAgent}${title ? ` · ${title}` : ''}\n\n${body}\n`;
     await atomicWriteFile(targetPath, `${header}${existing}${entry}`, workspace.memoryDir);
     const relativePath = relativeToSpace(workspace, targetPath);
     const event = await appendEvent(workspace, {
       type: 'memory.journal.appended',
       path: relativePath,
       actor: sourceAgent,
-      metadata: { day, weight: 'low', auto: true, entryAt: at },
+      metadata: { day, weight: 'low', auto: true, entryAt: at, entryHash },
     });
     return { path: relativePath, status: 'journaled', eventId: event.id, day };
   });
@@ -342,8 +555,11 @@ export async function appendFloorJournalOnce(
   const text = payload.text;
   if (typeof text !== 'string' || !text.trim()) throw new Error('journal_text_required');
   assertNoSecretLikeContent(text); // already redacted upstream; this is the hard gate (defence in depth)
-  const actor = `${payload.runtime}-floor`;
-  const title = payload.title?.trim();
+  // Heading/actor display strings are collapsed to safe ids + redacted-title (red-team Blocker 2, same
+  // class as appendJournal). NOTE: the dedup composite key still uses the RAW payload.runtime via
+  // metadata.floorRuntime below, so idempotency is unchanged — only the rendered heading/actor are safed.
+  const actor = `${safeActorId(payload.runtime)}-floor`;
+  const title = safeHeadingTitle(payload.title);
   return await withWorkspaceLock(workspace, async () => {
     // Under the lock: re-read the audit log and bail if THIS (runtime, sessionId) was already floored.
     // Reading inside the lock is what makes the check-then-write atomic against a concurrent sweep.
@@ -366,15 +582,17 @@ export async function appendFloorJournalOnce(
     // Audit FIRST (the dedup key), THEN the body. A crash between the two under-captures (the session is
     // marked floored but has no body — recoverable via a later cooperative journal / explicit continue)
     // instead of orphaning a body with no key that every future sweep would re-floor.
+    const body = text.trim();
+    const entryHash = journalEntryHash(body); // content-addressed handle for precise rollback (replay-safe)
     const event = await appendEvent(workspace, {
       type: 'memory.journal.appended',
       path: relativePath,
       actor,
-      metadata: { floor: true, sessionId: payload.sessionId, floorRuntime: payload.runtime, day, weight: 'low', auto: true, entryAt: at },
+      metadata: { floor: true, sessionId: payload.sessionId, floorRuntime: payload.runtime, day, weight: 'low', auto: true, entryAt: at, entryHash },
     });
     const existing = await readFileOrEmpty(targetPath);
     const header = existing ? '' : journalFileHeader(day);
-    const entry = `\n## ${at} · ${actor}${title ? ` · ${title}` : ''}\n\n${text.trim()}\n`;
+    const entry = `\n## ${at} · ${actor}${title ? ` · ${title}` : ''}\n\n${body}\n`;
     await atomicWriteFile(targetPath, `${header}${existing}${entry}`, workspace.memoryDir);
     return { status: 'journaled' as const, path: relativePath, eventId: event.id, day };
   });
@@ -388,14 +606,38 @@ export type RollbackResult = {
   rolledbackEventId: string;
 };
 
-// Remove one journal entry (identified by its ISO heading timestamp) from a daily journal file.
-// Entries are delimited by "\n## <ISO> · ..."; the preamble and other entries are preserved.
-function removeJournalEntry(content: string, entryAt: string): { content: string; removed: boolean } {
+// The body of an on-disk journal block (the text after the "## <heading>" line, before the trailing
+// newline) — reconstructed so journalEntryHash() over it reproduces the hash stored at append time.
+function journalBlockBody(block: string): string {
+  const nl = block.indexOf('\n');
+  if (nl === -1) return '';
+  // block = "<heading>\n\n<body>\n" → after the heading line a blank line precedes the body.
+  return block.slice(nl + 1).replace(/^\n/, '').replace(/\n$/, '');
+}
+
+// Remove ONE journal entry from a daily journal file. Entries are delimited by "\n## <ISO> · ...".
+// Removal is keyed by the content-addressed `entryHash` when present (precise even when two entries share
+// the same ISO `entryAt` — same-millisecond appends), and FALLS BACK to the ISO timestamp for legacy
+// entries written before the hash existed (backward compatible). Matching by hash removes exactly the one
+// intended block; the timestamp fallback preserves the prior behavior for un-hashed entries.
+function removeJournalEntry(content: string, entryAt: string, entryHash?: string): { content: string; removed: boolean } {
   const parts = content.split('\n## ');
   if (parts.length < 2) return { content, removed: false };
   const [preamble, ...entries] = parts;
-  const kept = entries.filter((entry) => !entry.startsWith(`${entryAt} `));
-  if (kept.length === entries.length) return { content, removed: false };
+  let dropped = false;
+  const kept = entries.filter((entry) => {
+    if (dropped) return true; // remove at most ONE block, even on a hash/timestamp tie
+    const sameStamp = entry.startsWith(`${entryAt} `);
+    if (entryHash) {
+      // Precise: only the block whose body hashes to entryHash AND carries the right timestamp is removed.
+      if (sameStamp && journalEntryHash(journalBlockBody(entry)) === entryHash) { dropped = true; return false; }
+      return true;
+    }
+    // Legacy fallback: timestamp-only match (pre-hash entries) — removes the first same-timestamp block.
+    if (sameStamp) { dropped = true; return false; }
+    return true;
+  });
+  if (!dropped) return { content, removed: false };
   const rebuilt = kept.length ? `${preamble}\n## ${kept.join('\n## ')}` : preamble;
   return { content: rebuilt, removed: true };
 }
@@ -425,18 +667,21 @@ export async function rollbackEvent(workspace: Workspace, eventId: string): Prom
 
 async function rollbackJournalAppend(workspace: Workspace, target: MemoryEvent, eventId: string): Promise<RollbackResult> {
   const entryAt = typeof target.metadata?.entryAt === 'string' ? target.metadata.entryAt : '';
+  // Content-addressed handle (when the entry was written by hash-aware code) → removes EXACTLY this block
+  // even if another append shares its ISO timestamp. Absent (legacy entry) → timestamp-only fallback.
+  const entryHash = typeof target.metadata?.entryHash === 'string' ? target.metadata.entryHash : undefined;
   const relativePath = target.path;
   if (!entryAt || !relativePath) throw new Error('rollback_missing_entry_metadata');
   return await withWorkspaceLock(workspace, async () => {
     const absolute = absoluteFromMemoryPath(workspace, relativePath);
     const existing = await readFileOrEmpty(absolute);
-    const { content, removed } = removeJournalEntry(existing, entryAt);
+    const { content, removed } = removeJournalEntry(existing, entryAt, entryHash);
     if (removed) await atomicWriteFile(absolute, content, workspace.memoryDir);
     const event = await appendEvent(workspace, {
       type: 'memory.rolledback',
       path: relativePath,
       actor: 'core.rollback',
-      metadata: { rolledBackEventId: eventId, entryAt, removed },
+      metadata: { rolledBackEventId: eventId, entryAt, entryHash, removed },
     });
     return { eventId, type: target.type, path: relativePath, removed, rolledbackEventId: event.id };
   });
@@ -482,19 +727,27 @@ export async function writeCandidate(
 ): Promise<WriteCandidateResult> {
   return await withWorkspaceLock(workspace, async () => {
     const candidateId = crypto.randomUUID();
-    const title = safeFileSlug(payload.title || candidateId, candidateId);
+    // Filename slug derives from the REDACTED title (red-team Blocker 1): a raw email/secret in the title
+    // must never reach the path. safeRedactedSlug drops to candidateId if a real secret is present.
+    const title = safeRedactedSlug(payload.title, candidateId);
+    // The candidate sub-dir is keyed by sourceAgent; collapse it to a safe actor id so a PII/secret
+    // sourceAgent (e.g. 'alice@example.com') cannot land in the directory path either.
     const sourceAgent = payload.sourceAgent || payload.source || 'unknown';
-    const filePath = path.join(candidateDirForAgent(workspace, sourceAgent), `${nowCompact()}-${title}.md`);
-    const content = markdownCandidate(candidateId, payload);
+    const filePath = path.join(candidateDirForAgent(workspace, safeActorId(sourceAgent)), `${nowCompact()}-${title}.md`);
+    // markdownCandidate's body is already benign-redacted via candidateText(); redact-in-place the FULL
+    // rendered candidate so an email tucked into the title/metadata also degrades to [redacted] rather
+    // than rejecting the entry (P0-C), and the redacted form is what we persist.
+    const content = redactIngestBenign(markdownCandidate(candidateId, payload));
     // Scan the FULL rendered candidate (title + metadata front-matter + body), not just the body
-    // text candidateText() already checks — otherwise a secret tucked into title/metadata slips in.
+    // text candidateText() already checks — otherwise a REAL secret tucked into title/metadata slips in.
+    // (Benign PII is already [redacted] above; only real-secret patterns can still trip this.)
     assertNoSecretLikeContent(content);
     await atomicWriteFile(filePath, content, workspace.memoryDir);
     const relativePath = relativeToSpace(workspace, filePath);
     await appendEvent(workspace, {
       type: 'candidate.created',
       path: relativePath,
-      actor: sourceAgent,
+      actor: safeActorId(sourceAgent), // audit actor must not carry a PII/secret sourceAgent value either
       metadata: {
         candidateId,
         status: 'candidate',
@@ -653,7 +906,11 @@ function verifyProvenance(payload: WriteCandidatePayload, cwd?: string): { ok: b
 }
 
 export function evaluateAutoPromote(payload: WriteCandidatePayload, opts: { cwd?: string } = {}): AutoPromoteVerdict {
-  const scan = fullScanText(payload); // title + body + metadata — everything that gets stored
+  // Scan the benign-redacted view (email/PII already → [redacted], matching what writeCandidate persists),
+  // so the secret gate fires ONLY on a REAL credential — an email no longer mislabels a clean handoff as a
+  // hard 'secret' rejection (P0-C). redactIngestBenign leaves real secrets untouched, so the gate below is
+  // exactly as strict for them as before; this only stops email from masquerading as a hard secret here.
+  const scan = redactIngestBenign(fullScanText(payload)); // title + body + metadata — everything that gets stored
   if (containsSecretLikeContent(scan)) {
     return { allow: false, reason: 'contains secret-like content (text/title/metadata)', category: 'secret' };
   }
@@ -688,6 +945,15 @@ export function evaluateAutoPromote(payload: WriteCandidatePayload, opts: { cwd?
 // and "optional async upgrade" never quietly becomes "never happens". Expiry DELETES the entry (it was
 // never trusted) and logs an audit event; it does NOT restore the candidate (that would just re-surface
 // the same un-reviewed item forever). Best-effort: one bad file never aborts the sweep.
+// A durable file's PATH for an AUDIT/return surface. Engine-written paths are always slug-safe, but a file
+// planted OUT-OF-BAND directly in the memory tree can sit under a PII/secret-named path the write-time slug
+// guards never saw. The sweeps below walk the whole tree, so they must not surface such a raw path into an
+// _events event or a returned list — redact a secret-like path for those surfaces (the real fs path is used
+// separately for the actual file op). (red-team r6: expireStaleFlagged / pendingFlaggedReview path leak.)
+function safeAuditPath(relative: string): string {
+  return containsSecretLikeContent(normalizeRef(relative)) ? redactSecretLikeContent(relative) : relative;
+}
+
 const FLAGGED_TTL_DAYS_DEFAULT = 14;
 
 export async function expireStaleFlagged(
@@ -730,13 +996,17 @@ export async function expireStaleFlagged(
     for (const s of stale) {
       try {
         await fs.rm(s.filePath, { force: true });
+        // r6: an out-of-band durable file can sit under a PII/secret-named path the engine never created;
+        // its raw path must not leak into the _events audit log or the returned expired[]. The fs.rm above
+        // uses the real absolute filePath, so deletion is unaffected.
+        const safeRelative = safeAuditPath(s.relative);
         await appendEvent(workspace, {
           type: 'memory.flagged.expired',
-          path: s.relative,
+          path: safeRelative,
           actor: 'flagged-ttl',
           metadata: { ttlDays, promotedAt: s.promotedAt },
         });
-        expired.push(s.relative);
+        expired.push(safeRelative);
       } catch {
         // best-effort — keep sweeping
       }
@@ -771,7 +1041,9 @@ export async function pendingFlaggedReview(
     } catch {
       continue;
     }
-    if (/^\s*flagged:\s*["']?true\b/im.test(front)) flagged.push(relative);
+    // r6: same out-of-band path-leak class as expireStaleFlagged — the returned sample is surfaced (stop hook),
+    // so a PII/secret-named durable path must be redacted before it leaves this function.
+    if (/^\s*flagged:\s*["']?true\b/im.test(front)) flagged.push(safeAuditPath(relative));
   }
   return { count: flagged.length, sample: flagged.slice(0, limit) };
 }
@@ -828,6 +1100,13 @@ export async function promoteCandidate(
     if (!isAllowedCandidatePath(workspace, candidate.path, candidateAbsolute)) {
       throw new Error('candidate_must_be_from_inbox');
     }
+    // r5: the candidate's OWN path/filename flows raw into the _events `candidatePath` field, the
+    // history/promoted-candidates archive filename, AND the returned plan — none redactable after the fact.
+    // A write_candidate-generated path is always slugged safe; reject an out-of-band PII/secret-named file
+    // (mirrors the explicit target.path reject) so it never reaches any of those persistence surfaces.
+    if (containsSecretLikeContent(normalizeRef(candidate.path))) {
+      throw new Error('candidate_path_contains_secret_like_content');
+    }
     const candidateIdMatch = candidate.content.match(/^candidate_id:\s*"?(.*?)"?\s*$/m);
     const candidateId = candidateIdMatch?.[1] || path.basename(candidate.path, '.md');
     const targetPath = resolveTargetPath(workspace, candidateId, target);
@@ -835,8 +1114,11 @@ export async function promoteCandidate(
     if (isProtectedPath(targetRelative)) throw new Error('protected_core_path');
 
     // Auto-promoted memory is tagged (tier/reviewed) so it can be told apart from human-confirmed
-    // promotions and treated as machine-judged. (Recall strips these tags from injected snippets;
-    // bm25 rank down-weighting of unreviewed entries is a tracked follow-up, not yet wired.)
+    // promotions and treated as machine-judged. (Recall strips these tags from injected snippets.)
+    // RED-TEAM-NEEDED: bm25 rank down-weighting of these unreviewed entries is now WIRED at search time
+    // (src/engine/fts.ts: `reviewed` UNINDEXED column + rank_penalty in searchFts). It is RANKING ONLY —
+    // an unreviewed entry stays fully searchable and fully recall-eligible; it just sorts below a
+    // human-reviewed entry of comparable lexical match. No eligibility/gate change here.
     const flaggedFrontmatter = options.tier === 'flagged'
       ? `flagged: true\nflag_reason: ${JSON.stringify(options.flagReason || 'governance marker')}\n`
       : '';
@@ -846,15 +1128,18 @@ export async function promoteCandidate(
       ? `provenance_kind: ${JSON.stringify(options.provenanceKind)}\n`
       : '';
     const autoFrontmatter = options.auto
-      ? `tier: "auto-promoted"\nreviewed: false\nauto_tier: ${JSON.stringify(options.tier || 'verified')}\npromoted_by: ${JSON.stringify(options.actor || 'agent-auto')}\n${provenanceKindFrontmatter}${flaggedFrontmatter}`
+      ? `tier: "auto-promoted"\nreviewed: false\nauto_tier: ${JSON.stringify(options.tier || 'verified')}\npromoted_by: ${JSON.stringify(safeActorId(options.actor || 'agent-auto'))}\n${provenanceKindFrontmatter}${flaggedFrontmatter}`
       : '';
     const body = candidate.content
       .replace(/^status:\s*"candidate"\s*$/m, 'status: "promoted"')
       .replace(/^type:\s*"memory_candidate"\s*$/m, 'type: "memory"')
       .replace(/^---\n/, `---\npromoted_at: "${new Date().toISOString()}"\n${autoFrontmatter}`);
-    // Auto-promote happens without a human gate, so it must clear the same durable secret check
-    // as durable_promote — a backstop on the full file content (title + metadata + body).
-    if (options.auto) assertNoSecretLikeDurableCandidate(body);
+    // EVERY promote (not just auto) must clear the durable secret check — a backstop on the FULL file content
+    // (title + metadata + body + the frontmatter candidate_id). An out-of-band candidate can carry raw
+    // PII/secret in a frontmatter field (e.g. candidate_id) that would otherwise flow into the _events
+    // candidateId AND the durable filename slug; gating here rejects it before any surface is written.
+    // write_candidate already redacts its output, so a normally-created candidate always passes (r5 self-audit).
+    assertNoSecretLikeDurableCandidate(body);
     await atomicWriteFile(targetPath, body, workspace.memoryDir);
 
     if (workspace.mode === 'existing-memory-root') {
@@ -870,10 +1155,10 @@ export async function promoteCandidate(
       type: 'memory.promoted',
       candidatePath: candidate.path,
       targetPath: targetRelative,
-      actor: options.actor || 'core.promote',
+      actor: safeActorId(options.actor || 'core.promote'), // audit actor must be PII/secret-safe (defense-in-depth; mirrors the durable lane)
       metadata: {
         candidateId,
-        target,
+        target: safeAuditTarget(target), // Blocker 1: a PII/secret target.title must not land in the audit log
         stagingOnly: workspace.mode === 'existing-memory-root',
         targetMemoryPath: relativeToMemory(workspace, targetPath),
         auto: options.auto || undefined,
@@ -881,7 +1166,7 @@ export async function promoteCandidate(
         provenanceKind: options.provenanceKind,
         flagReason: options.flagReason,
         reviewed: options.auto ? false : undefined,
-        provenance: options.provenance,
+        provenance: safeAuditMetadata(options.provenance), // r2 Blocker 1: no raw PII/secret in the audit log
       },
     });
     return {
@@ -912,6 +1197,13 @@ export async function durablePromoteCandidate(
     if (!isAllowedCandidatePath(workspace, candidate.path, candidateAbsolute)) {
       throw new Error('candidate_must_be_from_inbox');
     }
+    // r5: the candidate's OWN path/filename flows raw into the _events `candidatePath` field, the
+    // history/promoted-candidates archive filename, AND the returned plan — none redactable after the fact.
+    // A write_candidate-generated path is always slugged safe; reject an out-of-band PII/secret-named file
+    // (mirrors the explicit target.path reject) so it never reaches any of those persistence surfaces.
+    if (containsSecretLikeContent(normalizeRef(candidate.path))) {
+      throw new Error('candidate_path_contains_secret_like_content');
+    }
     assertCandidateFrontMatter(candidate.content);
     assertNoSecretLikeDurableCandidate(candidate.content);
 
@@ -929,7 +1221,10 @@ export async function durablePromoteCandidate(
 
     const at = new Date().toISOString();
     const eventId = crypto.randomUUID();
-    const actor = options.actor || 'core.durable-promote';
+    // r4 Blocker: actor is EXTERNAL input (CLI `--actor`, MCP `args.actor`, API `options.actor`) and flows
+    // into both the dry-run plan and the real-write _events audit event — collapse it to a safe id so a
+    // PII/secret-shaped actor never lands raw in the ndjson audit log (same policy as journal/candidate).
+    const actor = safeActorId(options.actor || 'core.durable-promote');
     const archiveCandidateTo = relativeToSpace(
       workspace,
       path.join(workspace.historyDir, 'promoted-candidates', path.basename(candidate.path)),
@@ -963,7 +1258,7 @@ export async function durablePromoteCandidate(
         targetPath: targetRelative,
         metadata: {
           candidateId,
-          target: options.target || {},
+          target: safeAuditTarget(options.target || {}), // Blocker 1: no PII/secret title in the audit log
           dryRun,
           source: 'candidate/inbox',
           archiveCandidateTo,
@@ -1003,7 +1298,9 @@ export async function durablePromoteCandidate(
       actor,
       metadata: {
         candidateId,
-        target: options.target || {},
+        // r3 Blocker 2: the real-write audit event must match the dry-run plan (line ~1200) — a raw PII/
+        // secret-shaped target.title must never land in the _events ndjson (a backed-up/grep-able surface).
+        target: safeAuditTarget(options.target || {}),
         dryRun: false,
         source: 'candidate/inbox',
         archiveCandidateTo,
