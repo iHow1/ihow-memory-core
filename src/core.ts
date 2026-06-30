@@ -121,6 +121,10 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
       const exists = fs.existsSync(workspace.indexPath);
       const documents = await countIndexedDocuments(workspace);
       const providerStatus = await engineStatus(workspace, engineConfig);
+      // Honest capability gate: semantic is ON only when a semantic provider is BOTH the active engine
+      // AND ready (not a fallback to FTS). The default binary, or an unreachable sidecar, reports false.
+      const p = providerStatus.provider;
+      const semanticActive = p.id === 'vector-gguf' && p.ready === true && p.fallback !== true;
       return {
         ok: true,
         workspace: {
@@ -139,6 +143,10 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
           lastError: providerStatus.manifestLastError,
         },
         provider: providerStatus.provider,
+        capabilities: {
+          lexical: true,
+          semantic: semanticActive,
+        },
         sync: {
           enabled: false,
         },

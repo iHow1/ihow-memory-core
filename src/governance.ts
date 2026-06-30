@@ -835,8 +835,11 @@ export async function promoteCandidate(
     if (isProtectedPath(targetRelative)) throw new Error('protected_core_path');
 
     // Auto-promoted memory is tagged (tier/reviewed) so it can be told apart from human-confirmed
-    // promotions and treated as machine-judged. (Recall strips these tags from injected snippets;
-    // bm25 rank down-weighting of unreviewed entries is a tracked follow-up, not yet wired.)
+    // promotions and treated as machine-judged. (Recall strips these tags from injected snippets.)
+    // RED-TEAM-NEEDED: bm25 rank down-weighting of these unreviewed entries is now WIRED at search time
+    // (src/engine/fts.ts: `reviewed` UNINDEXED column + rank_penalty in searchFts). It is RANKING ONLY —
+    // an unreviewed entry stays fully searchable and fully recall-eligible; it just sorts below a
+    // human-reviewed entry of comparable lexical match. No eligibility/gate change here.
     const flaggedFrontmatter = options.tier === 'flagged'
       ? `flagged: true\nflag_reason: ${JSON.stringify(options.flagReason || 'governance marker')}\n`
       : '';
