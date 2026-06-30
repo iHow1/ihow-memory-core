@@ -49,7 +49,9 @@ export type CaptureUnit = {
 type SessionSource = {
   tool: string;
   list: () => Promise<Array<{ file: string; mtimeMs: number }>>;
-  read: (file: string) => Promise<CaptureUnit | undefined>; // undefined => trivial/unreadable, skip
+  // opts.skipProject => don't spend a synchronous `git` probe inferring the project (the capture floor
+  // never reads projectDir/anchors; running git on the MCP event loop at startup would block it).
+  read: (file: string, opts?: { skipProject?: boolean }) => Promise<CaptureUnit | undefined>;
 };
 
 // Single-session handoff source for the cwd-scoped `continue`: the latest SUBSTANTIAL transcript under
@@ -340,7 +342,7 @@ const hermesSource: SessionSource = {
     }
     return out;
   },
-  read: async (file) => parseHermesSession(file),
+  read: async (file, opts) => parseHermesSession(file, opts?.skipProject),
 };
 
 function hermesTextOf(content: unknown): string {
@@ -409,7 +411,7 @@ function chooseHermesProject(workdirs: string[]): string | undefined {
 // and call here, so scope-lock (first user topic + assistant text + file paths + Bash binary names, never
 // tool-result content), project inference, and exclusions stay identical across stores. tool_calls must
 // already be an array (the JSON store has it parsed; the state.db store JSON-parses its per-row string).
-function hermesCaptureFromMessages(messages: unknown[], sessionId: string): CaptureUnit | undefined {
+function hermesCaptureFromMessages(messages: unknown[], sessionId: string, skipProject = false): CaptureUnit | undefined {
   if (!Array.isArray(messages) || messages.length < 2) return undefined;
   const records: TranscriptRecord[] = [];
   const workdirs: string[] = [];
@@ -439,17 +441,19 @@ function hermesCaptureFromMessages(messages: unknown[], sessionId: string): Capt
   if (records.length < 2) return undefined;
   const summary = summarizeTranscript(records);
   if (!summary.body) return undefined;
-  return { sessionId, body: summary.body, editedList: summary.editedList, projectDir: chooseHermesProject(workdirs) };
+  // chooseHermesProject probes each workdir with a synchronous `git` — skip it when the caller (the
+  // capture floor) does not need projectDir, so the sweep stays off the event-loop-blocking git path.
+  return { sessionId, body: summary.body, editedList: summary.editedList, projectDir: skipProject ? undefined : chooseHermesProject(workdirs) };
 }
 
-async function parseHermesSession(file: string): Promise<CaptureUnit | undefined> {
+async function parseHermesSession(file: string, skipProject = false): Promise<CaptureUnit | undefined> {
   const raw = await readSessionFile(file);
   if (raw === undefined) return undefined;
   let doc: any;
   try { doc = JSON.parse(raw); } catch { return undefined; }
   const messages = Array.isArray(doc?.messages) ? doc.messages : [];
   const sessionId = typeof doc?.session_id === 'string' ? doc.session_id : path.basename(file).replace(/^session_/, '').replace(/\.json$/, '');
-  return hermesCaptureFromMessages(messages, sessionId);
+  return hermesCaptureFromMessages(messages, sessionId, skipProject);
 }
 
 // Hermes CURRENT store: ~/.hermes/state.db (SQLite). The 2026.5 desktop build moved sessions out of the
@@ -483,7 +487,7 @@ function parseJsonArray(v: unknown): unknown[] {
   try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return []; }
 }
 
-async function parseHermesStateDbSession(file: string): Promise<CaptureUnit | undefined> {
+async function parseHermesStateDbSession(file: string, skipProject = false): Promise<CaptureUnit | undefined> {
   const hash = file.lastIndexOf('#');
   if (hash < 0) return undefined;
   const sessionId = file.slice(hash + 1);
@@ -495,7 +499,7 @@ async function parseHermesStateDbSession(file: string): Promise<CaptureUnit | un
       .all(sessionId) as Array<{ role: unknown; content: unknown; toolCalls: unknown }>;
     // Normalize to the shared shape: the JSON store keeps tool_calls parsed; state.db keeps a JSON string.
     const messages = rows.map((r) => ({ role: r.role, content: r.content, tool_calls: parseJsonArray(r.toolCalls) }));
-    return hermesCaptureFromMessages(messages, sessionId);
+    return hermesCaptureFromMessages(messages, sessionId, skipProject);
   } catch {
     return undefined;
   } finally {
@@ -525,7 +529,7 @@ const hermesStateDbSource: SessionSource = {
     }
     return out;
   },
-  read: async (file) => parseHermesStateDbSession(file),
+  read: async (file, opts) => parseHermesStateDbSession(file, opts?.skipProject),
 };
 
 // OpenCode (SST): ~/.local/share/opencode/opencode.db (SQLite, Drizzle). A `session` row carries the cwd
@@ -620,6 +624,7 @@ const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySo
 export async function listResumableSessions(
   limit: number,
   excludeSessionId?: string,
+  opts: { skipAnchors?: boolean } = {},
 ): Promise<ResumableSession[]> {
   const stamped: Array<{ file: string; mtimeMs: number; src: SessionSource }> = [];
   for (const src of SESSION_SOURCES) {
@@ -632,14 +637,17 @@ export async function listResumableSessions(
   for (const { file, mtimeMs, src } of stamped.slice(0, SCAN_CAP)) {
     if (out.length >= limit) break;
     let unit: CaptureUnit | undefined;
-    try { unit = await src.read(file); } catch { unit = undefined; }
+    try { unit = await src.read(file, { skipProject: opts.skipAnchors }); } catch { unit = undefined; }
     if (!unit) continue;
     if (excludeSessionId && unit.sessionId === excludeSessionId) continue; // no self-replay
-    const projectDir = unit.projectDir ?? inferProjectDir(unit.editedList); // tool-recorded cwd wins; else edits-only
+    // skipAnchors (the capture-floor path): never run `git` — neither to INFER the project (inferProjectDir
+    // probes git per edited file) nor to compute anchors. The floor reads only tool/sessionId/mtime/body,
+    // so a synchronous git probe on the MCP event loop at startup would block it for zero benefit.
+    const projectDir = opts.skipAnchors ? unit.projectDir : (unit.projectDir ?? inferProjectDir(unit.editedList));
     // Compute git anchors ONLY for a real project (don't spawn git on the transcript-storage dir for an
     // undetermined session), and memoize per project so N sessions in one repo cost one anchor lookup.
     let anchors: GitAnchors = { isRepo: false };
-    if (projectDir) {
+    if (!opts.skipAnchors && projectDir) {
       const cached = anchorCache.get(projectDir);
       if (cached) anchors = cached;
       else {
@@ -653,8 +661,8 @@ export async function listResumableSessions(
     }
     // Non-git fallback: when there's no git repo, fingerprint the files this session edited so a non-git
     // project still gets verify-first anchors. Spread into a fresh object — never mutate the shared
-    // (per-projectDir) anchor cache, since file anchors are per-session.
-    if (!anchors.isRepo && unit.editedList.length) {
+    // (per-projectDir) anchor cache, since file anchors are per-session. (Skipped on the floor path.)
+    if (!opts.skipAnchors && !anchors.isRepo && unit.editedList.length) {
       const files = fileAnchors(unit.editedList);
       if (files.length) anchors = { ...anchors, files };
     }

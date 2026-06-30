@@ -20,7 +20,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { containsSecretLikeContent } from '../src/governance.ts';
+import { containsSecretLikeContent, appendFloorJournalOnce } from '../src/governance.ts';
+import { openCore } from '../src/core.ts';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
 
@@ -167,6 +168,34 @@ test('floor: dedup — a cooperatively-journaled session is NOT floored, and re-
   // Re-running the hook (Stop/SessionStart fire often) must not write a duplicate either.
   runSessionStart({ session_id: 'new-sess-2', cwd: root, transcript_path: path.join(root, 'new2.jsonl') }, root, space);
   assert.equal(await journalText(root, space), before, 'idempotent: no duplicate floor on a later start');
+});
+
+test('floor: a CROSS-RUNTIME floor event in the window is NOT counted as cooperation (cross-floor pollution regression)', async (t) => {
+  // Regression for round-2 finding: the cross-runtime capture floor writes audit events with actor
+  // `${runtime}-floor` + metadata.floor:true into the SHARED audit lanes this hook also reads. Those must
+  // NOT be mistaken for a cooperative agent journal, or a Codex/Hermes floor landing in a Claude session's
+  // window would silently suppress a legitimate Claude floor (weakening the signed-off floor).
+  const root = await mkdtempReal('ihow-floor-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  const transcript = path.join(root, 'prev.jsonl');
+  const closing = '交接：足够长的实质收尾段用于触发段选择器,描述状态/下一步/回滚点,超过最小阈值,这条应被 floor 兜底记下。'.repeat(2);
+  await fs.writeFile(transcript, realTranscript(closing), 'utf8');
+  const markerFile = await writeMarker(root, space, 'prev', {
+    sessionId: 'prev-sess', cwd: root, transcriptPath: transcript,
+    hookStartedAt: iso(10 * 60 * 1000), hookLastAt: iso(9 * 60 * 1000), markerCreatedAt: iso(10 * 60 * 1000),
+  });
+
+  // A cross-runtime floor entry (actor 'codex-floor', metadata.floor:true) lands NOW — inside the Claude
+  // marker's open window [10min ago, now). Before the fix this counted as cooperation -> false skip.
+  const core = await openCore({ root, space });
+  await appendFloorJournalOnce(core.workspace, { text: 'a codex floor body, long enough to be a real captured entry.', runtime: 'codex', sessionId: 'codex-x', title: 'x' });
+
+  runSessionStart({ session_id: 'new-sess', cwd: root, transcript_path: path.join(root, 'new.jsonl') }, root, space);
+
+  const m = await readMarker(markerFile);
+  assert.equal(m.floorOutcome, 'journaled', 'the Claude session is still floored — a `codex-floor` event is NOT cooperation');
+  assert.match(await journalText(root, space), /claude-code-hook · auto-capture/, 'the legitimate Claude floor entry was written');
 });
 
 test('floor: redact zero-hit — a body that contained an email is hard-detector-clean on disk', async (t) => {
