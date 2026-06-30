@@ -16,6 +16,7 @@ The harnesses here go deeper, with numbers:
 | --- | --- | --- | --- |
 | `autopromote-precision.mjs` | `node bench/autopromote-precision.mjs` | the auto-promote floor allows only clean + non-directive + engine-verifiable-provenance content (14/14, 0 false-positive); the precision ceiling (provenanced ≠ true); coverage (~33% of realistic facts) | **yes** — exit non-zero if the safety contract is ever violated |
 | `recall-quality.mjs` | `node bench/recall-quality.mjs` | recall's deterministic safety guarantees: off-topic prompts inject nothing; a stale/superseded entry is never injected; plus injection rates and the reviewed-vs-auto delta | **safety part: yes** (gates the exit). The "useful vs noise" split (reviewed ~88% / auto ~25%) is LLM-judged and documented, not rerun here. |
+| `../scripts/retrieval-bench.mjs` | `node scripts/retrieval-bench.mjs` | the **default FTS5 engine's** retrieval quality: R@5 / R@10 / MRR + tokens-per-query on a labeled in-repo fixture (20 docs / 20 queries — **not** LongMemEval_S), and the honest lexical shape (keyword strong, paraphrase weak). Drives the real `write → promote → search` path. | **yes** — identical numbers every run; `--json` for machine output |
 
 Both require Node ≥ 22.12 (the engine's `node:sqlite`); `autopromote-precision.mjs` also needs `git`
 on PATH for the anchor-provenance cases. Each prints a report and exits non-zero if a guarantee fails —

@@ -124,7 +124,16 @@ The default retrieval engine is zero-dependency local full-text search — Node 
 
 ### Retrieval-quality evidence
 
-As honest evidence of retrieval quality — not the product's differentiator — we publish one LongMemEval_S retrieval-stage result: recall_all@10 = 1.0 across all 470 effective samples (500 raw; ndcg_any@10 0.946). Three boundaries: (1) this is retrieval-layer recall, not end-to-end LLM-judged answer accuracy — not directly comparable to the 90%+ figures reported by other vendors, which measure a different layer; (2) the score was produced on our experimental vector + lexical hybrid lane, while this published package defaults to zero-dependency FTS5 lexical search (with an optional local vector provider); (3) a one-command reproduction harness is WIP — until it lands, the public evidence manifest (metric definitions, run artifacts, full @5 disclosure incl. structural ceilings) is the auditable reference.
+As honest evidence of retrieval quality — not the product's differentiator — we publish two figures **side by side**: the **default shipped FTS5 engine** (what you actually run out of the box) and the **experimental vector + lexical hybrid lane** (not in the published binary).
+
+| Lane | Dataset | R@5 | R@10 | MRR | tokens/query | Reproduce |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Default FTS5** (shipped, zero-dependency) | in-repo representative fixture (20 docs / 20 queries — **not** LongMemEval_S) | 0.85 | 0.85 | 0.85 | ~5.7 | `node scripts/retrieval-bench.mjs` |
+| **Experimental hybrid** (vector + lexical, opt-in) | LongMemEval_S retrieval stage (470 effective / 500 raw) | — | recall_all@10 = 1.0 (ndcg_any@10 0.946) | — | evidence manifest below |
+
+The default-FTS5 row is a **deterministic, stranger-reproducible** harness: `node scripts/retrieval-bench.mjs` seeds a labeled fixture through the same `write → promote → search` path the product uses and scores R@5/R@10/MRR + tokens-per-query, with no cloud, no LLM and no third-party deps. The honest shape it shows: keyword and partial-keyword queries recall well (15/15 here), while **paraphrase / synonym queries that share no surface tokens miss** (2/5 here) — that gap is exactly the floor the optional semantic provider is meant to lift.
+
+Three boundaries (unchanged): (1) both are retrieval-layer recall, not end-to-end LLM-judged answer accuracy — not directly comparable to the 90%+ figures reported by other vendors, which measure a different layer; (2) the recall_all@10 = 1.0 figure was produced on the **experimental** vector + lexical hybrid lane, while this published package defaults to zero-dependency FTS5 lexical search (the default-FTS5 row above is the number you get out of the box, on an in-repo fixture, **not** LongMemEval_S); (3) the default-FTS5 number is one-command reproducible today (`node scripts/retrieval-bench.mjs`); a stranger-reproducible harness over the **full LongMemEval_S** hybrid lane is still WIP — until it lands, the public evidence manifest (metric definitions, run artifacts, full @5 disclosure incl. structural ceilings) is the auditable reference for that row.
 
 Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md).
 
