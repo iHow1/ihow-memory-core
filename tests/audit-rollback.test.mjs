@@ -52,6 +52,38 @@ test('rollback rejects an unknown event id', async (t) => {
   await assert.rejects(core.rollback('nonexistent-id'), /rollback_event_not_found/);
 });
 
+// Hardening regression: two journal appends in the SAME millisecond share one ISO `entryAt`. Rolling
+// back ONE must remove EXACTLY that entry — not both. The content-addressed entryHash disambiguates;
+// the old timestamp-only removal over-removed every same-stamp block (a replay/idempotency hazard).
+test('rollback of one of two same-millisecond entries removes exactly the targeted one (entryHash)', async (t) => {
+  const core = await managed(t);
+  const realISO = Date.prototype.toISOString;
+  const frozen = '2026-06-30T12:00:00.000Z';
+  // Freeze the wall clock so both appends stamp the identical entryAt (forces the collision).
+  // eslint-disable-next-line no-extend-native
+  Date.prototype.toISOString = function () { return frozen; };
+  let a, b;
+  try {
+    a = await core.journal({ text: 'same-ms entry AAA distinguishable', sourceAgent: 't' });
+    b = await core.journal({ text: 'same-ms entry BBB distinguishable', sourceAgent: 't' });
+  } finally {
+    Date.prototype.toISOString = realISO;
+  }
+  const abs = path.join(core.workspace.memoryDir, 'journal', `${a.day}.md`);
+  // both landed under the same ISO timestamp
+  const before = await fs.readFile(abs, 'utf8');
+  assert.match(before, /same-ms entry AAA/);
+  assert.match(before, /same-ms entry BBB/);
+
+  // rolling back A must leave B intact (timestamp alone could not have told them apart)
+  const r = await core.rollback(a.eventId);
+  assert.equal(r.removed, true, 'the targeted entry was removed');
+  const after = await fs.readFile(abs, 'utf8');
+  assert.doesNotMatch(after, /same-ms entry AAA/, 'the targeted same-ms entry is gone');
+  assert.match(after, /same-ms entry BBB/, 'the OTHER same-ms entry survives (no over-removal)');
+  void b;
+});
+
 test('managed-space audit + rollback span the MCP auto-capture (_mcp) lane', async (t) => {
   // CLI view of a managed space (events on the MAIN lane: memory/_events).
   const cli = await managed(t);
