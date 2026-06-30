@@ -107,7 +107,16 @@ MCP 工具与治理闭环与 runtime 无关。主动记忆 skill + 自动捕获 
 
 ### 检索质量证据
 
-作为检索质量的诚实证据——而非本产品的差异点——我们公开一项 LongMemEval_S 检索阶段结果：recall_all@10 = 1.0，覆盖全部 470 条有效样本（原始 500 条；ndcg_any@10 为 0.946）。三条边界：（1）这是检索层召回率，不是端到端、由 LLM 评判的答案准确率——不能与其他厂商报告的 90%+ 数字直接比较，后者度量的是另一层；（2）该成绩产生于我们实验性的「向量 + 词法」混合通道，而当前发布的包默认使用零依赖的 FTS5 词法检索（可选配本地向量 provider）；（3）一键复现工具链仍在开发中——在它落地之前，公开的 evidence manifest（指标定义、运行产物、完整的 @5 披露，含结构性上限）是可审计的依据。
+作为检索质量的诚实证据——而非本产品的差异点——我们把两组数字**并列**公开：**默认发布的 FTS5 引擎**（你开箱即用真正跑的那套）与**实验性的「向量 + 词法」混合通道**（不在发布二进制里）。
+
+| 通道 | 数据集 | R@5 | R@10 | MRR | tokens/query | 复现 |
+| --- | --- | --- | --- | --- | --- | --- |
+| **默认 FTS5**（已发布，零依赖） | 仓内代表性 fixture（20 文档 / 20 query——**非** LongMemEval_S） | 0.85 | 0.85 | 0.85 | ~5.7 | `node scripts/retrieval-bench.mjs` |
+| **实验性混合**（向量 + 词法，需 opt-in） | LongMemEval_S 检索阶段（470 有效 / 500 原始） | — | recall_all@10 = 1.0（ndcg_any@10 0.946） | — | 见下方 evidence manifest |
+
+默认 FTS5 这一行是一个**确定性、可被陌生人复跑**的 harness：`node scripts/retrieval-bench.mjs` 通过与产品相同的 `write → promote → search` 路径灌入带标注的 fixture，计算 R@5/R@10/MRR + tokens-per-query，无云、无 LLM、无第三方依赖。它展示的诚实形状是：关键词与部分关键词 query 召回良好（此处 15/15），而**与答案不共享任何表层 token 的同义/换词 query 会 miss**（此处 2/5）——这道 gap 正是可选语义 provider 要补的地板。
+
+三条边界（保持不变）：（1）两者都是检索层召回率，不是端到端、由 LLM 评判的答案准确率——不能与其他厂商报告的 90%+ 数字直接比较，后者度量的是另一层；（2）recall_all@10 = 1.0 这个数字产生于**实验性**的「向量 + 词法」混合通道，而当前发布的包默认使用零依赖的 FTS5 词法检索（上表的「默认 FTS5」行才是你开箱拿到的数字，跑在仓内 fixture 上，**非** LongMemEval_S）；（3）默认 FTS5 的数字现在就一键可复现（`node scripts/retrieval-bench.mjs`）；覆盖**完整 LongMemEval_S** 混合通道的、可被陌生人复跑的 harness 仍在开发中——在它落地之前，公开的 evidence manifest（指标定义、运行产物、完整的 @5 披露，含结构性上限）是那一行的可审计依据。
 
 Evidence manifest：[LongMemEval_S 检索阶段运行记录，2026-05-11](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md)。
 
