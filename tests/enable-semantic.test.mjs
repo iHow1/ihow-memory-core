@@ -36,8 +36,10 @@ import {
 const CLI = fileURLToPath(new URL('../bin/ihow-memory.mjs', import.meta.url));
 const DEAD_HOST = 'http://127.0.0.1:9'; // closed loopback port — refuses instantly
 
-// A fake Ollama. mode 'embed' serves /api/tags AND /api/embeddings (a real vector); mode 'tags-only'
-// serves /api/tags with the model but 404s /api/embeddings (the blocker repro).
+// A fake Ollama. mode 'embed' serves /api/tags AND /api/embeddings — but the embed endpoint is
+// MODEL-AWARE: it only returns a vector when the POSTed model equals `model`, else 404. That lets a test
+// prove the runtime sidecar actually uses the CONFIGURED model (not env/default). mode 'tags-only' serves
+// /api/tags with the model but always 404s /api/embeddings (the blocker repro).
 async function fakeOllama(mode, model = 'nomic-embed-text') {
   const server = http.createServer((req, res) => {
     if (req.url === '/api/tags') {
@@ -46,8 +48,19 @@ async function fakeOllama(mode, model = 'nomic-embed-text') {
       return;
     }
     if (req.url === '/api/embeddings' && mode === 'embed') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ embedding: Array.from({ length: 8 }, (_, i) => (i + 1) / 10) }));
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        let requested;
+        try { requested = JSON.parse(body).model; } catch { requested = undefined; }
+        if (requested === model) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ embedding: Array.from({ length: 8 }, (_, i) => (i + 1) / 10) }));
+        } else {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: `model '${requested}' not found` }));
+        }
+      });
       return;
     }
     res.writeHead(404);
@@ -126,14 +139,40 @@ test('enable-semantic SUCCEEDS against a real embedder; injects the vector lane 
   assert.deepEqual(semanticEngineArgs(workspace), [], 'default FTS restored');
 });
 
-test('MARKER VALIDATION: a tampered semantic.json (command not the bundled sidecar) is rejected on load', async (t) => {
+test('MODEL PROPAGATION: a custom model reaches the runtime sidecar (no green-while-FTS-fallback split)', async (t) => {
+  const home = await tmpHome(t);
+  const fake = await fakeOllama('embed', 'custom-embed'); // ONLY embeds "custom-embed"
+  t.after(() => fake.close());
+  const e = await runCli(home, ['enable-semantic', '--space', 'demo', '--host', fake.host, '--model', 'custom-embed', '--json']);
+  assert.equal(e.code, 0, 'enable succeeds for the custom model');
+  // doctor evaluates the EFFECTIVE engine: the sidecar must embed with the configured model, so the
+  // runtime engine is the vector lane — not a silent FTS fallback (which is what happened pre-fix, when
+  // the sidecar ignored the engine model and used the env/default nomic-embed-text).
+  const d = await runCli(home, ['doctor', '--space', 'demo', '--json']);
+  const report = JSON.parse(d.stdout);
+  const engine = report.checks.find((c) => c.name === 'engine');
+  const semantic = report.checks.find((c) => c.name === 'semantic');
+  assert.match(engine.detail, /active=vector-gguf/, 'runtime engine is the vector lane (sidecar used the configured model)');
+  assert.doesNotMatch(engine.detail, /fallback/i, 'no silent FTS fallback for a custom model');
+  assert.equal(semantic.ok, true, 'semantic check healthy and consistent with the active engine');
+});
+
+test('MARKER VALIDATION: tampered semantic.json is rejected — incl. the substring-bypass attempt', async (t) => {
   const home = await tmpHome(t);
   const workspace = await ensureWorkspace(ws(home, 'demo'));
   const p = semanticConfigPath(workspace);
   await fs.mkdir(path.dirname(p), { recursive: true });
-  await fs.writeFile(p, JSON.stringify({ engine: 'vector', vectorProviderCommand: '/bin/sh -c "curl evil"', vectorModel: 'x', host: 'http://localhost:11434', vectorTimeoutMs: 20000 }), 'utf8');
-  assert.equal(await loadSemanticConfig(workspace), null, 'a non-bundled command is not honored');
-  assert.deepEqual(semanticEngineArgs(workspace), [], 'and never injected into the spawned server args');
+  const tampered = [
+    '/bin/sh -c "curl evil"', // non-node command
+    '/bin/echo /tmp/providers/ollama-embedding-provider.mjs', // substring-bypass: magic name as an ARG
+    'node /tmp/providers/ollama-embedding-provider.mjs --extra evil', // extra args / wrong dir
+    'node /evil/ollama-embedding-provider.mjs', // right file name, wrong parent dir
+  ];
+  for (const cmd of tampered) {
+    await fs.writeFile(p, JSON.stringify({ engine: 'vector', vectorProviderCommand: cmd, vectorModel: 'x', host: 'http://localhost:11434', vectorTimeoutMs: 20000 }), 'utf8');
+    assert.equal(await loadSemanticConfig(workspace), null, `rejected: ${cmd}`);
+    assert.deepEqual(semanticEngineArgs(workspace), [], `not injected: ${cmd}`);
+  }
 });
 
 test('buildSemanticConfig points at the bundled sidecar with the chosen host/model', () => {

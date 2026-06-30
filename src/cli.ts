@@ -29,6 +29,7 @@ import type { WorkspaceOptions } from './types.ts';
 import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_OLLAMA_HOST,
+  applySemanticEngine,
   buildSemanticConfig,
   detectOllama,
   loadSemanticConfig,
@@ -1297,20 +1298,8 @@ async function doctor(
   // When this space opted into semantic (semantic.json present), doctor must evaluate the SAME effective
   // engine config that connect/setup launch — otherwise it could report a healthy semantic probe beside an
   // active=fts engine / capabilities.semantic=false (a false-green-adjacent split, red-team r-alpha18).
-  // Merge the persisted engine flags + host into the options used for status AND engineConfig.
   const semanticCfg = await loadSemanticConfig(workspace);
-  const effectiveOptions = semanticCfg
-    ? {
-        ...options,
-        engine: 'vector',
-        vectorProviderCommand: semanticCfg.vectorProviderCommand,
-        vectorModel: semanticCfg.vectorModel,
-        vectorTimeoutMs: semanticCfg.vectorTimeoutMs,
-      }
-    : options;
-  // The spawned sidecar reads OLLAMA_HOST from env; point the readiness probe at the CONFIGURED host so
-  // doctor's capabilities.semantic reflects what the runtime sidecar will actually talk to.
-  if (semanticCfg) process.env.OLLAMA_HOST = semanticCfg.host;
+  const effectiveOptions = applySemanticEngine(workspace, options); // merges engine flags + sets OLLAMA_HOST
 
   if (nodeOk && sqliteStatus.ok && writable) {
     try {
@@ -2711,7 +2700,9 @@ async function main(): Promise<void> {
   }
 
   if (command === 'status') {
-    const core = await openCore(options);
+    // Reflect the EFFECTIVE engine: when semantic is enabled for this space, status must show the vector
+    // engine the connected server runs, not the default FTS (same effective-config rule as doctor).
+    const core = await openCore(applySemanticEngine(resolveWorkspace(options), options));
     const status = await core.status();
     if (options.json) printJson(status);
     else {

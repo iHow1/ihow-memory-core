@@ -42,6 +42,10 @@ import path from 'node:path';
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'nomic-embed-text';
 const EMBED_TIMEOUT_MS = Number(process.env.OLLAMA_EMBED_TIMEOUT_MS || 20000);
+// The model the engine asks for (req.provider.model) is authoritative; env/default is only the fallback.
+// Set once per invocation in main() after parsing the request so every method (status/index/search)
+// embeds with the SAME model enable-semantic verified — no env-vs-engine divergence (red-team r-alpha18-2).
+let activeModel = EMBED_MODEL;
 
 async function ollamaEmbed(text) {
   const ctrl = new AbortController();
@@ -50,7 +54,7 @@ async function ollamaEmbed(text) {
     const res = await fetch(`${OLLAMA_HOST}/api/embeddings`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: EMBED_MODEL, prompt: String(text || '') }),
+      body: JSON.stringify({ model: activeModel, prompt: String(text || '') }),
       signal: ctrl.signal,
     });
     if (!res.ok) throw new Error(`ollama_http_${res.status}`);
@@ -95,7 +99,7 @@ async function listMarkdown(dir) {
 
 function sidecarPath(ws) {
   const base = ws.indexPath ? path.dirname(ws.indexPath) : (ws.memoryDir || process.cwd());
-  return path.join(base, `ollama-${EMBED_MODEL.replace(/[^a-z0-9]+/gi, '-')}-sidecar.json`);
+  return path.join(base, `ollama-${activeModel.replace(/[^a-z0-9]+/gi, '-')}-sidecar.json`);
 }
 
 function stripFrontmatter(content) {
@@ -156,7 +160,7 @@ async function buildIndex(ws) {
     return { path: c.rel, vec: await ollamaEmbed(c.body), preview: c.body.slice(0, 2000) };
   });
   await fsp.mkdir(path.dirname(sidecarPath(ws)), { recursive: true });
-  await fsp.writeFile(sidecarPath(ws), JSON.stringify({ model: EMBED_MODEL, docs: embedded }), 'utf8');
+  await fsp.writeFile(sidecarPath(ws), JSON.stringify({ model: activeModel, docs: embedded }), 'utf8');
   return embedded.length;
 }
 
@@ -182,18 +186,23 @@ async function main() {
   } catch {
     req = {};
   }
+  // The engine's selected model (req.provider.model) wins over env/default, so the model enable-semantic
+  // verified is the one actually embedded with — no env-vs-engine divergence.
+  if (req && req.provider && typeof req.provider.model === 'string' && req.provider.model) {
+    activeModel = req.provider.model;
+  }
   const ws = req.workspace || {};
 
   if (method === 'status') {
     // Probe Ollama reachability + model presence; ready:false makes the engine fall back to FTS.
     try {
       await ollamaEmbed('readiness probe');
-      process.stdout.write(JSON.stringify({ id: 'vector-gguf', model: EMBED_MODEL, ready: true, cloud: false }) + '\n');
+      process.stdout.write(JSON.stringify({ id: 'vector-gguf', model: activeModel, ready: true, cloud: false }) + '\n');
     } catch (error) {
       process.stdout.write(
         JSON.stringify({
           id: 'vector-gguf',
-          model: EMBED_MODEL,
+          model: activeModel,
           ready: false,
           cloud: false,
           lastError: `ollama_unreachable:${String(error && error.message ? error.message : error)}`,

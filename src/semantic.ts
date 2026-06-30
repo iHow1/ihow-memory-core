@@ -11,7 +11,7 @@
 import fs from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import type { Workspace } from './types.ts';
+import type { Workspace, WorkspaceOptions } from './types.ts';
 import { BUNDLED_PROVIDERS, providerScriptPath } from './provider-path.ts';
 
 export const DEFAULT_OLLAMA_HOST = 'http://localhost:11434';
@@ -31,14 +31,28 @@ export function semanticConfigPath(workspace: Workspace): string {
   return path.join(workspace.spaceDir, '.runtime', 'semantic.json');
 }
 
-// A persisted marker is only honored if its command points at OUR bundled sidecar — never an arbitrary
-// executable. The engine spawns vectorProviderCommand, so a tampered local marker must not be able to
-// turn enable-semantic wiring into arbitrary-command execution (red-team r-alpha18 minor). Location-
-// independent: we match the bundled provider filename under a providers/ segment, and reject shell
-// command-chaining / substitution metacharacters defensively (the engine spawns without a shell anyway).
+// Tokenize a provider command the SAME way the engine does (splitCommand) so validation sees the exact
+// argv that would be spawned — quotes respected.
+function tokenizeCommand(cmd: string): string[] {
+  return (cmd.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || []).map((t) => t.replace(/^["']|["']$/g, ''));
+}
+
+// A persisted marker is only honored if its command is EXACTLY `<node> <bundled-sidecar>` — never an
+// arbitrary executable. The engine spawns vectorProviderCommand[0], so a substring check is not enough:
+// `/bin/echo /tmp/providers/ollama-embedding-provider.mjs` contains the magic name but spawns /bin/echo
+// (red-team r-alpha18-2). We parse argv and require: exactly two tokens, the FIRST is a node binary, and
+// the SECOND resolves to a bundled provider file under a `providers/` dir. No wrapper exe, no extra args.
 function isBundledProviderCommand(cmd: string): boolean {
   if (/[;&|`]|\$\(/.test(cmd)) return false;
-  return BUNDLED_PROVIDERS.some((name) => cmd.includes(`providers/${name}`) || cmd.includes(`providers\\${name}`));
+  const argv = tokenizeCommand(cmd);
+  if (argv.length !== 2) return false;
+  const exe = (argv[0].split(/[\\/]/).pop() || '').toLowerCase();
+  if (exe !== 'node' && exe !== 'node.exe') return false;
+  const script = argv[1].replace(/\\/g, '/');
+  const base = script.slice(script.lastIndexOf('/') + 1);
+  const dir = script.slice(0, script.lastIndexOf('/'));
+  const parentBase = dir.slice(dir.lastIndexOf('/') + 1);
+  return parentBase === 'providers' && (BUNDLED_PROVIDERS as readonly string[]).includes(base);
 }
 
 function coerce(raw: string): SemanticConfig | null {
@@ -106,6 +120,24 @@ export function semanticEngineArgs(workspace: Workspace): string[] {
     '--vector-timeout-ms', String(cfg.vectorTimeoutMs),
     '--vector-host', cfg.host,
   ];
+}
+
+// Merge the persisted semantic engine config into CLI options so a one-shot command (status/doctor)
+// evaluates the SAME effective engine the connected MCP server runs — otherwise it would always report
+// the default FTS engine even when semantic is enabled (a false-green-adjacent split). SIDE EFFECT: sets
+// process.env.OLLAMA_HOST to the configured host so the spawned sidecar's readiness probe hits the right
+// daemon. No-op when semantic is off.
+export function applySemanticEngine<T extends WorkspaceOptions>(workspace: Workspace, options: T): T {
+  const cfg = loadSemanticConfigSync(workspace);
+  if (!cfg) return options;
+  process.env.OLLAMA_HOST = cfg.host;
+  return {
+    ...options,
+    engine: 'vector',
+    vectorProviderCommand: cfg.vectorProviderCommand,
+    vectorModel: cfg.vectorModel,
+    vectorTimeoutMs: cfg.vectorTimeoutMs,
+  };
 }
 
 export async function removeSemanticConfig(workspace: Workspace): Promise<boolean> {
