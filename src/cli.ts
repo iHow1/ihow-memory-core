@@ -1363,7 +1363,7 @@ async function packageInfo(): Promise<{ name: string; version: string }> {
 
 async function diagnosticReport(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' } = {},
 ): Promise<Record<string, unknown>> {
   const sanitized = sanitizeDoctorResult(result, options);
   const info = await packageInfo();
@@ -1411,7 +1411,7 @@ function githubIssueUrl(body: string): string {
 
 async function feedbackTemplate(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' } = {},
 ): Promise<{ body: string; url: string }> {
   const report = await diagnosticReport(result, options);
   const body = `## What happened
