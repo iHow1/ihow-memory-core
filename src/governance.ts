@@ -91,7 +91,32 @@ const REDACT_IN_PLACE_INGEST_PATTERNS = [
 // `@`/structure the URL-cred / Bearer detectors key on and silently downgrade a real secret to "clean".
 const REAL_SECRET_PATTERNS = SECRET_LIKE_PATTERNS.filter((p) => !REDACT_IN_PLACE_INGEST_PATTERNS.includes(p));
 
+// WIDE, low-false-positive prechecks for the redact-in-place NO-OP guard (red-team Blocker 3). The narrow
+// `Bearer [A-Za-z0-9._~+/=-]{12,}` detector keys on a STRICT RFC token alphabet, so an adversarial
+// `Bearer xxx@yyy.com` (a credential-shaped value whose body is also email-shaped) misses the Bearer
+// detector, matches ONLY EMAIL_PATTERN, and would be silently downgraded to `Bearer [redacted]` → clean by
+// redactIngestBenign. These guards make redactIngestBenign a NO-OP on such inputs so the value survives to
+// the hard gate instead of being masked. Kept separate from the strict SECRET_LIKE_PATTERNS Bearer detector
+// so the hard-reject detector's false-positive profile is unchanged — these gate ONLY the redact no-op.
+//
+// FALSE-POSITIVE TUNING (do not widen to a bare `Bearer \S+`): English prose contains "the bearer of bad
+// news" — `Bearer \S+` would match `bearer of`, no-op the redactor, and bounce a LEGITIMATE email-bearing
+// handoff to a hard reject (breaks the P0-C friction-fix invariant). So:
+//  • `Authorization: Bearer <anything non-empty>` — the `Authorization:` prefix essentially never appears in
+//    prose, so a bare `\S+` value is safe here and catches the full header form.
+//  • bare `Bearer <value>` ONLY when the value is credential-SHAPED: it contains an `@` (the email-shaped
+//    adversarial case + creds-in-URL tails) OR it is a ≥8-char token from the RFC Bearer alphabet that is
+//    NOT a plain alphabetic word (so `Bearer of`/`Bearer bad` do not match, but `Bearer xxx@yyy.com`,
+//    `Bearer ey....`, `Bearer a1b2c3d4e5` do). This keeps the email-shaped downgrade closed without
+//    swallowing ordinary prose that uses the word "bearer".
+const REAL_SECRET_PRECHECK_PATTERNS = [
+  /\bAuthorization\s*:\s*Bearer\s+\S+/i, // `Authorization: Bearer <anything non-empty>`
+  /\bBearer\s+\S*@\S+/i, // `Bearer <…@…>` — email-shaped / creds-in-URL value (the named adversarial case)
+  /\bBearer\s+(?=[A-Za-z0-9._~+/=-]{8,}\b)(?=\S*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{8,}\b/i, // ≥8-char token, not a plain word
+];
+
 function containsRealSecret(text: string): boolean {
+  if (REAL_SECRET_PRECHECK_PATTERNS.some((pattern) => pattern.test(text))) return true;
   return REAL_SECRET_PATTERNS.some((pattern) => pattern.test(text));
 }
 
@@ -178,6 +203,69 @@ function assertNoSecretLikeContent(text: string): void {
   }
 }
 
+// Ingest-safe view of a free-text HEADING field (journal title) that gets persisted into a markdown
+// heading — a derived persistence surface the body redaction did NOT cover (red-team Blocker 2). Runs the
+// SAME redact-in-place (email -> [redacted]) + hard gate as the body: a benign email degrades to
+// [redacted], a real secret throws (so the whole entry rejects rather than leaking a raw secret into the
+// heading). Returns undefined for empty input so the caller can omit the heading segment entirely.
+function safeHeadingTitle(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  const redacted = redactIngestBenign(trimmed);
+  assertNoSecretLikeContent(redacted); // real secret in the title -> reject (never lands in the heading)
+  return redacted;
+}
+
+// Collapse a free-text actor / sourceAgent label down to a SAFE id before it lands in a journal heading or
+// audit actor field (red-team Blocker 2: sourceAgent='alice@example.com' previously wrote the raw email
+// into the heading). Whitelist charset [a-z0-9._-], lowercased, length-capped; anything else is dropped to
+// '-'. An email/secret-shaped sourceAgent therefore cannot carry its value through — `alice@example.com`
+// becomes `alice-example.com` is NOT acceptable here (still leaks local+domain), so we go further: any '@'
+// or run of illegal chars collapses to a single '-' AND if the result is empty we fall back to 'unknown'.
+// This is intentionally stricter than safeFileSlug — a sourceAgent is an identifier, not free text.
+// Derive a filesystem slug from a free-text title WITHOUT letting any PII/secret VALUE reach the path
+// (red-team Blocker 1). safeFileSlug alone is NOT enough: it only swaps illegal chars, so an email title
+// `alice@example.com` becomes the slug `alice-example.com`, leaking local+domain into filename/path/audit.
+// Here we FIRST run the ingest redactor (email -> [redacted]); if the redacted form is STILL detector-dirty
+// (a real secret made redactIngestBenign a no-op) we DROP the title entirely and fall back to candidateId,
+// so a credential can never be slugged into a path either. Result: path/filename derive only from a
+// redacted, detector-clean title (or the opaque candidateId), never from a raw PII/secret value.
+function safeRedactedSlug(title: string | undefined, candidateId: string): string {
+  const trimmed = title?.trim();
+  if (!trimmed) return safeFileSlug(candidateId, candidateId);
+  const redacted = redactIngestBenign(trimmed);
+  if (containsSecretLikeContent(redacted)) return safeFileSlug(candidateId, candidateId);
+  return safeFileSlug(redacted, candidateId);
+}
+
+// Ingest-safe copy of a PromoteTarget for the AUDIT metadata surface (red-team Blocker 1: the raw
+// `target` — including `target.title` — was written verbatim into the _events ndjson audit log). The
+// title is the only free-text field; run it through the same redact-in-place + drop-if-real-secret guard
+// as the filename slug so a PII/secret title never lands in the audit log either. scope/path are
+// constrained identifiers already validated upstream and are left as-is.
+function safeAuditTarget(target: PromoteTarget): PromoteTarget {
+  if (target.title === undefined) return target;
+  const redacted = redactIngestBenign(String(target.title));
+  // If a real secret made the redactor a no-op, drop the title entirely rather than log the value.
+  const safeTitle = containsSecretLikeContent(redacted) ? undefined : redacted;
+  return { ...target, title: safeTitle };
+}
+
+function safeActorId(raw: string | undefined): string {
+  const cleaned = (raw ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '')
+    .slice(0, 40);
+  // If after whitelisting the label still parses as an email/secret (e.g. it was 'a.b-example.com' from an
+  // email), null it out — an actor id must never carry an exfiltratable value. The detector catches the
+  // dotted domain tail; on any hit we drop to the neutral fallback.
+  if (!cleaned || containsSecretLikeContent(raw ?? '')) return 'unknown';
+  return cleaned;
+}
+
 function assertNoSecretLikeDurableCandidate(content: string): void {
   if (containsSecretLikeContent(content)) {
     throw new Error('redact_check_failed_candidate_contains_secret_like_content');
@@ -223,7 +311,7 @@ function stripMemoryPrefix(ref: string): string {
 
 function resolveTargetPath(workspace: Workspace, candidateId: string, target: PromoteTarget = {}): string {
   if (workspace.mode === 'existing-memory-root') {
-    const title = safeFileSlug(target.title || candidateId, candidateId);
+    const title = safeRedactedSlug(target.title, candidateId); // Blocker 1: no raw PII/secret in path
     return path.join(workspace.promotedDir, `${nowCompact()}-${title}.md`);
   }
 
@@ -235,7 +323,7 @@ function resolveTargetPath(workspace: Workspace, candidateId: string, target: Pr
   }
 
   const scope = safeFileSlug(target.scope || 'general', 'general');
-  const title = safeFileSlug(target.title || candidateId, candidateId);
+  const title = safeRedactedSlug(target.title, candidateId); // Blocker 1: no raw PII/secret in path
   const relative = path.join('scopes', scope, `${nowCompact()}-${title}.md`);
   if (isProtectedPath(relative)) throw new Error('protected_core_path');
   return path.join(workspace.memoryDir, relative);
@@ -290,7 +378,7 @@ function resolveDurableTargetPath(workspace: Workspace, candidateId: string, tar
   }
 
   const scope = safeFileSlug(target.scope || 'general', 'general');
-  const title = safeFileSlug(target.title || candidateId, candidateId);
+  const title = safeRedactedSlug(target.title, candidateId); // Blocker 1: no raw PII/secret in path
   return path.join(workspace.memoryDir, 'scopes', scope, `${nowCompact()}-${title}.md`);
 }
 
@@ -371,8 +459,11 @@ export async function appendJournal(workspace: Workspace, payload: JournalPayloa
   // secret is untouched here and still hard-rejects below; only an email/PII match degrades to [redacted].
   const text = redactIngestBenign(raw);
   assertNoSecretLikeContent(text);
-  const sourceAgent = payload.sourceAgent || payload.source || 'unknown';
-  const title = payload.title?.trim();
+  // Heading-derived persistence surfaces (red-team Blocker 2): the title goes through the SAME
+  // redact-in-place + hard gate as the body, and the sourceAgent is collapsed to a safe actor id, so
+  // neither a PII email nor a raw secret can leak through the journal heading or the audit actor field.
+  const sourceAgent = safeActorId(payload.sourceAgent || payload.source || 'unknown');
+  const title = safeHeadingTitle(payload.title);
   return await withWorkspaceLock(workspace, async () => {
     const at = new Date().toISOString();
     const day = localDay(new Date(at)); // LOCAL calendar day — matches the wall clock, not UTC (see time.ts)
@@ -411,8 +502,11 @@ export async function appendFloorJournalOnce(
   const text = payload.text;
   if (typeof text !== 'string' || !text.trim()) throw new Error('journal_text_required');
   assertNoSecretLikeContent(text); // already redacted upstream; this is the hard gate (defence in depth)
-  const actor = `${payload.runtime}-floor`;
-  const title = payload.title?.trim();
+  // Heading/actor display strings are collapsed to safe ids + redacted-title (red-team Blocker 2, same
+  // class as appendJournal). NOTE: the dedup composite key still uses the RAW payload.runtime via
+  // metadata.floorRuntime below, so idempotency is unchanged — only the rendered heading/actor are safed.
+  const actor = `${safeActorId(payload.runtime)}-floor`;
+  const title = safeHeadingTitle(payload.title);
   return await withWorkspaceLock(workspace, async () => {
     // Under the lock: re-read the audit log and bail if THIS (runtime, sessionId) was already floored.
     // Reading inside the lock is what makes the check-then-write atomic against a concurrent sweep.
@@ -580,9 +674,13 @@ export async function writeCandidate(
 ): Promise<WriteCandidateResult> {
   return await withWorkspaceLock(workspace, async () => {
     const candidateId = crypto.randomUUID();
-    const title = safeFileSlug(payload.title || candidateId, candidateId);
+    // Filename slug derives from the REDACTED title (red-team Blocker 1): a raw email/secret in the title
+    // must never reach the path. safeRedactedSlug drops to candidateId if a real secret is present.
+    const title = safeRedactedSlug(payload.title, candidateId);
+    // The candidate sub-dir is keyed by sourceAgent; collapse it to a safe actor id so a PII/secret
+    // sourceAgent (e.g. 'alice@example.com') cannot land in the directory path either.
     const sourceAgent = payload.sourceAgent || payload.source || 'unknown';
-    const filePath = path.join(candidateDirForAgent(workspace, sourceAgent), `${nowCompact()}-${title}.md`);
+    const filePath = path.join(candidateDirForAgent(workspace, safeActorId(sourceAgent)), `${nowCompact()}-${title}.md`);
     // markdownCandidate's body is already benign-redacted via candidateText(); redact-in-place the FULL
     // rendered candidate so an email tucked into the title/metadata also degrades to [redacted] rather
     // than rejecting the entry (P0-C), and the redacted form is what we persist.
@@ -596,7 +694,7 @@ export async function writeCandidate(
     await appendEvent(workspace, {
       type: 'candidate.created',
       path: relativePath,
-      actor: sourceAgent,
+      actor: safeActorId(sourceAgent), // audit actor must not carry a PII/secret sourceAgent value either
       metadata: {
         candidateId,
         status: 'candidate',
@@ -982,7 +1080,7 @@ export async function promoteCandidate(
       actor: options.actor || 'core.promote',
       metadata: {
         candidateId,
-        target,
+        target: safeAuditTarget(target), // Blocker 1: a PII/secret target.title must not land in the audit log
         stagingOnly: workspace.mode === 'existing-memory-root',
         targetMemoryPath: relativeToMemory(workspace, targetPath),
         auto: options.auto || undefined,
@@ -1072,7 +1170,7 @@ export async function durablePromoteCandidate(
         targetPath: targetRelative,
         metadata: {
           candidateId,
-          target: options.target || {},
+          target: safeAuditTarget(options.target || {}), // Blocker 1: no PII/secret title in the audit log
           dryRun,
           source: 'candidate/inbox',
           archiveCandidateTo,
