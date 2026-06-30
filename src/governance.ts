@@ -1106,7 +1106,7 @@ export async function promoteCandidate(
       ? `provenance_kind: ${JSON.stringify(options.provenanceKind)}\n`
       : '';
     const autoFrontmatter = options.auto
-      ? `tier: "auto-promoted"\nreviewed: false\nauto_tier: ${JSON.stringify(options.tier || 'verified')}\npromoted_by: ${JSON.stringify(options.actor || 'agent-auto')}\n${provenanceKindFrontmatter}${flaggedFrontmatter}`
+      ? `tier: "auto-promoted"\nreviewed: false\nauto_tier: ${JSON.stringify(options.tier || 'verified')}\npromoted_by: ${JSON.stringify(safeActorId(options.actor || 'agent-auto'))}\n${provenanceKindFrontmatter}${flaggedFrontmatter}`
       : '';
     const body = candidate.content
       .replace(/^status:\s*"candidate"\s*$/m, 'status: "promoted"')
@@ -1130,7 +1130,7 @@ export async function promoteCandidate(
       type: 'memory.promoted',
       candidatePath: candidate.path,
       targetPath: targetRelative,
-      actor: options.actor || 'core.promote',
+      actor: safeActorId(options.actor || 'core.promote'), // audit actor must be PII/secret-safe (defense-in-depth; mirrors the durable lane)
       metadata: {
         candidateId,
         target: safeAuditTarget(target), // Blocker 1: a PII/secret target.title must not land in the audit log
@@ -1189,7 +1189,10 @@ export async function durablePromoteCandidate(
 
     const at = new Date().toISOString();
     const eventId = crypto.randomUUID();
-    const actor = options.actor || 'core.durable-promote';
+    // r4 Blocker: actor is EXTERNAL input (CLI `--actor`, MCP `args.actor`, API `options.actor`) and flows
+    // into both the dry-run plan and the real-write _events audit event — collapse it to a safe id so a
+    // PII/secret-shaped actor never lands raw in the ndjson audit log (same policy as journal/candidate).
+    const actor = safeActorId(options.actor || 'core.durable-promote');
     const archiveCandidateTo = relativeToSpace(
       workspace,
       path.join(workspace.historyDir, 'promoted-candidates', path.basename(candidate.path)),

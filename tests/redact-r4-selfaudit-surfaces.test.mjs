@@ -109,3 +109,22 @@ test('journal(): a PII/secret-shaped sourceAgent never lands raw in the _events 
   await core.journal({ text: 'a clean harmless note', sourceAgent: 'carol@example.net' });
   assert.equal(await anyFileContains(root, 'carol@example.net'), false, 'sourceAgent PII must be collapsed by safeActorId in the audit actor');
 });
+
+// --- r4 red-team Blocker: durable_promote external actor must be audit-safe ---
+
+test('durable_promote(): an external PII/secret actor never lands raw in the _events audit log', async (t) => {
+  for (const actor of ['actor-carol@example.net', 'sk-ABCDEFGH1234567890IJKLMNOP', 'Bearer abc1234-']) {
+    const { root, core } = await managed(t, 'actorleak');
+    const c = await core.write_candidate({ text: 'clean body', sourceAgent: 't', autoPromote: false });
+    await core.durable_promote(c.path, { realWrite: true, actor, target: { scope: 'general', title: 'ok' } });
+    assert.equal(await anyFileContains(root, actor), false, `durable actor "${actor}" must be collapsed by safeActorId, not raw in _events`);
+  }
+});
+
+test('durable_promote(): a benign actor is preserved in the audit event (no over-redaction)', async (t) => {
+  const { root, core } = await managed(t, 'actorok');
+  const c = await core.write_candidate({ text: 'clean body', sourceAgent: 't', autoPromote: false });
+  const r = await core.durable_promote(c.path, { realWrite: true, actor: 'agent-auto', target: { scope: 'general', title: 'ok' } });
+  assert.equal(r.status, 'promoted', 'benign actor still promotes');
+  assert.equal(await anyFileContains(root, 'agent-auto'), true, 'a benign actor must survive in the audit event');
+});
