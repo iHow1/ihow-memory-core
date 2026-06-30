@@ -24,6 +24,7 @@ import { migrateLocalDay } from './migrate.ts';
 import { planImport, applyImport, collectExistingImports, type ImportPlan } from './import.ts';
 import { runBenchmark } from './benchmark.ts';
 import { mcpLaneWorkspace } from './store/events.ts';
+import { elapsedDays, isDecayExempt, lastVerificationMs, timeSinceVerificationPenalty } from './decay.ts';
 import type { WorkspaceOptions } from './types.ts';
 import * as telemetry from './telemetry.ts';
 
@@ -2290,6 +2291,12 @@ function redactRecallPII(text: string): string {
 // entry as the corrected/current one in a topic pair; combined with promote time it scores recency so the
 // CURRENT entry beats a superseded/contradicted one even when both were promoted in the same second.
 const RECALL_CURRENCY = /supersed|correction|corrected|updated|update:|deprecat|do not use|no longer|outdated|migrated to|raised to|lowered to|changed to|as of \d{4}|replaces|revoked|valid until/i;
+// Phase-4 time dimension: the maximum freshness "discount", expressed in the same MILLISECOND basis the
+// recency score uses, that a long-unverified NON-pinned curated fact can lose. Bounded to a small window
+// (7 days) so the penalty can only ever break ties / reorder PEERS of comparable recency — a genuinely
+// newer entry (minutes/hours/days newer) still wins, and a currency-marked correction (worth ~1e15) is
+// untouchable. This keeps the signal a strict reorder, never an eligibility change.
+const VERIFICATION_FRESHNESS_MAX_DISCOUNT_MS = 7 * 24 * 60 * 60 * 1000;
 function recallRecencyScore(workspace: Awaited<ReturnType<typeof openCore>>['workspace'], relPath: string, snippet: string): { score: number; terms: Set<string> } {
   let content = snippet;
   try {
@@ -2297,13 +2304,29 @@ function recallRecencyScore(workspace: Awaited<ReturnType<typeof openCore>>['wor
   } catch {
     // unreadable -> fall back to the snippet for terms; score stays low
   }
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+  const front = fmMatch ? fmMatch[1] : '';
   const promotedAt = content.match(/promoted_at:\s*"?([^"\n]+)"?/);
   const ms = promotedAt ? Date.parse(promotedAt[1]) : NaN;
   // Topic terms + currency marker from the BODY only — frontmatter keys (team/scope/candidate_id/...) are
   // shared across ALL promoted entries, so including them would make every pair look "same topic" and
   // collapse recall to a single entry. Strip the leading YAML frontmatter first.
   const body = content.replace(/^---[\s\S]*?\n---\n?/, '');
-  const score = (RECALL_CURRENCY.test(body) ? 1e15 : 0) + (Number.isNaN(ms) ? 0 : ms);
+  // TIME-SINCE-VERIFICATION freshness penalty (Phase 4, NON-GIT verify-first extension). A non-pinned
+  // curated fact (a preference/decision with no machine-judged markers... wait: see isDecayExempt) erodes
+  // in freshness as time since its last (re)verification grows. PINNED (verified/flagged) entries are
+  // EXEMPT — isDecayExempt short-circuits them to zero penalty, so the moat's hardest facts never decay.
+  // The discount is bounded to a 7-day-equivalent window: it only ever reorders comparable-recency peers,
+  // never changes what is eligible (this function feeds the sort only). Deterministic, model-free.
+  let freshnessDiscount = 0;
+  if (!isDecayExempt(front)) {
+    const verifiedMs = lastVerificationMs(front);
+    if (verifiedMs !== null) {
+      const penalty = timeSinceVerificationPenalty({ ageDaysSinceVerification: elapsedDays(verifiedMs, Date.now()) });
+      freshnessDiscount = penalty * VERIFICATION_FRESHNESS_MAX_DISCOUNT_MS; // [0, 7d-in-ms]
+    }
+  }
+  const score = (RECALL_CURRENCY.test(body) ? 1e15 : 0) + (Number.isNaN(ms) ? 0 : ms) - freshnessDiscount;
   return { score, terms: recallTerms(body) };
 }
 
