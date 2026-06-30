@@ -616,7 +616,172 @@ async function parseOpencodeSession(file: string): Promise<CaptureUnit | undefin
   }
 }
 
-const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource, openclawSource, hermesSource, hermesStateDbSource, opencodeSource];
+// Gemini CLI: ~/.gemini/tmp/<projectKey>/logs.json is an append-only ARRAY of {sessionId, messageId,
+// type, message, timestamp}. PASSIVE reader (resume/import, NOT real-time). Honest ceiling: Gemini CLI
+// persists ONLY user prompts to logs.json (no assistant turns on disk), so the handoff body is the
+// session's topic/intent + git anchors — lighter than a tool that records full transcripts. One file
+// holds MANY sessions; we surface the LATEST (newest entry) per project, mirroring Codex. The sibling
+// .project_root file holds the absolute project path. Routed through the SHARED summarizeTranscript so
+// the locked scope (Topic only here) + downstream redaction are identical to every other runtime.
+const geminiSource: SessionSource = {
+  tool: 'gemini',
+  list: async () => {
+    const root = path.join(os.homedir(), '.gemini', 'tmp');
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    let entries;
+    try { entries = await fs.readdir(root, { withFileTypes: true }); } catch { return out; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const full = path.join(root, e.name, 'logs.json');
+      try { out.push({ file: full, mtimeMs: (await fs.stat(full)).mtimeMs }); } catch { /* no logs.json here */ }
+    }
+    return out;
+  },
+  read: async (file) => parseGeminiLogs(file),
+};
+
+async function parseGeminiLogs(file: string): Promise<CaptureUnit | undefined> {
+  const raw = await readSessionFile(file);
+  if (raw === undefined) return undefined;
+  let entries: unknown;
+  try { entries = JSON.parse(raw); } catch { return undefined; }
+  if (!Array.isArray(entries) || entries.length === 0) return undefined;
+  // Group user prompts by sessionId; track each session's newest timestamp so we surface the LATEST.
+  const byId = new Map<string, { msgs: Array<{ messageId: number; message: string }>; ts: number }>();
+  for (const e of entries as Array<Record<string, unknown>>) {
+    if (!e || typeof e.sessionId !== 'string' || e.type !== 'user' || typeof e.message !== 'string') continue;
+    const messageId = typeof e.messageId === 'number' ? e.messageId : 0;
+    // messageId 0 is Gemini's launch-mode marker ("cli" / "tui" / ...), not a real prompt — drop it.
+    if (messageId === 0 && /^(cli|tui|interactive|screen-reader)$/i.test(e.message.trim())) continue;
+    if (!e.message.trim()) continue;
+    const ts = typeof e.timestamp === 'string' ? Date.parse(e.timestamp) || 0 : 0;
+    const cur = byId.get(e.sessionId) ?? { msgs: [], ts: 0 };
+    cur.msgs.push({ messageId, message: e.message });
+    if (ts > cur.ts) cur.ts = ts;
+    byId.set(e.sessionId, cur);
+  }
+  if (byId.size === 0) return undefined;
+  let sessionId = '';
+  let best = -1;
+  let chosen: { msgs: Array<{ messageId: number; message: string }>; ts: number } | undefined;
+  for (const [id, v] of byId) {
+    if (v.ts > best) { best = v.ts; sessionId = id; chosen = v; }
+  }
+  if (!chosen || chosen.msgs.length < 2) return undefined; // trivial / freshly-started — skip
+  chosen.msgs.sort((a, b) => a.messageId - b.messageId);
+  // user-only records => summarizeTranscript yields a Topic-only body (no assistant Summary). That is the
+  // honest ceiling for a tool that records only user prompts.
+  const records: TranscriptRecord[] = chosen.msgs.map((m) => ({
+    type: 'user',
+    message: { content: [{ type: 'text', text: m.message }] },
+  }));
+  const body = summarizeTranscript(records).body;
+  if (!body) return undefined;
+  // .project_root sibling holds the absolute project path (authoritative cwd); none => UNDETERMINED.
+  let projectDir: string | undefined;
+  try {
+    const pr = (await fs.readFile(path.join(path.dirname(file), '.project_root'), 'utf8')).trim();
+    if (pr) projectDir = pr;
+  } catch { /* no .project_root — leave the project undetermined */ }
+  return { sessionId, body, editedList: [], projectDir };
+}
+
+// Cline (VS Code extension, publisher id saoudrizwan.claude-dev): each task lives at
+// <globalStorage>/saoudrizwan.claude-dev/tasks/<taskId>/api_conversation_history.json — an Anthropic-shape
+// MessageParam[] — plus ui_messages.json. PASSIVE reader (resume/import, NOT real-time). Discovery is
+// BOUNDED: a fixed set of VS Code-family globalStorage roots (cross-OS + common forks) and the SDK data
+// dir (~/.cline/data or $CLINE_DATA_DIR) — never a home-wide scan, so it stays cheap on the session-start
+// floor path. cwd comes from the environment_details header Cline injects into the first user message.
+// Routed through the SHARED summarizeTranscript so the locked scope + downstream redaction are identical.
+function clineTaskRoots(): string[] {
+  const home = os.homedir();
+  const roots: string[] = [];
+  const apps = ['Code', 'Code - Insiders', 'VSCodium', 'Cursor', 'Windsurf'];
+  const bases: string[] = [];
+  if (process.platform === 'darwin') {
+    for (const app of apps) bases.push(path.join(home, 'Library', 'Application Support', app, 'User', 'globalStorage'));
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+    for (const app of apps) bases.push(path.join(appData, app, 'User', 'globalStorage'));
+  } else {
+    const xdg = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+    for (const app of apps) bases.push(path.join(xdg, app, 'User', 'globalStorage'));
+  }
+  for (const b of bases) roots.push(path.join(b, 'saoudrizwan.claude-dev', 'tasks'));
+  // SDK data dir (current Cline also writes here): $CLINE_DATA_DIR or $CLINE_DIR/data or ~/.cline/data.
+  const sdkBase = process.env.CLINE_DATA_DIR || path.join(process.env.CLINE_DIR || path.join(home, '.cline'), 'data');
+  roots.push(path.join(sdkBase, 'tasks'));
+  return roots;
+}
+
+const clineSource: SessionSource = {
+  tool: 'cline',
+  list: async () => {
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    for (const tasksDir of clineTaskRoots()) {
+      let ids;
+      try { ids = await fs.readdir(tasksDir, { withFileTypes: true }); } catch { continue; }
+      for (const e of ids) {
+        if (!e.isDirectory()) continue;
+        const file = path.join(tasksDir, e.name, 'api_conversation_history.json');
+        try { out.push({ file, mtimeMs: (await fs.stat(file)).mtimeMs }); } catch { /* no history in this task dir */ }
+      }
+    }
+    return out;
+  },
+  read: async (file) => parseClineTask(file),
+};
+
+// Pull visible assistant/user text out of an Anthropic MessageParam.content (string | block[]).
+function clineMessageText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const b of content) {
+    if (b && typeof b === 'object' && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string') {
+      parts.push((b as { text: string }).text);
+    }
+  }
+  return parts.join('\n');
+}
+
+async function parseClineTask(file: string): Promise<CaptureUnit | undefined> {
+  const raw = await readSessionFile(file);
+  if (raw === undefined) return undefined;
+  let messages: unknown;
+  try { messages = JSON.parse(raw); } catch { return undefined; }
+  if (!Array.isArray(messages) || messages.length === 0) return undefined;
+  // cwd: Cline injects "# Current Working Directory (/abs/path) Files" into the first user message's
+  // environment_details. Pull it from the first user message's RAW text before we strip the wrappers.
+  let projectDir: string | undefined;
+  const records: TranscriptRecord[] = [];
+  for (const m of messages as Array<Record<string, unknown>>) {
+    const role = m?.role;
+    if (role !== 'user' && role !== 'assistant') continue;
+    let text = clineMessageText(m.content).trim();
+    if (!text) continue;
+    if (role === 'user' && !projectDir) {
+      const cwd = text.match(/# Current Working Directory \((.+?)\) Files/);
+      if (cwd) projectDir = cwd[1].trim();
+    }
+    // Strip Cline's machine wrappers: environment_details is noise (and a file-listing leak surface);
+    // unwrap <task>…</task> so the topic is the user's actual ask, not the XML tag.
+    text = text
+      .replace(/<environment_details>[\s\S]*?<\/environment_details>/g, '')
+      .replace(/<\/?task>/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (text) records.push({ type: role, message: { content: [{ type: 'text', text }] } });
+  }
+  if (records.length < 2) return undefined; // trivial / unparseable
+  const body = summarizeTranscript(records).body;
+  if (!body) return undefined;
+  // taskId (the parent dir name) is the stable session id.
+  const sessionId = path.basename(path.dirname(file));
+  return { sessionId, body, editedList: [], projectDir };
+}
+
+const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource, openclawSource, hermesSource, hermesStateDbSource, opencodeSource, geminiSource, clineSource];
 
 // Enumerate the most recent RESUMABLE sessions across EVERY recorded runtime (Claude, Codex, ...),
 // newest activity first. Each source contributes a reader; project inference, anchors and redaction are
