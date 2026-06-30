@@ -175,6 +175,16 @@ Not directly comparable to vendor end-to-end LLM-judged figures.
 
 Semantic recall requires a **user-provided embedding sidecar** (e.g. Ollama `nomic-embed-text`) running as a separate local process. The default install is **lexical-only and zero-dependency by design** — that is the moat, not an omission. If the sidecar is unconfigured or unhealthy, retrieval falls back visibly to FTS.
 
+Turn it on per space with one command — it **probes your local Ollama and only enables if the model is actually pulled**, then persists the opt-in so `connect`/`setup` launch the server with the (bundled) sidecar:
+
+```bash
+ollama pull nomic-embed-text            # once
+npx ihow-memory@next enable-semantic    # probes Ollama; writes <space>/.runtime/semantic.json
+# re-run `setup`/`connect` + restart your runtime to apply · reverse anytime: disable-semantic
+```
+
+`enable-semantic` **refuses** (non-zero, with guidance) if Ollama is unreachable or the model isn't pulled — it never enables a lane that would only fall back. `doctor` then reports semantic health as a **warning, never a failure** (the lane is additive). On the in-repo fixture this lifts paraphrase recall from **2/5 → 5/5** (fused R@5 0.85 → 1.0); the default binary stays lexical-only with `capabilities.semantic=false` until you opt in.
+
 Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md).
 
 ## MCP tools

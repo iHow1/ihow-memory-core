@@ -26,6 +26,17 @@ import { runBenchmark } from './benchmark.ts';
 import { mcpLaneWorkspace } from './store/events.ts';
 import { elapsedDays, isDecayExempt, lastVerificationMs, timeSinceVerificationPenalty } from './decay.ts';
 import type { WorkspaceOptions } from './types.ts';
+import {
+  DEFAULT_EMBED_MODEL,
+  DEFAULT_OLLAMA_HOST,
+  buildSemanticConfig,
+  detectOllama,
+  loadSemanticConfig,
+  removeSemanticConfig,
+  semanticConfigPath,
+  semanticEngineArgs,
+  writeSemanticConfig,
+} from './semantic.ts';
 import * as telemetry from './telemetry.ts';
 
 // Suppress only Node's node:sqlite ExperimentalWarning (Node >= 22.12 is our supported runtime); all other warnings pass through unchanged.
@@ -271,10 +282,16 @@ function mcpServerSpec(
   workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
 ): { command: string; args: string[] } {
   const serverEntry = path.join(workspace.spaceDir, '.runtime', 'mcp', 'server.js');
+  const args = [serverEntry, '--memory-root', workspace.memoryDir, '--state-root', workspace.root];
+  // Opt-in semantic: when this space has been turned on with `enable-semantic` (semantic.json present),
+  // append the vector engine flags so the connected MCP server runs the additive semantic lane. Absent
+  // the file, this adds nothing — the server is the default zero-dependency FTS5 binary
+  // (capabilities.semantic=false). The sidecar is a SPAWNED subprocess, never imported into the graph.
+  args.push(...semanticEngineArgs(workspace));
   return {
     // Pin process.execPath (the node that ran setup), not bare 'node' — see workspaceMcpConfigSnippet.
     command: process.execPath,
-    args: [serverEntry, '--memory-root', workspace.memoryDir, '--state-root', workspace.root],
+    args,
   };
 }
 
@@ -1037,6 +1054,8 @@ Usage:
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory benchmark [--json]   # deterministic LOCAL proof of the verify-first guarantees: the three-color resume verdict discriminates (GREEN narrow · drift→RED · uncertainty→YELLOW) and the no-false-green floor isolates unverified/standing-rule content while blocking secret/fabricated-anchor content. Re-run for the same result; exit non-zero if any guarantee fails.
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
+  ihow-memory enable-semantic [--host url] [--model name] [--space name] [--json]   # OPT-IN: turn on the additive semantic lane for this space. Probes a LOCAL Ollama (default http://localhost:11434, model nomic-embed-text) and only enables if it is reachable AND the model is pulled; persists <space>/.runtime/semantic.json so connect/setup launch the MCP server with the spawned embedding sidecar. The default install stays zero-dependency FTS5 (capabilities.semantic=false) until you run this; the lane is additive — search falls back to FTS if the provider is down. Re-run setup/connect + restart the runtime to apply.
+  ihow-memory disable-semantic [--space name] [--json]   # reverse enable-semantic: remove the opt-in marker and return to the default FTS5 engine (re-run setup/connect + restart to apply)
   ihow-memory search <query> [--limit n] [--include-flagged]
   ihow-memory read <memory/path.md>
   ihow-memory write-candidate <text> [--space name] [--no-auto-promote]
@@ -1316,6 +1335,30 @@ async function doctor(
       severity: 'info',
       required: false,
     });
+    // Opt-in semantic health: only when this space has enable-semantic on (semantic.json present). The
+    // lane is ADDITIVE — a down/unpulled provider degrades to the FTS floor, so it is a WARNING, never a
+    // doctor failure (required:false). Absent the opt-in, no check is emitted at all.
+    const semantic = await loadSemanticConfig(workspace);
+    if (semantic) {
+      const probe = await detectOllama({ host: semantic.host, model: semantic.vectorModel, timeoutMs: 4000 });
+      const healthy = probe.reachable && probe.hasModel;
+      checks.push({
+        name: 'semantic',
+        ok: healthy,
+        detail: healthy
+          ? `enabled · Ollama ${semantic.host} · model ${semantic.vectorModel} (reachable)`
+          : probe.reachable
+            ? `enabled · Ollama ${semantic.host} up but model "${semantic.vectorModel}" not pulled → search falls back to FTS`
+            : `enabled · Ollama ${semantic.host} unreachable (${probe.error}) → search falls back to FTS`,
+        hint: healthy
+          ? undefined
+          : probe.reachable
+            ? `ollama pull ${semantic.vectorModel}`
+            : `start Ollama at ${semantic.host}, or run: ihow-memory disable-semantic`,
+        severity: healthy ? 'info' : 'warning',
+        required: false, // additive lane — provider down is a WARNING, never a doctor failure
+      });
+    }
     checks.push({
       name: 'index-manifest',
       ok: Boolean(index.manifestPath),
@@ -2954,6 +2997,65 @@ async function main(): Promise<void> {
         : '✗ not trustworthy — fix the ✗ lines above, then re-run: ihow-memory verify';
     console.log(`OVERALL   ${overall}`);
     process.exitCode = ok ? 0 : 1;
+    return;
+  }
+
+  if (command === 'enable-semantic') {
+    const workspace = await ensureWorkspace(resolveWorkspace(options));
+    const argv = process.argv.slice(2);
+    const flag = (name: string): string | undefined => {
+      const i = argv.indexOf(name);
+      return i >= 0 ? argv[i + 1] : undefined;
+    };
+    const host = flag('--host') || DEFAULT_OLLAMA_HOST;
+    const model = flag('--model') || options.vectorModel || DEFAULT_EMBED_MODEL;
+    // Verify the provider is actually usable BEFORE persisting the opt-in — never enable a lane that
+    // would only fall back. detectOllama never throws; we branch on its honest result.
+    const probe = await detectOllama({ host, model });
+    if (!probe.reachable) {
+      const hint = `Start a local Ollama (https://ollama.com) reachable at ${host}, run \`ollama pull ${model}\`, then re-run enable-semantic. Default search stays lexical FTS5 until then.`;
+      if (options.json) printJson({ ok: false, error: 'ollama_unreachable', host, model, detail: probe.error, hint });
+      else {
+        console.error(`enable-semantic: Ollama not reachable at ${host} (${probe.error}).`);
+        console.error(`  ${hint}`);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    if (!probe.hasModel) {
+      const hint = `Pull the embedding model once: \`ollama pull ${model}\`, then re-run enable-semantic.`;
+      if (options.json) printJson({ ok: false, error: 'model_not_pulled', host, model, models: probe.models, hint });
+      else {
+        console.error(`enable-semantic: Ollama is up at ${host} but the embedding model "${model}" is not pulled.`);
+        console.error(`  ${hint}`);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    const target = await writeSemanticConfig(workspace, buildSemanticConfig({ host, model, enabledAt: new Date().toISOString() }));
+    const customHost = host !== DEFAULT_OLLAMA_HOST;
+    if (options.json) {
+      printJson({ ok: true, enabled: true, space: workspace.space, host, model, config: target, engine: 'vector', applies: 'after re-running setup/connect and restarting the runtime', customHostNote: customHost ? 'export OLLAMA_HOST in the runtime environment that launches the MCP server' : undefined });
+    } else {
+      console.log(`✓ semantic enabled for space "${workspace.space}" → ${target}`);
+      console.log(`  provider: local Ollama ${host} · model ${model} (spawned sidecar; ADDITIVE — search falls back to FTS if it is down)`);
+      console.log('  apply: re-run `ihow-memory setup` (or `connect` for your runtime) so the server launches with the semantic engine, then restart the runtime.');
+      console.log('  reverse anytime: ihow-memory disable-semantic');
+      if (customHost) console.log('  note: custom host — also export OLLAMA_HOST in the environment that launches the MCP server (the spawned sidecar reads it from env).');
+    }
+    return;
+  }
+
+  if (command === 'disable-semantic') {
+    const workspace = resolveWorkspace(options); // read-only intent: just remove the opt-in marker
+    const removed = await removeSemanticConfig(workspace);
+    if (options.json) printJson({ ok: true, disabled: true, wasEnabled: removed, space: workspace.space, config: semanticConfigPath(workspace) });
+    else if (removed) {
+      console.log(`✓ semantic disabled for space "${workspace.space}" (removed ${semanticConfigPath(workspace)})`);
+      console.log('  apply: re-run `ihow-memory setup`/`connect` + restart the runtime to return to the default zero-dependency FTS5 engine.');
+    } else {
+      console.log(`semantic was not enabled for space "${workspace.space}" — nothing to remove (already on the default FTS5 engine).`);
+    }
     return;
   }
 
