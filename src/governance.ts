@@ -1085,6 +1085,13 @@ export async function promoteCandidate(
     if (!isAllowedCandidatePath(workspace, candidate.path, candidateAbsolute)) {
       throw new Error('candidate_must_be_from_inbox');
     }
+    // r5: the candidate's OWN path/filename flows raw into the _events `candidatePath` field, the
+    // history/promoted-candidates archive filename, AND the returned plan — none redactable after the fact.
+    // A write_candidate-generated path is always slugged safe; reject an out-of-band PII/secret-named file
+    // (mirrors the explicit target.path reject) so it never reaches any of those persistence surfaces.
+    if (containsSecretLikeContent(normalizeRef(candidate.path))) {
+      throw new Error('candidate_path_contains_secret_like_content');
+    }
     const candidateIdMatch = candidate.content.match(/^candidate_id:\s*"?(.*?)"?\s*$/m);
     const candidateId = candidateIdMatch?.[1] || path.basename(candidate.path, '.md');
     const targetPath = resolveTargetPath(workspace, candidateId, target);
@@ -1112,9 +1119,12 @@ export async function promoteCandidate(
       .replace(/^status:\s*"candidate"\s*$/m, 'status: "promoted"')
       .replace(/^type:\s*"memory_candidate"\s*$/m, 'type: "memory"')
       .replace(/^---\n/, `---\npromoted_at: "${new Date().toISOString()}"\n${autoFrontmatter}`);
-    // Auto-promote happens without a human gate, so it must clear the same durable secret check
-    // as durable_promote — a backstop on the full file content (title + metadata + body).
-    if (options.auto) assertNoSecretLikeDurableCandidate(body);
+    // EVERY promote (not just auto) must clear the durable secret check — a backstop on the FULL file content
+    // (title + metadata + body + the frontmatter candidate_id). An out-of-band candidate can carry raw
+    // PII/secret in a frontmatter field (e.g. candidate_id) that would otherwise flow into the _events
+    // candidateId AND the durable filename slug; gating here rejects it before any surface is written.
+    // write_candidate already redacts its output, so a normally-created candidate always passes (r5 self-audit).
+    assertNoSecretLikeDurableCandidate(body);
     await atomicWriteFile(targetPath, body, workspace.memoryDir);
 
     if (workspace.mode === 'existing-memory-root') {
@@ -1171,6 +1181,13 @@ export async function durablePromoteCandidate(
     const candidateAbsolute = absoluteFromMemoryPath(workspace, candidate.path);
     if (!isAllowedCandidatePath(workspace, candidate.path, candidateAbsolute)) {
       throw new Error('candidate_must_be_from_inbox');
+    }
+    // r5: the candidate's OWN path/filename flows raw into the _events `candidatePath` field, the
+    // history/promoted-candidates archive filename, AND the returned plan — none redactable after the fact.
+    // A write_candidate-generated path is always slugged safe; reject an out-of-band PII/secret-named file
+    // (mirrors the explicit target.path reject) so it never reaches any of those persistence surfaces.
+    if (containsSecretLikeContent(normalizeRef(candidate.path))) {
+      throw new Error('candidate_path_contains_secret_like_content');
     }
     assertCandidateFrontMatter(candidate.content);
     assertNoSecretLikeDurableCandidate(candidate.content);

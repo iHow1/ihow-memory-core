@@ -128,3 +128,48 @@ test('durable_promote(): a benign actor is preserved in the audit event (no over
   assert.equal(r.status, 'promoted', 'benign actor still promotes');
   assert.equal(await anyFileContains(root, 'agent-auto'), true, 'a benign actor must survive in the audit event');
 });
+
+// --- r5 red-team Blocker: candidate REF path itself must not carry raw PII into _events / history ---
+
+async function plantCandidate(root, space, needle) {
+  const rel = `memory/candidate/inbox/${needle}.md`;
+  const abs = path.join(root, space, rel);
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  await fs.writeFile(abs, `---\ntype: "memory_candidate"\ncandidate_id: "cid-r5"\nstatus: "candidate"\nsource_agent: "unit"\ncreated_at: "2026-06-30T00:00:00.000Z"\n---\n# Clean\n\nclean body\n`);
+  return rel;
+}
+
+test('promote()/durable_promote(): an out-of-band candidate with a PII/secret FILENAME is hard-rejected (no raw candidatePath in _events/history)', async (t) => {
+  for (const needle of ['candpath-carol@example.net', 'candpath-sk-ABCDEFGH1234567890IJKL']) {
+    const { root, core } = await managed(t, 'candpath');
+    const rel = await plantCandidate(root, 'r4', needle);
+    await assert.rejects(core.promote(rel, { scope: 'general', title: 'ok' }), /secret_like|secret/, `promote must reject "${needle}"`);
+    await assert.rejects(core.durable_promote(rel, { realWrite: true, actor: 'unit', target: { scope: 'general', title: 'ok' } }), /secret_like|secret/, `durable must reject "${needle}"`);
+    const eventsDir = path.join(root, 'r4', 'memory', '_events');
+    assert.equal(await anyFileContains(eventsDir, needle), false, `candidatePath "${needle}" must not reach _events`);
+    const histDir = path.join(root, 'r4', 'memory', 'history');
+    assert.equal(await anyFileContains(histDir, needle), false, `candidate "${needle}" must not be archived to history`);
+  }
+});
+
+test('promote(): a normal write_candidate path still promotes (candidate-path guard does not over-reject)', async (t) => {
+  const { core } = await managed(t, 'candok');
+  const c = await core.write_candidate({ text: 'clean body', sourceAgent: 'unit', autoPromote: false });
+  const r = await core.promote(c.path, { scope: 'general', title: 'ok' });
+  assert.equal(r.status, 'promoted', 'a safe slugged candidate path must still promote');
+});
+
+// --- r5 self-audit (9th vector): a frontmatter candidate_id carrying PII must not leak via promote() ---
+
+test('promote(): a PII/secret candidate_id in an out-of-band candidate frontmatter is gated (no _events/filename leak)', async (t) => {
+  const { root, core } = await managed(t, 'cidfm');
+  const needle = 'cidpii-carol@example.net';
+  const rel = 'memory/candidate/inbox/safe-named.md';
+  const abs = path.join(root, 'r4', rel);
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  // safe FILENAME but PII candidate_id in frontmatter + empty title (would slug the id into the path)
+  await fs.writeFile(abs, `---\ntype: "memory_candidate"\ncandidate_id: "${needle}"\nstatus: "candidate"\nsource_agent: "unit"\ncreated_at: "2026-06-30T00:00:00.000Z"\n---\n# \n\nclean body\n`);
+  await assert.rejects(core.promote(rel, { scope: 'general' }), /secret/, 'promote must gate a PII candidate_id (content backstop, not just auto-promote)');
+  assert.equal(await anyFileContains(path.join(root, 'r4', 'memory', '_events'), needle), false, 'candidate_id must not reach _events');
+  assert.equal(await anyFileContains(path.join(root, 'r4', 'memory', 'scopes'), needle), false, 'candidate_id must not become a durable filename');
+});
