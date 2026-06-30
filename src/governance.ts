@@ -16,7 +16,7 @@ import type {
 } from './types.ts';
 import { gitAnchors } from './anchors.ts';
 import { absoluteFromMemoryPath, isMcpSandboxPath, relativeToMemory, relativeToSpace } from './workspace.ts';
-import { appendEvent, readEvents, type MemoryEvent } from './store/events.ts';
+import { appendEvent, readEvents, readEventsAllLanes, type MemoryEvent } from './store/events.ts';
 import { atomicWriteFile, listMarkdownFiles, nowCompact, readMemoryFile, safeFileSlug } from './store/files.ts';
 import { withWorkspaceLock } from './store/lock.ts';
 import { localDay } from './time.ts';
@@ -322,6 +322,61 @@ export async function appendJournal(workspace: Workspace, payload: JournalPayloa
       metadata: { day, weight: 'low', auto: true, entryAt: at },
     });
     return { path: relativePath, status: 'journaled', eventId: event.id, day };
+  });
+}
+
+export type FloorJournalResult = { status: 'journaled' | 'skipped-duplicate'; path?: string; eventId?: string; day?: string };
+
+// Crash-safe, idempotent single-shot writer for the CROSS-RUNTIME capture floor (src/floor.ts). Unlike
+// appendJournal (which unconditionally appends — correct for the cooperative lane), this does the dedup
+// CHECK and the WRITE under ONE workspace lock, so two MCP servers sweeping the SAME memory-root
+// concurrently cannot both write the same session (the lock carries the read-decision across the write).
+// The idempotency key is COMPOSITE (runtime + sessionId), because sessionId is NOT globally unique across
+// runtimes (WorkBuddy/OpenClaw derive it from a file basename). The audit event is appended BEFORE the
+// markdown body, so a crash in the gap leaves a dedup key with no body (under-capture, recoverable) rather
+// than a body the next sweep would re-floor into a duplicate.
+export async function appendFloorJournalOnce(
+  workspace: Workspace,
+  payload: { text: string; runtime: string; sessionId: string; title?: string },
+): Promise<FloorJournalResult> {
+  const text = payload.text;
+  if (typeof text !== 'string' || !text.trim()) throw new Error('journal_text_required');
+  assertNoSecretLikeContent(text); // already redacted upstream; this is the hard gate (defence in depth)
+  const actor = `${payload.runtime}-floor`;
+  const title = payload.title?.trim();
+  return await withWorkspaceLock(workspace, async () => {
+    // Under the lock: re-read the audit log and bail if THIS (runtime, sessionId) was already floored.
+    // Reading inside the lock is what makes the check-then-write atomic against a concurrent sweep.
+    let already = false;
+    try {
+      already = (await readEventsAllLanes(workspace)).some((event) => {
+        if (event.type !== 'memory.journal.appended') return false;
+        const meta = (event.metadata ?? {}) as { floor?: unknown; sessionId?: unknown; floorRuntime?: unknown };
+        return meta.floor === true && meta.sessionId === payload.sessionId && meta.floorRuntime === payload.runtime;
+      });
+    } catch {
+      already = false; // unreadable audit -> fall through and write (a rare duplicate beats a crash)
+    }
+    if (already) return { status: 'skipped-duplicate' as const };
+
+    const at = new Date().toISOString();
+    const day = localDay(new Date(at)); // LOCAL calendar day — matches the wall clock (see time.ts)
+    const targetPath = path.join(workspace.journalDir, `${day}.md`);
+    const relativePath = relativeToSpace(workspace, targetPath);
+    // Audit FIRST (the dedup key), THEN the body. A crash between the two under-captures (the session is
+    // marked floored but has no body — recoverable via a later cooperative journal / explicit continue)
+    // instead of orphaning a body with no key that every future sweep would re-floor.
+    const event = await appendEvent(workspace, {
+      type: 'memory.journal.appended',
+      path: relativePath,
+      actor,
+      metadata: { floor: true, sessionId: payload.sessionId, floorRuntime: payload.runtime, day, weight: 'low', auto: true, entryAt: at },
+    });
+    const existing = await readFileOrEmpty(targetPath);
+    const header = existing ? '' : journalFileHeader(day);
+    const entry = `\n## ${at} · ${actor}${title ? ` · ${title}` : ''}\n\n${text.trim()}\n`;
+    await atomicWriteFile(targetPath, `${header}${existing}${entry}`, workspace.memoryDir);
+    return { status: 'journaled' as const, path: relativePath, eventId: event.id, day };
   });
 }
 

@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildHandoffPacket } from '../handoff.ts';
+import { runCaptureFloorSweep } from '../floor.ts';
 
 type JsonRpcRequest = {
   jsonrpc?: '2.0';
@@ -173,6 +174,26 @@ const TOOL_DEFINITIONS = [
 
 async function main(): Promise<void> {
   const core = await openCore(parseWorkspaceArgs(process.argv.slice(2)));
+
+  // Cross-runtime capture FLOOR (automation v2.1). The MCP server is the one touchpoint EVERY connected
+  // runtime shares, so its startup is where the deterministic capture floor reaches runtimes with no
+  // native session-end hook (Codex / Hermes / OpenCode / WorkBuddy / OpenClaw). For per-session stdio
+  // runtimes (Codex/OpenCode/WorkBuddy) the server — and this sweep — launches once per session. For a
+  // GATEWAY-hosted runtime (Hermes runs the server behind a persistent `hermes gateway`) the server boots
+  // once and serves many sessions, so the sweep fires per gateway lifetime, not per session; those
+  // sessions are still captured (idempotently) on the next gateway boot — a known v1 bound, with a
+  // per-turn trigger left for v2. Fire-and-forget AFTER openCore so it never delays the initialize
+  // handshake or a tool call; it is bounded, idempotent, redaction-gated, and never throws. Opt out with
+  // IHOW_CAPTURE_FLOOR=0. (Claude Code keeps its own marker-driven SessionStart floor — not swept here.)
+  if (process.env.IHOW_CAPTURE_FLOOR !== '0') {
+    void runCaptureFloorSweep(core.workspace, {
+      now: Date.now(),
+      reindex: () => core.rebuild(),
+    }).catch(() => {
+      // a capture-floor failure must never disrupt the MCP server it rides on
+    });
+  }
+
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
   rl.on('line', async (line) => {

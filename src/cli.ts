@@ -2082,13 +2082,20 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
   } catch {
     events = [];
   }
-  const appendedAt = (predicate: (actor: string) => boolean): number[] =>
+  const appendedAt = (predicate: (event: (typeof events)[number]) => boolean): number[] =>
     events
-      .filter((e) => e.type === 'memory.journal.appended' && predicate(typeof e.actor === 'string' ? e.actor : ''))
+      .filter((e) => e.type === 'memory.journal.appended' && predicate(e))
       .map((e) => Date.parse(typeof e.at === 'string' ? e.at : ''))
       .filter((n) => !Number.isNaN(n));
-  const cooperativeAt = appendedAt((actor) => actor !== FLOOR_SOURCE_AGENT);
-  const floorAt = appendedAt((actor) => actor === FLOOR_SOURCE_AGENT);
+  // A FLOOR entry must never be mistaken for a cooperative (agent-written) journal. Exclude BOTH this
+  // hook's own floor (actor === FLOOR_SOURCE_AGENT) AND the cross-runtime capture floor's entries
+  // (metadata.floor === true, actor `${runtime}-floor`) — otherwise a Codex/Hermes floor event that lands
+  // in THIS Claude session's window would read as cooperation and silently suppress a legitimate floor.
+  const isFloorEvent = (e: (typeof events)[number]): boolean =>
+    (typeof e.actor === 'string' && e.actor === FLOOR_SOURCE_AGENT) ||
+    (e.metadata as { floor?: unknown } | undefined)?.floor === true;
+  const cooperativeAt = appendedAt((e) => !isFloorEvent(e));
+  const floorAt = appendedAt((e) => typeof e.actor === 'string' && e.actor === FLOOR_SOURCE_AGENT);
 
   const engineConfig = resolveEngineConfig(options);
 
