@@ -945,6 +945,15 @@ export function evaluateAutoPromote(payload: WriteCandidatePayload, opts: { cwd?
 // and "optional async upgrade" never quietly becomes "never happens". Expiry DELETES the entry (it was
 // never trusted) and logs an audit event; it does NOT restore the candidate (that would just re-surface
 // the same un-reviewed item forever). Best-effort: one bad file never aborts the sweep.
+// A durable file's PATH for an AUDIT/return surface. Engine-written paths are always slug-safe, but a file
+// planted OUT-OF-BAND directly in the memory tree can sit under a PII/secret-named path the write-time slug
+// guards never saw. The sweeps below walk the whole tree, so they must not surface such a raw path into an
+// _events event or a returned list — redact a secret-like path for those surfaces (the real fs path is used
+// separately for the actual file op). (red-team r6: expireStaleFlagged / pendingFlaggedReview path leak.)
+function safeAuditPath(relative: string): string {
+  return containsSecretLikeContent(normalizeRef(relative)) ? redactSecretLikeContent(relative) : relative;
+}
+
 const FLAGGED_TTL_DAYS_DEFAULT = 14;
 
 export async function expireStaleFlagged(
@@ -987,13 +996,17 @@ export async function expireStaleFlagged(
     for (const s of stale) {
       try {
         await fs.rm(s.filePath, { force: true });
+        // r6: an out-of-band durable file can sit under a PII/secret-named path the engine never created;
+        // its raw path must not leak into the _events audit log or the returned expired[]. The fs.rm above
+        // uses the real absolute filePath, so deletion is unaffected.
+        const safeRelative = safeAuditPath(s.relative);
         await appendEvent(workspace, {
           type: 'memory.flagged.expired',
-          path: s.relative,
+          path: safeRelative,
           actor: 'flagged-ttl',
           metadata: { ttlDays, promotedAt: s.promotedAt },
         });
-        expired.push(s.relative);
+        expired.push(safeRelative);
       } catch {
         // best-effort — keep sweeping
       }
@@ -1028,7 +1041,9 @@ export async function pendingFlaggedReview(
     } catch {
       continue;
     }
-    if (/^\s*flagged:\s*["']?true\b/im.test(front)) flagged.push(relative);
+    // r6: same out-of-band path-leak class as expireStaleFlagged — the returned sample is surfaced (stop hook),
+    // so a PII/secret-named durable path must be redacted before it leaves this function.
+    if (/^\s*flagged:\s*["']?true\b/im.test(front)) flagged.push(safeAuditPath(relative));
   }
   return { count: flagged.length, sample: flagged.slice(0, limit) };
 }

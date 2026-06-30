@@ -173,3 +173,39 @@ test('promote(): a PII/secret candidate_id in an out-of-band candidate frontmatt
   assert.equal(await anyFileContains(path.join(root, 'r4', 'memory', '_events'), needle), false, 'candidate_id must not reach _events');
   assert.equal(await anyFileContains(path.join(root, 'r4', 'memory', 'scopes'), needle), false, 'candidate_id must not become a durable filename');
 });
+
+// --- r6 red-team Blocker + sibling: durable-tree sweeps must not surface a raw out-of-band PII path ---
+
+import { expireStaleFlagged, pendingFlaggedReview } from '../src/governance.ts';
+
+async function plantFlagged(memoryDir, scopeDir, name, promotedAt) {
+  const dir = path.join(memoryDir, 'scopes', scopeDir);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, `${name}.md`), `---\ntype: "memory"\nstatus: "promoted"\nflagged: true\npromoted_at: "${promotedAt}"\n---\n# clean\n\nclean body\n`);
+}
+
+test('expireStaleFlagged(): an out-of-band PII-named durable path is expired but never logged raw to _events / expired[]', async (t) => {
+  const { root, core } = await managed(t, 'ttlleak');
+  const PII = 'r6-victim@example.test';
+  await plantFlagged(core.workspace.memoryDir, PII, 'old-flagged', '2020-01-01T00:00:00.000Z');
+  const res = await expireStaleFlagged(core.workspace, { now: Date.parse('2026-06-30T00:00:00Z'), ttlDays: 14 });
+  assert.equal(res.expired.length, 1, 'the stale flagged file is still expired (function preserved)');
+  assert.ok(res.expired.every((p) => !p.includes(PII)), 'expired[] must not echo the raw PII path');
+  assert.equal(await anyFileContains(path.join(core.workspace.memoryDir, '_events'), PII), false, 'raw PII path must not reach _events');
+});
+
+test('pendingFlaggedReview(): a surfaced sample never contains a raw out-of-band PII path', async (t) => {
+  const { core } = await managed(t, 'pendleak');
+  const PII = 'r6-victim@example.test';
+  await plantFlagged(core.workspace.memoryDir, PII, 'pending-flagged', '2026-06-29T00:00:00.000Z');
+  const res = await pendingFlaggedReview(core.workspace, 5);
+  assert.equal(res.count, 1, 'the flagged file is still surfaced (function preserved)');
+  assert.ok(res.sample.every((p) => !p.includes(PII)), 'sample[] must not echo the raw PII path');
+});
+
+test('durable-tree sweeps do not over-redact a benign scope path', async (t) => {
+  const { core } = await managed(t, 'sweepok');
+  await plantFlagged(core.workspace.memoryDir, 'work-notes', 'normal-flagged', '2026-06-29T00:00:00.000Z');
+  const res = await pendingFlaggedReview(core.workspace, 5);
+  assert.ok(res.sample.some((p) => p.includes('work-notes')), 'a benign scope path is preserved');
+});
