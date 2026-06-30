@@ -1294,9 +1294,27 @@ async function doctor(
     });
   }
 
+  // When this space opted into semantic (semantic.json present), doctor must evaluate the SAME effective
+  // engine config that connect/setup launch — otherwise it could report a healthy semantic probe beside an
+  // active=fts engine / capabilities.semantic=false (a false-green-adjacent split, red-team r-alpha18).
+  // Merge the persisted engine flags + host into the options used for status AND engineConfig.
+  const semanticCfg = await loadSemanticConfig(workspace);
+  const effectiveOptions = semanticCfg
+    ? {
+        ...options,
+        engine: 'vector',
+        vectorProviderCommand: semanticCfg.vectorProviderCommand,
+        vectorModel: semanticCfg.vectorModel,
+        vectorTimeoutMs: semanticCfg.vectorTimeoutMs,
+      }
+    : options;
+  // The spawned sidecar reads OLLAMA_HOST from env; point the readiness probe at the CONFIGURED host so
+  // doctor's capabilities.semantic reflects what the runtime sidecar will actually talk to.
+  if (semanticCfg) process.env.OLLAMA_HOST = semanticCfg.host;
+
   if (nodeOk && sqliteStatus.ok && writable) {
     try {
-      const core = await openCore(options);
+      const core = await openCore(effectiveOptions);
       status = (await core.status()) as unknown as Record<string, unknown>;
     } catch (error) {
       checks.push({
@@ -1310,7 +1328,7 @@ async function doctor(
     }
   }
 
-  const engineConfig = resolveEngineConfig(options);
+  const engineConfig = resolveEngineConfig(effectiveOptions);
   if (status) {
     const provider = status.provider as Record<string, unknown>;
     const index = status.index as Record<string, unknown>;
@@ -1338,23 +1356,24 @@ async function doctor(
     // Opt-in semantic health: only when this space has enable-semantic on (semantic.json present). The
     // lane is ADDITIVE — a down/unpulled provider degrades to the FTS floor, so it is a WARNING, never a
     // doctor failure (required:false). Absent the opt-in, no check is emitted at all.
-    const semantic = await loadSemanticConfig(workspace);
-    if (semantic) {
-      const probe = await detectOllama({ host: semantic.host, model: semantic.vectorModel, timeoutMs: 4000 });
-      const healthy = probe.reachable && probe.hasModel;
+    if (semanticCfg) {
+      // Real embed probe (canEmbed), not just /api/tags presence — same gate enable-semantic uses, so the
+      // check can't be fooled by a tags-only stub. Probes the CONFIGURED host (OLLAMA_HOST set above).
+      const probe = await detectOllama({ host: semanticCfg.host, model: semanticCfg.vectorModel, timeoutMs: 4000 });
+      const healthy = probe.canEmbed;
       checks.push({
         name: 'semantic',
         ok: healthy,
         detail: healthy
-          ? `enabled · Ollama ${semantic.host} · model ${semantic.vectorModel} (reachable)`
+          ? `enabled · Ollama ${semanticCfg.host} · model ${semanticCfg.vectorModel} (embeds, ${probe.dims}-dim)`
           : probe.reachable
-            ? `enabled · Ollama ${semantic.host} up but model "${semantic.vectorModel}" not pulled → search falls back to FTS`
-            : `enabled · Ollama ${semantic.host} unreachable (${probe.error}) → search falls back to FTS`,
+            ? `enabled · Ollama ${semanticCfg.host} up but cannot embed with "${semanticCfg.vectorModel}" (${probe.error}) → search falls back to FTS`
+            : `enabled · Ollama ${semanticCfg.host} unreachable (${probe.error}) → search falls back to FTS`,
         hint: healthy
           ? undefined
           : probe.reachable
-            ? `ollama pull ${semantic.vectorModel}`
-            : `start Ollama at ${semantic.host}, or run: ihow-memory disable-semantic`,
+            ? `ollama pull ${semanticCfg.vectorModel} (or confirm a working Ollama at ${semanticCfg.host})`
+            : `start Ollama at ${semanticCfg.host}, or run: ihow-memory disable-semantic`,
         severity: healthy ? 'info' : 'warning',
         required: false, // additive lane — provider down is a WARNING, never a doctor failure
       });
@@ -3007,10 +3026,13 @@ async function main(): Promise<void> {
       const i = argv.indexOf(name);
       return i >= 0 ? argv[i + 1] : undefined;
     };
-    const host = flag('--host') || DEFAULT_OLLAMA_HOST;
+    // Host precedence mirrors the sidecar's own (OLLAMA_HOST env, else localhost); whatever we PROBE is
+    // persisted and propagated to the runtime sidecar via the server (--vector-host → OLLAMA_HOST), so the
+    // probe host and the runtime host are always the same.
+    const host = flag('--host') || process.env.OLLAMA_HOST || DEFAULT_OLLAMA_HOST;
     const model = flag('--model') || options.vectorModel || DEFAULT_EMBED_MODEL;
-    // Verify the provider is actually usable BEFORE persisting the opt-in — never enable a lane that
-    // would only fall back. detectOllama never throws; we branch on its honest result.
+    // Verify the provider can ACTUALLY embed BEFORE persisting the opt-in — never enable a lane that would
+    // only fall back. detectOllama does a real /api/embeddings call; we branch on its honest result.
     const probe = await detectOllama({ host, model });
     if (!probe.reachable) {
       const hint = `Start a local Ollama (https://ollama.com) reachable at ${host}, run \`ollama pull ${model}\`, then re-run enable-semantic. Default search stays lexical FTS5 until then.`;
@@ -3022,26 +3044,29 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    if (!probe.hasModel) {
-      const hint = `Pull the embedding model once: \`ollama pull ${model}\`, then re-run enable-semantic.`;
-      if (options.json) printJson({ ok: false, error: 'model_not_pulled', host, model, models: probe.models, hint });
+    if (!probe.canEmbed) {
+      // Reachable but cannot embed: either the model isn't pulled, or this isn't a working Ollama
+      // embeddings endpoint (a /api/tags-only stub passes reachability but fails the real embed call).
+      const error = probe.hasModel ? 'embeddings_failed' : 'model_not_pulled';
+      const hint = probe.hasModel
+        ? `${host} answered /api/tags but a real embedding call failed (${probe.error}). Confirm this is a working Ollama with model "${model}".`
+        : `Pull the embedding model once: \`ollama pull ${model}\`, then re-run enable-semantic.`;
+      if (options.json) printJson({ ok: false, error, host, model, models: probe.models, detail: probe.error, hint });
       else {
-        console.error(`enable-semantic: Ollama is up at ${host} but the embedding model "${model}" is not pulled.`);
+        console.error(`enable-semantic: ${host} is reachable but cannot embed with "${model}" (${probe.error}).`);
         console.error(`  ${hint}`);
       }
       process.exitCode = 1;
       return;
     }
     const target = await writeSemanticConfig(workspace, buildSemanticConfig({ host, model, enabledAt: new Date().toISOString() }));
-    const customHost = host !== DEFAULT_OLLAMA_HOST;
     if (options.json) {
-      printJson({ ok: true, enabled: true, space: workspace.space, host, model, config: target, engine: 'vector', applies: 'after re-running setup/connect and restarting the runtime', customHostNote: customHost ? 'export OLLAMA_HOST in the runtime environment that launches the MCP server' : undefined });
+      printJson({ ok: true, enabled: true, space: workspace.space, host, model, embeddingDims: probe.dims, config: target, engine: 'vector', applies: 'after re-running setup/connect and restarting the runtime' });
     } else {
       console.log(`✓ semantic enabled for space "${workspace.space}" → ${target}`);
-      console.log(`  provider: local Ollama ${host} · model ${model} (spawned sidecar; ADDITIVE — search falls back to FTS if it is down)`);
+      console.log(`  provider: local Ollama ${host} · model ${model} (verified: ${probe.dims}-dim embedding · spawned sidecar; ADDITIVE — search falls back to FTS if it is down)`);
       console.log('  apply: re-run `ihow-memory setup` (or `connect` for your runtime) so the server launches with the semantic engine, then restart the runtime.');
       console.log('  reverse anytime: ihow-memory disable-semantic');
-      if (customHost) console.log('  note: custom host — also export OLLAMA_HOST in the environment that launches the MCP server (the spawned sidecar reads it from env).');
     }
     return;
   }

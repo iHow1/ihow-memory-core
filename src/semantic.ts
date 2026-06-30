@@ -12,7 +12,7 @@ import fs from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Workspace } from './types.ts';
-import { providerScriptPath } from './provider-path.ts';
+import { BUNDLED_PROVIDERS, providerScriptPath } from './provider-path.ts';
 
 export const DEFAULT_OLLAMA_HOST = 'http://localhost:11434';
 export const DEFAULT_EMBED_MODEL = 'nomic-embed-text';
@@ -31,6 +31,16 @@ export function semanticConfigPath(workspace: Workspace): string {
   return path.join(workspace.spaceDir, '.runtime', 'semantic.json');
 }
 
+// A persisted marker is only honored if its command points at OUR bundled sidecar — never an arbitrary
+// executable. The engine spawns vectorProviderCommand, so a tampered local marker must not be able to
+// turn enable-semantic wiring into arbitrary-command execution (red-team r-alpha18 minor). Location-
+// independent: we match the bundled provider filename under a providers/ segment, and reject shell
+// command-chaining / substitution metacharacters defensively (the engine spawns without a shell anyway).
+function isBundledProviderCommand(cmd: string): boolean {
+  if (/[;&|`]|\$\(/.test(cmd)) return false;
+  return BUNDLED_PROVIDERS.some((name) => cmd.includes(`providers/${name}`) || cmd.includes(`providers\\${name}`));
+}
+
 function coerce(raw: string): SemanticConfig | null {
   try {
     const cfg = JSON.parse(raw);
@@ -38,7 +48,8 @@ function coerce(raw: string): SemanticConfig | null {
       cfg &&
       cfg.engine === 'vector' &&
       typeof cfg.vectorProviderCommand === 'string' &&
-      cfg.vectorProviderCommand.trim()
+      cfg.vectorProviderCommand.trim() &&
+      isBundledProviderCommand(cfg.vectorProviderCommand)
     ) {
       return {
         engine: 'vector',
@@ -85,11 +96,15 @@ export async function writeSemanticConfig(workspace: Workspace, cfg: SemanticCon
 export function semanticEngineArgs(workspace: Workspace): string[] {
   const cfg = loadSemanticConfigSync(workspace);
   if (!cfg) return [];
+  // --vector-host carries the CONFIGURED host so the server can export OLLAMA_HOST for the spawned
+  // sidecar — deterministic propagation, so the runtime sidecar talks to the SAME host enable-semantic
+  // probed (no recorded-but-unpropagated host → no configured-healthy-but-runtime-degraded split).
   return [
     '--engine', 'vector',
     '--vector-provider-command', cfg.vectorProviderCommand,
     '--vector-model', cfg.vectorModel,
     '--vector-timeout-ms', String(cfg.vectorTimeoutMs),
+    '--vector-host', cfg.host,
   ];
 }
 
@@ -123,28 +138,68 @@ export function buildSemanticConfig(
   };
 }
 
-// Probe a local Ollama daemon: GET <host>/api/tags. Returns reachability + whether the embed model is
-// already pulled. Never throws — an unreachable daemon is a normal (reportable) state, not an error.
+// Probe a local Ollama daemon. Two steps, because /api/tags is NOT proof of embeddability — a non-Ollama
+// server (or a stub) can return 200 with the model name and still have no working /api/embeddings (red-team
+// r-alpha18 blocker). The REAL gate is `canEmbed`: an actual POST /api/embeddings that returns a non-empty
+// numeric vector for the selected model. `hasModel` (from /api/tags) is kept only for better diagnostics.
+// Never throws — an unreachable daemon is a normal, reportable state.
 export async function detectOllama(
   opts: { host?: string; model?: string; timeoutMs?: number } = {},
-): Promise<{ reachable: boolean; host: string; model: string; models: string[]; hasModel: boolean; error?: string }> {
-  const host = opts.host || DEFAULT_OLLAMA_HOST;
+): Promise<{
+  reachable: boolean;
+  host: string;
+  model: string;
+  models: string[];
+  hasModel: boolean;
+  canEmbed: boolean;
+  dims?: number;
+  error?: string;
+}> {
+  const host = (opts.host || DEFAULT_OLLAMA_HOST).replace(/\/+$/, '');
   const model = opts.model || DEFAULT_EMBED_MODEL;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs || 4000);
-  try {
-    const res = await fetch(`${host.replace(/\/+$/, '')}/api/tags`, { signal: ctrl.signal });
-    if (!res.ok) return { reachable: false, host, model, models: [], hasModel: false, error: `http_${res.status}` };
-    const json = (await res.json()) as { models?: Array<{ name?: unknown }> };
-    const models = Array.isArray(json?.models)
-      ? json.models.map((m) => String(m?.name || '')).filter(Boolean)
-      : [];
-    // Ollama tags look like "nomic-embed-text:latest" — match the base name or an explicit tag.
-    const hasModel = models.some((m) => m === model || m.startsWith(`${model}:`));
-    return { reachable: true, host, model, models, hasModel };
-  } catch (err) {
-    return { reachable: false, host, model, models: [], hasModel: false, error: (err as Error).message };
-  } finally {
-    clearTimeout(timer);
+
+  // Step 1 — reachability + tag list (for clearer error messages only).
+  let reachable = false;
+  let models: string[] = [];
+  let hasModel = false;
+  {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs || 4000);
+    try {
+      const res = await fetch(`${host}/api/tags`, { signal: ctrl.signal });
+      if (!res.ok) return { reachable: false, host, model, models: [], hasModel: false, canEmbed: false, error: `tags_http_${res.status}` };
+      reachable = true;
+      const json = (await res.json()) as { models?: Array<{ name?: unknown }> };
+      models = Array.isArray(json?.models) ? json.models.map((m) => String(m?.name || '')).filter(Boolean) : [];
+      hasModel = models.some((m) => m === model || m.startsWith(`${model}:`));
+    } catch (err) {
+      return { reachable: false, host, model, models: [], hasModel: false, canEmbed: false, error: (err as Error).message };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Step 2 — the REAL gate: a genuine embedding call against the selected model.
+  {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs || 8000);
+    try {
+      const res = await fetch(`${host}/api/embeddings`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, prompt: 'ihow-memory enable-semantic probe' }),
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return { reachable, host, model, models, hasModel, canEmbed: false, error: `embeddings_http_${res.status}` };
+      const json = (await res.json()) as { embedding?: unknown };
+      const vec = json?.embedding;
+      const ok = Array.isArray(vec) && vec.length > 0 && vec.every((n) => typeof n === 'number' && Number.isFinite(n));
+      if (!ok) return { reachable, host, model, models, hasModel, canEmbed: false, error: 'empty_or_non_numeric_embedding' };
+      return { reachable, host, model, models, hasModel, canEmbed: true, dims: (vec as number[]).length };
+    } catch (err) {
+      return { reachable, host, model, models, hasModel, canEmbed: false, error: (err as Error).message };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

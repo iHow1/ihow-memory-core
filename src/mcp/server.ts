@@ -173,7 +173,13 @@ const TOOL_DEFINITIONS = [
 ] as const;
 
 async function main(): Promise<void> {
-  const core = await openCore(parseWorkspaceArgs(process.argv.slice(2)));
+  const argv = process.argv.slice(2);
+  // Opt-in semantic host propagation: mcpServerSpec injects --vector-host (the host enable-semantic
+  // probed). The embedding sidecar reads OLLAMA_HOST from env, so export it here — deterministically, so
+  // the runtime sidecar talks to the SAME host that was verified, not a silent localhost default.
+  const hostIndex = argv.indexOf('--vector-host');
+  if (hostIndex >= 0 && argv[hostIndex + 1]) process.env.OLLAMA_HOST = argv[hostIndex + 1];
+  const core = await openCore(parseWorkspaceArgs(argv));
 
   // Cross-runtime capture FLOOR (automation v2.1). The MCP server is the one touchpoint EVERY connected
   // runtime shares, so its startup is where the deterministic capture floor reaches runtimes with no

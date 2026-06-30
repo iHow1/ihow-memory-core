@@ -2,21 +2,26 @@
 // Copyright (c) 2026 iHow Memory
 //
 // Opt-in semantic engine (alpha.18). Turning semantic ON is explicit, per-space, reversible, and
-// ADDITIVE. These tests lock the invariants WITHOUT requiring a real Ollama (CI has none):
-//   (1) DEFAULT is FTS5 — no semantic.json ⇒ mcpServerSpec injects NOTHING (capabilities.semantic stays
-//       false). This is the moat red line: semantic never leaks into the default binary.
-//   (2) enable-semantic REFUSES when the provider is unreachable — it never persists a lane that would
-//       only fall back (probed against a closed port; exits non-zero; writes no semantic.json).
-//   (3) when semantic.json IS present, the server args carry the vector lane pointing at the BUNDLED
-//       sidecar; disable-semantic reverses it.
-//   (4) doctor treats a configured-but-down provider as a WARNING, never a failure (additive lane).
+// ADDITIVE. These tests lock the invariants — including the red-team r-alpha18 fixes — WITHOUT a real
+// Ollama (a local node:http stub stands in for the daemon):
+//   (1) DEFAULT is FTS5 — no semantic.json ⇒ mcpServerSpec injects NOTHING (capabilities.semantic false).
+//   (2) enable-semantic REFUSES unless a REAL embedding call succeeds — a /api/tags-only stub (200 with
+//       the model name but no working /api/embeddings) must NOT enable (blocker fix).
+//   (3) against a stub that actually embeds, enable persists + injects the vector lane incl. --vector-host
+//       (host propagation fix), pointing at the BUNDLED sidecar; disable reverses it.
+//   (4) a TAMPERED marker (command not the bundled sidecar) is rejected on load (marker-validation fix).
+//   (5) doctor treats a configured-but-down provider as a WARNING, never a failure.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import http from 'node:http';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+
+const execFileAsync = promisify(execFile);
 import { resolveWorkspace, ensureWorkspace } from '../src/workspace.ts';
 import {
   buildSemanticConfig,
@@ -29,88 +34,141 @@ import {
 } from '../src/semantic.ts';
 
 const CLI = fileURLToPath(new URL('../bin/ihow-memory.mjs', import.meta.url));
-// A host that is essentially guaranteed to refuse instantly — a closed port on loopback.
-const DEAD_HOST = 'http://127.0.0.1:9';
+const DEAD_HOST = 'http://127.0.0.1:9'; // closed loopback port — refuses instantly
 
-function runCli(home, args) {
-  const env = { ...process.env, IHOW_MEMORY_HOME: home, IHOW_MEMORY_STATE_ROOT: path.join(home, '.state') };
+// A fake Ollama. mode 'embed' serves /api/tags AND /api/embeddings (a real vector); mode 'tags-only'
+// serves /api/tags with the model but 404s /api/embeddings (the blocker repro).
+async function fakeOllama(mode, model = 'nomic-embed-text') {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/api/tags') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ models: [{ name: `${model}:latest` }] }));
+      return;
+    }
+    if (req.url === '/api/embeddings' && mode === 'embed') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ embedding: Array.from({ length: 8 }, (_, i) => (i + 1) / 10) }));
+      return;
+    }
+    res.writeHead(404);
+    res.end('not found');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return { host: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) };
+}
+
+// ASYNC on purpose: the fake Ollama http server runs in THIS test process's event loop, so the CLI must
+// run without blocking it (execFileSync would freeze the loop and the stub could never answer).
+async function runCli(home, args, extraEnv = {}) {
+  const env = { ...process.env, IHOW_MEMORY_HOME: home, IHOW_MEMORY_STATE_ROOT: path.join(home, '.state'), ...extraEnv };
   try {
-    return { code: 0, stdout: execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env }), stderr: '' };
+    const { stdout, stderr } = await execFileAsync(process.execPath, [CLI, ...args], { encoding: 'utf8', env });
+    return { code: 0, stdout, stderr };
   } catch (err) {
-    return { code: err.status ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
+    return { code: err.code ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
   }
 }
 const ws = (home, space) => resolveWorkspace({ root: home, stateRoot: path.join(home, '.state'), space });
+const tmpHome = (t) => fs.mkdtemp(path.join(os.tmpdir(), 'ihow-sem-')).then((home) => {
+  t.after(async () => { await fs.rm(home, { recursive: true, force: true }); });
+  return home;
+});
 
 test('RED LINE: no semantic.json ⇒ mcpServerSpec injects nothing (default stays zero-dependency FTS5)', async (t) => {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-sem-'));
-  t.after(async () => { await fs.rm(home, { recursive: true, force: true }); });
+  const home = await tmpHome(t);
   const workspace = await ensureWorkspace(ws(home, 'demo'));
   assert.deepEqual(semanticEngineArgs(workspace), [], 'default workspace has no semantic engine args');
 });
 
 test('enable-semantic REFUSES an unreachable provider — exits non-zero, persists nothing', async (t) => {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-sem-'));
-  t.after(async () => { await fs.rm(home, { recursive: true, force: true }); });
-  const r = runCli(home, ['enable-semantic', '--space', 'demo', '--host', DEAD_HOST]);
-  assert.notEqual(r.code, 0, 'non-zero exit when Ollama is unreachable');
+  const home = await tmpHome(t);
+  const r = await runCli(home, ['enable-semantic', '--space', 'demo', '--host', DEAD_HOST]);
+  assert.notEqual(r.code, 0, 'non-zero when Ollama is unreachable');
   assert.match(r.stderr, /not reachable/i);
-  const workspace = ws(home, 'demo');
-  assert.equal(await loadSemanticConfig(workspace), null, 'no semantic.json written on failure');
-  assert.deepEqual(semanticEngineArgs(workspace), [], 'and therefore no injected engine args');
+  assert.equal(await loadSemanticConfig(ws(home, 'demo')), null, 'no semantic.json written on failure');
 });
 
-test('persisted semantic config injects the vector lane pointing at the bundled sidecar; disable reverses it', async (t) => {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-sem-'));
-  t.after(async () => { await fs.rm(home, { recursive: true, force: true }); });
-  const workspace = await ensureWorkspace(ws(home, 'demo'));
+test('BLOCKER FIX: a /api/tags-only stub (no working embeddings) does NOT enable semantic', async (t) => {
+  const home = await tmpHome(t);
+  const fake = await fakeOllama('tags-only');
+  t.after(() => fake.close());
+  const r = await runCli(home, ['enable-semantic', '--space', 'demo', '--host', fake.host, '--json']);
+  assert.notEqual(r.code, 0, 'tags-only stub cannot embed → refuse');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.ok, false);
+  assert.equal(out.error, 'embeddings_failed', 'reports the failed real embed call, not a tags pass');
+  assert.equal(await loadSemanticConfig(ws(home, 'demo')), null, 'no semantic.json persisted for a fall-back-only lane');
+});
 
-  // buildSemanticConfig points at the bundled sidecar (dist/providers), with the chosen host/model.
+test('enable-semantic SUCCEEDS against a real embedder; injects the vector lane incl. --vector-host; disable reverses', async (t) => {
+  const home = await tmpHome(t);
+  const fake = await fakeOllama('embed');
+  t.after(() => fake.close());
+  const r = await runCli(home, ['enable-semantic', '--space', 'demo', '--host', fake.host, '--json']);
+  assert.equal(r.code, 0, 'a working embedder enables');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.ok, true);
+  assert.equal(out.host, fake.host);
+  assert.equal(out.embeddingDims, 8, 'reports the verified embedding dimensionality');
+
+  const workspace = ws(home, 'demo');
+  const cfg = await loadSemanticConfig(workspace);
+  assert.equal(cfg?.host, fake.host);
+  assert.match(cfg.vectorProviderCommand, /dist\/providers\/ollama-embedding-provider\.mjs/, 'points at the bundled sidecar');
+
+  const args = semanticEngineArgs(workspace);
+  assert.equal(args[args.indexOf('--engine') + 1], 'vector');
+  assert.equal(args[args.indexOf('--vector-host') + 1], fake.host, 'host is propagated to the server (→ sidecar OLLAMA_HOST)');
+  assert.equal(args[args.indexOf('--vector-model') + 1], 'nomic-embed-text');
+
+  assert.equal((await runCli(home, ['disable-semantic', '--space', 'demo'])).code, 0);
+  assert.equal(await loadSemanticConfig(workspace), null, 'disable removes the marker');
+  assert.deepEqual(semanticEngineArgs(workspace), [], 'default FTS restored');
+});
+
+test('MARKER VALIDATION: a tampered semantic.json (command not the bundled sidecar) is rejected on load', async (t) => {
+  const home = await tmpHome(t);
+  const workspace = await ensureWorkspace(ws(home, 'demo'));
+  const p = semanticConfigPath(workspace);
+  await fs.mkdir(path.dirname(p), { recursive: true });
+  await fs.writeFile(p, JSON.stringify({ engine: 'vector', vectorProviderCommand: '/bin/sh -c "curl evil"', vectorModel: 'x', host: 'http://localhost:11434', vectorTimeoutMs: 20000 }), 'utf8');
+  assert.equal(await loadSemanticConfig(workspace), null, 'a non-bundled command is not honored');
+  assert.deepEqual(semanticEngineArgs(workspace), [], 'and never injected into the spawned server args');
+});
+
+test('buildSemanticConfig points at the bundled sidecar with the chosen host/model', () => {
   const cfg = buildSemanticConfig({ host: 'http://localhost:11434', model: 'nomic-embed-text' });
   assert.equal(cfg.engine, 'vector');
   assert.match(cfg.vectorProviderCommand, /dist\/providers\/ollama-embedding-provider\.mjs/);
   assert.equal(cfg.vectorModel, 'nomic-embed-text');
-
-  // Persist directly (bypassing the live Ollama probe) and assert the injection + round-trip.
-  await writeSemanticConfig(workspace, cfg);
-  const loaded = await loadSemanticConfig(workspace);
-  assert.equal(loaded?.engine, 'vector');
-  const args = semanticEngineArgs(workspace);
-  assert.ok(args.includes('--engine') && args[args.indexOf('--engine') + 1] === 'vector', 'injects --engine vector');
-  assert.ok(args.includes('--vector-provider-command'), 'injects the provider command');
-  assert.equal(args[args.indexOf('--vector-model') + 1], 'nomic-embed-text');
-
-  // disable-semantic removes the marker → back to default FTS (no args).
-  const r = runCli(home, ['disable-semantic', '--space', 'demo']);
-  assert.equal(r.code, 0);
-  assert.equal(await loadSemanticConfig(workspace), null, 'semantic.json removed');
-  assert.deepEqual(semanticEngineArgs(workspace), [], 'default FTS restored');
-  // removeSemanticConfig is idempotent (already off ⇒ false, no throw).
-  assert.equal(await removeSemanticConfig(workspace), false);
 });
 
-test('detectOllama reports an unreachable daemon honestly (never throws)', async () => {
-  const probe = await detectOllama({ host: DEAD_HOST, timeoutMs: 1500 });
-  assert.equal(probe.reachable, false);
-  assert.equal(probe.hasModel, false);
-  assert.ok(typeof probe.error === 'string' && probe.error.length > 0);
+test('detectOllama: real embed probe — unreachable is honest, a real embedder reports canEmbed + dims', async (t) => {
+  const down = await detectOllama({ host: DEAD_HOST, timeoutMs: 1500 });
+  assert.equal(down.reachable, false);
+  assert.equal(down.canEmbed, false);
+  assert.ok(typeof down.error === 'string' && down.error.length > 0);
+
+  const fake = await fakeOllama('embed');
+  t.after(() => fake.close());
+  const up = await detectOllama({ host: fake.host });
+  assert.equal(up.reachable, true);
+  assert.equal(up.canEmbed, true);
+  assert.equal(up.dims, 8);
 });
 
 test('doctor: a configured-but-down semantic provider is a WARNING, never a failure (additive lane)', async (t) => {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-sem-'));
-  t.after(async () => { await fs.rm(home, { recursive: true, force: true }); });
+  const home = await tmpHome(t);
   const workspace = await ensureWorkspace(ws(home, 'demo'));
-  // Enable semantic pointing at a dead host (write directly — the doctor probe will find it down).
   await writeSemanticConfig(workspace, buildSemanticConfig({ host: DEAD_HOST, model: 'nomic-embed-text' }));
-  assert.ok(await fs.stat(semanticConfigPath(workspace)).then(() => true), 'semantic.json present');
 
-  const r = runCli(home, ['doctor', '--space', 'demo', '--json']);
+  const r = await runCli(home, ['doctor', '--space', 'demo', '--json']);
   const report = JSON.parse(r.stdout);
   const semantic = report.checks.find((c) => c.name === 'semantic');
   assert.ok(semantic, 'doctor emits a semantic check when enabled');
   assert.equal(semantic.ok, false, 'down provider is not ok');
   assert.equal(semantic.required, false, 'but it is NOT a required check');
-  assert.match(semantic.detail, /falls back to FTS/i, 'detail says search degrades to FTS');
+  assert.match(semantic.detail, /falls back to FTS/i);
   assert.equal(report.ok, true, 'doctor still passes overall — semantic is additive, not load-bearing');
-  assert.equal(r.code, 0, 'doctor exits 0 despite the down semantic provider');
+  assert.equal(r.code, 0);
 });
