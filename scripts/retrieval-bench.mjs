@@ -23,6 +23,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { openCore } from '../src/core.ts';
 
 // ── Fixture: in-repo, representative, labeled. Each doc has a stable `id` used as its scope, so a
@@ -95,26 +96,97 @@ function pathMatchesDoc(resultPath, docId) {
   return resultPath.includes(`/scopes/${docId}/`);
 }
 
+// Invoke a vector provider's `index` method directly over its one-shot stdio protocol (identical to
+// src/engine/retrieval.ts → VectorProcessEngine.callProvider), with NO timeout cap. Used only to warm
+// the sidecar before the measured search run — see the call site for why the engine's capped rebuild()
+// can't do this for a slow real model. Returns the provider's reported indexed-doc count.
+function buildSidecarDirect(providerCommand, workspace, vectorModel) {
+  const parts = providerCommand.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((p) => p.replace(/^["']|["']$/g, '')) || [];
+  const [command, ...baseArgs] = parts;
+  if (!command) throw new Error('buildSidecarDirect: empty provider command');
+  const request = {
+    method: 'index',
+    workspace: {
+      root: workspace.root,
+      space: workspace.space,
+      memoryDir: workspace.memoryDir,
+      indexPath: workspace.indexPath,
+      indexManifestPath: workspace.indexManifestPath,
+    },
+    provider: { id: 'vector-gguf', model: vectorModel || null },
+  };
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, [...baseArgs, 'index'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c) => (stdout += String(c)));
+    child.stderr.on('data', (c) => (stderr += String(c)));
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`provider_index_exit_${code}:${stderr.trim().slice(0, 200)}`));
+      try {
+        resolve(JSON.parse(stdout.trim() || '{}'));
+      } catch {
+        reject(new Error('provider_index_invalid_json'));
+      }
+    });
+    child.stdin.end(`${JSON.stringify(request)}\n`);
+  });
+}
+
 // Run the benchmark against the DEFAULT FTS5 engine. Returns the full scorecard (no console output),
 // so tests can assert on it and the CLI can render it.
-export async function runRetrievalBench({ fixture = FIXTURE } = {}) {
+//
+// `engineOptions` lets the semantic-comparison path (below) seed the SAME fixture through the SAME
+// write→promote→search code with a vector provider wired in. When omitted, this is the published
+// zero-dependency FTS5 floor and the asserts below pin that (id=fts, no cloud, no model).
+export async function runRetrievalBench({ fixture = FIXTURE, engineOptions = null } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-retrieval-bench-'));
   const space = 'bench';
-  // Explicit engine:'fts' — the shipped default. No vector provider configured: this is the
-  // zero-dependency floor exactly as published.
-  const core = await openCore({ root, space, engine: 'fts' });
+  const semanticMode = engineOptions != null;
   try {
-    // Seed the corpus through the real write -> promote path (same as the product). Promote scope =
-    // doc id, so hits are matchable. --no-auto-promote equivalent: stage candidate, then promote.
+    // Seed the corpus through the real write -> promote path (same as the product), on a FAST FTS-only
+    // core. Promote scope = doc id, so hits are matchable. Seeding with FTS avoids re-running the vector
+    // provider's index after EVERY one of the 40 write/promote ops — which against a real network model
+    // is minutes of redundant work. The semantic lane is then attached and indexed ONCE below, so the
+    // measured search path is still the exact product path (FTS floor + vector lane, RRF-fused).
+    const seedCore = await openCore({ root, space, engine: 'fts' });
     for (const doc of fixture.docs) {
-      const cand = await core.write_candidate({ text: doc.text, autoPromote: false });
-      await core.promote(cand.path, { scope: doc.id, title: doc.id });
+      const cand = await seedCore.write_candidate({ text: doc.text, autoPromote: false });
+      await seedCore.promote(cand.path, { scope: doc.id, title: doc.id });
+    }
+
+    // In semantic mode, re-open the SAME workspace with the vector engine and build its index ONCE.
+    const core = semanticMode ? await openCore({ root, space, ...engineOptions }) : seedCore;
+    if (semanticMode) {
+      // Build the vector sidecar by invoking the provider's `index` method DIRECTLY (the same one-shot
+      // stdio protocol the engine uses), with NO timeout cap. WHY bypass core.rebuild() here: the engine
+      // applies a single `vectorTimeoutMs` (hard-capped at 30s) to EVERY provider call, including the
+      // long index op. A REAL local embedding model serializes requests, so indexing even ~20 docs can
+      // exceed 30s → the engine SIGTERMs index, the sidecar is never written, and search silently
+      // degrades to FTS-only (a measured 2/5 paraphrase no-op that masquerades as "the lane ran").
+      // Building the sidecar here, uncapped, means the SEARCH + RRF FUSION we then measure is still the
+      // exact real engine path (`core.search` → searchWithEngineFallback → fuseRrf) reading the same
+      // sidecar the engine would. Only the one-time index latency is taken off the engine's stopwatch.
+      // (The architecture-proof oracle indexes in milliseconds, so this is a no-op for it.)
+      //
+      // BEST-EFFORT: a provider that can't even index (broken command, unreachable service) is exactly
+      // the case the honesty guard must catch — don't crash here. Fall back to the engine's own capped
+      // rebuild(); the downstream `semanticActive` check then correctly reports ran:false and no gain.
+      try {
+        await buildSidecarDirect(engineOptions.vectorProviderCommand, core.workspace, engineOptions.vectorModel);
+      } catch {
+        await core.rebuild();
+      }
     }
 
     const status = await core.status();
-    if (status.provider.id !== 'fts') throw new Error(`expected default fts engine, got ${status.provider.id}`);
-    if (status.provider.cloud !== false) throw new Error('default engine must be local / no-cloud');
-    if (status.provider.model !== null) throw new Error('default engine must not use a model');
+    if (!semanticMode) {
+      // Default-floor invariants — only assert these when NO provider was wired in.
+      if (status.provider.id !== 'fts') throw new Error(`expected default fts engine, got ${status.provider.id}`);
+      if (status.provider.cloud !== false) throw new Error('default engine must be local / no-cloud');
+      if (status.provider.model !== null) throw new Error('default engine must not use a model');
+    }
 
     const perQuery = [];
     let reciprocalRankSum = 0;
@@ -162,7 +234,16 @@ export async function runRetrievalBench({ fixture = FIXTURE } = {}) {
     }
 
     return {
-      engine: { id: status.provider.id, cloud: status.provider.cloud, model: status.provider.model },
+      engine: {
+        id: status.provider.id,
+        cloud: status.provider.cloud,
+        model: status.provider.model,
+        // True only when a semantic provider is the active engine AND ready (not a silent FTS fallback).
+        // The semantic-comparison path uses this to refuse to report a gain from a lane that never ran.
+        semanticActive: status.provider.id === 'vector-gguf' && status.provider.ready === true && status.provider.fallback !== true,
+        fallback: status.provider.fallback === true,
+        lastError: status.provider.lastError,
+      },
       fixture: { source: fixture.source, docs: fixture.docs.length, queries: n, topics: new Set(fixture.docs.map((d) => d.id)).size },
       metrics: {
         recall_at_5: round(hitAt5 / n),
@@ -176,6 +257,137 @@ export async function runRetrievalBench({ fixture = FIXTURE } = {}) {
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+}
+
+// ── Semantic-lane comparison ──────────────────────────────────────────────────────────────────────
+// Runs the SAME fixture twice on the SAME write→promote→search engine path: once with the DEFAULT
+// FTS5-only floor, once with the OPT-IN vector lane wired in (FTS5 + semantic, RRF-fused). Returns a
+// side-by-side delta — most importantly on the PARAPHRASE battery, the known FTS floor where queries
+// share no surface tokens with the answer. This is the honest "does the semantic lane actually lift
+// paraphrase recall?" measurement on a labeled fixture.
+//
+// HONESTY CONTRACT (enforced, not advisory):
+//   - `proofKind` MUST be declared by the caller and is echoed into the result so a reader can never
+//     mistake an architecture demo for a model benchmark:
+//       'real-model'        → numbers came from a REAL learned embedding model (e.g. nomic-embed-text
+//                             via the ollama sidecar). The paraphrase gain is a genuine quality signal.
+//       'architecture-proof' → numbers came from the controlled synonym-oracle sidecar. The gain proves
+//                             the WIRING (RRF pulls a true-synonym doc into top-K), NOT model quality.
+//   - If the provider never actually ran (unreachable Ollama, bad command), the semantic engine reports
+//     a silent FTS fallback. We DETECT that (`semanticActive===false`) and refuse to claim a gain —
+//     `ran:false` is returned so the CLI/README shows "lane did not run" instead of a fake delta.
+export async function runSemanticComparison({
+  fixture = FIXTURE,
+  vectorProviderCommand,
+  vectorModel = null,
+  vectorTimeoutMs = 30000,
+  proofKind, // 'real-model' | 'architecture-proof'  (required — no silent default)
+} = {}) {
+  if (!vectorProviderCommand) throw new Error('runSemanticComparison: vectorProviderCommand is required');
+  if (proofKind !== 'real-model' && proofKind !== 'architecture-proof') {
+    throw new Error("runSemanticComparison: proofKind must be 'real-model' or 'architecture-proof' (honesty label)");
+  }
+
+  const ftsOnly = await runRetrievalBench({ fixture });
+  const fused = await runRetrievalBench({
+    fixture,
+    engineOptions: { engine: 'vector', vectorProviderCommand, vectorModel, vectorTimeoutMs },
+  });
+
+  // Did the semantic lane actually run? If the sidecar fell back to FTS, the two runs would be
+  // identical and any "gain" would be a lie — surface that explicitly instead.
+  const ran = fused.engine.semanticActive === true;
+
+  const round = (x) => Math.round(x * 1000) / 1000;
+  const kinds = [...new Set(fixture.queries.map((q) => q.kind))];
+  const byKindDelta = {};
+  for (const kind of kinds) {
+    const before = ftsOnly.byKind[kind] || { n: 0, hit5: 0, hit10: 0 };
+    const after = fused.byKind[kind] || { n: 0, hit5: 0, hit10: 0 };
+    byKindDelta[kind] = {
+      n: before.n,
+      fts_hit5: before.hit5,
+      fts_hit10: before.hit10,
+      fused_hit5: after.hit5,
+      fused_hit10: after.hit10,
+      delta_hit5: after.hit5 - before.hit5,
+      delta_hit10: after.hit10 - before.hit10,
+    };
+  }
+
+  return {
+    proofKind, // 'real-model' | 'architecture-proof' — the load-bearing honesty label
+    ran, // false ⇒ the semantic lane did NOT run (fallback); deltas are not trustworthy
+    semanticEngine: { id: fused.engine.id, model: fused.engine.model, fallback: fused.engine.fallback, lastError: fused.engine.lastError },
+    fixture: ftsOnly.fixture,
+    fts: { metrics: ftsOnly.metrics, byKind: ftsOnly.byKind },
+    fused: { metrics: fused.metrics, byKind: fused.byKind },
+    delta: {
+      recall_at_5: round(fused.metrics.recall_at_5 - ftsOnly.metrics.recall_at_5),
+      recall_at_10: round(fused.metrics.recall_at_10 - ftsOnly.metrics.recall_at_10),
+      mrr: round(fused.metrics.mrr - ftsOnly.metrics.mrr),
+    },
+    byKindDelta,
+    // The headline this whole task is about: paraphrase/synonym recall before vs after.
+    paraphrase: byKindDelta.paraphrase || null,
+  };
+}
+
+function renderComparison(cmp) {
+  const lines = [];
+  const bar = '═'.repeat(78);
+  const isReal = cmp.proofKind === 'real-model';
+  lines.push(bar);
+  lines.push('iHow Memory — semantic-lane comparison · DEFAULT FTS5  vs  FTS5 + semantic (RRF-fused)');
+  lines.push(
+    isReal
+      ? 'mode: REAL-MODEL BENCHMARK — numbers are a genuine retrieval-quality signal from a learned model'
+      : 'mode: ARCHITECTURE PROOF — numbers prove the RRF WIRING, NOT model quality (real-model number is separate)',
+  );
+  lines.push(bar);
+  lines.push(`semantic engine: ${cmp.semanticEngine.id}  (model=${cmp.semanticEngine.model})`);
+  if (!cmp.ran) {
+    lines.push('');
+    lines.push('⚠  THE SEMANTIC LANE DID NOT RUN — the provider fell back to FTS, so there is NO honest');
+    lines.push(`   gain to report. lastError: ${cmp.semanticEngine.lastError || '(none)'}`);
+    if (isReal) lines.push('   (Is Ollama running and the model pulled?  `ollama pull nomic-embed-text`)');
+    lines.push(bar);
+    return lines.join('\n');
+  }
+  lines.push(`fixture:         ${cmp.fixture.docs} docs · ${cmp.fixture.queries} queries`);
+  lines.push('');
+  lines.push('overall (FTS-only → fused):');
+  const m0 = cmp.fts.metrics;
+  const m1 = cmp.fused.metrics;
+  const sign = (x) => (x > 0 ? `+${x}` : `${x}`);
+  lines.push(`  R@5   ${m0.recall_at_5.toFixed(3)} → ${m1.recall_at_5.toFixed(3)}   (${sign(cmp.delta.recall_at_5)})`);
+  lines.push(`  R@10  ${m0.recall_at_10.toFixed(3)} → ${m1.recall_at_10.toFixed(3)}   (${sign(cmp.delta.recall_at_10)})`);
+  lines.push(`  MRR   ${m0.mrr.toFixed(3)} → ${m1.mrr.toFixed(3)}   (${sign(cmp.delta.mrr)})`);
+  lines.push('');
+  lines.push('by query kind — recall@5 (FTS-only → fused, Δ):');
+  for (const [kind, d] of Object.entries(cmp.byKindDelta)) {
+    const star = kind === 'paraphrase' ? '  ◀── the known FTS floor' : '';
+    lines.push(`  ${kind.padEnd(11)} ${d.fts_hit5}/${d.n} → ${d.fused_hit5}/${d.n}   (${sign(d.delta_hit5)})${star}`);
+  }
+  lines.push('');
+  const p = cmp.paraphrase;
+  if (p) {
+    lines.push(
+      `HEADLINE — paraphrase / synonym recall@5: ${p.fts_hit5}/${p.n}  →  ${p.fused_hit5}/${p.n}  (${sign(p.delta_hit5)})`,
+    );
+  }
+  lines.push(
+    isReal
+      ? 'This is a REAL-MODEL gain on a labeled fixture: the learned embedding lane recovers paraphrase'
+      : 'This is an ARCHITECTURE PROOF: a controlled synonym oracle shows RRF pulls the true-synonym doc',
+  );
+  lines.push(
+    isReal
+      ? 'hits that share no surface tokens with the answer — the gap pure FTS5 leaves open.'
+      : 'into top-K. It is NOT a model-quality number — for that, run the real-model (ollama) comparison.',
+  );
+  lines.push(bar);
+  return lines.join('\n');
 }
 
 function renderScorecard(result) {
@@ -205,13 +417,56 @@ function renderScorecard(result) {
   return lines.join('\n');
 }
 
+function flagValue(name) {
+  const i = process.argv.indexOf(name);
+  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : undefined;
+}
+
 // CLI entrypoint (only when run directly, not when imported by the test).
+//
+//   node scripts/retrieval-bench.mjs                       # DEFAULT FTS5 scorecard (zero-dep floor)
+//   node scripts/retrieval-bench.mjs --json
+//
+//   # Architecture proof (deterministic, offline, no deps — proves RRF wiring, not model quality):
+//   node scripts/retrieval-bench.mjs --semantic "node examples/synonym-oracle-provider.mjs" \
+//        --proof architecture
+//
+//   # Real-model benchmark (needs local Ollama + `ollama pull nomic-embed-text` — REAL quality gain):
+//   node scripts/retrieval-bench.mjs --semantic "node examples/ollama-embedding-provider.mjs" \
+//        --proof real --model nomic-embed-text
 if (import.meta.url === `file://${process.argv[1]}`) {
   const json = process.argv.includes('--json');
-  const result = await runRetrievalBench();
-  if (json) {
-    console.log(JSON.stringify(result, null, 2));
+  const semanticCmd = flagValue('--semantic');
+
+  if (semanticCmd) {
+    // --proof real|architecture  (required so a reader can never confuse the two; default refuses).
+    const proofRaw = (flagValue('--proof') || '').toLowerCase();
+    const proofKind = proofRaw === 'real' || proofRaw === 'real-model' ? 'real-model'
+      : proofRaw === 'architecture' || proofRaw === 'architecture-proof' ? 'architecture-proof'
+        : null;
+    if (!proofKind) {
+      console.error("--semantic requires --proof <real|architecture> (honest label: real model vs wiring demo)");
+      process.exit(2);
+    }
+    const cmp = await runSemanticComparison({
+      vectorProviderCommand: semanticCmd,
+      vectorModel: flagValue('--model') || null,
+      proofKind,
+    });
+    if (json) {
+      console.log(JSON.stringify(cmp, null, 2));
+    } else {
+      console.log(renderComparison(cmp));
+    }
+    // A real-model run that silently fell back to FTS is a failed measurement — exit non-zero so a
+    // skeptic's CI catches "the lane didn't actually run" instead of trusting a no-op delta.
+    if (!cmp.ran) process.exitCode = 1;
   } else {
-    console.log(renderScorecard(result));
+    const result = await runRetrievalBench();
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(renderScorecard(result));
+    }
   }
 }
