@@ -157,22 +157,32 @@ test('MODEL PROPAGATION: a custom model reaches the runtime sidecar (no green-wh
   assert.equal(semantic.ok, true, 'semantic check healthy and consistent with the active engine');
 });
 
-test('MARKER VALIDATION: tampered semantic.json is rejected — incl. the substring-bypass attempt', async (t) => {
+test('MARKER VALIDATION: only THIS package\'s exact bundled sidecar is honored — every tamper rejected', async (t) => {
   const home = await tmpHome(t);
   const workspace = await ensureWorkspace(ws(home, 'demo'));
   const p = semanticConfigPath(workspace);
   await fs.mkdir(path.dirname(p), { recursive: true });
+  const write = (cmd) => fs.writeFile(p, JSON.stringify({ engine: 'vector', vectorProviderCommand: cmd, vectorModel: 'x', host: 'http://localhost:11434', vectorTimeoutMs: 20000 }), 'utf8');
+
   const tampered = [
     '/bin/sh -c "curl evil"', // non-node command
-    '/bin/echo /tmp/providers/ollama-embedding-provider.mjs', // substring-bypass: magic name as an ARG
-    'node /tmp/providers/ollama-embedding-provider.mjs --extra evil', // extra args / wrong dir
-    'node /evil/ollama-embedding-provider.mjs', // right file name, wrong parent dir
+    '/bin/echo /tmp/providers/ollama-embedding-provider.mjs', // substring bypass: magic name as an ARG
+    'node /tmp/providers/ollama-embedding-provider.mjs --extra evil', // extra args
+    'node /evil/ollama-embedding-provider.mjs', // wrong parent dir
+    'node /tmp/providers/ollama-embedding-provider.mjs', // same-named file under ANOTHER providers/ dir
+    'node /tmp/lookalike/providers/ollama-embedding-provider.mjs', // nested lookalike providers/ dir
+    'node "../providers/ollama-embedding-provider.mjs"', // quoted relative path
   ];
   for (const cmd of tampered) {
-    await fs.writeFile(p, JSON.stringify({ engine: 'vector', vectorProviderCommand: cmd, vectorModel: 'x', host: 'http://localhost:11434', vectorTimeoutMs: 20000 }), 'utf8');
+    await write(cmd);
     assert.equal(await loadSemanticConfig(workspace), null, `rejected: ${cmd}`);
     assert.deepEqual(semanticEngineArgs(workspace), [], `not injected: ${cmd}`);
   }
+
+  // POSITIVE: the real, current bundled sidecar path (what buildSemanticConfig writes) IS honored.
+  await write(buildSemanticConfig({ host: 'http://localhost:11434', model: 'nomic-embed-text' }).vectorProviderCommand);
+  assert.ok(await loadSemanticConfig(workspace), 'the genuine bundled sidecar command is accepted');
+  assert.ok(semanticEngineArgs(workspace).length > 0, 'and injected');
 });
 
 test('buildSemanticConfig points at the bundled sidecar with the chosen host/model', () => {

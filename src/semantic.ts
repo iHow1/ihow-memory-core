@@ -37,22 +37,21 @@ function tokenizeCommand(cmd: string): string[] {
   return (cmd.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || []).map((t) => t.replace(/^["']|["']$/g, ''));
 }
 
-// A persisted marker is only honored if its command is EXACTLY `<node> <bundled-sidecar>` — never an
-// arbitrary executable. The engine spawns vectorProviderCommand[0], so a substring check is not enough:
-// `/bin/echo /tmp/providers/ollama-embedding-provider.mjs` contains the magic name but spawns /bin/echo
-// (red-team r-alpha18-2). We parse argv and require: exactly two tokens, the FIRST is a node binary, and
-// the SECOND resolves to a bundled provider file under a `providers/` dir. No wrapper exe, no extra args.
+// A persisted marker is only honored if its command is EXACTLY `<node> <THIS package's bundled sidecar>`
+// — never an arbitrary executable, and never a same-named file under some OTHER providers/ dir. The engine
+// spawns vectorProviderCommand[0], so neither a substring check (`/bin/echo /tmp/providers/...mjs` spawns
+// echo) nor a parent-basename check (`node /tmp/providers/...mjs` is not OUR file) is enough (red-team
+// r-alpha18-2/3). We parse argv and require: exactly two tokens, argv[0] basename is node, and argv[1]
+// resolves to the exact path providerScriptPath() returns for a bundled provider. Fails CLOSED (→ default
+// FTS) if the package moved — the user re-runs enable-semantic to refresh the marker.
 function isBundledProviderCommand(cmd: string): boolean {
   if (/[;&|`]|\$\(/.test(cmd)) return false;
   const argv = tokenizeCommand(cmd);
   if (argv.length !== 2) return false;
   const exe = (argv[0].split(/[\\/]/).pop() || '').toLowerCase();
   if (exe !== 'node' && exe !== 'node.exe') return false;
-  const script = argv[1].replace(/\\/g, '/');
-  const base = script.slice(script.lastIndexOf('/') + 1);
-  const dir = script.slice(0, script.lastIndexOf('/'));
-  const parentBase = dir.slice(dir.lastIndexOf('/') + 1);
-  return parentBase === 'providers' && (BUNDLED_PROVIDERS as readonly string[]).includes(base);
+  const resolved = path.resolve(argv[1]);
+  return BUNDLED_PROVIDERS.some((name) => path.resolve(providerScriptPath(name)) === resolved);
 }
 
 function coerce(raw: string): SemanticConfig | null {
