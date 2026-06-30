@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
+## [Unreleased]
+
+### Added
+
+- **Two more receiver runtimes: VS Code (Copilot) and Gemini CLI.** `connect --runtime vscode` writes the
+  user-level VS Code `mcp.json` (`servers` key, `type: "stdio"` entry; macOS/Linux/Windows user-data dir)
+  and `connect --runtime gemini` adds an `mcpServers` entry to `~/.gemini/settings.json`. Both back up an
+  existing config and refuse to clobber an unparseable one, like the other JSON runtimes. They are
+  receiver-only — no readable local session store to resume *from* — but reach `memory.search` /
+  `memory.read` / `memory.continue`, so they can pull a verify-first handoff packet recorded by a capture
+  runtime. `setup`/`connect --auto` now detect them (`code` / `gemini` on PATH, or their config dir).
+- **Handoff schema doc.** [`docs/handoff-schema.md`](./docs/handoff-schema.md) formalizes the verify-first
+  handoff contract: machine anchors are the only facts, the narrative is carried verbatim and unverified,
+  and the GREEN/YELLOW/RED verdict is code-computed against live git (never a false GREEN).
+
 ## [0.1.0-alpha.14] — 2026-06-29
 
 The **capture-experience** release: capturing memory is now fully automatic — nothing is blocked
