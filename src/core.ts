@@ -13,6 +13,7 @@ import type {
   SearchResult,
   Workspace,
   WorkspaceOptions,
+  SearchOptions,
   WriteCandidatePayload,
   WriteCandidateResult,
 } from './types.ts';
@@ -27,7 +28,7 @@ import { engineStatus, indexWithEngineFallback, resolveEngineConfig, searchWithE
 
 export type MemoryCore = {
   workspace: Workspace;
-  search(query: string, opts?: { limit?: number }): Promise<SearchResult[]>;
+  search(query: string, opts?: SearchOptions): Promise<SearchResult[]>;
   read(ref: string): Promise<ReadResult>;
   write_candidate(payload: WriteCandidatePayload): Promise<WriteCandidateResult>;
   journal(payload: JournalPayload): Promise<JournalResult>;
@@ -52,7 +53,7 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     workspace,
     async search(query, opts = {}) {
       if (typeof query !== 'string' || !query.trim()) return [];
-      return (await searchWithEngineFallback(workspace, engineConfig, query, { limit: opts.limit })).hits;
+      return (await searchWithEngineFallback(workspace, engineConfig, query, opts)).hits;
     },
     async read(ref) {
       const result = await readMemoryFile(workspace, ref);
@@ -70,11 +71,9 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     },
     async write_candidate(payload) {
       const result = await writeCandidate(workspace, payload);
-      // Auto-promote (default ON): the engine floor decides — qualifying low-risk
-      // content with provenance is promoted automatically; everything else stays a
-      // candidate with a reason. High-risk content never auto-promotes. This makes
-      // "remember this" one call (agents no longer have to remember a second promote
-      // step), while the floor — not the agent — guards what reaches durable memory.
+      // Auto-promote (default ON): the engine floor decides the yellow sub-tier.
+      // Clean content is durable immediately; flagged/unverified entries stay out
+      // of default recall, while secrets and falsified anchors remain hard rejects.
       let autoPromote: WriteCandidateResult['autoPromote'];
       // Global kill switch: IHOW_AUTO_PROMOTE=0 forces every write to stay a candidate (full human gate),
       // for deployments that want zero machine-judged durable writes. The engine floor (engine-verified
@@ -85,9 +84,12 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
           const promoted = await promoteCandidate(workspace, result.path, {}, {
             actor: 'agent-auto',
             auto: true,
+            tier: verdict.tier,
+            flagReason: verdict.tier === 'flagged' ? verdict.reason : undefined,
+            provenanceKind: verdict.tier === 'verified' ? verdict.provenanceKind : undefined,
             provenance: payload.metadata,
           });
-          autoPromote = { promoted: true, path: promoted.path, eventId: promoted.eventId, tier: 'auto-promoted' };
+          autoPromote = { promoted: true, path: promoted.path, eventId: promoted.eventId, tier: verdict.tier, reason: verdict.reason };
         } else {
           autoPromote = { promoted: false, reason: verdict.reason, category: verdict.category };
         }

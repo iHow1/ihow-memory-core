@@ -52,6 +52,7 @@ export type SearchResult = {
 export type SearchOptions = {
   limit?: number;
   rebuild?: boolean;
+  includeFlagged?: boolean;
 };
 
 export type RetrievalEngineStatus = {
@@ -89,15 +90,15 @@ export type WriteCandidatePayload = {
   source?: string;
   metadata?: JsonRecord;
   // When true (the default), the engine evaluates the candidate against the
-  // auto-promote floor and promotes it automatically if it qualifies. Set false
-  // to only stage a candidate. High-risk content never auto-promotes regardless.
+  // auto-promote floor. Clean content lands in a durable yellow tier; secrets and
+  // falsified anchors are still hard-rejected. Set false to only stage a candidate.
   autoPromote?: boolean;
 };
 
 // Outcome of the engine's auto-promote evaluation, attached to write_candidate.
 export type AutoPromoteOutcome =
-  | { promoted: true; path: string; eventId: string; tier: 'auto-promoted' }
-  | { promoted: false; reason: string; category: 'secret' | 'governance' | 'no-provenance' | 'conflict' };
+  | { promoted: true; path: string; eventId: string; tier: 'verified' | 'unverified' | 'flagged'; reason?: string }
+  | { promoted: false; reason: string; category: 'secret' | 'conflict' };
 
 export type WriteCandidateResult = {
   candidateId: string;

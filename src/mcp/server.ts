@@ -95,7 +95,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory.write_candidate',
-    description: "The one call to remember something — you do NOT need a separate promote step. Use after a verified result, a decision with evidence, a blocker, or a handoff summary. ATTACH PROVENANCE in metadata (e.g. evidence, anchors, command, repo/git, verified): the engine AUTO-PROMOTES qualifying low-risk content that carries provenance into durable memory, and leaves everything else as a candidate with a reason. High-risk content (standing rules/policy, access/identity/credentials, destructive actions) is NEVER auto-promoted — it stays a candidate for human review. Never store secrets/tokens (rejected). Set autoPromote=false to only stage a candidate without promoting.",
+    description: "The one call to remember something — you do NOT need a separate promote step. Use after a verified result, a decision with evidence, a blocker, or a handoff summary. ATTACH PROVENANCE in metadata (e.g. anchors, command, repo/git): the engine AUTO-PROMOTES clean content into durable yellow memory. Clean provenanced content becomes verified; clean unprovenanced content becomes unverified; governance-adjacent content becomes flagged (durable but excluded from default search/recall). Secrets/tokens and falsified git anchors are rejected. Set autoPromote=false to only stage a candidate without promoting.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -114,7 +114,7 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object',
       properties: {
-        candidate: { type: 'string' },
+        candidate: { type: 'string', description: 'The candidate to promote — pass EITHER the `path` OR the `candidateId` that write_candidate returned (both work).' },
         target: { type: 'object' },
       },
       required: ['candidate'],
@@ -126,7 +126,7 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object',
       properties: {
-        candidate: { type: 'string' },
+        candidate: { type: 'string', description: 'The candidate to promote — pass EITHER the `path` OR the `candidateId` that write_candidate returned (both work).' },
         dryRun: { type: 'boolean' },
         realWrite: { type: 'boolean' },
         actor: { type: 'string' },

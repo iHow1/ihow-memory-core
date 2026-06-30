@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import type { RetrievalEngine, SearchResult, Workspace } from '../types.ts';
+import type { RetrievalEngine, SearchOptions, SearchResult, Workspace } from '../types.ts';
 import { listMarkdownFiles } from '../store/files.ts';
 import { withWorkspaceLock } from '../store/lock.ts';
 import { relativeToSpace } from '../workspace.ts';
@@ -13,6 +13,7 @@ import { defaultFtsManifest, writeProviderManifest } from './manifest.ts';
 type IndexDocument = {
   path: string;
   content: string;
+  flagged: boolean;
 };
 
 const BUSY_TIMEOUT_MS = 10000;
@@ -68,7 +69,7 @@ function openDatabase(workspace: Workspace, opts: { initialize?: boolean } = {})
     db.exec('PRAGMA synchronous = NORMAL;');
     db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
-      USING fts5(path UNINDEXED, content, orig UNINDEXED, tokenize = 'unicode61');
+      USING fts5(path UNINDEXED, content, orig UNINDEXED, flagged UNINDEXED, tokenize = 'unicode61');
     `);
   }
   return db;
@@ -120,6 +121,12 @@ function queryToFts(query: string): string {
 
 // Readable snippet from the ORIGINAL text (the indexed column is bigram-segmented and renders garbled).
 // Center a ~160-char window on the earliest query-term hit.
+function frontmatterIsFlagged(content: string): boolean {
+  const fm = content.match(/^﻿?\s*---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fm) return false;
+  return /^\s*flagged:\s*["']?true\b/im.test(fm[1]);
+}
+
 function buildSnippet(orig: string, query: string): string {
   let body = typeof orig === 'string' ? orig : '';
   // drop a leading YAML frontmatter block so the snippet is CONTENT, not metadata (candidate_id, timestamps)
@@ -150,7 +157,7 @@ async function collectDocuments(workspace: Workspace): Promise<IndexDocument[]> 
     if (relative.startsWith('memory/_mcp/_events/')) continue;
     if (relative.startsWith('memory/_mcp/history/')) continue;
     const content = await fsp.readFile(filePath, 'utf8');
-    documents.push({ path: relative, content });
+    documents.push({ path: relative, content, flagged: frontmatterIsFlagged(content) });
   }
   return documents;
 }
@@ -161,11 +168,11 @@ async function rebuildFtsIndexUnlocked(workspace: Workspace): Promise<number> {
   try {
     // DROP+CREATE (not just DELETE) so an old-schema index (pre-bigram, no `orig` column) migrates cleanly.
     db.exec('DROP TABLE IF EXISTS memory_fts');
-    db.exec("CREATE VIRTUAL TABLE memory_fts USING fts5(path UNINDEXED, content, orig UNINDEXED, tokenize = 'unicode61')");
+    db.exec("CREATE VIRTUAL TABLE memory_fts USING fts5(path UNINDEXED, content, orig UNINDEXED, flagged UNINDEXED, tokenize = 'unicode61')");
     db.exec('BEGIN');
-    const insert = db.prepare('INSERT INTO memory_fts(path, content, orig) VALUES (?, ?, ?)');
+    const insert = db.prepare('INSERT INTO memory_fts(path, content, orig, flagged) VALUES (?, ?, ?, ?)');
     for (const document of documents) {
-      insert.run(document.path, cjkIndexSegment(document.content), document.content);
+      insert.run(document.path, cjkIndexSegment(document.content), document.content, document.flagged ? 1 : 0);
     }
     db.exec('COMMIT');
   } catch (error) {
@@ -187,7 +194,7 @@ async function hasUsableIndex(workspace: Workspace): Promise<boolean> {
   const db = openDatabase(workspace, { initialize: false });
   try {
     // selecting `orig` also verifies the current schema — a pre-bigram index lacks it, fails here, rebuilds.
-    db.prepare('SELECT orig FROM memory_fts LIMIT 1').all();
+    db.prepare('SELECT orig, flagged FROM memory_fts LIMIT 1').all();
     return true;
   } catch {
     return false;
@@ -211,7 +218,7 @@ export async function rebuildFtsIndex(workspace: Workspace): Promise<number> {
 export async function searchFts(
   workspace: Workspace,
   query: string,
-  opts: { limit?: number; rebuild?: boolean } = {},
+  opts: SearchOptions = {},
 ): Promise<SearchResult[]> {
   if (opts.rebuild === true) {
     await rebuildFtsIndex(workspace);
@@ -229,11 +236,11 @@ export async function searchFts(
           bm25(memory_fts) AS rank,
           (CASE WHEN path LIKE 'memory/journal/%' OR path LIKE 'memory/_mcp/journal/%' THEN 1 ELSE 0 END) AS is_journal
         FROM memory_fts
-        WHERE memory_fts MATCH ?
+        WHERE memory_fts MATCH ? AND (? = 1 OR flagged != 1)
         ORDER BY is_journal ASC, rank
         LIMIT ?
       `)
-      .all(queryToFts(query), limit) as Array<{ path: string; orig: string; rank: number; is_journal: number }>;
+      .all(queryToFts(query), opts.includeFlagged === true ? 1 : 0, limit) as Array<{ path: string; orig: string; rank: number; is_journal: number }>;
     return rows.map((row) => {
       const snippet = buildSnippet(row.orig, query); // clean window from the ORIGINAL text, not the segmented column
       return {

@@ -37,10 +37,10 @@ test('benchmark: the three-color verdict genuinely DISCRIMINATES (not a rubber s
 test('benchmark: the floor blocks junk and allows only engine-verified provenance', () => {
   const r = runBenchmark();
   const by = (id) => r.scenarios.find((s) => s.id === id);
-  assert.equal(by('B1').actual, 'block', 'no provenance -> blocked');
-  assert.equal(by('B2').actual, 'allow', 'command+exitCode -> allowed');
+  assert.equal(by('B1').actual, 'unverified', 'no provenance -> durable unverified yellow');
+  assert.equal(by('B2').actual, 'verified', 'command+exitCode -> verified yellow');
   assert.equal(by('B3').actual, 'block', 'secret -> blocked');
-  assert.equal(by('B4').actual, 'block', 'standing-rule -> blocked');
+  assert.equal(by('B4').actual, 'flagged', 'standing-rule -> isolated flagged yellow');
 });
 
 test('benchmark: the CLI command exits 0 and prints a PASS scorecard', () => {

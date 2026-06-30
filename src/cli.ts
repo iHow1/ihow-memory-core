@@ -13,7 +13,7 @@ import { absoluteFromMemoryPath, defaultRoot, ensureWorkspace, isCuratedMemoryPa
 import { indexWithEngineFallback, resolveEngineConfig } from './engine/retrieval.ts';
 import { sqliteRuntimeStatus } from './engine/fts.ts';
 import { readEventsAllLanes } from './store/events.ts';
-import { appendJournal, containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
+import { appendJournal, containsSecretLikeContent, expireStaleFlagged, pendingFlaggedReview, redactSecretLikeContent } from './governance.ts';
 import { parseTranscript, summarizeTranscript } from './transcript.ts';
 import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { assembleEnvelope, formatAge } from './envelope.ts';
@@ -42,6 +42,7 @@ type ParsedArgs = {
   options: WorkspaceOptions & {
     json?: boolean;
     limit?: number;
+    includeFlagged?: boolean;
     list?: boolean;
     dryRun?: boolean;
     realWrite?: boolean;
@@ -57,6 +58,7 @@ type ParsedArgs = {
     write?: boolean;
     apply?: boolean;
     update?: boolean;
+    autoPromote?: boolean;
     from?: string;
     importSource?: 'claude-code' | 'markdown';
   };
@@ -118,11 +120,13 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--json') options.json = true;
     else if (arg === '--list') options.list = true;
     else if (arg === '--limit') options.limit = Number(tail[++index]);
+    else if (arg === '--include-flagged') options.includeFlagged = true;
     else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--real-write') options.realWrite = true;
     else if (arg === '--actor') options.actor = tail[++index];
     else if (arg === '--apply') options.apply = true;
     else if (arg === '--update') options.update = true;
+    else if (arg === '--no-auto-promote') options.autoPromote = false;
     else if (arg === '--from') options.from = tail[++index];
     else if (arg === '--source') {
       const src = tail[++index];
@@ -982,11 +986,11 @@ Usage:
   ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw] [--share-diagnostics] [--json]
   ihow-memory verify [--runtime name] [--cwd path] [--json]   # print a REPRODUCIBLE self-proof receipt: local store + each runtime's MCP reachability + this checkout's GREEN/YELLOW/RED resume verdict, each line with the exact command to re-run yourself (no trust required, local-only). Exit non-zero if anything fails to round-trip.
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
-  ihow-memory benchmark [--json]   # deterministic LOCAL proof of the verify-first guarantees: the three-color resume verdict discriminates (GREEN narrow · drift→RED · uncertainty→YELLOW) and the no-false-green floor blocks unverified/secret/standing-rule/fabricated-anchor content. Re-run for the same result; exit non-zero if any guarantee fails.
+  ihow-memory benchmark [--json]   # deterministic LOCAL proof of the verify-first guarantees: the three-color resume verdict discriminates (GREEN narrow · drift→RED · uncertainty→YELLOW) and the no-false-green floor isolates unverified/standing-rule content while blocking secret/fabricated-anchor content. Re-run for the same result; exit non-zero if any guarantee fails.
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
-  ihow-memory search <query> [--limit n]
+  ihow-memory search <query> [--limit n] [--include-flagged]
   ihow-memory read <memory/path.md>
-  ihow-memory write-candidate <text> [--space name]
+  ihow-memory write-candidate <text> [--space name] [--no-auto-promote]
   ihow-memory journal <text> [--title t] [--actor name] [--space name]   # append a low-weight auto-capture entry (searchable but ranked below curated memory)
   ihow-memory import [--from path] [--source claude-code|markdown] [--apply] [--update] [--json]   # import EXISTING memory you wrote elsewhere (Claude Code native MEMORY.md = biggest stock source, ai-memory markdown, any folder of .md notes) into the searchable journal lane. Dry-run unless --apply; auto-detects Claude Code memory when --from is omitted; reversible per item; proves the import by searching one item back out. Re-import is idempotent (unchanged items skipped); an EDITED fact is reported as changed and refreshed only with --update (replaces the stale copy).
   ihow-memory promote <candidate-path> [--scope name] [--title title]
@@ -1950,8 +1954,18 @@ async function runStopHook(options: ParsedArgs['options']): Promise<void> {
     // Worst case the dedup marker is missing and we may re-nudge next turn — recoverable; crashing the
     // host session (the old unguarded fs.writeFile reaching main().catch with exit 1) is not.
   }
+  // T5: surface the human-review backlog alongside the handoff nudge — a session never ends silently
+  // sitting on un-reviewed flagged 🟡 memory. Piggybacks the existing re-prompt (no extra emission / spam).
+  let reason = STOP_HOOK_REASON;
+  try {
+    const pending = await pendingFlaggedReview(workspace);
+    if (pending.count > 0) {
+      const more = pending.count > pending.sample.length ? ', …' : '';
+      reason += `\n\nAlso: ${pending.count} memory ${pending.count === 1 ? 'entry is' : 'entries are'} flagged for review (🟡 — durable but NOT authoritative, never auto-recalled): ${pending.sample.join(', ')}${more}. Promote the keepers to authoritative with \`ihow-memory promote <path>\`; anything left auto-expires.`;
+    }
+  } catch { /* never block the stop hook */ }
   hookLog(`stop: re-prompt (decision=block) session=${sessionId} prompt#${next.prompts} entries=${entries}`);
-  process.stdout.write(`${JSON.stringify({ decision: 'block', reason: STOP_HOOK_REASON })}\n`);
+  process.stdout.write(`${JSON.stringify({ decision: 'block', reason })}\n`);
 }
 
 // Floor-capture tuning. The floor is a BACKSTOP, not the primary path: it only fires for a prior
@@ -1986,6 +2000,10 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
   } catch {
     return;
   }
+
+  // T4: lazy TTL sweep — drop any flagged 🟡 entry nobody upgraded to 🟢 within the window, so the
+  // human-review backlog can't pile up silently. Best-effort; never blocks the session-start hint.
+  await expireStaleFlagged(workspace).catch(() => {});
 
   // RESUME AWARENESS (opt out: IHOW_RESUME_HINT=0). On a FRESH context (a brand-new session or one
   // started after /clear), surface a ONE-LINE pointer that a prior session is resumable — never its
@@ -2249,11 +2267,12 @@ function recallRecencyScore(workspace: Awaited<ReturnType<typeof openCore>>['wor
 function recallTier(
   workspace: Awaited<ReturnType<typeof openCore>>['workspace'],
   relPath: string,
-): { tier: 'reviewed' | 'auto'; provenance?: string } {
+): { tier: 'reviewed' | 'auto' | 'flagged'; provenance?: string } {
   try {
     const head = readFileSync(absoluteFromMemoryPath(workspace, relPath), 'utf8').slice(0, 1024);
     const fm = head.match(/^---\n([\s\S]*?)\n---/);
     const front = fm ? fm[1] : head;
+    if (/^\s*flagged:\s*["']?true\b/im.test(front)) return { tier: 'flagged' };
     // Case-insensitive + quote-tolerant: a shared multi-agent vault means an entry can be written by ANY
     // runtime / by hand, so `reviewed: "false"` / `Reviewed: False` / `tier: 'auto-promoted'` all count.
     const isAuto = /^\s*reviewed:\s*["']?false\b/im.test(front) || /^\s*tier:\s*["']?auto-promoted\b/im.test(front);
@@ -2261,6 +2280,8 @@ function recallTier(
     const cmd = front.match(/^\s*command:\s*["']?([^"'\n]+)/im);
     const exit = front.match(/^\s*exitCode:\s*["']?(-?\d+)/im);
     const sha = front.match(/^\s*head:\s*["']?([0-9a-f]{7,40})/im);
+    // NOTE: recall-eligibility is NOT decided from frontmatter here (provenance_kind is forgeable). The
+    // anchored-trust gate lives in runRecallHook against the append-only engine event log (engineAnchored).
     let provenance: string | undefined;
     if (cmd) provenance = `\`${cmd[1].trim()}\`${exit ? ` exit ${exit[1]}` : ''}`;
     else if (sha) provenance = `git ${sha[1].slice(0, 12)}`;
@@ -2311,10 +2332,39 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
   // machine-judged memory. Opt in to the attributed auto tier with IHOW_RECALL_INCLUDE_AUTO=1; flipping that
   // default on (Option A go-live) is a separate, explicit decision, not taken here.
   const includeAuto = process.env.IHOW_RECALL_INCLUDE_AUTO === '1';
+  // Red-team blocker: an auto entry is recall-eligible ONLY if the ENGINE itself emitted a memory.promoted
+  // event for it with a VERIFIED anchor. A frontmatter `provenance_kind: anchor` is forgeable (a hand-written
+  // or external-runtime curated file can claim it), so it is NEVER the trust signal — the append-only event
+  // log is. Built only when the knob is on; keyed by absolute path so the event's targetMemoryPath and the
+  // search hit path normalize to the same file.
+  const engineAnchored = new Set<string>();
+  if (includeAuto) {
+    try {
+      // Events are oldest-first, so process in order and let the LAST event for a path win: a verified
+      // anchor promote ADDS the path; a later rollback of that path REMOVES it (so a stale promote event
+      // can't keep trusting a path whose entry was rolled back, even if a new file later lands there); a
+      // re-promote re-adds it. This closes the rollback-staleness gap on the anchored-trust set.
+      for (const e of await readEventsAllLanes(core.workspace)) {
+        if (e.type === 'memory.promoted' && e.metadata?.auto === true
+          && e.metadata?.autoTier === 'verified' && e.metadata?.provenanceKind === 'anchor'
+          && typeof e.metadata?.targetMemoryPath === 'string') {
+          try { engineAnchored.add(absoluteFromMemoryPath(core.workspace, String(e.metadata.targetMemoryPath))); } catch { /* unresolvable -> not trusted */ }
+        } else if (e.type === 'memory.rolledback' && typeof e.path === 'string') {
+          try { engineAnchored.delete(absoluteFromMemoryPath(core.workspace, String(e.path))); } catch { /* ignore */ }
+        }
+      }
+    } catch { /* no readable event log -> nothing is engine-anchored */ }
+  }
+  const isEngineAnchored = (relPath: string): boolean => {
+    try { return engineAnchored.has(absoluteFromMemoryPath(core.workspace, relPath)); } catch { return false; }
+  };
   const curated = hits
     .filter((h) => h && typeof h.path === 'string' && isCuratedMemoryPath(h.path))
     .map((h) => ({ h, ...recallTier(core.workspace, String(h.path)) }))
-    .filter((x) => includeAuto || x.tier === 'reviewed') // reviewed-only unless explicitly opted into the auto tier
+    .filter((x) => x.tier !== 'flagged')
+    // reviewed always; under the knob, an auto entry is recall-eligible ONLY if the engine event log proves
+    // an anchor was verified for THIS path — command+exitCode alone, and any forged frontmatter, stay out.
+    .filter((x) => x.tier === 'reviewed' || (includeAuto && x.tier === 'auto' && isEngineAnchored(String(x.h.path))))
     .filter((x) => recallSharesTerm(promptTerms, String(x.h.snippet ?? '')))
     .slice(0, RECALL_MAX_INJECT);
   if (!curated.length) return; // nothing curated AND relevant -> stay silent (no noise)
@@ -2909,7 +2959,7 @@ async function main(): Promise<void> {
   if (command === 'benchmark') {
     // A deterministic, local, reproducible proof of the verify-first DIFFERENTIATORS: the three-color
     // resume verdict discriminates (GREEN is narrow; drift->RED, uncertainty->YELLOW), and the floor
-    // blocks unverified/secret/standing-rule/fabricated-anchor content from durable memory. Exit non-zero
+    // isolates unverified/standing-rule content while hard-blocking secret/fabricated-anchor content. Exit non-zero
     // if any guarantee fails — the benchmark cannot false-green about itself.
     const result = runBenchmark();
     if (options.json) {
@@ -3171,7 +3221,7 @@ async function main(): Promise<void> {
   }
   if (command === 'search') {
     const query = rest.join(' ');
-    printJson(await core.search(query, { limit: options.limit }));
+    printJson(await core.search(query, { limit: options.limit, includeFlagged: options.includeFlagged }));
     return;
   }
   if (command === 'read') {
@@ -3179,7 +3229,7 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'write-candidate') {
-    printJson(await core.write_candidate({ text: rest.join(' '), sourceAgent: 'cli' }));
+    printJson(await core.write_candidate({ text: rest.join(' '), sourceAgent: 'cli', autoPromote: options.autoPromote }));
     return;
   }
   if (command === 'journal') {

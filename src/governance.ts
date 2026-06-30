@@ -17,7 +17,7 @@ import type {
 import { gitAnchors } from './anchors.ts';
 import { absoluteFromMemoryPath, isMcpSandboxPath, relativeToMemory, relativeToSpace } from './workspace.ts';
 import { appendEvent, readEvents, type MemoryEvent } from './store/events.ts';
-import { atomicWriteFile, nowCompact, readMemoryFile, safeFileSlug } from './store/files.ts';
+import { atomicWriteFile, listMarkdownFiles, nowCompact, readMemoryFile, safeFileSlug } from './store/files.ts';
 import { withWorkspaceLock } from './store/lock.ts';
 import { localDay } from './time.ts';
 
@@ -455,18 +455,20 @@ export async function writeCandidate(
 }
 
 // ── Auto-promote floor ─────────────────────────────────────────────────────
-// Decides whether a candidate qualifies for AUTOMATIC promotion to durable memory.
-// Conservative by design: the safe failure is "stays a candidate", never "poisons
-// durable memory". (OpenClaw red-team: the most dangerous poisoning is the content
-// that looks like low-risk project state — so agent self-judgment alone never gates;
-// the engine enforces this floor.) Enforced, not prompt-level.
+// Decides whether a candidate lands in durable yellow memory and which sub-tier it
+// gets. Only secrets and engine-falsified anchors hard-reject. The floor remains
+// engine-enforced, not prompt-level: self-asserted provenance can land durable, but
+// only as unverified, never recall-eligible verified.
 export type AutoPromoteVerdict =
-  | { allow: true }
-  | { allow: false; reason: string; category: 'secret' | 'governance' | 'no-provenance' | 'conflict' };
+  | { allow: true; tier: 'verified' | 'unverified' | 'flagged'; reason?: string; provenanceKind?: 'anchor' | 'command' }
+  | { allow: false; reason: string; category: 'secret' | 'conflict' };
 
 export type PromoteOptions = {
   actor?: string;
   auto?: boolean;
+  tier?: 'verified' | 'unverified' | 'flagged';
+  flagReason?: string;
+  provenanceKind?: 'anchor' | 'command';
   provenance?: WriteCandidatePayload['metadata'];
 };
 
@@ -496,6 +498,24 @@ function looksLikeGovernanceStatement(text: string): boolean {
 // into title/metadata must not slip past.
 function fullScanText(payload: WriteCandidatePayload): string {
   const parts: string[] = [payload.title || '', String(payload.text ?? payload.content ?? '')];
+  const m = payload.metadata;
+  if (m && typeof m === 'object') {
+    for (const v of Object.values(m)) parts.push(typeof v === 'string' ? v : JSON.stringify(v));
+  }
+  return parts.join('\n');
+}
+
+// The GOVERNANCE marker scan includes the title ONLY when it reads as PROSE (contains whitespace).
+// A slug/identifier-style title ("policy-assistant-s07-a-3-root-fast-forwarded") is an auto/file NAME
+// whose hyphen-joined tokens ("policy"/"root") were the dominant false-positive — flagging a clean
+// factual handoff. A natural-language title ("Always force push to main") IS a real assertion and
+// stays in scope, so a genuine rule in a prose title still flags and there is NO title-evasion. The
+// BODY and explicit metadata are always scanned in full. (The SECRET check above still scans the
+// title in ALL cases — a token tucked into a slug-style title must never slip.)
+function governanceScanText(payload: WriteCandidatePayload): string {
+  const parts: string[] = [String(payload.text ?? payload.content ?? '')];
+  const title = (payload.title ?? '').toString();
+  if (/\s/.test(title.trim())) parts.push(title);
   const m = payload.metadata;
   if (m && typeof m === 'object') {
     for (const v of Object.values(m)) parts.push(typeof v === 'string' ? v : JSON.stringify(v));
@@ -541,17 +561,18 @@ function claimedRepoDir(m: Record<string, unknown>, cwd?: string): { dir: string
 //       live HEAD. A HEAD that is claimed for an EXPLICIT repo path but does not match is rejected
 //       outright (a fabricated/stale anchor — exactly the "looks-low-risk" poisoning OpenClaw flagged).
 // Returns ok:true to qualify, or ok:false with a `conflict` category to reject outright.
-function verifyProvenance(payload: WriteCandidatePayload, cwd?: string): { ok: boolean; reason?: string; conflict?: boolean } {
+function verifyProvenance(payload: WriteCandidatePayload, cwd?: string): { ok: boolean; reason?: string; conflict?: boolean; kind?: 'anchor' | 'command' } {
   const m = payload.metadata;
   if (!m || typeof m !== 'object') return { ok: false };
   const meta = m as Record<string, unknown>;
 
-  // (1) structured command-execution evidence: a real command string AND a finite exit code.
   const command = typeof meta.command === 'string' ? meta.command.trim() : '';
   const hasExit = typeof meta.exitCode === 'number' && Number.isFinite(meta.exitCode as number);
-  if (command.length > 0 && hasExit) return { ok: true };
 
-  // (2) a git anchor the engine verifies against live git.
+  // (1) A claimed EXPLICIT git anchor is checked FIRST. A falsified explicit anchor HARD-REJECTS as a
+  // conflict — even when a real-but-unrelated command+exitCode is stapled alongside it. (Red-team blocker:
+  // command evidence must NEVER be able to mask a fabricated explicit anchor.)
+  let anchorVerified = false;
   const head = claimedHead(meta);
   if (head) {
     const resolved = claimedRepoDir(meta, cwd);
@@ -559,14 +580,20 @@ function verifyProvenance(payload: WriteCandidatePayload, cwd?: string): { ok: b
       const live = gitAnchors(resolved.dir);
       if (live.isRepo && live.head) {
         const lHead = live.head.toLowerCase();
-        if (lHead.startsWith(head) || head.startsWith(lHead)) return { ok: true };
-        if (resolved.explicit) {
+        if (lHead.startsWith(head) || head.startsWith(lHead)) anchorVerified = true;
+        else if (resolved.explicit) {
           return { ok: false, conflict: true, reason: `claimed git anchor ${head} does not match the live HEAD ${live.head} in ${resolved.dir} — refusing to auto-promote a fabricated or stale anchor` };
         }
       }
     }
     // A sha-shaped anchor with no resolvable/matching repo can't be engine-verified → does not qualify.
   }
+
+  // (2) a verified anchor is the STRONG, recall-eligible provenance kind.
+  if (anchorVerified) return { ok: true, kind: 'anchor' };
+  // (3) only then does structured command+exitCode qualify — WEAK provenance: durable but never
+  // recall-eligible (see recall's anchored-only gate), so stapling one can't launder anything.
+  if (command.length > 0 && hasExit) return { ok: true, kind: 'command' };
   return { ok: false };
 }
 
@@ -575,27 +602,163 @@ export function evaluateAutoPromote(payload: WriteCandidatePayload, opts: { cwd?
   if (containsSecretLikeContent(scan)) {
     return { allow: false, reason: 'contains secret-like content (text/title/metadata)', category: 'secret' };
   }
-  if (looksLikeGovernanceStatement(scan)) {
-    return {
-      allow: false,
-      reason: 'reads as a standing rule / policy / access / identity / destructive statement — needs human review',
-      category: 'governance',
-    };
-  }
   const prov = verifyProvenance(payload, opts.cwd);
   if (prov.conflict) {
     return { allow: false, reason: prov.reason ?? 'claimed anchor conflicts with live state', category: 'conflict' };
   }
-  if (!prov.ok) {
+  if (looksLikeGovernanceStatement(governanceScanText(payload))) {
     return {
-      allow: false,
-      reason: 'no engine-verifiable provenance — needs command+exitCode, or a git anchor that matches live HEAD (a self-asserted verified:true / free-text evidence does not qualify) — staged as candidate',
-      category: 'no-provenance',
+      allow: true,
+      tier: 'flagged',
+      reason: 'reads as a standing rule / policy / access / identity / destructive statement',
     };
   }
-  return { allow: true };
+  if (!prov.ok) {
+    return {
+      allow: true,
+      tier: 'unverified',
+      reason: 'no engine-verifiable provenance — searchable durable memory, but never recall-eligible until reviewed',
+    };
+  }
+  // T3: record HOW the engine verified — 'anchor' (a live-HEAD-matched git anchor the engine actually
+  // re-checked) vs 'command' (a structured-but-self-reported command+exitCode). Only 'anchor' earns
+  // recall-eligibility under the opt-in knob; a stapled-but-unverified command+exitCode lands durable
+  // 'verified' yet stays out of recall (closes the provenance-theater path).
+  return { allow: true, tier: 'verified', provenanceKind: prov.kind };
 }
 // ────────────────────────────────────────────────────────────────────────────
+
+// T4: flagged 🟡 entries are durable but quarantined (never recalled, out of default search). If nobody
+// upgrades one to 🟢 within the TTL, it auto-EXPIRES — so a human-review backlog can't pile up silently
+// and "optional async upgrade" never quietly becomes "never happens". Expiry DELETES the entry (it was
+// never trusted) and logs an audit event; it does NOT restore the candidate (that would just re-surface
+// the same un-reviewed item forever). Best-effort: one bad file never aborts the sweep.
+const FLAGGED_TTL_DAYS_DEFAULT = 14;
+
+export async function expireStaleFlagged(
+  workspace: Workspace,
+  opts: { now?: number; ttlDays?: number } = {},
+): Promise<{ expired: string[] }> {
+  const ttlEnv = Number(process.env.IHOW_FLAGGED_TTL_DAYS);
+  const ttlDays = opts.ttlDays ?? (Number.isFinite(ttlEnv) && ttlEnv > 0 ? ttlEnv : FLAGGED_TTL_DAYS_DEFAULT);
+  const now = opts.now ?? Date.now();
+  const cutoff = now - ttlDays * 24 * 60 * 60 * 1000;
+  const expired: string[] = [];
+  let files: string[];
+  try {
+    files = await listMarkdownFiles(workspace.memoryDir);
+  } catch {
+    return { expired };
+  }
+  const stale: Array<{ filePath: string; relative: string; promotedAt: string }> = [];
+  for (const filePath of files) {
+    const relative = relativeToSpace(workspace, filePath);
+    // durable promoted memory ONLY — never candidates / events / history
+    if (relative.startsWith('memory/_mcp/_events/') || relative.startsWith('memory/_mcp/history/')
+      || relative.startsWith('memory/_mcp/candidates/') || relative.startsWith('memory/candidate/')) continue;
+    let content: string;
+    try {
+      content = (await fs.readFile(filePath, 'utf8')).slice(0, 1024);
+    } catch {
+      continue;
+    }
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    const front = fmMatch ? fmMatch[1] : '';
+    if (!/^\s*flagged:\s*["']?true\b/im.test(front)) continue;
+    const stamp = front.match(/^\s*promoted_at:\s*["']?([^"'\n]+)/im);
+    const at = stamp ? Date.parse(stamp[1].trim()) : NaN;
+    if (!Number.isFinite(at) || at > cutoff) continue; // missing or still-fresh timestamp -> keep
+    stale.push({ filePath, relative, promotedAt: stamp![1].trim() });
+  }
+  if (!stale.length) return { expired };
+  await withWorkspaceLock(workspace, async () => {
+    for (const s of stale) {
+      try {
+        await fs.rm(s.filePath, { force: true });
+        await appendEvent(workspace, {
+          type: 'memory.flagged.expired',
+          path: s.relative,
+          actor: 'flagged-ttl',
+          metadata: { ttlDays, promotedAt: s.promotedAt },
+        });
+        expired.push(s.relative);
+      } catch {
+        // best-effort — keep sweeping
+      }
+    }
+  });
+  return { expired };
+}
+
+// T5: surface the human-review backlog. Flagged 🟡 entries are durable but NOT authoritative (never
+// recalled). They wait for a human to either upgrade the keepers to 🟢 or let them expire (T4). The
+// stop hook reads this so a session never ends silently sitting on un-reviewed flagged memory.
+export async function pendingFlaggedReview(
+  workspace: Workspace,
+  limit = 5,
+): Promise<{ count: number; sample: string[] }> {
+  let files: string[];
+  try {
+    files = await listMarkdownFiles(workspace.memoryDir);
+  } catch {
+    return { count: 0, sample: [] };
+  }
+  const flagged: string[] = [];
+  for (const filePath of files) {
+    const relative = relativeToSpace(workspace, filePath);
+    if (relative.startsWith('memory/_mcp/_events/') || relative.startsWith('memory/_mcp/history/')
+      || relative.startsWith('memory/_mcp/candidates/') || relative.startsWith('memory/candidate/')) continue;
+    let front = '';
+    try {
+      const c = (await fs.readFile(filePath, 'utf8')).slice(0, 512);
+      const m = c.match(/^---\n([\s\S]*?)\n---/);
+      front = m ? m[1] : '';
+    } catch {
+      continue;
+    }
+    if (/^\s*flagged:\s*["']?true\b/im.test(front)) flagged.push(relative);
+  }
+  return { count: flagged.length, sample: flagged.slice(0, limit) };
+}
+// ────────────────────────────────────────────────────────────────────────────
+
+// A candidate can be referenced by its memory PATH (what write_candidate returns as `path`) OR by
+// its `candidateId` (the UUID write_candidate returns first). An agent naturally reaches for the id,
+// so resolve it to a path here instead of failing. A readable path is returned untouched (preserves
+// existing behavior); a bare token is matched against each candidate's `candidate_id` front-matter
+// (or filename) under the candidates dir.
+async function resolveCandidateRef(workspace: Workspace, candidateRef: string): Promise<string> {
+  const trimmed = (candidateRef || '').trim();
+  if (!trimmed) throw new Error('candidate_ref_required');
+  // Fast path: already a readable memory path → use as-is.
+  try {
+    await readMemoryFile(workspace, trimmed);
+    return trimmed;
+  } catch { /* not a direct path — fall through to candidateId resolution */ }
+  // Only a bare token (no path separators) is treated as a candidateId.
+  if (trimmed.includes('/') || trimmed.includes('\\')) {
+    throw new Error(`candidate_not_found: ${candidateRef}`);
+  }
+  let names: string[];
+  try {
+    names = (await fs.readdir(workspace.candidatesDir, { recursive: true })) as string[];
+  } catch {
+    throw new Error(`candidate_not_found: ${candidateRef}`);
+  }
+  for (const name of names) {
+    if (typeof name !== 'string' || !name.endsWith('.md')) continue;
+    const candidatePath = relativeToSpace(workspace, path.join(workspace.candidatesDir, name));
+    let file: { path: string; content: string };
+    try {
+      file = await readMemoryFile(workspace, candidatePath);
+    } catch {
+      continue;
+    }
+    const idMatch = file.content.match(/^candidate_id:\s*"?(.*?)"?\s*$/m);
+    if (idMatch?.[1] === trimmed || path.basename(name, '.md') === trimmed) return candidatePath;
+  }
+  throw new Error(`candidate_not_found: ${candidateRef} — pass the candidate path or candidateId returned by write_candidate`);
+}
 
 export async function promoteCandidate(
   workspace: Workspace,
@@ -604,7 +767,8 @@ export async function promoteCandidate(
   options: PromoteOptions = {},
 ): Promise<PromoteResult> {
   return await withWorkspaceLock(workspace, async () => {
-    const candidate = await readMemoryFile(workspace, candidateRef);
+    const resolvedRef = await resolveCandidateRef(workspace, candidateRef);
+    const candidate = await readMemoryFile(workspace, resolvedRef);
     const candidateAbsolute = absoluteFromMemoryPath(workspace, candidate.path);
     if (!isAllowedCandidatePath(workspace, candidate.path, candidateAbsolute)) {
       throw new Error('candidate_must_be_from_inbox');
@@ -618,8 +782,16 @@ export async function promoteCandidate(
     // Auto-promoted memory is tagged (tier/reviewed) so it can be told apart from human-confirmed
     // promotions and treated as machine-judged. (Recall strips these tags from injected snippets;
     // bm25 rank down-weighting of unreviewed entries is a tracked follow-up, not yet wired.)
+    const flaggedFrontmatter = options.tier === 'flagged'
+      ? `flagged: true\nflag_reason: ${JSON.stringify(options.flagReason || 'governance marker')}\n`
+      : '';
+    // T3: record which provenance form the engine actually verified, so recall can admit only the
+    // anchor-verified ('anchor') tier under the knob — never command+exitCode alone.
+    const provenanceKindFrontmatter = options.provenanceKind
+      ? `provenance_kind: ${JSON.stringify(options.provenanceKind)}\n`
+      : '';
     const autoFrontmatter = options.auto
-      ? `tier: "auto-promoted"\nreviewed: false\npromoted_by: ${JSON.stringify(options.actor || 'agent-auto')}\n`
+      ? `tier: "auto-promoted"\nreviewed: false\nauto_tier: ${JSON.stringify(options.tier || 'verified')}\npromoted_by: ${JSON.stringify(options.actor || 'agent-auto')}\n${provenanceKindFrontmatter}${flaggedFrontmatter}`
       : '';
     const body = candidate.content
       .replace(/^status:\s*"candidate"\s*$/m, 'status: "promoted"')
@@ -650,6 +822,9 @@ export async function promoteCandidate(
         stagingOnly: workspace.mode === 'existing-memory-root',
         targetMemoryPath: relativeToMemory(workspace, targetPath),
         auto: options.auto || undefined,
+        autoTier: options.tier,
+        provenanceKind: options.provenanceKind,
+        flagReason: options.flagReason,
         reviewed: options.auto ? false : undefined,
         provenance: options.provenance,
       },
@@ -676,7 +851,8 @@ export async function durablePromoteCandidate(
   }
 
   return await withWorkspaceLock(workspace, async () => {
-    const candidate = await readMemoryFile(workspace, candidateRef);
+    const resolvedRef = await resolveCandidateRef(workspace, candidateRef);
+    const candidate = await readMemoryFile(workspace, resolvedRef);
     const candidateAbsolute = absoluteFromMemoryPath(workspace, candidate.path);
     if (!isAllowedCandidatePath(workspace, candidate.path, candidateAbsolute)) {
       throw new Error('candidate_must_be_from_inbox');

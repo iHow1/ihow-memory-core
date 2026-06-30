@@ -65,6 +65,7 @@ test('journal entries are searchable but ranked below curated memory', async (t)
     text: 'kafka consumer lag deploy decision: raise max.poll.interval.ms',
     sourceAgent: 'tester',
     title: 'kafka-lag',
+    autoPromote: false,
   });
   await core.promote(cand.path, { scope: 'team' });
 
@@ -89,4 +90,3 @@ test('CLI journal command appends a journal entry', async (t) => {
   assert.equal(parsed.status, 'journaled');
   assert.match(parsed.path, /memory\/journal\/\d{4}-\d{2}-\d{2}\.md$/);
 });
-

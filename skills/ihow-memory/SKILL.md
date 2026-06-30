@@ -70,8 +70,12 @@ Call `memory.write_candidate` when something durable happens:
 
 Keep each candidate concise and self-contained: one durable fact or decision, with enough
 context to act on it cold. Prefer a few high-value candidates over many noisy ones.
-**Attach provenance** in `metadata` (evidence, anchors, command, repo/git, verified) for
-anything you want remembered durably — that's what lets the engine auto-promote it.
+**Attach engine-verifiable provenance** in `metadata` — the engine accepts exactly two
+falsifiable forms, and a low-risk fact that carries one of them auto-promotes:
+(1) `command` + `exitCode` together ("ran X, got exit 0"), or
+(2) a git `head` anchor (with an absolute `repoPath`) that matches the repo's **live** HEAD.
+A self-asserted `verified: true`, a free-text `evidence: "I ran it"`, or a lone `exitCode`
+does **not** qualify — that's grading your own homework, and the engine ignores it.
 
 **Link related memory.** Before writing a candidate that refines, extends, or relates to an
 existing decision, `memory.search` for it; if one exists, reference its path in your candidate
@@ -87,12 +91,26 @@ connected instead of drifting into duplicates a future reader can't reconcile.
 ## Promotion — the engine gates, not you
 
 - **You don't need a manual promote step.** `write_candidate` auto-promotes qualifying content
-  for you: low-risk facts that carry **provenance** (evidence / anchors / command / repo /
-  verified in `metadata`) become durable automatically. Attach that provenance.
-- The engine **keeps as a candidate** (and tells you why) anything high-risk — standing
-  rules/policy, access/identity/credentials, destructive actions, or content with no
-  provenance. Those wait for human review; don't try to force them.
-- `memory.promote` remains for an explicit manual promotion when you want one.
+  for you: low-risk facts that carry **engine-verifiable provenance** (command+exitCode, or a
+  git head anchor that matches live HEAD — see above) become durable automatically.
+- The engine **keeps as a candidate** (and tells you why) anything it can't safely auto-promote.
+  Read the returned `category` and act on it — do **not** route around it:
+  - `governance` (standing rule / policy / preference, access / identity / credentials, a
+    destructive action), `secret`, or `conflict` (a claimed anchor that doesn't match live git)
+    → **human-gated. Do NOT self-promote these — a "verified handoff" does not earn an override.**
+    A handoff being committed-and-verified says nothing about whether its *content* is a standing
+    rule. **You MUST surface it before you end the turn**: tell the user the item is staged as a
+    candidate pending their review, name it (its `path` or `candidateId`), give the block reason, and
+    ask whether to promote. Do **not** silently leave a blocked candidate unmentioned — a decision the
+    user never hears about is, to them, the same as not recording it. Promote only on their explicit
+    say-so. This floor is enforced precisely so your own judgment never gates what reaches durable
+    memory: an over-trusted standing rule, once promoted, is auto-recalled into every future session
+    as 🟢 reviewed.
+  - `no-provenance` is the **one** category you can resolve yourself — not by forcing it, but by
+    re-issuing the candidate with real engine-verifiable provenance (command+exitCode, or a
+    live-matching git anchor), then letting the engine auto-promote it.
+- `memory.promote` is the explicit-manual path — use it for a candidate the user has OK'd, not to
+  bypass a governance/secret/conflict block on your own initiative.
 - `memory.durable_promote`: default to `dryRun: true` to preview the plan. Only set
   `realWrite: true` on explicit user confirmation.
 
@@ -101,6 +119,9 @@ connected instead of drifting into duplicates a future reader can't reconcile.
 Before you finish a substantive task, propose a short handoff candidate covering:
 
 - What changed (paths/mechanisms), what's **verified** (and how), what's **next**, any **blockers**.
+- **Any candidate that was blocked this session** (governance / secret / conflict): list it and ask
+  the user whether to promote. A pending-review item must never end a session unmentioned — that is
+  the human-confirmation step, and it is on YOU to trigger it.
 
 That one candidate is what makes the next session continuous instead of starting cold.
 

@@ -21,7 +21,7 @@ function cli(args, root, space) {
   });
 }
 const promote = (text, title, root, space) => {
-  const cand = JSON.parse(cli(['write-candidate', text], root, space)).path;
+  const cand = JSON.parse(cli(['write-candidate', '--no-auto-promote', text], root, space)).path;
   cli(['promote', cand, '--scope', 'team', '--title', title], root, space);
 };
 

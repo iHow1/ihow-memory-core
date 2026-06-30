@@ -14,7 +14,8 @@ export type MemoryEvent = {
     | 'memory.promoted'
     | 'memory.promoted.durable'
     | 'memory.journal.appended'
-    | 'memory.rolledback';
+    | 'memory.rolledback'
+    | 'memory.flagged.expired';
   at: string;
   path?: string;
   candidatePath?: string;
