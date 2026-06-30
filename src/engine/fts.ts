@@ -255,13 +255,22 @@ export async function searchFts(
           -- positive penalty to UNREVIEWED (machine auto-promoted) rows pushes them DOWN the order so a
           -- human-reviewed entry of comparable lexical match wins. Ranking only — eligibility is untouched
           -- (the row is still returned and still recall-gated downstream by the event log, not by rank).
-          (CASE WHEN reviewed = 0 THEN 1.0 ELSE 0 END) AS rank_penalty
+          (CASE WHEN reviewed = 0 THEN 1.0 ELSE 0 END) AS rank_penalty,
+          -- Phase-4 DETERMINISTIC SALIENCE DECAY for the SOFT (journal/floor) lane. Journal/floor files are
+          -- day-named (memory/journal/YYYY-MM-DD.md); the date is a deterministic, model-free salience proxy
+          -- — an older note has lower salience and sorts BELOW a newer one of equal lexical match. This is a
+          -- TIEBREAKER applied ONLY among journal rows (is_journal=1): it orders newest-day first (DESC) so
+          -- a stale low-weight note sinks. ARCHIVE/RANKING ONLY — same WHERE clause, same eligibility, never
+          -- a delete; verified/flagged (the PINNED governance tiers) are not in the journal lane at all, so
+          -- this can never touch them. Non-journal rows get '' here and are unaffected (constant key).
+          (CASE WHEN path LIKE 'memory/journal/%' OR path LIKE 'memory/_mcp/journal/%'
+                THEN substr(path, length(path) - 12, 10) ELSE '' END) AS journal_day
         FROM memory_fts
         WHERE memory_fts MATCH ? AND (? = 1 OR flagged != 1)
-        ORDER BY is_journal ASC, (rank + rank_penalty)
+        ORDER BY is_journal ASC, (rank + rank_penalty), journal_day DESC
         LIMIT ?
       `)
-      .all(queryToFts(query), opts.includeFlagged === true ? 1 : 0, limit) as Array<{ path: string; orig: string; rank: number; is_journal: number; rank_penalty: number }>;
+      .all(queryToFts(query), opts.includeFlagged === true ? 1 : 0, limit) as Array<{ path: string; orig: string; rank: number; is_journal: number; rank_penalty: number; journal_day: string }>;
     return rows.map((row) => {
       const snippet = buildSnippet(row.orig, query); // clean window from the ORIGINAL text, not the segmented column
       return {
