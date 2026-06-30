@@ -116,13 +116,14 @@ npx ihow-memory@next continue            # or pass a repo keyword: continue <nam
 | Cursor | ✓ (merges `~/.cursor/mcp.json`) | ✗ | receiver-only — Cursor keeps chats in a binary IndexedDB, not readable for resume |
 | Claude Desktop | ✓ | ✗ | receiver-only (chat app; no resumable local sessions) |
 | VS Code (Copilot) | ✓ (user `mcp.json`, `servers` key) | ✗ | receiver-only — reaches `memory.search`/`read`/`continue`; no readable local session store to resume from |
-| Gemini CLI | ✓ (`~/.gemini/settings.json`) | ✗ | receiver-only — reaches `memory.search`/`read`/`continue`; no readable local session store to resume from |
+| Gemini CLI | ✓ (`~/.gemini/settings.json`) | ✓ (`~/.gemini/tmp/*/logs.json`) | passive reader of Gemini's on-disk **user-prompt log** (Gemini records no assistant turns) → session topic + git anchors; manual `GEMINI.md` nudge. Verified against real local data |
+| Cline (VS Code) | — (add via Cline's own MCP settings) | ✓ (`globalStorage` / `~/.cline/data`) | passive reader of `tasks/<id>/api_conversation_history.json`; cwd from `environment_details`. Fixture-tested, not yet real-app smoke |
 
 The MCP tools and governed loop are runtime-agnostic. The proactive skill + auto-capture hooks are Claude Code-specific; the resume nudge is auto-injected for the runtimes whose config exposes an instructions file (Claude Code, WorkBuddy, OpenClaw, Hermes, OpenCode).
 
-### Receiver-only runtimes (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
+### Runtimes wired without an auto-injected resume nudge (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
 
-These four runtimes do not expose a readable local session store, so iHow cannot capture *their* past sessions for resume. They are wired as **receivers**: `connect` registers the shared MCP server so the agent can call `memory.search` / `memory.read` / `memory.continue` and pull a [verify-first handoff packet](./docs/handoff-schema.md) (query + GREEN/YELLOW/RED verdict + verbatim-unverified narrative) recorded by any *capture* runtime (Claude Code, Codex, …). That gives cross-tool resume — e.g. pick up in VS Code work that Claude Code left off — without any session reading on the receiver side. Because their always-on instruction surface is app- or project-managed, iHow does not auto-write a global rules file for them; add the resume nudge yourself once:
+For these, `connect` wires the shared MCP server but iHow does **not** auto-write a global rules file (their instruction surface is app- or project-managed), so add the resume nudge yourself once. Cursor, Claude Desktop and VS Code Copilot are also **receiver-only** — no readable local session store, so iHow cannot resume *their* past sessions; they instead pull a [verify-first handoff packet](./docs/handoff-schema.md) (query + GREEN/YELLOW/RED verdict + verbatim-unverified narrative) recorded by any *capture* runtime (Claude Code, Codex, …), e.g. pick up in VS Code work that Claude Code left off. Gemini CLI is now a **passive reader** (its on-disk user-prompt log — see the table above) but still needs the manual `GEMINI.md` nudge:
 
 - **Cursor** — `npx ihow-memory@next connect --runtime cursor` (merges `~/.cursor/mcp.json`, backed up; never clobbers an unparseable file). Add a User Rule like: *"On resume / when I say 继续, call the `memory.continue` MCP tool first; treat its narrative as UNVERIFIED and run its git preflight before acting."*
 - **Claude Desktop** — `npx ihow-memory@next connect --runtime claude-desktop` (writes `claude_desktop_config.json`; macOS `~/Library/Application Support/Claude/`, Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude\`). Restart the app to load the tools.
@@ -152,7 +153,15 @@ This is a deterministic, stranger-reproducible harness: `node scripts/retrieval-
 
 **The honest floor: paraphrase recall is the weak spot.** Keyword and partial-keyword queries recall well (15/15 in the fixture), but **paraphrase / synonym queries that share no surface tokens score 2/5 = 0.40** — a reworded query exposes a lexical engine's lack of semantics. That gap is exactly what an optional semantic provider is meant to lift.
 
-This fixture is a **self-authored 20-doc / 20-query** set, **not** a standard benchmark (LongMemEval-S / LoCoMo). A stranger-reproducible, standard-dataset harness running on the **default binary** is still WIP.
+The fixture above is a **self-authored 20-doc / 20-query** set. So that the numbers don't rest on our own data, there is also a stranger-reproducible run on a **public, MIT-licensed standard dataset** — LongMemEval (oracle variant, [arXiv:2410.10813](https://arxiv.org/abs/2410.10813)) — on the **same default FTS5 binary**:
+
+| Metric (default FTS5 · global-corpus · recall_any@k) | LongMemEval-oracle |
+| --- | --- |
+| Recall@5 | **0.788** |
+| Recall@10 | **0.857** |
+| MRR | **0.651** |
+
+`node scripts/standard-bench.mjs --download` fetches + **sha256-verifies** the dataset and runs all 419 usable instances (831 session-docs) on the default engine; the vendored N=8 slice runs offline (`node scripts/standard-bench.mjs`). This is **global-corpus** retrieval — find the gold evidence session among *every* instance's sessions, which is **harder** than the paper's per-instance oracle setup. Recall@k is recall_any@k (the official reading); MRR is our own metric (LongMemEval reports NDCG), so it is **not** directly comparable to the paper's tables. The weak spots stay visible: assistant-answer and preference questions — where the evidence lives in the assistant's turn or is implicit, so the indexed user turns share little surface with the query — recall worst, the same lexical gap an optional semantic provider lifts.
 
 #### Optional semantic sidecar (not the default binary)
 

@@ -8,6 +8,51 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.17] — 2026-06-30
+
+The **first-run + standard-evidence** release: the README's governed-loop quickstart now copy-pastes
+clean for a brand-new user, the retrieval numbers are corroborated on a public standard dataset on the
+default engine, cross-tool resume widens to Gemini CLI and Cline, and the optional embedding sidecar now
+ships inside the package.
+
+### Fixed
+
+- **Quickstart copy-paste was broken for new users (ship-blocker).** The README §"The governed loop in
+  60 seconds" block errored: `write-candidate` auto-promotes by default, so `promote $CAND` hit
+  `candidate_not_found`, `$PROMOTED` came back empty, and `read ""` resolved to the memory-root directory
+  → a cryptic `EISDIR`. The block now passes `--no-auto-promote` to make the two-step gate explicit
+  (matching its own narrative), `read` rejects an empty/missing path with a clean message + non-zero exit
+  instead of `EISDIR`, `init` prints a governed-loop next step, and `status` surfaces the auto-promote
+  mode. Locked by `tests/quickstart-governed-loop.test.mjs`.
+
+### Added
+
+- **Standard retrieval benchmark on the default engine (LongMemEval-oracle, MIT).** `scripts/standard-bench.mjs`
+  runs a public, MIT-licensed dataset ([arXiv:2410.10813](https://arxiv.org/abs/2410.10813)) through the
+  SAME `write → promote → search` scorer as the in-repo bench, on the **default zero-dependency FTS5
+  engine** (`engine.id==='fts'`, `cloud=false`, `model=null`). `--download` fetches + **sha256-verifies**
+  the corpus; a vendored N=8 slice runs offline in CI. Full-set figures: **Recall@5 = 0.788, Recall@10 =
+  0.857, MRR = 0.651** over 419 usable instances / 831 session-docs (global-corpus retrieval — harder than
+  the per-instance oracle; recall_any@k; MRR is ours, not LongMemEval's NDCG). The weak spots
+  (assistant-answer / preference questions) stay visible.
+- **Passive resume readers for Gemini CLI and Cline.** Cross-tool `continue` now reads two more runtimes'
+  on-disk sessions (passive — resume/import, not real-time; only Claude Code has a live capture hook).
+  Both route through the shared session path, so the locked summarizer scope + secret redaction are
+  identical to every other runtime. **Gemini CLI** reads `~/.gemini/tmp/*/logs.json` (a user-prompt log —
+  Gemini records no assistant turns to disk — so the handoff is the session topic + git anchors; verified
+  against real local data). **Cline** reads `tasks/<id>/api_conversation_history.json` from VS Code-family
+  globalStorage and `~/.cline/data` with cwd from `environment_details` (bounded discovery — no home-wide
+  scan; fixture-tested). Aider is intentionally deferred: it keeps no global session registry, so global
+  discovery would require a `$HOME` scan on the session-start hot path.
+- **Optional embedding sidecar now ships in the tarball.** `examples/` is not in package.json `files[]`,
+  so a published install could not find the sidecar; the build now copies it into `dist/providers/`
+  (`dist/` is packaged) and a `providerScriptPath()` resolver locates it. The sidecar stays a SPAWNED
+  subprocess on explicit opt-in only — never imported into the default graph, so the default engine
+  remains zero-dependency FTS5 (`capabilities.semantic = false`). A red-line test forbids any default-graph
+  module from importing it.
+
+## [0.1.0-alpha.16] — 2026-06-30
+
 ### Added
 
 - **Two more receiver runtimes: VS Code (Copilot) and Gemini CLI.** `connect --runtime vscode` writes the

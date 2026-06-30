@@ -98,6 +98,8 @@ npx ihow-memory@next proof
 | WorkBuddy | ✓（`~/.workbuddy/mcp.json`） | ✓ | 单机真机 smoke |
 | Cursor | ✓（合并 `~/.cursor/mcp.json`） | ✗ | 只能接收——Cursor 把会话存在二进制 IndexedDB 里，无法读取用于 resume |
 | Claude Desktop | ✓ | ✗ | 只能接收（聊天 app；没有可 resume 的本地会话） |
+| Gemini CLI | ✓（`~/.gemini/settings.json`） | ✓（`~/.gemini/tmp/*/logs.json`） | 被动读取 Gemini 的磁盘**用户 prompt 日志**（Gemini 不在磁盘记录助手轮）→ 会话主题 + git 锚点；需手动在 `GEMINI.md` 加提示。已对真实本地数据验证 |
+| Cline (VS Code) | —（经 Cline 自己的 MCP 设置接入） | ✓（`globalStorage` / `~/.cline/data`） | 被动读取 `tasks/<id>/api_conversation_history.json`；cwd 取自 `environment_details`。已 fixture 测试，尚未真机 smoke |
 
 MCP 工具与治理闭环与 runtime 无关。主动记忆 skill + 自动捕获 hooks 是 Claude Code 专属；resume 提示会自动注入到那些配置暴露了指令文件的 runtime（Claude Code、WorkBuddy、OpenClaw、Hermes、OpenCode）。
 
@@ -122,7 +124,15 @@ MCP 工具与治理闭环与 runtime 无关。主动记忆 skill + 自动捕获 
 
 **诚实的地板：同义换词召回是弱项。** 关键词与部分关键词 query 召回良好（fixture 中 15/15），但**与答案不共享任何表层 token 的同义/换词 query 只有 2/5 = 0.40**——一次换词的 query 就暴露了词法引擎的零语义。这道 gap 正是可选语义 provider 要补的地方。
 
-该 fixture 是一个**自建的 20 文档 / 20 query** 集合，**不是**标准 benchmark（LongMemEval-S / LoCoMo）。在**默认二进制**上跑、可被陌生人复跑的标准数据集 harness 仍在开发中。
+上面的 fixture 是**自建的 20 文档 / 20 query** 集合。为了不让数字只依赖我们自己的数据，还有一个在**公开、MIT 许可的标准数据集**上、可被陌生人复跑的运行——LongMemEval（oracle 变体，[arXiv:2410.10813](https://arxiv.org/abs/2410.10813)），跑在**同一个默认 FTS5 二进制**上：
+
+| 指标（默认 FTS5 · 全局语料 · recall_any@k） | LongMemEval-oracle |
+| --- | --- |
+| Recall@5 | **0.788** |
+| Recall@10 | **0.857** |
+| MRR | **0.651** |
+
+`node scripts/standard-bench.mjs --download` 会下载并 **sha256 校验**数据集，在默认引擎上跑全部 419 条可用实例（831 个 session 文档）；自带的 N=8 切片可离线跑（`node scripts/standard-bench.mjs`）。这是**全局语料**检索——在*所有*实例的 session 里找到那条 gold 证据 session，比论文的 per-instance oracle 设定**更难**。Recall@k 即 recall_any@k（官方口径）；MRR 是我们自己的指标（LongMemEval 报告 NDCG），**不**与论文表格直接可比。弱项保持可见：assistant 回答类与 preference 类问题——证据在助手那一轮、或是隐式的，被索引的用户轮与 query 几乎不共享表层 token——召回最差，正是可选语义 provider 要补的那道词法 gap。
 
 #### 可选语义 sidecar（不在默认二进制里）
 
