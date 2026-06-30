@@ -137,16 +137,34 @@ The default retrieval engine is zero-dependency local full-text search — Node 
 
 ### Retrieval-quality evidence
 
-As honest evidence of retrieval quality — not the product's differentiator — we publish two figures **side by side**: the **default shipped FTS5 engine** (what you actually run out of the box) and the **experimental vector + lexical hybrid lane** (not in the published binary).
+Retrieval recall is **not** iHow's differentiator — verify-first governance is. We publish the honest shipped numbers anyway, because "claimed vs observed" must never diverge for a tool whose whole pitch is *don't trust green*.
 
-| Lane | Dataset | R@5 | R@10 | MRR | tokens/query | Reproduce |
-| --- | --- | --- | --- | --- | --- | --- |
-| **Default FTS5** (shipped, zero-dependency) | in-repo representative fixture (20 docs / 20 queries — **not** LongMemEval_S) | 0.85 | 0.85 | 0.85 | ~5.7 | `node scripts/retrieval-bench.mjs` |
-| **Experimental hybrid** (vector + lexical, opt-in) | LongMemEval_S retrieval stage (470 effective / 500 raw) | — | recall_all@10 = 1.0 (ndcg_any@10 0.946) | — | evidence manifest below |
+The headline numbers are the ones you actually get out of the box — the **default zero-dependency FTS5 lexical engine** (BM25). On the in-repo reproducible fixture (`node scripts/retrieval-bench.mjs`):
 
-The default-FTS5 row is a **deterministic, stranger-reproducible** harness: `node scripts/retrieval-bench.mjs` seeds a labeled fixture through the same `write → promote → search` path the product uses and scores R@5/R@10/MRR + tokens-per-query, with no cloud, no LLM and no third-party deps. The honest shape it shows: keyword and partial-keyword queries recall well (15/15 here), while **paraphrase / synonym queries that share no surface tokens miss** (2/5 here) — that gap is exactly the floor the optional semantic provider is meant to lift.
+| Metric | Default FTS5 (shipped, zero-dependency) |
+| --- | --- |
+| R@5 | **0.85** |
+| R@10 | **0.85** |
+| MRR | **0.85** |
+| tokens/query | **~5.7** |
 
-Three boundaries (unchanged): (1) both are retrieval-layer recall, not end-to-end LLM-judged answer accuracy — not directly comparable to the 90%+ figures reported by other vendors, which measure a different layer; (2) the recall_all@10 = 1.0 figure was produced on the **experimental** vector + lexical hybrid lane, while this published package defaults to zero-dependency FTS5 lexical search (the default-FTS5 row above is the number you get out of the box, on an in-repo fixture, **not** LongMemEval_S); (3) the default-FTS5 number is one-command reproducible today (`node scripts/retrieval-bench.mjs`); a stranger-reproducible harness over the **full LongMemEval_S** hybrid lane is still WIP — until it lands, the public evidence manifest (metric definitions, run artifacts, full @5 disclosure incl. structural ceilings) is the auditable reference for that row.
+This is a deterministic, stranger-reproducible harness: `node scripts/retrieval-bench.mjs` seeds a labeled fixture through the same `write → promote → search` path the product uses and scores R@5/R@10/MRR + tokens-per-query, with no cloud, no LLM and no third-party deps.
+
+**The honest floor: paraphrase recall is the weak spot.** Keyword and partial-keyword queries recall well (15/15 in the fixture), but **paraphrase / synonym queries that share no surface tokens score 2/5 = 0.40** — a reworded query exposes a lexical engine's lack of semantics. That gap is exactly what an optional semantic provider is meant to lift.
+
+This fixture is a **self-authored 20-doc / 20-query** set, **not** a standard benchmark (LongMemEval-S / LoCoMo). A stranger-reproducible, standard-dataset harness running on the **default binary** is still WIP.
+
+#### Optional semantic sidecar (not the default binary)
+
+Higher recall figures exist, but they come from a different lane and must not be read as the shipped default:
+
+| Figure | Provenance |
+| --- | --- |
+| recall_all@10 = 1.0, ndcg_any@10 ≈ 0.946 | **OPT-IN semantic sidecar** (not the default binary), **EXPERIMENTAL hybrid lane**, from an **EXTERNAL evidence manifest** (repo `iHow1/ihow-memory-standard`, dated 2026-05-11), **RETRIEVAL-STAGE recall only** (NOT end-to-end LLM-judged). |
+
+Not directly comparable to vendor end-to-end LLM-judged figures.
+
+Semantic recall requires a **user-provided embedding sidecar** (e.g. Ollama `nomic-embed-text`) running as a separate local process. The default install is **lexical-only and zero-dependency by design** — that is the moat, not an omission. If the sidecar is unconfigured or unhealthy, retrieval falls back visibly to FTS.
 
 Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md).
 
