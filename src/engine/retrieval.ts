@@ -28,6 +28,11 @@ type EngineConfig = {
   vectorProviderCommand?: string;
   vectorModel?: string;
   vectorTimeoutMs: number;
+  // SEPARATE ceiling for the whole-corpus index() call. The interactive vectorTimeoutMs (default 1.5s, max 30s)
+  // is right for status/search, but applying it to index() SIGTERM-killed a slow embedding model mid-index —
+  // and the failure degraded silently to FTS while status could still look healthy (the exact "fake green" this
+  // floor exists to prevent). index() is not interactive, so it gets a generous ceiling of its own.
+  vectorIndexTimeoutMs: number;
 };
 
 type ProviderCall = 'status' | 'index' | 'search';
@@ -44,6 +49,9 @@ export type EngineSearchResult = {
 };
 
 const DEFAULT_VECTOR_TIMEOUT_MS = 1500;
+// index() runs over the whole corpus and may legitimately take minutes on a slow local model — generous
+// default, far higher ceiling than the interactive search timeout (which clamps to 30s).
+const DEFAULT_VECTOR_INDEX_TIMEOUT_MS = 600_000; // 10 min
 
 function stringEnv(name: string): string | undefined {
   const value = process.env[name];
@@ -54,6 +62,13 @@ function parseTimeout(value: unknown): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_VECTOR_TIMEOUT_MS;
   return Math.max(100, Math.min(parsed, 30000));
+}
+
+// index() is non-interactive, so its ceiling is much higher than the search timeout — up to 1h.
+function parseIndexTimeout(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_VECTOR_INDEX_TIMEOUT_MS;
+  return Math.max(1000, Math.min(parsed, 3_600_000));
 }
 
 function requestedEngineId(options: WorkspaceOptions): string {
@@ -69,6 +84,7 @@ export function resolveEngineConfig(options: WorkspaceOptions = {}): EngineConfi
     vectorProviderCommand: options.vectorProviderCommand || stringEnv('IHOW_MEMORY_VECTOR_PROVIDER_COMMAND'),
     vectorModel: options.vectorModel || stringEnv('IHOW_MEMORY_VECTOR_MODEL') || null || undefined,
     vectorTimeoutMs: parseTimeout(options.vectorTimeoutMs || stringEnv('IHOW_MEMORY_VECTOR_TIMEOUT_MS')),
+    vectorIndexTimeoutMs: parseIndexTimeout(options.vectorIndexTimeoutMs || stringEnv('IHOW_MEMORY_VECTOR_INDEX_TIMEOUT_MS')),
   };
 }
 
@@ -158,10 +174,12 @@ class VectorProcessEngine implements RetrievalEngine {
       });
       let stdout = '';
       let stderr = '';
+      // index() gets its own generous ceiling; status/search keep the tight interactive timeout.
+      const timeoutMs = method === 'index' ? this.config.vectorIndexTimeoutMs : this.config.vectorTimeoutMs;
       const timer = setTimeout(() => {
         child.kill('SIGTERM');
-        reject(new Error(`vector_provider_timeout:${method}`));
-      }, this.config.vectorTimeoutMs);
+        reject(new Error(`vector_provider_timeout:${method}:${timeoutMs}ms`));
+      }, timeoutMs);
 
       child.stdout.on('data', (chunk) => {
         stdout += String(chunk);
@@ -284,10 +302,13 @@ export async function indexWithEngineFallback(workspace: Workspace, config: Engi
     await writeReadyManifest(workspace, status, ftsIndexed);
     return ftsIndexed;
   } catch (error) {
+    // LOUD, not silent: a failed semantic INDEX must not look like a healthy build. The manifest records
+    // status:'fallback' + this reason, which status/doctor surface — so a user sees "semantic index failed,
+    // search is lexical-only" instead of a quiet green. (The interactive search-time fallback says less.)
     await writeFallbackManifest(workspace, {
       from: 'vector-gguf',
       to: 'fts',
-      reason: safeErrorMessage(error),
+      reason: `semantic index FAILED — search is LEXICAL-ONLY until a successful reindex: ${safeErrorMessage(error)}`,
     });
     return ftsIndexed;
   }

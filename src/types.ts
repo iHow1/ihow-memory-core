@@ -12,6 +12,7 @@ export type WorkspaceOptions = {
   vectorProviderCommand?: string;
   vectorModel?: string;
   vectorTimeoutMs?: number;
+  vectorIndexTimeoutMs?: number;
 };
 
 export type Workspace = {
