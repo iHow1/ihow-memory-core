@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
+## [0.1.0-alpha.14] — 2026-06-29
+
+The **capture-experience** release: capturing memory is now fully automatic — nothing is blocked
+except secrets and engine-falsified anchors — while the verify-first floor that keeps junk out of
+authoritative, auto-recalled memory is preserved and hardened. The floor change was reviewed and
+signed off by an external red team.
+
+### Changed
+
+- **Label, don't block.** Governance-flagged and unverified content no longer fails to capture: it
+  auto-promotes into durable *yellow* tiers (verified / unverified / flagged) instead of staying a
+  blocked candidate. Flagged entries are durable and findable on demand but are never auto-recalled and
+  are excluded from default search; only human-promoted (and engine-anchor-verified) memory is
+  authoritative. A misjudgment now costs a label, not your capture.
+- **Sharper governance classifier.** Markers no longer scan the auto-derived slug/identifier title, so
+  a factual handoff named like a file (`policy-…-root`) stops false-flagging; a genuine rule in a prose
+  title or in the body still flags.
+- **Provenance binding.** A `command`+`exitCode` keeps an entry durable but never recall-eligible; only
+  a git anchor the engine verified against live HEAD earns auto-recall, and recall trusts the
+  append-only event log rather than forgeable front-matter.
+
+### Added
+
+- **`promote` accepts a candidateId**, not just the candidate file path.
+- **Flagged TTL expiry** — un-reviewed flagged memory auto-expires so the human-review backlog can't
+  pile up silently; the session-end hook surfaces what is pending review.
+
+### Fixed
+
+- Two issues found by the external red-team review of the floor change: a stapled `command`+`exitCode`
+  could mask a falsified git anchor (now a hard reject); recall could trust a hand-written
+  `provenance_kind: anchor` front-matter (recall is now bound to the engine event log).
+
 ## [0.1.0-alpha.13] — 2026-06-27
 
 The **verify-first wedge + import** release: a reproducible local proof of the trust guarantees, one
