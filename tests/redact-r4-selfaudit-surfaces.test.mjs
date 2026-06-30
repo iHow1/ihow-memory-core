@@ -226,3 +226,19 @@ test('FTS index never stores an out-of-band PII-named durable path, and normal m
   const idxBytes = await fs.readFile(path.join(root, 'r4', 'index.sqlite')).catch(() => Buffer.alloc(0));
   assert.equal(idxBytes.includes(Buffer.from(PII)), false, 'raw PII path must not be stored in index.sqlite');
 });
+
+// --- r7 red-team Blocker: an opt-in vector provider must not surface a secret-like path via search/RRF ---
+
+test('search: a vector provider hit with a secret-like path is gated out of results (RRF result boundary)', async (t) => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-r7vec-')));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const provider = path.join(root, 'fake-provider.mjs');
+  await fs.writeFile(provider, "const m=process.argv[process.argv.length-1];let i='';process.stdin.on('data',c=>i+=c);process.stdin.on('end',()=>{const out=m==='status'?{id:'vector-gguf',ready:true,cloud:false}:m==='search'?{hits:[{path:'memory/scopes/r7-vec@example.test/n.md',score:0.99,snippet:'x',source:'vector'}]}:m==='index'?{indexed:0}:{};process.stdout.write(JSON.stringify(out));});");
+  const core = await openCore({ root, space: 'r7vec', cwd: root, engine: 'vector-gguf', vectorProviderCommand: `node ${provider}` });
+  const c = await core.write_candidate({ text: 'apple legit body', sourceAgent: 'unit', autoPromote: false });
+  await core.durable_promote(c.path, { realWrite: true, actor: 'unit', target: { scope: 'general', title: 'ok' } });
+  const hits = await core.search('n');
+  assert.ok(hits.every((h) => !(h.path || '').includes('r7-vec@example.test')), 'a vector hit with a secret-like path must be gated out of search results');
+  const legit = await core.search('apple');
+  assert.ok(legit.length > 0, 'a normal search still returns legit hits with the vector lane enabled');
+});

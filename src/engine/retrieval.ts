@@ -11,6 +11,17 @@ import type {
 } from '../types.ts';
 import { countIndexedDocuments, ftsEngine } from './fts.ts';
 import { readProviderManifest, writeProviderManifest } from './manifest.ts';
+import { containsSecretLikeContent } from '../governance.ts';
+
+// A search RESULT must never surface a secret-like path — and not only on the FTS lane (gated at
+// collectDocuments). An OPT-IN vector provider can return a hit for an out-of-band PII/secret-named file the
+// FTS index gate never saw, and RRF would fuse it into the result list (red-team r7). This is the result-
+// boundary chokepoint applied to EVERY lane/return of searchWithEngineFallback, so MCP / CLI / HTTP / recall
+// (all of which go through core.search → here) can never echo a foreign secret-like path. Engine-written
+// durable paths are always slug-safe, so a normal hit is never dropped.
+function gateSearchHits(hits: SearchResult[]): SearchResult[] {
+  return hits.filter((hit) => hit && typeof hit.path === 'string' && !containsSecretLikeContent(hit.path));
+}
 
 type EngineConfig = {
   requestedId: string;
@@ -328,7 +339,7 @@ export async function searchWithEngineFallback(
   // false in this path because no semantic engine was even constructed.
   const ftsHits = await ftsEngine.search(workspace, query, opts);
   if (!isVectorRequested(config)) {
-    return { hits: ftsHits };
+    return { hits: gateSearchHits(ftsHits) };
   }
 
   // Semantic lane is OPT-IN. Run it ALONGSIDE FTS (not instead of) and RRF-fuse: vector hits re-order
@@ -343,7 +354,7 @@ export async function searchWithEngineFallback(
     const vectorHits = await requested.search(workspace, query, { ...opts, limit: vectorLimit });
     await writeReadyManifest(workspace, status);
     const limit = Math.max(1, Math.min(Number(opts.limit || 5), 25));
-    return { hits: fuseRrf(ftsHits, vectorHits, limit) };
+    return { hits: gateSearchHits(fuseRrf(ftsHits, vectorHits, limit)) };
   } catch (error) {
     const fallback = {
       from: requested.id,
@@ -352,10 +363,10 @@ export async function searchWithEngineFallback(
     };
     await writeFallbackManifest(workspace, fallback);
     return {
-      hits: ftsHits.map((hit) => ({
+      hits: gateSearchHits(ftsHits.map((hit) => ({
         ...hit,
         fallback,
-      })),
+      }))),
       fallback,
     };
   }
