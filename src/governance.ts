@@ -112,7 +112,12 @@ const REAL_SECRET_PATTERNS = SECRET_LIKE_PATTERNS.filter((p) => !REDACT_IN_PLACE
 const REAL_SECRET_PRECHECK_PATTERNS = [
   /\bAuthorization\s*:\s*Bearer\s+\S+/i, // `Authorization: Bearer <anything non-empty>`
   /\bBearer\s+\S*@\S+/i, // `Bearer <…@…>` — email-shaped / creds-in-URL value (the named adversarial case)
-  /\bBearer\s+(?=[A-Za-z0-9._~+/=-]{8,}\b)(?=\S*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{8,}\b/i, // ≥8-char token, not a plain word
+  // ≥8-char token, not a plain word. The right boundary is "not another Bearer-alphabet char" (a negative
+  // lookahead) — NOT \b: a token ending in `- ~ + / =` (RFC 6750 / base64url tails) has no word boundary after
+  // it, so the old \b silently missed `Bearer abc1234-` and the redactor (which shares this pattern) drifted
+  // with it (red-team r3 Blocker 1). `Bearer of`/`Bearer marched` still don't match (need ≥8 chars AND a
+  // non-alpha char via the second lookahead), so ordinary prose using "bearer" stays unflagged.
+  /\bBearer\s+(?=[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-]))(?=\S*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])/i,
 ];
 
 function containsRealSecret(text: string): boolean {
@@ -245,17 +250,28 @@ function safeRedactedSlug(title: string | undefined, candidateId: string): strin
   return safeFileSlug(redacted, candidateId);
 }
 
-// Ingest-safe copy of a PromoteTarget for the AUDIT metadata surface (red-team Blocker 1: the raw
-// `target` — including `target.title` — was written verbatim into the _events ndjson audit log). The
-// title is the only free-text field; run it through the same redact-in-place + drop-if-real-secret guard
-// as the filename slug so a PII/secret title never lands in the audit log either. scope/path are
-// constrained identifiers already validated upstream and are left as-is.
+// A scope becomes a durable DIRECTORY name AND the raw `event.targetPath` in the _events audit log AND an
+// index.sqlite row — none of them redactable after the fact. safeFileSlug alone only swaps illegal chars
+// (scope-pii@corp.example -> scope-pii-corp.example, keeping the email local-part+domain; an sk- key survives
+// byte-intact), so scope must get the SAME redact-before-slug treatment as the title (r4 self-audit round 2:
+// the metadata.target.scope copy was redacted but the sibling targetPath it mirrors was not). Falls back to
+// 'general' on a real secret, mirroring safeRedactedSlug's drop-to-candidateId.
+function safeScopeSlug(scope: string | undefined): string {
+  const trimmed = scope?.trim();
+  if (!trimmed) return safeFileSlug('general', 'general');
+  const redacted = redactIngestBenign(trimmed);
+  if (containsSecretLikeContent(redacted)) return safeFileSlug('general', 'general');
+  return safeFileSlug(redacted, 'general');
+}
+
+// Ingest-safe copy of a PromoteTarget for the AUDIT metadata surface. EVERY user-controlled field
+// (scope / path / title) is free text and is NOT redacted upstream — resolveTargetPath only slugs scope/title
+// into a filename, and an explicit path is rejected (not redacted) at resolve time — so a raw PII/secret in
+// ANY of them would otherwise land verbatim in the _events ndjson audit log. Route the whole target through
+// the recursive full-set audit redactor (proven in lockstep with the detector). r2 covered only title; the
+// r4 self-audit found scope (and path) still passed through raw via the `{ ...target }` spread.
 function safeAuditTarget(target: PromoteTarget): PromoteTarget {
-  if (target.title === undefined) return target;
-  const redacted = redactIngestBenign(String(target.title));
-  // If a real secret made the redactor a no-op, drop the title entirely rather than log the value.
-  const safeTitle = containsSecretLikeContent(redacted) ? undefined : redacted;
-  return { ...target, title: safeTitle };
+  return safeAuditMetadata(target);
 }
 
 // Deep-sanitize a provenance/metadata object before it lands in an audit EVENT (red-team r2 Blocker 1):
@@ -272,7 +288,12 @@ function safeAuditMetadata<T>(value: T): T {
   if (Array.isArray(value)) return value.map((entry) => safeAuditMetadata(entry)) as unknown as T;
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) out[key] = safeAuditMetadata(entry);
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      // Redact KEYS too, not just values: a PII/secret used as an object KEY (e.g. { 'carol@example.net': v })
+      // otherwise lands raw in the _events audit ndjson, while the markdown frontmatter — which redacts the
+      // rendered JSON string — masks it. That asymmetry is a detector/redactor drift (r4 self-audit: key-leak).
+      out[safeAuditMetadata(key) as string] = safeAuditMetadata(entry);
+    }
     return out as unknown as T;
   }
   return value;
@@ -345,11 +366,14 @@ function resolveTargetPath(workspace: Workspace, candidateId: string, target: Pr
   const explicit = target.path?.trim();
   if (explicit) {
     if (isProtectedPath(explicit)) throw new Error('protected_core_path');
+    // A PII/secret in an explicit path becomes the durable FILENAME and the raw event.targetPath in the audit
+    // log — neither is redactable after the fact — so reject it at resolve time (r4 self-audit: target.path leak).
+    if (containsSecretLikeContent(normalizeRef(explicit))) throw new Error('target_path_contains_secret_like_content');
     const absolute = absoluteFromMemoryPath(workspace, explicit);
     return absolute;
   }
 
-  const scope = safeFileSlug(target.scope || 'general', 'general');
+  const scope = safeScopeSlug(target.scope); // r4 self-audit: redact PII/secret BEFORE it becomes a dir name / raw targetPath / sqlite row
   const title = safeRedactedSlug(target.title, candidateId); // Blocker 1: no raw PII/secret in path
   const relative = path.join('scopes', scope, `${nowCompact()}-${title}.md`);
   if (isProtectedPath(relative)) throw new Error('protected_core_path');
@@ -396,6 +420,8 @@ function resolveDurableTargetPath(workspace: Workspace, candidateId: string, tar
   const explicit = target.path?.trim();
   if (explicit) {
     if (isProtectedPath(explicit)) throw new Error('protected_core_path');
+    // PII/secret in an explicit path leaks into the durable filename + the raw audit targetPath (r4 self-audit).
+    if (containsSecretLikeContent(normalizeRef(explicit))) throw new Error('target_path_contains_secret_like_content');
     const normalized = normalizeRef(explicit);
     if (normalized.startsWith('projects/')) {
       const workspaceRoot = workspace.mode === 'existing-memory-root' ? path.dirname(workspace.memoryDir) : workspace.spaceDir;
@@ -404,7 +430,7 @@ function resolveDurableTargetPath(workspace: Workspace, candidateId: string, tar
     return absoluteFromMemoryPath(workspace, normalized);
   }
 
-  const scope = safeFileSlug(target.scope || 'general', 'general');
+  const scope = safeScopeSlug(target.scope); // r4 self-audit: redact PII/secret BEFORE it becomes a dir name / raw targetPath / sqlite row
   const title = safeRedactedSlug(target.title, candidateId); // Blocker 1: no raw PII/secret in path
   return path.join(workspace.memoryDir, 'scopes', scope, `${nowCompact()}-${title}.md`);
 }
@@ -1237,7 +1263,9 @@ export async function durablePromoteCandidate(
       actor,
       metadata: {
         candidateId,
-        target: options.target || {},
+        // r3 Blocker 2: the real-write audit event must match the dry-run plan (line ~1200) — a raw PII/
+        // secret-shaped target.title must never land in the _events ndjson (a backed-up/grep-able surface).
+        target: safeAuditTarget(options.target || {}),
         dryRun: false,
         source: 'candidate/inbox',
         archiveCandidateTo,
