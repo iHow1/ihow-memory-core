@@ -3,6 +3,8 @@ dist/
 node_modules/
 *.tgz
 .DS_Store
+# Downloaded benchmark corpora (LongMemEval oracle, ~15MB) — fetched + sha256-verified on demand, never committed.
+scripts/bench/.cache/
 tmp-floor-quality/
 *.ihow-bak-*
 .claude/settings.local.json
