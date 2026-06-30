@@ -34,7 +34,7 @@ npx ihow-memory@next setup
 ### 1. Connect a single runtime
 
 ```bash
-npx ihow-memory@next connect --runtime claude-code   # or: codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw
+npx ihow-memory@next connect --runtime claude-code   # or: codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw | vscode | gemini
 ```
 
 `connect` provisions a managed workspace under `~/.ihow-memory` (space name derived from the current directory unless you pass `--space`) and registers the `ihow-memory` MCP server with the selected runtime:
@@ -103,7 +103,7 @@ npx ihow-memory@next continue            # or pass a repo keyword: continue <nam
 
 ## Runtime support
 
-`connect` registers the MCP server for eight runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted — this is alpha.
+`connect` registers the MCP server for ten runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted — this is alpha.
 
 | Runtime | connect | resume reader | Notes |
 | --- | --- | --- | --- |
@@ -115,8 +115,21 @@ npx ihow-memory@next continue            # or pass a repo keyword: continue <nam
 | WorkBuddy | ✓ (`~/.workbuddy/mcp.json`) | ✓ | single-machine real-app smoke |
 | Cursor | ✓ (merges `~/.cursor/mcp.json`) | ✗ | receiver-only — Cursor keeps chats in a binary IndexedDB, not readable for resume |
 | Claude Desktop | ✓ | ✗ | receiver-only (chat app; no resumable local sessions) |
+| VS Code (Copilot) | ✓ (user `mcp.json`, `servers` key) | ✗ | receiver-only — reaches `memory.search`/`read`/`continue`; no readable local session store to resume from |
+| Gemini CLI | ✓ (`~/.gemini/settings.json`) | ✗ | receiver-only — reaches `memory.search`/`read`/`continue`; no readable local session store to resume from |
 
 The MCP tools and governed loop are runtime-agnostic. The proactive skill + auto-capture hooks are Claude Code-specific; the resume nudge is auto-injected for the runtimes whose config exposes an instructions file (Claude Code, WorkBuddy, OpenClaw, Hermes, OpenCode).
+
+### Receiver-only runtimes (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
+
+These four runtimes do not expose a readable local session store, so iHow cannot capture *their* past sessions for resume. They are wired as **receivers**: `connect` registers the shared MCP server so the agent can call `memory.search` / `memory.read` / `memory.continue` and pull a [verify-first handoff packet](./docs/handoff-schema.md) (query + GREEN/YELLOW/RED verdict + verbatim-unverified narrative) recorded by any *capture* runtime (Claude Code, Codex, …). That gives cross-tool resume — e.g. pick up in VS Code work that Claude Code left off — without any session reading on the receiver side. Because their always-on instruction surface is app- or project-managed, iHow does not auto-write a global rules file for them; add the resume nudge yourself once:
+
+- **Cursor** — `npx ihow-memory@next connect --runtime cursor` (merges `~/.cursor/mcp.json`, backed up; never clobbers an unparseable file). Add a User Rule like: *"On resume / when I say 继续, call the `memory.continue` MCP tool first; treat its narrative as UNVERIFIED and run its git preflight before acting."*
+- **Claude Desktop** — `npx ihow-memory@next connect --runtime claude-desktop` (writes `claude_desktop_config.json`; macOS `~/Library/Application Support/Claude/`, Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude\`). Restart the app to load the tools.
+- **VS Code (Copilot)** — `npx ihow-memory@next connect --runtime vscode` writes the **user** `mcp.json` (macOS `~/Library/Application Support/Code/User/mcp.json`, Linux `~/.config/Code/User/mcp.json`, Windows `%APPDATA%\Code\User\mcp.json`) under the `servers` key with a `type: "stdio"` entry, backed up; an unparseable file is never overwritten. Reload the window, then enable the server in Copilot agent mode. Add a line to `.github/copilot-instructions.md`: *"On resume, call the `memory.continue` MCP tool first and verify its anchors before acting."*
+- **Gemini CLI** — `npx ihow-memory@next connect --runtime gemini` adds an `mcpServers` entry to `~/.gemini/settings.json` (backed up; unparseable file left untouched). Restart `gemini`, confirm with `/mcp list`. Add the same nudge to your `GEMINI.md`.
+
+For any of these, `npx ihow-memory@next init --runtime <name>` prints the exact snippet to paste by hand instead of writing it, and `npx ihow-memory@next doctor --runtime <name>` round-trips the configured server to confirm it is reachable.
 
 ## Retrieval engine
 
@@ -156,7 +169,7 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 ```text
 ihow-memory setup            zero-config: detect runtimes -> wire MCP + skill + auto-capture/recall hooks -> verify (recommended; idempotent, local-only) [--dry-run] [--json]
 ihow-memory init             create a managed workspace, print the MCP config snippet
-ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes) [--dry-run]
+ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw | vscode | gemini) [--dry-run]
 ihow-memory continue         resume after a context boundary — verify-first handoff with live git anchors (GREEN/YELLOW/RED) [project-keyword] [--list] [--json]
 ihow-memory install-skill    copy the Claude Code proactive-memory skill into ~/.claude/skills/
 ihow-memory install-hook     add the hooks — Stop (cooperative nudge) + SessionStart (deterministic floor) + UserPromptSubmit recall (🟢 reviewed, on by default; --no-recall to skip) (Claude Code; --global-hook for user-wide)
