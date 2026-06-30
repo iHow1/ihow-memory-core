@@ -39,4 +39,18 @@ for (const sourcePath of await sourceFiles(sourceDir)) {
   if (shebang) await fs.chmod(outputPath, 0o755);
 }
 
+// Optional embedding-provider sidecars: copied VERBATIM (already .mjs — no type-strip) from examples/
+// into dist/providers/ so they ship in the tarball (dist/ is in package.json "files", examples/ is not).
+// They are spawned as a SUBPROCESS on explicit opt-in only, never imported into the default graph — the
+// default engine stays zero-dependency FTS5. Keep this list in sync with BUNDLED_PROVIDERS in
+// src/provider-path.ts and the resolver there. Made executable so they can be run directly if desired.
+const providerScripts = ['ollama-embedding-provider.mjs'];
+const providersOut = path.join(outputDir, 'providers');
+await fs.mkdir(providersOut, { recursive: true });
+for (const name of providerScripts) {
+  const dest = path.join(providersOut, name);
+  await fs.copyFile(path.join(packageDir, 'examples', name), dest);
+  await fs.chmod(dest, 0o755);
+}
+
 console.log(`built ${outputDir}`);
