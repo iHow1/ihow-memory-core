@@ -8,6 +8,25 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.18] — 2026-07-01
+
+The **opt-in semantic engine** release: cross-wording / paraphrase recall — the weak spot of the default
+lexical FTS engine — is addressed by a one-command opt-in semantic engine, so a memory phrased differently
+from the query can still be recalled. The core stays lexical and zero-dependency by default; the semantic
+path is a single opt-in command. Red-team gated (OpenClaw, 4 rounds).
+
+### Added
+
+- **One-command opt-in semantic engine (`enable-semantic`).** Cross-wording / paraphrase queries that the
+  default FTS5 engine missed now recall the relevant memory once the semantic engine is enabled. The core
+  stays lexical-and-zero-dependency by default; enabling semantics is a single opt-in command.
+
+### Fixed
+
+- **Semantic sidecar hardening (red-team r-alpha18 / r-2 / r-3).** Closed a model-propagation gap and a
+  marker-bypass path; marker validation now requires the EXACT bundled sidecar path, so a look-alike
+  marker cannot spoof the semantic engine's provenance.
+
 ## [0.1.0-alpha.17] — 2026-06-30
 
 The **first-run + standard-evidence** release: the README's governed-loop quickstart now copy-pastes
