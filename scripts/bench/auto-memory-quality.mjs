@@ -21,7 +21,7 @@ import { FIXTURE } from './auto-memory-fixture.mjs';
 // KEPT IN SYNC (verbatim) with cli.ts recallTerms / recallSharesTerm so the harness measures the SAME
 // relevance gate production recall uses — otherwise the numbers are the harness's, not the product's.
 const RECALL_STOPWORDS = new Set(['what', 'when', 'which', 'where', 'does', 'need', 'needs', 'with', 'from', 'that', 'this', 'have', 'work', 'works', 'about', 'into']);
-const CJK_COMMON_BIGRAMS = new Set(['什么', '怎么', '一个', '我们', '你们', '他们', '这个', '那个', '可以', '没有', '一首', '请问', '帮我', '帮忙', '是的', '就是', '还是', '一下', '一样', '这是', '那是', '为什', '是什']);
+const CJK_COMMON_BIGRAMS = new Set(['什么','怎么','怎样','为什','是什','为何','是否','多少','哪个','哪些','如何','现在','目前','最近','今天','明天','昨天','以后','以前','当时','后来','时候','时间','几点','问题','事情','东西','情况','地方','方面','方法','内容','意思','知道','觉得','认为','感觉','希望','想要','需要','应该','可能','已经','正在','一直','总是','经常','有时','开始','结束','继续','这样','那样','这些','那些','这里','那里','这是','那是','这个','那个','如果','因为','所以','但是','不过','而且','或者','虽然','然后','其实','就是','还是','只是','也是','都是','一个','一些','一下','一点','一样','一起','一首','我们','你们','他们','她们','咱们','大家','自己','可以','没有','不是','不能','不会','不用','不要','帮我','帮忙','请问','是的']);
 function terms(s) {
   const out = new Set();
   for (const tok of String(s).toLowerCase().match(/[a-z0-9]+|[一-鿿]+/g) || []) {

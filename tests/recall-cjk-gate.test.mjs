@@ -50,3 +50,25 @@ test('recall CJK gate: an off-topic Chinese prompt injects nothing (no over-perm
   const ctx = recall('帮我写一首诗', root, space);
   assert.equal(ctx, '', 'off-topic Chinese prompt stays silent — the bigram gate did not start over-injecting');
 });
+
+// red-team r-cjk-1: generic bigrams (现在 / 问题) must not ALONE satisfy the relevance gate, or an
+// off-topic prompt sharing only a filler word injects unrelated reviewed memory.
+test('recall CJK gate: a generic shared bigram (现在) does NOT surface an unrelated reviewed memory', async (t) => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-cjk-recall-')));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  const cand = JSON.parse(cli(['write-candidate', '--no-auto-promote', '现在状态：数据库迁移方案采用蓝绿发布，负责人是 DBA 小组。'], root, space)).path;
+  cli(['promote', cand, '--scope', 'team', '--title', '数据库迁移状态'], root, space);
+  assert.equal(recall('现在几点了', root, space), '', '"现在几点了" shares only the filler bigram 现在 → stays silent');
+});
+
+test('recall CJK gate: a generic shared bigram (问题) does NOT surface an unrelated reviewed memory', async (t) => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-cjk-recall-')));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  const cand = JSON.parse(cli(['write-candidate', '--no-auto-promote', '问题记录：支付网关限流阈值已经改为 500 req/s。'], root, space)).path;
+  cli(['promote', cand, '--scope', 'team', '--title', '支付问题记录'], root, space);
+  assert.equal(recall('这个问题怎么翻译成英文', root, space), '', '"…这个问题…" shares only the filler bigram 问题 → stays silent');
+  // but an on-topic query (shares the CONTENT bigram 支付) still surfaces it — the fix didn't break recall.
+  assert.match(recall('支付网关的限流阈值是多少', root, space), /支付|限流|500/, 'on-topic content bigram 支付 still recalls it');
+});

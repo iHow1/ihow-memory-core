@@ -2298,12 +2298,27 @@ const RECALL_SNIPPET_CAP = 280; // per-entry snippet cap
 // of France" got Postgres/API entries). Require a shared MEANINGFUL term between the prompt and the
 // entry's snippet, and inject only the entries that pass (0..N). No relevant entry -> recall stays SILENT.
 const RECALL_STOPWORDS = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'of', 'to', 'in', 'on', 'for', 'and', 'or', 'what', 'which', 'how', 'who', 'whom', 'when', 'where', 'why', 'do', 'does', 'did', 'this', 'that', 'these', 'those', 'about', 'with', 'as', 'at', 'be', 'by', 'from', 'can', 'could', 'should', 'would', 'will', 'have', 'has', 'had', 'you', 'your', 'our', 'we', 'it', 'its', 'me', 'my']);
-// Ultra-common CJK function-word bigrams — skipped so the gate doesn't match on "什么 / 一个 / 帮我" etc.
-// (a small, deliberately conservative list; content bigrams are never listed).
-const CJK_COMMON_BIGRAMS = new Set(['什么', '怎么', '一个', '我们', '你们', '他们', '这个', '那个', '可以', '没有', '一首', '请问', '帮我', '帮忙', '是的', '就是', '还是', '一下', '一样', '这是', '那是', '为什', '是什']);
+// GENERIC CJK bigrams — function words, pronouns, temporal / discourse / filler terms. A GATE match on
+// one of these is NOT evidence of relevance (a reviewed memory containing "现在" must not surface for an
+// off-topic "现在几点了"), so they are dropped from the relevance-term set. They still participate in FTS
+// SEARCH (which uses the raw prompt, not recallTerms) — this only stops a generic bigram from ALONE
+// satisfying recallSharesTerm. Content bigrams (配色 / 字体 / 支付 …) are never listed. Red-team r-cjk-1.
+const CJK_COMMON_BIGRAMS = new Set([
+  '什么', '怎么', '怎样', '为什', '是什', '为何', '是否', '多少', '哪个', '哪些', '如何',
+  '现在', '目前', '最近', '今天', '明天', '昨天', '以后', '以前', '当时', '后来', '时候', '时间', '几点',
+  '问题', '事情', '东西', '情况', '地方', '方面', '方法', '内容', '意思',
+  '知道', '觉得', '认为', '感觉', '希望', '想要', '需要', '应该', '可能', '已经', '正在', '一直', '总是', '经常', '有时', '开始', '结束', '继续',
+  '这样', '那样', '这些', '那些', '这里', '那里', '这是', '那是', '这个', '那个',
+  '如果', '因为', '所以', '但是', '不过', '而且', '或者', '虽然', '然后', '其实', '就是', '还是', '只是', '也是', '都是',
+  '一个', '一些', '一下', '一点', '一样', '一起', '一首',
+  '我们', '你们', '他们', '她们', '咱们', '大家', '自己',
+  '可以', '没有', '不是', '不能', '不会', '不用', '不要',
+  '帮我', '帮忙', '请问', '是的',
+]);
 function recallTerms(s: string): Set<string> {
   const out = new Set<string>();
-  for (const tok of s.toLowerCase().match(/[a-z0-9]+|[一-鿿]+/g) || []) {
+  // Defensive length cap before tokenization — bigram expansion is O(n) in CJK-run length (red-team caveat).
+  for (const tok of String(s).slice(0, 8000).toLowerCase().match(/[a-z0-9]+|[一-鿿]+/g) || []) {
     if (/[一-鿿]/.test(tok)) {
       // BIGRAMS, matching the FTS bigram index (src/engine/fts.ts). A whole-run token substring-matches
       // almost nothing, so a rephrased Chinese prompt ("配色偏好…" vs the stored "配色…冷色调") was FOUND by
