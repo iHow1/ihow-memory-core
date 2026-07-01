@@ -2298,11 +2298,22 @@ const RECALL_SNIPPET_CAP = 280; // per-entry snippet cap
 // of France" got Postgres/API entries). Require a shared MEANINGFUL term between the prompt and the
 // entry's snippet, and inject only the entries that pass (0..N). No relevant entry -> recall stays SILENT.
 const RECALL_STOPWORDS = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'of', 'to', 'in', 'on', 'for', 'and', 'or', 'what', 'which', 'how', 'who', 'whom', 'when', 'where', 'why', 'do', 'does', 'did', 'this', 'that', 'these', 'those', 'about', 'with', 'as', 'at', 'be', 'by', 'from', 'can', 'could', 'should', 'would', 'will', 'have', 'has', 'had', 'you', 'your', 'our', 'we', 'it', 'its', 'me', 'my']);
+// Ultra-common CJK function-word bigrams — skipped so the gate doesn't match on "什么 / 一个 / 帮我" etc.
+// (a small, deliberately conservative list; content bigrams are never listed).
+const CJK_COMMON_BIGRAMS = new Set(['什么', '怎么', '一个', '我们', '你们', '他们', '这个', '那个', '可以', '没有', '一首', '请问', '帮我', '帮忙', '是的', '就是', '还是', '一下', '一样', '这是', '那是', '为什', '是什']);
 function recallTerms(s: string): Set<string> {
   const out = new Set<string>();
   for (const tok of s.toLowerCase().match(/[a-z0-9]+|[一-鿿]+/g) || []) {
     if (/[一-鿿]/.test(tok)) {
-      if (tok.length >= 2) out.add(tok); // CJK run of >=2 chars
+      // BIGRAMS, matching the FTS bigram index (src/engine/fts.ts). A whole-run token substring-matches
+      // almost nothing, so a rephrased Chinese prompt ("配色偏好…" vs the stored "配色…冷色调") was FOUND by
+      // search yet DROPPED by this gate. Emitting overlapping bigrams lets a shared meaningful 2-char term
+      // pass; skipping a few function-word bigrams keeps an off-topic Chinese prompt from over-injecting.
+      if (tok.length === 2) { if (!CJK_COMMON_BIGRAMS.has(tok)) out.add(tok); }
+      else for (let i = 0; i + 2 <= tok.length; i += 1) {
+        const bg = tok.slice(i, i + 2);
+        if (!CJK_COMMON_BIGRAMS.has(bg)) out.add(bg);
+      }
     } else if (tok.length >= 4 && !RECALL_STOPWORDS.has(tok)) {
       out.add(tok); // latin word >=4 chars, not a stopword
     }
