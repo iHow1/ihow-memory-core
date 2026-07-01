@@ -72,3 +72,26 @@ test('recall CJK gate: a generic shared bigram (问题) does NOT surface an unre
   // but an on-topic query (shares the CONTENT bigram 支付) still surfaces it — the fix didn't break recall.
   assert.match(recall('支付网关的限流阈值是多少', root, space), /支付|限流|500/, 'on-topic content bigram 支付 still recalls it');
 });
+
+// red-team r-cjk-2: the denylist must cover the long tail of discourse/connective bigrams, not just
+// 现在/问题. Each case: an off-topic meta prompt shares ONLY a generic connective/modifier with the memory.
+test('recall CJK gate: long-tail generic discourse bigrams do NOT over-inject', async (t) => {
+  const cases = [
+    ['关于数据库迁移的状态已经确认，负责人是 DBA 小组。', '关于这个词怎么造句'],
+    ['对于支付网关限流策略，当前阈值是 500 req/s。', '对于这句话你怎么看'],
+    ['通过蓝绿发布完成数据库迁移，回滚窗口为两小时。', '通过这个方法能学英语吗'],
+    ['使用低饱和冷色调作为默认配色方案。', '使用这个词怎么写句子'],
+    ['进行订单服务灰度发布时需要先冻结配置。', '进行是什么意思'],
+    ['因此支付网关必须先启用限流。', '因此和所以有什么区别'],
+    ['所有发布都需要回滚预案。', '所有这个词怎么用'],
+    ['实际阈值是 500 req/s。', '实际是什么意思'],
+  ];
+  for (const [mem, q] of cases) {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-cjk-tail-')));
+    t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+    const space = 'h';
+    const cand = JSON.parse(cli(['write-candidate', '--no-auto-promote', mem], root, space)).path;
+    cli(['promote', cand, '--scope', 'team', '--title', 't'], root, space);
+    assert.equal(recall(q, root, space), '', `off-topic "${q}" shares only a generic bigram with the memory → stays silent`);
+  }
+});
