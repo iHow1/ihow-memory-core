@@ -2324,6 +2324,8 @@ const CJK_COMMON_BIGRAMS = new Set([
   '一个', '一些', '一下', '一点', '一样', '一起', '一首', '一切', '一定',
   // negation / modal /请求
   '可以', '没有', '不是', '不能', '不会', '不用', '不要', '帮我', '帮忙', '请问', '是的', '那么', '这么', '多么', '是不', '有没',
+  // red-team r-cjk-3 residuals: more common connectives / prepositions / quantifiers / modal-verbs
+  '必须', '相关', '若是', '随后', '先后', '同样', '共同', '此时', '此处', '各种', '多个', '某个', '其他', '其它', '必要', '重要', '默认', '对应', '针对', '根据', '基于', '仍然', '确认', '进而', '继而', '此外', '再者', '据此', '为此', '对此', '与此',
 ]);
 function recallTerms(s: string): Set<string> {
   const out = new Set<string>();

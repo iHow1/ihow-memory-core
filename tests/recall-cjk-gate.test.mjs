@@ -85,6 +85,13 @@ test('recall CJK gate: long-tail generic discourse bigrams do NOT over-inject', 
     ['因此支付网关必须先启用限流。', '因此和所以有什么区别'],
     ['所有发布都需要回滚预案。', '所有这个词怎么用'],
     ['实际阈值是 500 req/s。', '实际是什么意思'],
+    // red-team r-cjk-3 residuals
+    ['支付发布必须经过审批。', '必须是什么意思'],
+    ['相关负责人是 DBA 小组。', '相关这个词英文'],
+    ['根据发布流程先备份。', '根据这个词怎么用'],
+    ['针对支付网关启用限流。', '针对是什么意思'],
+    ['其它节点保持不变。', '其它是什么意思'],
+    ['默认配色是低饱和冷色调。', '默认是什么意思'],
   ];
   for (const [mem, q] of cases) {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-cjk-tail-')));
