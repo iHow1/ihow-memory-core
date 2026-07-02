@@ -788,13 +788,21 @@ export type PromoteOptions = {
 const GOVERNANCE_MARKERS: RegExp[] = [
   // Standing rules / preferences / policy / imperatives — a durable directive, not a fact.
   /\b(always|never|from now on|going forward|by default|as a rule|policy|standing rule|guideline|convention|preference|make sure to|remember to|prefer\b.{0,24}\bover\b|auto[-\s]?approve)\b/i,
-  /(以后|从现在起|今后|默认|始终|永远|一律|总是|策略|规则|规范|约定|偏好|方针|准则|务必|记住要|不要再)/,
-  // Access / security / identity / credentials.
+  // ZH: DIRECTIVE-TONE anchored (knob-②, Commander 2026-07-01). The old noun/topic keyword classes
+  // (偏好/默认/策略/权限/授权/管理员/回滚/删除…) flagged 11% of real ZH writebacks — measured 64% of those
+  // flags were plain FACTS ("API 授权失败", "默认端口 8788", "回滚点：…"), silently killing the default-auto
+  // surface for Chinese soft facts (CJK has no word boundaries and 偏好 doubles as the everyday verb
+  // "prefers"). This exact regex was evaluated against 300 dual-judged real entries: only PRESCRIPTIVE
+  // tone flags now; factual mentions of the same topics flow to the normal unverified/verified tiers,
+  // where the C1 recall gate still keeps status/bypass claims out of the default surface. System-level
+  // (write flag ∪ C1): dangerous-content recall 87%→65% with soft-fact survival 33%→~68% — the knob-②
+  // trade Commander chose. Red-team gated like every recall-surface change.
+  /(以后|从现在起|今后|一律|务必|永远不|绝不|不要|勿|禁止|不得|不准|必须|请?记住|统一(?:用|按|走)|只(?:用|走|发|放|做|改)|仅(?:用|放|发|限)|默认(?:改|用|走|按)|从此|规定|要求所有|标准流程|红线)/,
+  // Access / security / identity / credentials (EN kept as-is — the eval corpus was ZH-dominant; EN
+  // markers are already directive-leaning. Revisit with an EN-labeled sample before touching).
   /\b(permission|access control|credential|api[\s_-]?key|password|\bsecret\b|\btoken\b|grant|revoke|sudo|chmod|chown|\broot\b|identity|impersonate|whitelist|allowlist|2fa|mfa|bypass\s+(?:auth|review|checks?)|skip\s+(?:review|code\s*review|checks?))\b/i,
-  /(权限|访问控制|凭据|令牌|密钥|密码|身份|授权|提权|管理员|吊销|跳过审核|免审|放行)/,
-  // Destructive / high-blast-radius actions.
+  // Destructive / high-blast-radius actions (EN kept as-is, same rationale).
   /\b(delete|drop\s+(?:table|database)|destroy|wipe|rm\s+-rf|truncate|force[\s-]?push|reset\s+--hard|terraform\s+destroy|kubectl\s+delete)\b/i,
-  /(删除|清除|销毁|抹除|格式化|覆盖线上|回滚|下线|停服)/,
 ];
 
 function looksLikeGovernanceStatement(text: string): boolean {

@@ -2467,8 +2467,8 @@ function recallTier(
 // (Red-team C1 X1/X4: a keyword list is not a perfect classifier — this is deliberately broad on the dangerous
 // shapes; a soft fact wrongly excluded merely doesn't surface, whereas a false green surfacing is the harm.)
 const RECALL_STATUS_EN = /\b(pass(?:ed|ing|es)?|fail(?:ed|ing|s|ure)?|ship(?:ped|s)?|deploy(?:ed|s|ment)?|release[ds]?|merged?|revert(?:ed)?|rollback|done|complete[ds]?|finish(?:ed)?|succeed(?:ed|s)?|broke[n]?|fixed|stable|works?|working|ok(?:ay)?|clean|healthy|ready|validated|verified|confirmed|resolved|green)\b/i;
-const RECALL_STATUS_EN_PHRASE = /\bno (?:issues|errors|failures|regressions|problems)\b|\ball (?:good|set)\b|\bgood to go\b|\bsafe to (?:merge|deploy|use)\b|\blooks (?:good|fine|ok)\b/i;
-const RECALL_STATUS_ZH = /完成|通过|失败|发布|上线|部署|已发|搞定|回滚|合并|没问题|无问题|一切正常|正常运行|稳定|稳了|可用|可以用了|跑通|跑起来|没报错|无异常|没挂|绿了|全绿|验收没问题|检查没问题|服务健康|链路通了/;
+const RECALL_STATUS_EN_PHRASE = /\bno (?:issues|errors|failures|regressions|problems)\b|\ball (?:good|set)\b|\bgood to go\b|\bsafe to (?:merge|deploy|use)\b|\blooks (?:good|fine|ok)\b|\bsign(?:ed)?[- ]?off\b|\bgreen[- ]?light\b|\bzero (?:hits?|findings)\b/i;
+const RECALL_STATUS_ZH = /完成|通过|失败|发布|上线|部署|已发|搞定|回滚|合并|没问题|无问题|一切正常|正常运行|稳定|稳了|可用|可以用了|跑通|跑起来|没报错|无异常|没挂|绿了|全绿|验收没问题|检查没问题|服务健康|链路通了|已验证|验证通过|全验证|零命中|0 ?命中|无命中|达标|过条|签核|放行|复核(?:通过|无误)|自查(?:通过|无误)|无敏感/;
 const RECALL_ACTIONABILITY_BYPASS = /\bskip(?:ping)? (?:approval|review|tests?|checks?|confirmation)\b|\bwithout asking\b|\bdo ?n'?t ask\b|\bno (?:need to )?(?:ask|confirm)\b|\bignore (?:safety|rules?|checks?)\b|\bbypass\b|\bforce[- ]?push\b|\bdeploy (?:directly|straight)\b|\bsend (?:directly|straight)\b|\bapproval (?:is )?(?:unnecessary|not needed|not required)\b|\bno confirmation\b|不用确认|无需确认|不需要审批|跳过(?:审批|确认|测试|检查|评审)|忽略(?:规则|安全|检查)|关闭安全|直接(?:发布|外发|部署|上线|推送?)|强推|删库|删除即可/i;
 function looksStatusClaimForDefaultAuto(text: string): boolean {
   const s = typeof text === 'string' ? text : '';
