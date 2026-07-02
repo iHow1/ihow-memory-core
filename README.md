@@ -199,6 +199,8 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 | `memory.promote` | Explicit manual promote of a candidate into governed staging, with an audit event. |
 | `memory.durable_promote` | Governed durable promote. Requires explicit `dryRun: true` or `realWrite: true`. |
 | `memory.journal` | Append a low-weight, append-only journal entry (auto-capture lane). Searchable but ranked below curated memory. |
+| `memory.forget` | One-gesture correction: tombstone the matching memory so it stops surfacing in search and recall everywhere. Reversible, audited, file untouched; human-reviewed entries need explicit confirmation. |
+| `memory.remember` | Reverse a `memory.forget` — the entry surfaces again. |
 | `memory.status` | Report workspace, retrieval provider, index and sync status. |
 
 ## CLI reference
@@ -222,6 +224,8 @@ ihow-memory journal <text>   append a low-weight auto-capture entry (searchable,
 ihow-memory import           import existing memory you wrote elsewhere (Claude Code MEMORY.md, ai-memory markdown, any .md folder) into the searchable journal lane [--from path] [--apply] [--update]
 ihow-memory audit            list the append-only event log [--since YYYY-MM-DD]
 ihow-memory rollback         undo one auto-captured journal entry (--event <id>)
+ihow-memory forget <text|path>  one-gesture correction: stop a memory surfacing in search AND recall everywhere (reversible tombstone; file untouched; reviewed entries need --yes; --list shows what's forgotten)
+ihow-memory remember <text|path>  reverse a forget — the entry surfaces again
 ihow-memory reindex          rebuild the SQLite index from Markdown
 ihow-memory migrate-local-day  one-time: re-bucket UTC-named journal/event files to local-day (dry-run unless --apply)
 ihow-memory upgrade          refresh the workspace's frozen server copy after updating the package (then restart the runtime)
@@ -315,7 +319,7 @@ adds two layers to raise that on Claude Code:
 > backstop (`next` only) that captures the prior session when the nudge was not honored. Both write
 > **low-weight, unreviewed** notes — use `promote` / `durable-promote` for trusted long-term memory. The
 > floor is offline-validated as a backstop; it is not yet promoted to a primary/default-weight path, and
-> `recall` (reading reviewed memory back into a new session) is **on** by default — it injects only 🟢 reviewed, human-promoted memory, relevance-gated (off-topic prompts get nothing) and tagged; the machine-judged 🟡 auto tier is opt-in (`IHOW_RECALL_INCLUDE_AUTO=1`). Disable with `--no-recall` or `IHOW_RECALL_OFF=1`.
+> `recall` (reading memory back into a new session) is **on** by default and relevance-gated (off-topic prompts get nothing). Since alpha.19 it surfaces reviewed decisions **and** auto-captured soft facts (preferences, configs) seamlessly, while unverified status claims ("all green") and risky behavior-priors ("skip approval") are excluded from the ambient default surface — ask about status explicitly and the unverified note is shown, fenced as reference. Remembered something wrong? `ihow-memory forget <what you'd say>` stops it surfacing everywhere, reversibly (`remember` undoes it). Disable recall with `--no-recall` or `IHOW_RECALL_OFF=1`; restore reviewed-only with `IHOW_RECALL_AUTO_DEFAULT=0`.
 
 ## Examples
 
@@ -340,7 +344,7 @@ Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest pu
 | dist-tag | auto-capture |
 | --- | --- |
 | `latest` | cooperative Stop-hook nudge only (depends on the agent honoring it) |
-| `next` | adds the **deterministic SessionStart floor** backstop (single-cwd, low-weight, offline-validated) and turns **recall on** (🟢 reviewed-only, relevance-gated, tagged; 🟡 auto tier opt-in) |
+| `next` | adds the **deterministic SessionStart floor** backstop (single-cwd, low-weight, offline-validated), turns **recall on** (reviewed + guard-railed auto soft facts since alpha.19; status/bypass claims held back), and ships **one-gesture `forget`/`remember`** |
 
 To try the floor backstop: `npm install ihow-memory@next`. A plain `npm install ihow-memory` stays on the conservative `latest`.
 
@@ -348,7 +352,7 @@ To try the floor backstop: `npm install ihow-memory@next`. A plain `npm install 
 
 - **Floor capture is single-cwd.** The SessionStart floor backs up only its designated workspace/cwd. If you `connect --auto` across multiple projects sharing one workspace, the floor covers one cwd; broad multi-cwd rollout is pending further dogfood.
 - **Default retrieval is lexical, not semantic.** The shipped default is zero-dependency FTS5 lexical search. The vector + lexical hybrid (behind the published recall figures) is an *optional* local provider, not in the out-of-the-box binary.
-- **Auto-capture notes are low-weight and unreviewed**, and the deterministic floor is a backstop, not yet a primary/default-weight path. `recall` injects only 🟢 **reviewed** memory by default — the unreviewed auto-capture / journal lanes are never auto-injected; the machine-judged 🟡 auto tier is opt-in (`IHOW_RECALL_INCLUDE_AUTO=1`). Use `promote` / `durable-promote` for trusted long-term memory.
+- **Auto-tier memory is machine-judged, not human-reviewed.** Since alpha.19 relevant auto-captured SOFT facts do surface by default — but behind measured guardrails: status/completion claims and actionability-bypass priors are excluded from the ambient surface (red-team gated), the journal/floor lanes are still never auto-injected, and `IHOW_RECALL_AUTO_DEFAULT=0` restores reviewed-only. The keyword guardrails are deliberately broad, not a perfect classifier — a wrongly held-back soft fact just doesn't surface, and `ihow-memory forget` reversibly silences anything that surfaced wrongly. Use `promote` / `durable-promote` for trusted long-term memory.
 - **Storage grows without bound (no rotation/compaction/GC yet).** Journals, the audit ndjson log and `*.ihow-bak-*` backups currently accumulate, and every write rebuilds the full FTS index — rotation/compaction/GC is planned but not shipped. Fine for normal use; heavy long-running use will pile up. Manual mitigation: occasional `ihow-memory reindex` and pruning of old backups by hand.
 - **Windows native is experimental** (use WSL); only macOS and Linux are validated lanes.
 
