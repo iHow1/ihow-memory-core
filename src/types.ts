@@ -58,6 +58,8 @@ export type SearchOptions = {
   limit?: number;
   rebuild?: boolean;
   includeFlagged?: boolean;
+  // C4: skip the forgotten-tombstone filter (used by the forget/remember flows themselves).
+  includeForgotten?: boolean;
 };
 
 export type RetrievalEngineStatus = {

@@ -146,6 +146,9 @@ function buildSnippet(orig: string, query: string): string {
   let body = typeof orig === 'string' ? orig : '';
   // drop a leading YAML frontmatter block so the snippet is CONTENT, not metadata (candidate_id, timestamps)
   body = body.replace(/^﻿?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+  // drop the engine-generated "# Candidate <uuid>" heading too — it is never content, and a snippet
+  // window that opens mid-heading leaks fragments ("…te 用户偏好…" ← Candida|te) into the recall block
+  body = body.replace(/^\s*#\s*Candidate\s+[0-9a-f][0-9a-f-]{6,}\s*\r?\n/gim, '');
   const flat = body.replace(/\s+/g, ' ').trim();
   if (!flat) return '';
   const low = flat.toLowerCase();

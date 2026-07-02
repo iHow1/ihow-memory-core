@@ -696,3 +696,20 @@ test('recall (knob-②): sign-off-shaped status claims stay OUT of the ambient d
   assert.ok(!ask('what do we know about the sigmaservice audit').includes('ZKB2'), 'EN sign-off claim stays out ambiently');
   assert.ok(ask('rhoservice 图表配色偏好是什么').includes('ZKB3'), 'the knob-② freed ZH preference FACT now surfaces by default (was flagged before)');
 });
+
+// --- snippet hygiene: the engine-generated "# Candidate <uuid>" heading must never leak into the recall
+// block — not even as a mid-word window fragment ("…te 用户偏好…" ← Candida|te). Stripped at the snippet
+// SOURCE (fts buildSnippet), so search results are clean too, not just recall. ---
+test('recall (snippet hygiene): no Candidate-heading fragments or uuid debris in the block', async (t) => {
+  const root = await mkdtempReal('ihow-recall-snip-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const space = 'h';
+  cli(['write-candidate', '用户偏好：周报用飞书文档发，不用邮件。cetusservice weekly notes.'], root, space);
+  cli(['reindex'], root, space);
+  const out = recall('cetusservice 周报用什么发？', root, space);
+  const ctx = out.stdout.trim() ? JSON.parse(out.stdout).hookSpecificOutput.additionalContext : '';
+  assert.match(ctx, /飞书文档/, 'the soft fact surfaces');
+  assert.ok(!/Candidate/i.test(ctx), 'no heading text in the block');
+  assert.ok(!/\b[0-9a-f]{4,}-[0-9a-f-]{4,}/i.test(ctx), 'no uuid debris in the block');
+  assert.ok(!/^- \s*[a-z]{1,4}\s+用户偏好/m.test(ctx), 'no mid-word window fragment before the content');
+});

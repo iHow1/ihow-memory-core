@@ -1066,6 +1066,9 @@ Usage:
   ihow-memory durable-promote <candidate-path> (--dry-run | --real-write) [--scope name] [--title title] [--path path]
   ihow-memory audit [--since YYYY-MM-DD] [--space name]   # list the append-only audit log (candidate / promote / journal / rollback events)
   ihow-memory rollback --event <eventId> [--space name]   # undo one auto-captured journal entry by its audit eventId
+  ihow-memory forget <text-or-path> [--yes] [--json]   # one-gesture correction: "forget that / I was wrong" — tombstones the matching memory so it stops surfacing in search AND recall everywhere (file untouched, fully reversible). Free text applies only on a single unambiguous match; multiple matches are listed to pick from. Forgetting a human-reviewed entry asks for --yes. Undo: ihow-memory remember
+  ihow-memory forget --list [--json]                   # list everything currently forgotten (path + first line)
+  ihow-memory remember <text-or-path> [--json]         # reverse a forget: the entry surfaces again in search/recall
   ihow-memory upgrade [--space name] [--root path]   # re-stamp the connected server bundle after 'npm update' (then restart the runtime)
   ihow-memory migrate-local-day [--memory-root path] [--apply]   # one-time: re-bucket UTC-named journal/event files to local-day (dry-run unless --apply)
   ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
@@ -3553,6 +3556,63 @@ async function main(): Promise<void> {
     else {
       console.log(`reindexed: documents=${documents}`);
       console.log(`index: ${status.index.path}`);
+    }
+    return;
+  }
+  if (command === 'forget') {
+    if (options.list) {
+      const gone = await core.forgotten();
+      if (options.json) printJson({ forgotten: gone });
+      else if (!gone.length) console.log('nothing is forgotten.');
+      else for (const g of gone) console.log(`- ${g.path}\n    ${g.snippet}`);
+      return;
+    }
+    const needle = rest.join(' ').trim();
+    if (!needle) {
+      console.error('usage: ihow-memory forget <text-or-path> [--yes] | forget --list');
+      process.exitCode = 1;
+      return;
+    }
+    const outcome = await core.forget(needle, { actor: 'cli', yes: options.easy === true });
+    if (options.json) { printJson(outcome); if (outcome.status !== 'forgotten') process.exitCode = 1; return; }
+    if (outcome.status === 'forgotten') {
+      console.log(`✓ forgotten — ${outcome.path}`);
+      console.log('  it will no longer surface in search or recall (the file itself is untouched).');
+      console.log(`  changed your mind?  ${outcome.undo}`);
+    } else if (outcome.status === 'needs-confirm') {
+      console.log(`⚠ ${outcome.path} is a human-reviewed entry.`);
+      console.log(`  ${outcome.hint}`);
+      process.exitCode = 1;
+    } else if (outcome.status === 'ambiguous') {
+      console.log(outcome.matches.length === 1
+        ? 'too many matches to prove this is the only one — use the exact path:'
+        : 'several memories match — pick one by path:');
+      for (const m of outcome.matches) console.log(`  ihow-memory forget ${m.path}\n      ${m.snippet.slice(0, 100)}`);
+      process.exitCode = 1;
+    } else {
+      console.log('no matching memory found (it may already be forgotten — see: ihow-memory forget --list).');
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (command === 'remember') {
+    const needle = rest.join(' ').trim();
+    if (!needle) {
+      console.error('usage: ihow-memory remember <text-or-path>');
+      process.exitCode = 1;
+      return;
+    }
+    const outcome = await core.remember(needle, { actor: 'cli' });
+    if (options.json) { printJson(outcome); if (outcome.status !== 'remembered') process.exitCode = 1; return; }
+    if (outcome.status === 'remembered') {
+      console.log(`✓ remembered — ${outcome.path} surfaces again in search and recall.`);
+    } else if (outcome.status === 'ambiguous') {
+      console.log('several forgotten entries match — pick one by path:');
+      for (const m of outcome.matches) console.log(`  ihow-memory remember ${m.path}\n      ${m.snippet.slice(0, 100)}`);
+      process.exitCode = 1;
+    } else {
+      console.log('nothing forgotten matches that (see: ihow-memory forget --list).');
+      process.exitCode = 1;
     }
     return;
   }
