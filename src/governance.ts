@@ -929,7 +929,7 @@ export function evaluateAutoPromote(payload: WriteCandidatePayload, opts: { cwd?
     return {
       allow: true,
       tier: 'unverified',
-      reason: 'no engine-verifiable provenance — searchable durable memory, but never recall-eligible until reviewed',
+      reason: 'no engine-verifiable provenance — durable auto-tier memory: recalled by default only as a relevant SOFT fact (status/bypass claims stay out until reviewed)',
     };
   }
   // T3: record HOW the engine verified — 'anchor' (a live-HEAD-matched git anchor the engine actually

@@ -10,7 +10,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openCore } from './core.ts';
 import { absoluteFromMemoryPath, defaultRoot, ensureWorkspace, isCuratedMemoryPath, resolveWorkspace } from './workspace.ts';
-import { indexWithEngineFallback, resolveEngineConfig } from './engine/retrieval.ts';
+import { indexWithEngineFallback, resolveEngineConfig, semanticRecallFloor } from './engine/retrieval.ts';
 import { sqliteRuntimeStatus } from './engine/fts.ts';
 import { readEventsAllLanes } from './store/events.ts';
 import { appendJournal, containsSecretLikeContent, expireStaleFlagged, pendingFlaggedReview, redactSecretLikeContent } from './governance.ts';
@@ -2470,9 +2470,22 @@ const RECALL_STATUS_EN = /\b(pass(?:ed|ing|es)?|fail(?:ed|ing|s|ure)?|ship(?:ped
 const RECALL_STATUS_EN_PHRASE = /\bno (?:issues|errors|failures|regressions|problems)\b|\ball (?:good|set)\b|\bgood to go\b|\bsafe to (?:merge|deploy|use)\b|\blooks (?:good|fine|ok)\b/i;
 const RECALL_STATUS_ZH = /完成|通过|失败|发布|上线|部署|已发|搞定|回滚|合并|没问题|无问题|一切正常|正常运行|稳定|稳了|可用|可以用了|跑通|跑起来|没报错|无异常|没挂|绿了|全绿|验收没问题|检查没问题|服务健康|链路通了/;
 const RECALL_ACTIONABILITY_BYPASS = /\bskip(?:ping)? (?:approval|review|tests?|checks?|confirmation)\b|\bwithout asking\b|\bdo ?n'?t ask\b|\bno (?:need to )?(?:ask|confirm)\b|\bignore (?:safety|rules?|checks?)\b|\bbypass\b|\bforce[- ]?push\b|\bdeploy (?:directly|straight)\b|\bsend (?:directly|straight)\b|\bapproval (?:is )?(?:unnecessary|not needed|not required)\b|\bno confirmation\b|不用确认|无需确认|不需要审批|跳过(?:审批|确认|测试|检查|评审)|忽略(?:规则|安全|检查)|关闭安全|直接(?:发布|外发|部署|上线|推送?)|强推|删库|删除即可/i;
-function looksUnsafeForDefaultAuto(text: string): boolean {
+function looksStatusClaimForDefaultAuto(text: string): boolean {
   const s = typeof text === 'string' ? text : '';
-  return RECALL_STATUS_EN.test(s) || RECALL_STATUS_EN_PHRASE.test(s) || RECALL_STATUS_ZH.test(s) || RECALL_ACTIONABILITY_BYPASS.test(s);
+  return RECALL_STATUS_EN.test(s) || RECALL_STATUS_EN_PHRASE.test(s) || RECALL_STATUS_ZH.test(s);
+}
+function looksBypassPriorForDefaultAuto(text: string): boolean {
+  return RECALL_ACTIONABILITY_BYPASS.test(typeof text === 'string' ? text : '');
+}
+// Knob-① (Commander 2026-07-01: comfort over blanket conservatism). Status-claim auto entries are no
+// longer excluded UNCONDITIONALLY — the same intent-aware move as PII values: when the prompt explicitly
+// ASKS about status/progress/outcome, an unverified status note IS the answer the user wants (rendered
+// inside the C2 fence as reference, not as a verified conclusion). AMBIENT injection of status claims —
+// the "false green seamlessly steers an unrelated task" harm — stays excluded exactly as red-teamed.
+// An actionability-bypass prior stays excluded on EVERY path: no prompt can ask its way to "skip approval".
+const RECALL_STATUS_INTENT = /\b(?:status|progress|state)\b|\bhow did .{0,32}\bgo\b|\bis (?:it|the .{0,24}) (?:done|ready|working|fixed|green)\b|\bdid .{0,32}\b(?:pass|fail|work)(?:ed|s|ing)?\b|\bany (?:issues|errors|failures)\b|状态|进度|进展|怎么样了|好了吗|完成了吗|通过了吗|跑通了吗|修好了吗|还有(?:问题|报错)吗|结果如何|什么情况/i;
+function recallPromptWantsStatus(prompt: string): boolean {
+  return RECALL_STATUS_INTENT.test(prompt);
 }
 // C1 red-team X2: judge a DEFAULT-auto entry on a BOUNDED read of its FULL body (frontmatter stripped), not
 // just the FTS snippet — a status/bypass claim outside the snippet window must not sneak the entry in. Falls
@@ -2507,8 +2520,18 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
   const cwd = typeof payload.cwd === 'string' ? payload.cwd : options.cwd;
 
   let core;
+  let semanticFloor: number | null = null;
   try {
-    core = await openCore({ ...options, cwd });
+    // C3: recall runs the SAME effective engine as the connected server — when this space opted into
+    // semantic (enable-semantic → semantic.json), merge the persisted vector flags so paraphrase recall
+    // works in the hook too. No-op (default FTS) when semantic is off; if the sidecar/daemon is down,
+    // searchWithEngineFallback degrades to the FTS floor — recall never gets slower to fail.
+    const merged = { ...options, cwd };
+    const effective = applySemanticEngine(resolveWorkspace(merged), merged);
+    // The lexical-gate bypass floor for THIS space's embedding model (null = bypass disabled; see
+    // semanticRecallFloor — per-model measured calibration, fail-closed for unmeasured models).
+    semanticFloor = semanticRecallFloor(resolveEngineConfig(effective).vectorModel);
+    core = await openCore(effective);
   } catch {
     return;
   }
@@ -2524,6 +2547,7 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
   // pass (0..N) — so recall stays silent on an off-topic prompt instead of padding to a fixed N (harm-eval).
   const promptTerms = recallTerms(prompt);
   const wantsPiiValue = recallPromptWantsPiiValue(prompt); // reveal PII values only when the prompt asks
+  const wantsStatus = recallPromptWantsStatus(prompt); // knob-①: status claims surface only when asked for
   // Tier each curated hit: 🟢 reviewed (human-promoted) vs 🟡 auto (machine-gated by provenance, reviewed:false).
   // The DEFAULT stays the OpenClaw-signed guard — reviewed-only — so this change never silently injects
   // machine-judged memory. Opt in to the attributed auto tier with IHOW_RECALL_INCLUDE_AUTO=1; flipping that
@@ -2563,17 +2587,38 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
     .filter((h) => h && typeof h.path === 'string' && isCuratedMemoryPath(h.path))
     .map((h) => ({ h, ...recallTier(core.workspace, String(h.path)) }))
     .filter((x) => x.tier !== 'flagged')
-    .filter((x) => recallSharesTerm(promptTerms, String(x.h.snippet ?? ''))) // relevance FIRST (cheap; bounds the body reads below to relevant hits only)
+    // Relevance FIRST (cheap; bounds the body reads below to relevant hits only). C3: a SEMANTIC-lane hit
+    // whose raw cosine clears the per-model measured floor bypasses the lexical share-a-term gate — that
+    // gate exists to stop FTS stopword matches and must not veto the paraphrase win ("包管理器" must recall
+    // the pnpm note). Cosine floor because "nearest" ≠ "relevant": the provider returns top-K neighbors for
+    // ANY prompt, so an unfloored bypass would re-open the off-topic injection harm-eval closed. FAIL-CLOSED
+    // twice over: no semanticScore (not vector-surfaced) or no floor (unmeasured model) → lexical gate stays.
+    .filter((x) => (semanticFloor !== null && typeof x.h.semanticScore === 'number' && x.h.semanticScore >= semanticFloor)
+      || recallSharesTerm(promptTerms, String(x.h.snippet ?? '')))
     // C1 (UX-first) recall eligibility:
     //   • reviewed → always (the trusted lane, unchanged).
     //   • auto → surfaces by DEFAULT when it's a relevant curated fact (fixes "feels dead"), EXCEPT when a
-    //     BOUNDED full-body read reads as a status/completion claim OR an actionability-bypass behavior-prior
-    //     (a false "green" / a "skip approval" must not seamlessly steer). Sorts BELOW reviewed (fts rank_penalty).
+    //     BOUNDED full-body read reads as an actionability-bypass behavior-prior (always out — "skip
+    //     approval" must never seamlessly steer), or as a status/completion claim on an AMBIENT prompt
+    //     (knob-①: a prompt that explicitly ASKS for status DOES get the unverified status note — asked-for
+    //     is not ambient steering; it renders inside the C2 reference-only fence). Sorts BELOW reviewed.
     //   • the explicit IHOW_RECALL_INCLUDE_AUTO knob still force-admits an engine-ANCHORED auto entry (unguarded).
     // flagged/secret already excluded above; IHOW_RECALL_AUTO_DEFAULT=0 restores reviewed-only.
-    .filter((x) => x.tier === 'reviewed'
-      || (x.tier === 'auto' && autoDefaultOn && !looksUnsafeForDefaultAuto(recallDefaultAutoText(core.workspace, String(x.h.path), String(x.h.snippet ?? ''))))
-      || (x.tier === 'auto' && includeAuto && isEngineAnchored(String(x.h.path))))
+    .filter((x) => {
+      if (x.tier === 'reviewed') return true;
+      if (x.tier !== 'auto') return false;
+      const body = recallDefaultAutoText(core.workspace, String(x.h.path), String(x.h.snippet ?? ''));
+      // Red-team blocker (2026-07-01): the bypass-prior gate comes FIRST — before even the explicit
+      // IHOW_RECALL_INCLUDE_AUTO anchored admit. A verified git anchor proves the entry described real
+      // repo state, NOT that its behavioral instruction is safe: "skip approval" must not surface on ANY
+      // auto path, opt-in or not, asked-for or not.
+      if (looksBypassPriorForDefaultAuto(body)) return false;
+      // The anchored opt-in stays otherwise unguarded BY DESIGN (C1 verdict boundary): an anchor-verified
+      // status claim is the one kind of "green" with engine-checked provenance — locked by test.
+      if (includeAuto && isEngineAnchored(String(x.h.path))) return true;
+      if (!autoDefaultOn) return false;
+      return wantsStatus || !looksStatusClaimForDefaultAuto(body);
+    })
     .slice(0, RECALL_MAX_INJECT);
   if (!curated.length) return; // nothing curated AND relevant -> stay silent (no noise)
 
@@ -3494,7 +3539,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  const core = await openCore(options);
+  // Same effective-config rule as status/doctor (red-team r-alpha18): when this space opted into
+  // semantic, reindex/search/write commands here must run the SAME engine the connected server runs —
+  // otherwise `reindex` silently builds only the FTS index and the vector store stays EMPTY, so semantic
+  // search/recall (C3) finds nothing while status happily reports the provider ready (a false-green split
+  // between "enabled" and "indexed"). Falls back to FTS per lane if the provider is down — additive only.
+  const core = await openCore(applySemanticEngine(resolveWorkspace(options), options));
   if (command === 'reindex') {
     const documents = await core.rebuild();
     const status = await core.status();
