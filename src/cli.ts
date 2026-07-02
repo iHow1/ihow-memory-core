@@ -2984,6 +2984,11 @@ async function main(): Promise<void> {
           body = redactSecretLikeContent(raw.slice(0, 4000));
           projectDir = projDir;
           fromStateDoc = name;
+          // Single attribution (red-team ③): the doc now supplies the narrative — clear any session
+          // metadata a broken/empty-summary capture left behind, so the envelope can't self-contradict.
+          sourceSessionId = undefined;
+          transcriptRef = undefined;
+          sourceAgeMs = undefined;
           const rh = referencedHead(body);
           if (rh) recordedAnchors = { isRepo: true, head: rh };
           break;
@@ -3019,13 +3024,14 @@ async function main(): Promise<void> {
       sourceSessionId,
       transcriptRef,
       sourceAgeMs,
+      stateDocName: fromStateDoc,
     });
     // B② grooming-decay measurement (opt-out via IHOW_HANDOFF_METRICS=0): append one derived, hashed,
     // content-free row per handoff so the anchor-conflict trend can be read over weeks. Fully
     // fault-tolerant — never throws, never blocks the handoff, never touches the network.
     await recordHandoffMetric({ projectDir, anchors, narrative: body, sourceSessionId, sourceAgeMs });
     if (options.json) {
-      printJson({ cwd, projectDir: projectDir ?? null, verdict: verdict ?? null, anchors, quotedBody: body, transcriptRef: transcriptRef ?? null, sourceSession: sourceSessionId ?? null });
+      printJson({ cwd, projectDir: projectDir ?? null, verdict: verdict ?? null, anchors, quotedBody: body, transcriptRef: transcriptRef ?? null, sourceSession: sourceSessionId ?? null, stateDoc: fromStateDoc ?? null });
     } else {
       if (verdict) {
         const icon = verdict.state === 'GREEN' ? '🟢' : verdict.state === 'YELLOW' ? '🟡' : '🔴';

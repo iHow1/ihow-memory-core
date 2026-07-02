@@ -62,6 +62,10 @@ export type EnvelopeInput = {
   sourceSessionId?: string;
   transcriptRef?: string;
   sourceAgeMs?: number; // now - source transcript mtime; undefined when no capture / timing unknown
+  // First-run fallback attribution: when the narrative came from a hand-written project doc (no prior
+  // session existed), this carries the doc name so the section header tells the TRUTH about the source —
+  // a README quoted under "PREVIOUS AGENT SAID" is false attribution (nobody said it).
+  stateDocName?: string;
 };
 
 // A handoff product that silently hands over a STALE or EMPTY capsule is worse than no product: the
@@ -91,8 +95,12 @@ export function assembleEnvelope(input: EnvelopeInput): string {
     `created_at: ${input.createdAt}`,
     `producer_agent: ${input.producerAgent}`,
   ];
-  if (input.sourceSessionId) lines.push(`source_session: ${input.sourceSessionId}`);
-  if (input.transcriptRef) lines.push(`transcript_ref: ${input.transcriptRef}`);
+  // Single attribution (red-team ③): when a hand-written doc supplies the narrative, session metadata
+  // is suppressed even if a (broken/empty-summary) session was found — a PROJECT DOC header alongside
+  // source_session/transcript_ref lines would contradict itself about where the words came from.
+  const docAttributed = !!input.stateDocName;
+  if (!docAttributed && input.sourceSessionId) lines.push(`source_session: ${input.sourceSessionId}`);
+  if (!docAttributed && input.transcriptRef) lines.push(`transcript_ref: ${input.transcriptRef}`);
   if (input.projectDir) lines.push(`project: ${input.projectDir}  (inferred from files touched; anchors below are for THIS project)`);
   else lines.push('project: UNDETERMINED  (no files were edited this session; anchors below are for session_cwd, not an inferred project — use `ihow-memory continue <keyword>` to target a specific project)');
   lines.push(`session_cwd: ${input.cwd}`);
@@ -101,22 +109,31 @@ export function assembleEnvelope(input: EnvelopeInput): string {
     lines.push('');
     lines.push('--- ⚠️ CAPTURE HEALTH: EMPTY — no prior session captured ---');
     lines.push('There is NO handoff narrative to resume. The Stop hook may not be running (or this is a fresh setup). The MACHINE ANCHORS below are live git state, but nothing was captured to continue from — run `ihow-memory doctor` / `ihow-memory install-hook` to check capture.');
-  } else if (input.sourceAgeMs !== undefined && input.sourceAgeMs > STALE_HANDOFF_MS) {
+  } else if (!docAttributed && input.sourceAgeMs !== undefined && input.sourceAgeMs > STALE_HANDOFF_MS) {
     lines.push('');
     lines.push(`--- ⚠️ CAPTURE HEALTH: POSSIBLY STALE — source last active ${formatAge(input.sourceAgeMs)} ago ---`);
     lines.push('If you have worked since then, this handoff is out of date and the capture hook may have stopped firing. Re-verify against live state before relying on the narrative below.');
-  } else if (input.sourceAgeMs !== undefined) {
+  } else if (!docAttributed && input.sourceAgeMs !== undefined) {
     lines.push(`source_freshness: source session last active ${formatAge(input.sourceAgeMs)} ago`);
   }
   lines.push('');
   lines.push('--- MACHINE ANCHORS — git facts for the project above (re-check live before trusting) ---');
   lines.push(renderAnchors(input.anchors));
   lines.push('');
-  lines.push("--- PREVIOUS AGENT SAID — UNVERIFIED (its own words, not checked by this tool) ---");
+  if (input.stateDocName) {
+    lines.push(`--- PROJECT DOC (${input.stateDocName}) — a hand-written project doc quoted as the starting narrative; NO prior agent session was captured for this project. UNVERIFIED ---`);
+  } else {
+    lines.push("--- PREVIOUS AGENT SAID — UNVERIFIED (its own words, not checked by this tool) ---");
+  }
   lines.push(body);
   lines.push('');
   lines.push('--- RECEIVER PROTOCOL ---');
-  lines.push(RECEIVER_INSTRUCTION);
+  lines.push(docAttributed
+    ? RECEIVER_INSTRUCTION.replace(
+      "the narrative below is the previous agent's UNVERIFIED claim, never a fact.",
+      'the narrative above is quoted from a hand-written project doc (no prior session narrative) — UNVERIFIED context, never a fact.',
+    )
+    : RECEIVER_INSTRUCTION);
   if (!input.anchors.isRepo && input.anchors.files && input.anchors.files.length) {
     lines.push('');
     lines.push(FILE_ANCHOR_NOTE);
