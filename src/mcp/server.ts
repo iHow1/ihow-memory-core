@@ -137,6 +137,30 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'memory.forget',
+    description: "One-gesture correction — use when the user says to forget something or that a remembered fact is wrong ('忘掉这条', 'forget that', '记错了'). Tombstones the matching memory so it stops surfacing in search and recall EVERYWHERE (the file is untouched; fully reversible with memory.remember). Pass the user's wording as needle, or an exact memory/….md path. Applies only on a single unambiguous match — on status 'ambiguous', show the matches and ask the user which one. On status 'needs-confirm' the target is a HUMAN-REVIEWED entry: confirm with the user first, then retry with yes:true. Never set yes:true without the user's explicit confirmation.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        needle: { type: 'string', description: "The user's wording of what to forget, or an exact memory/….md path." },
+        yes: { type: 'boolean', description: 'Confirm forgetting a human-reviewed entry. Only after the user explicitly confirmed.' },
+        reason: { type: 'string', description: "Optional short note recorded in the audit event (e.g. 'user says outdated')." },
+      },
+      required: ['needle'],
+    },
+  },
+  {
+    name: 'memory.remember',
+    description: "Reverse a memory.forget: the entry surfaces again in search and recall. Pass the user's wording or the exact memory/….md path. On 'ambiguous', show the matches and ask.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        needle: { type: 'string' },
+      },
+      required: ['needle'],
+    },
+  },
+  {
     name: 'memory.journal',
     description: 'Append a low-weight, append-only entry to the daily journal (auto-capture lane). Unlike write_candidate -> promote, this writes directly: the entry is searchable but always ranked BELOW curated memory, so it is safe for automatic session-end capture of what happened. Never store secrets. For high-value durable facts worth keeping, use write_candidate + promote instead.',
     inputSchema: {
@@ -244,6 +268,14 @@ async function main(): Promise<void> {
             actor: typeof args.actor === 'string' ? args.actor : 'mcp',
             target: (args.target || {}) as Record<string, string>,
           });
+        } else if (name === 'memory.forget') {
+          payload = await core.forget(String(args.needle || ''), {
+            actor: 'mcp',
+            yes: args.yes === true,
+            reason: typeof args.reason === 'string' ? args.reason : undefined,
+          });
+        } else if (name === 'memory.remember') {
+          payload = await core.remember(String(args.needle || ''), { actor: 'mcp' });
         } else if (name === 'memory.journal') {
           payload = await core.journal(args);
         } else if (name === 'memory.status') {

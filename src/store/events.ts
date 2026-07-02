@@ -15,7 +15,11 @@ export type MemoryEvent = {
     | 'memory.promoted.durable'
     | 'memory.journal.appended'
     | 'memory.rolledback'
-    | 'memory.flagged.expired';
+    | 'memory.flagged.expired'
+    // C4 tombstones: forget hides an entry from search/recall everywhere (file untouched); remember
+    // reverses it. Folded oldest-first into the forgotten set — the event log, not frontmatter, is trust.
+    | 'memory.forgotten'
+    | 'memory.remembered';
   at: string;
   path?: string;
   candidatePath?: string;

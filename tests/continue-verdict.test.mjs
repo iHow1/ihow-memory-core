@@ -11,6 +11,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { computeContinueVerdict, referencedHead } from '../src/handoff.ts';
 import { gitAnchors } from '../src/anchors.ts';
+import { assembleEnvelope } from '../src/envelope.ts';
 
 async function tmpRepo(t) {
   const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-verdict-')));
@@ -143,4 +144,31 @@ test('YELLOW (not GREEN, not RED) when the recorded HEAD anchor is too short to 
   const v = computeContinueVerdict(recorded, dir, 'clean');
   assert.equal(v.state, 'YELLOW', v.reason);
   assert.match(v.reason, /too short/i);
+});
+
+test('C1 honesty: a STATE-doc narrative is labeled PROJECT DOC, never "PREVIOUS AGENT SAID"', () => {
+  const base = {
+    cwd: '/tmp/x', producerAgent: 'ihow-continue', createdAt: '2026-07-02T00:00:00Z',
+    anchors: { isRepo: false }, quotedBody: 'Project readme text.',
+  };
+  const doc = assembleEnvelope({ ...base, stateDocName: 'README.md' });
+  assert.match(doc, /PROJECT DOC \(README\.md\)/, 'source is attributed truthfully');
+  assert.ok(!doc.includes('PREVIOUS AGENT SAID'), 'a hand-written doc is never presented as a prior agent\'s words');
+  const sess = assembleEnvelope({ ...base, sourceSessionId: 'abc12345' });
+  assert.match(sess, /PREVIOUS AGENT SAID/, 'a real captured session keeps the original header');
+});
+
+test('C1 honesty (mixed path): doc attribution suppresses session metadata AND fixes the receiver line', () => {
+  const doc = assembleEnvelope({
+    cwd: '/tmp/x', producerAgent: 'ihow-continue', createdAt: '2026-07-02T00:00:00Z',
+    anchors: { isRepo: false }, quotedBody: 'Doc text.',
+    stateDocName: 'STATE.md',
+    // a broken capture left these behind — the envelope must not render contradictory attribution
+    sourceSessionId: 'deadbeef', transcriptRef: '/tmp/t.jsonl', sourceAgeMs: 1000,
+  });
+  assert.ok(!doc.includes('source_session'), 'no session line under doc attribution');
+  assert.ok(!doc.includes('transcript_ref'), 'no transcript line under doc attribution');
+  assert.ok(!doc.includes('source_freshness'), 'no session freshness under doc attribution');
+  assert.match(doc, /quoted from a hand-written project doc/, 'receiver protocol names the true source');
+  assert.ok(!doc.includes("previous agent's UNVERIFIED claim"), 'no residual previous-agent attribution');
 });

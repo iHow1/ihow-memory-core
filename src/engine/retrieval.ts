@@ -322,19 +322,70 @@ export async function indexWithEngineFallback(workspace: Workspace, config: Engi
 // first, so its citation/snippet/source (the audited lexical record) wins ties on identical paths.
 const RRF_K = 60;
 
+// C3 (semantic recall): did this hit arrive on the SEMANTIC lane? The vector engine already judged it
+// relevant (cosine over the whole entry), so recall's lexical share-a-term gate — which exists to stop
+// FTS stopword matches, a failure mode the semantic lane doesn't have — must not veto it. FAIL-CLOSED:
+// only a recognized vector/semantic source qualifies; 'fts', a missing source, or any unknown value keeps
+// the lexical gate. fuseRrf keeps the FTS representation (source:'fts') for a path BOTH lanes surfaced,
+// so this admits only semantic-ONLY hits — the paraphrase wins lexical search could never see.
+export function isSemanticSourced(hit: { source?: unknown } | null | undefined): boolean {
+  const s = typeof hit?.source === 'string' ? hit.source.toLowerCase() : '';
+  return s === 'semantic' || s === 'vector' || s.startsWith('vector-');
+}
+
+// C3 similarity floor — MEASURED per embedding model (2026-07-01 live calibration on short ZH/EN memory
+// text; see the alpha19 plan §3). Raw cosine only means "nearest", never "relevant" — the provider returns
+// top-K neighbors for ANY prompt — so the lexical-gate bypass may fire only above a floor with measured
+// separation between related and off-topic pairs:
+//   • bge-m3: separates. Scaled calibration (18 related / 144 off-topic ZH pairs): floor 0.58 → 0
+//     off-topic pairs leak, 15/18 paraphrases rescued (worst off-topic 0.575 nginx↔pnpm; the 3 misses
+//     fall back to the lexical gate = status quo). Cross-language pairs (~0.57) sit at the boundary —
+//     an honest, documented weak spot, not a safety gap (a rare leak is one fenced reference-only line
+//     that still passed the curated/tier/C1 checks and the top-N cap).
+//   • nomic-embed-text: does NOT separate on short CJK text (off-topic pairs reach 0.79, ABOVE most true
+//     positives, prefixed or not) → bypass DISABLED; it keeps its semantic RANKING value, which is safe.
+//   • unknown models: DISABLED (fail-closed) until measured.
+// IHOW_RECALL_SEMANTIC_MIN overrides (an explicit local calibration beats the table).
+const SEMANTIC_RECALL_FLOORS: Array<[RegExp, number]> = [
+  [/^bge-m3\b/i, 0.58],
+];
+export function semanticRecallFloor(model: string | null | undefined): number | null {
+  const raw = process.env.IHOW_RECALL_SEMANTIC_MIN;
+  if (raw !== undefined && raw.trim() !== '') {
+    const env = Number(raw);
+    // clamp to [0,1]: cosine range — a stray negative/huge override must not self-harm (red-team polish)
+    if (Number.isFinite(env)) return Math.min(1, Math.max(0, env));
+  }
+  const m = (model || '').trim();
+  for (const [re, floor] of SEMANTIC_RECALL_FLOORS) if (re.test(m)) return floor;
+  return null; // no measured separation for this model -> the lexical relevance gate stays authoritative
+}
+
 export function fuseRrf(ftsHits: SearchResult[], vectorHits: SearchResult[], limit: number): SearchResult[] {
   const acc = new Map<string, { hit: SearchResult; score: number }>();
   const fold = (hits: SearchResult[], prefer: boolean): void => {
     hits.forEach((hit, rank) => {
       if (!hit || typeof hit.path !== 'string') return;
       const contribution = 1 / (RRF_K + rank + 1);
+      // C3: preserve the semantic lane's raw cosine as `semanticScore` BEFORE any representation swap —
+      // on a shared path the FTS shape wins below, which would otherwise erase the only evidence that the
+      // semantic engine surfaced this path (an FTS stopword co-match must not veto the paraphrase win).
+      // Only a semantic-sourced lane may stamp it (a second lexical lane could never smuggle evidence in).
+      const semScore = isSemanticSourced(hit) && Number.isFinite(Number(hit.score)) ? Number(hit.score) : undefined;
       const existing = acc.get(hit.path);
       if (existing) {
         existing.score += contribution;
-        // keep the FTS-lane representation (citation/snippet/source) as the canonical one when present
-        if (prefer) existing.hit = { ...hit, score: existing.score };
+        // keep the FTS-lane representation (citation/snippet/source) as the canonical one when present —
+        // but never at the cost of an already-stamped semanticScore (fold order must not matter here)
+        if (prefer) {
+          const kept = existing.hit.semanticScore;
+          existing.hit = { ...hit, score: existing.score, ...(kept !== undefined ? { semanticScore: kept } : {}) };
+        }
+        if (semScore !== undefined && existing.hit.semanticScore === undefined) {
+          existing.hit = { ...existing.hit, semanticScore: semScore };
+        }
       } else {
-        acc.set(hit.path, { hit, score: contribution });
+        acc.set(hit.path, { hit: semScore !== undefined ? { ...hit, semanticScore: semScore } : hit, score: contribution });
       }
     });
   };

@@ -352,3 +352,29 @@ test('T5: pendingFlaggedReview lists flagged entries and ignores non-flagged one
   assert.equal(pending.count, 1, 'only the flagged entry is pending review');
   assert.ok(pending.sample.some((p) => p.endsWith('.md')), 'the sample lists the flagged entry path');
 });
+
+// --- Knob-② (Commander 2026-07-01, measured on 300 dual-judged real writebacks): ZH governance flagging
+// is DIRECTIVE-TONE anchored. A factual mention of 偏好/默认/授权/管理员/回滚 is a FACT (11% of real ZH
+// writebacks used to flag; 64% of those flags were plain facts) — only prescriptive tone flags. ---
+test('knob-②: ZH factual mentions of former marker words are NOT flagged; directive tone still is', async (t) => {
+  const core = await managed(t);
+  const facts = [
+    '用户偏好：仪表盘配色用低饱和度冷色调。',            // 偏好 as observation
+    'API 授权失败，该账号没有邮箱权限。',                 // 授权/权限 in an error report
+    '本地控制台默认端口是 8788。',                        // 默认 as configuration fact
+    '回滚点：next 退 alpha.9 用 dist-tag add。',          // 回滚 as recorded procedure fact
+  ];
+  for (const text of facts) {
+    const r = await core.write_candidate({ text, sourceAgent: 'tester' });
+    assert.equal(r.autoPromote.tier, 'unverified', `factual mention must NOT flag: ${text}`);
+  }
+  const rules = [
+    '以后一律用 pnpm 装依赖。',
+    '禁止直接改线上配置，必须走审批。',
+    '记住：默认改用深色主题。',
+  ];
+  for (const text of rules) {
+    const r = await core.write_candidate({ text, sourceAgent: 'tester' });
+    assert.equal(r.autoPromote.tier, 'flagged', `directive tone must still flag: ${text}`);
+  }
+});

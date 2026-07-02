@@ -141,5 +141,5 @@ test('RECALL TIME-DIM: the time-since-verification penalty NEVER drops or down-r
   // freshness discount can never override a real currency marker, and never drops a pinned verified entry.
   assert.match(ctx, /500 requests per second|raised to 500/, 'the corrected entry is recalled (currency beats the freshness discount)');
   assert.ok(!/100 requests per second/.test(ctx), 'the superseded entry is collapsed away, not the corrected one');
-  assert.match(ctx, /🟢 reviewed/, 'the recalled entry stays the pinned/reviewed tier (never decayed out)');
+  assert.match(ctx, /omegaservice/, 'the pinned/reviewed entry still recalls (never decayed out)');
 });

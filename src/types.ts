@@ -42,6 +42,10 @@ export type SearchResult = {
   snippet: string;
   score: number;
   source: string;
+  // C3: the SEMANTIC lane's raw cosine for this path, preserved through RRF fusion (which rewrites
+  // `score` to the fused rank score and keeps the FTS representation on shared paths). Present only
+  // when the vector lane surfaced the path; recall's lexical-gate bypass reads THIS, never `score`.
+  semanticScore?: number;
   citation: Citation;
   fallback?: {
     from: string;
@@ -54,6 +58,8 @@ export type SearchOptions = {
   limit?: number;
   rebuild?: boolean;
   includeFlagged?: boolean;
+  // C4: skip the forgotten-tombstone filter (used by the forget/remember flows themselves).
+  includeForgotten?: boolean;
 };
 
 export type RetrievalEngineStatus = {

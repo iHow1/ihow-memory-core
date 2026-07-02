@@ -25,6 +25,8 @@ import { readEventsAllLanes, mcpLaneWorkspace } from './store/events.ts';
 import type { MemoryEvent } from './store/events.ts';
 import { countIndexedDocuments } from './engine/fts.ts';
 import { engineStatus, indexWithEngineFallback, resolveEngineConfig, searchWithEngineFallback } from './engine/retrieval.ts';
+import { filterForgotten, forgetPath, listForgotten, rememberPath } from './forget.ts';
+import type { ForgetOutcome, RememberOutcome } from './forget.ts';
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -38,6 +40,10 @@ export type MemoryCore = {
   rebuild(): Promise<number>;
   audit(opts?: { since?: string }): Promise<MemoryEvent[]>;
   rollback(eventId: string): Promise<RollbackResult>;
+  // C4 one-gesture correction: needle = a memory path (memory/….md) or free text resolved via search.
+  forget(needle: string, opts?: { actor?: string; yes?: boolean; reason?: string }): Promise<ForgetOutcome>;
+  remember(needle: string, opts?: { actor?: string }): Promise<RememberOutcome>;
+  forgotten(): Promise<Array<{ path: string; snippet: string }>>;
 };
 
 function excerpt(content: string, max = 300): string {
@@ -53,11 +59,22 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     workspace,
     async search(query, opts = {}) {
       if (typeof query !== 'string' || !query.trim()) return [];
-      return (await searchWithEngineFallback(workspace, engineConfig, query, opts)).hits;
+      const hits = (await searchWithEngineFallback(workspace, engineConfig, query, opts)).hits;
+      // C4: forgotten entries stop surfacing HERE — the one chokepoint recall (hook), CLI search, MCP
+      // memory.search and HTTP all flow through. Explicit includeForgotten (the forget/remember flows
+      // themselves) opts out; the filter degrades OPEN on an unreadable event log (see forget.ts).
+      if (opts.includeForgotten === true) return hits;
+      return await filterForgotten(workspace, hits);
     },
     async read(ref) {
       const result = await readMemoryFile(workspace, ref);
-      const snippet = excerpt(result.content);
+      // snippet is a PREVIEW — skip frontmatter and the engine's "# Candidate <uuid>" heading so it
+      // opens on content, not metadata (content itself stays raw: it IS the file)
+      const snippet = excerpt(
+        result.content
+          .replace(/^﻿?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')
+          .replace(/^\s*#\s*Candidate\s+[0-9a-f][0-9a-f-]{6,}\s*\r?\n/gim, ''),
+      );
       return {
         path: result.path,
         content: result.content,
@@ -176,6 +193,42 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
       }
       if (result.removed) await indexWithEngineFallback(workspace, engineConfig);
       return result;
+    },
+    // C4 — one gesture, two entry shapes: an exact memory path applies directly; free text resolves via
+    // search and applies ONLY on an unambiguous single match (multiple matches come back for the caller
+    // to disambiguate — never guess which memory to silence). Resolution searches WITHOUT the forgotten
+    // filter so `remember` can find what `forget` hid.
+    async forget(needle, opts = {}) {
+      const n = typeof needle === 'string' ? needle.trim() : '';
+      if (!n) return { status: 'no-match' };
+      if (/^memory\/.+\.md$/.test(n)) return await forgetPath(workspace, n, opts);
+      // Uniqueness must be PROVEN, never window-shaped (red-team BLOCK 2026-07-02): the tombstone filter
+      // runs AFTER the search cap, so a shallow window can hide a second LIVE match behind already-
+      // forgotten hits (6 matches, 4 forgotten, limit-5 window → false "unique" → wrong tombstone).
+      // Search deep; and if the raw window comes back FULL, uniqueness is unprovable → conservative
+      // ambiguous (list what we saw, apply nothing) even when exactly one live match is visible.
+      const FORGET_RESOLVE_LIMIT = 25;
+      const hits = (await searchWithEngineFallback(workspace, engineConfig, n, { limit: FORGET_RESOLVE_LIMIT })).hits;
+      const live = await filterForgotten(workspace, hits); // only things that still surface can be forgotten
+      if (!live.length) return { status: 'no-match' };
+      if (live.length > 1 || hits.length >= FORGET_RESOLVE_LIMIT) {
+        return { status: 'ambiguous', matches: live.slice(0, 10).map((h) => ({ path: String(h.path), snippet: String(h.snippet ?? '') })) };
+      }
+      return await forgetPath(workspace, String(live[0].path), opts);
+    },
+    async remember(needle, opts = {}) {
+      const n = typeof needle === 'string' ? needle.trim() : '';
+      if (/^memory\/.+\.md$/.test(n)) return await rememberPath(workspace, n, opts);
+      // free text: match against the FORGOTTEN list (path or snippet substring, case-insensitive)
+      const gone = await listForgotten(workspace);
+      const needleLc = n.toLowerCase();
+      const matches = n ? gone.filter((g) => g.path.toLowerCase().includes(needleLc) || g.snippet.toLowerCase().includes(needleLc)) : [];
+      if (!matches.length) return { status: 'not-forgotten' };
+      if (matches.length > 1) return { status: 'ambiguous', matches };
+      return await rememberPath(workspace, matches[0].path, opts);
+    },
+    async forgotten() {
+      return await listForgotten(workspace);
     },
   };
 }
