@@ -37,6 +37,9 @@ function stopCommands(settings) {
 function sessionStartCommands(settings) {
   return (settings.hooks?.SessionStart ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
 }
+function userPromptCommands(settings) {
+  return (settings.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
+}
 
 test('install-hook defaults to this project (.claude/settings.local.json), wiring BOTH capture hooks', async (t) => {
   const proj = await mkdtempReal('ihow-proj-');
@@ -91,4 +94,49 @@ test('install-hook --no-install-hook writes nothing', async (t) => {
   t.after(async () => { await fs.rm(proj, { recursive: true, force: true }); });
   assert.match(runInstallHook({ cwd: proj, args: ['--no-install-hook'] }), /Skipped/);
   await assert.rejects(fs.readFile(path.join(proj, '.claude', 'settings.local.json'), 'utf8'));
+});
+
+test('install-hook --runtime codex writes ~/.codex/hooks.json idempotently and preserves hooks', async (t) => {
+  const home = await mkdtempReal('ihow-home-');
+  const proj = await mkdtempReal('ihow-proj-');
+  t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(proj, { recursive: true, force: true }); });
+  const hooksPath = path.join(home, '.codex', 'hooks.json');
+  await fs.mkdir(path.dirname(hooksPath), { recursive: true });
+  await fs.writeFile(
+    hooksPath,
+    JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo keep-me' }] }] }, other: 'KEEP' }, null, 2),
+    'utf8',
+  );
+
+  const out1 = runInstallHook({ cwd: proj, home, args: ['--runtime', 'codex', '--root', '/tmp/ihow-root', '--space', 'codex-space'] });
+  assert.match(out1, /installed Codex SessionStart \+ UserPromptSubmit hooks/);
+  const settings = await readJson(hooksPath);
+  assert.equal(settings.other, 'KEEP', 'unrelated keys preserved');
+  assert.ok(sessionStartCommands(settings).some((c) => c.includes('echo keep-me')), 'existing hook preserved');
+  assert.ok(sessionStartCommands(settings).some((c) => c.includes('hook-session-start') && c.includes('--runtime') && c.includes('codex')), 'Codex SessionStart hook present');
+  assert.ok(sessionStartCommands(settings).some((c) => c.includes('/tmp/ihow-root') && c.includes('codex-space')), 'workspace binding baked in');
+  assert.ok(userPromptCommands(settings).some((c) => c.includes('hook-user-prompt-submit')), 'Codex UserPromptSubmit recall hook present');
+
+  const out2 = runInstallHook({ cwd: proj, home, args: ['--runtime', 'codex', '--root', '/tmp/ihow-root', '--space', 'codex-space'] });
+  assert.match(out2, /Codex hooks already present/);
+  const body = await fs.readFile(hooksPath, 'utf8');
+  assert.equal(body.match(/hook-session-start/g).length, 1, 'SessionStart hook not duplicated');
+  assert.equal(body.match(/hook-user-prompt-submit/g).length, 1, 'UserPromptSubmit hook not duplicated');
+});
+
+test('install-hook --runtime codex refuses malformed hooks shape instead of clobbering it', async (t) => {
+  const home = await mkdtempReal('ihow-home-');
+  const proj = await mkdtempReal('ihow-proj-');
+  t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(proj, { recursive: true, force: true }); });
+  const hooksPath = path.join(home, '.codex', 'hooks.json');
+  await fs.mkdir(path.dirname(hooksPath), { recursive: true });
+  await fs.writeFile(hooksPath, JSON.stringify({ hooks: { SessionStart: { hooks: [] } } }, null, 2), 'utf8');
+
+  assert.throws(
+    () => runInstallHook({ cwd: proj, home, args: ['--runtime', 'codex'] }),
+    /refusing to modify/,
+  );
+  const unchanged = JSON.parse(await fs.readFile(hooksPath, 'utf8'));
+  assert.equal(typeof unchanged.hooks.SessionStart, 'object');
+  assert.equal(Array.isArray(unchanged.hooks.SessionStart), false, 'bad shape preserved for user repair');
 });

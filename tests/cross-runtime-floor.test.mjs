@@ -16,11 +16,13 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { openCore } from '../src/core.ts';
 import { runCaptureFloorSweep } from '../src/floor.ts';
 import { appendFloorJournalOnce } from '../src/governance.ts';
 import { listResumableSessions } from '../src/handoff.ts';
 
+const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
 const IDLE_OLD = 40 * 60 * 1000; // > the 30-min idle gate -> eligible
 const NARR = 'FLOOR-NARRATIVE 这是最近一段跨 runtime 工作,做了若干改动并验证,下一步继续收口。'.repeat(2);
 
@@ -125,6 +127,40 @@ test('floors an idle Codex session once: low-weight entry, codex-floor actor, co
   assert.equal(fe[0].metadata.floorRuntime, 'codex', 'composite key carries the runtime');
   assert.equal(fe[0].metadata.weight, 'low', 'always low weight — never authoritative');
   assert.match(await readJournal(core, fe[0].metadata.day), /FLOOR-NARRATIVE/, 'session narrative captured');
+});
+
+test('Codex SessionStart hook triggers the Codex floor sweep while excluding the live session', async (t) => {
+  const { core, home } = await setup(t);
+  const now = Date.now();
+  await plantCodexSession(home, { id: 'prior-codex', mtimeMs: now - IDLE_OLD });
+  await plantCodexSession(home, { id: 'live-codex', text: 'LIVE-SHOULD-NOT-FLOOR '.repeat(8), mtimeMs: now });
+
+  const out = execFileSync(process.execPath, [CLI, 'hook-session-start', '--runtime', 'codex', '--root', core.workspace.root, '--space', core.workspace.space], {
+    encoding: 'utf8',
+    input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'live-codex', source: 'startup', cwd: '/tmp/codexproj' }),
+    env: { ...process.env, HOME: home, IHOW_RESUME_HINT: '0' },
+  });
+  assert.equal(out.trim(), '', 'floor hook is silent when resume hint is disabled');
+  const fe = await floorEvents(core);
+  assert.equal(fe.length, 1, 'floored exactly one prior Codex session');
+  assert.equal(fe[0].metadata.sessionId, 'prior-codex');
+  assert.equal(fe[0].metadata.floorRuntime, 'codex');
+  const body = await readJournal(core, fe[0].metadata.day);
+  assert.match(body, /FLOOR-NARRATIVE/, 'prior session captured');
+  assert.doesNotMatch(body, /LIVE-SHOULD-NOT-FLOOR/, 'live session was excluded');
+});
+
+test('Codex SessionStart hook keeps the idle gate: fresh prior sessions are not floored', async (t) => {
+  const { core, home } = await setup(t);
+  const now = Date.now();
+  await plantCodexSession(home, { id: 'fresh-prior-codex', text: 'FRESH-SHOULD-NOT-FLOOR '.repeat(8), mtimeMs: now - 60 * 1000 });
+
+  execFileSync(process.execPath, [CLI, 'hook-session-start', '--runtime', 'codex', '--root', core.workspace.root, '--space', core.workspace.space], {
+    encoding: 'utf8',
+    input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'new-codex', source: 'startup', cwd: '/tmp/codexproj' }),
+    env: { ...process.env, HOME: home, IHOW_RESUME_HINT: '0' },
+  });
+  assert.equal((await floorEvents(core)).length, 0, 'fresh prior session remains protected by idle gate');
 });
 
 test('idempotent by composite key: a second sweep writes nothing for the same session', async (t) => {

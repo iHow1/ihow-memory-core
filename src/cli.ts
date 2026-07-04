@@ -39,6 +39,7 @@ import {
   writeSemanticConfig,
 } from './semantic.ts';
 import * as telemetry from './telemetry.ts';
+import { runCaptureFloorSweep } from './floor.ts';
 
 // Suppress only Node's node:sqlite ExperimentalWarning (Node >= 22.12 is our supported runtime); all other warnings pass through unchanged.
 const _emitWarning = process.emitWarning.bind(process);
@@ -202,6 +203,14 @@ function runtimeLabel(runtime?: string): string {
   if (runtime === 'vscode') return 'VS Code (Copilot)';
   if (runtime === 'gemini') return 'Gemini CLI';
   return 'generic MCP client';
+}
+
+function codexHomeDir(): string {
+  return process.env.CODEX_HOME ? path.resolve(process.env.CODEX_HOME) : path.join(os.homedir(), '.codex');
+}
+
+function codexConfigLabel(file: string): string {
+  return process.env.CODEX_HOME ? path.join(codexHomeDir(), file) : `~/.codex/${file}`;
 }
 
 function codexTomlSnippet(memoryRoot: string, stateRoot: string, runtimeDir: string): string {
@@ -411,7 +420,7 @@ function connectViaCodexCli(
   }
   return {
     ok: true, runtime: 'codex', method: 'official-cli:codex',
-    target: '~/.codex/config.toml (codex mcp add)', replaced: exists,
+    target: `${codexConfigLabel('config.toml')} (codex mcp add)`, replaced: exists,
   };
 }
 
@@ -741,10 +750,143 @@ async function maybeInstallOpenCodeResume(): Promise<'installed' | 'already' | '
   } catch { return 'failed'; }
 }
 
+// Codex has native lifecycle hooks, but AGENTS.md is still the strategy layer: it tells the model WHEN
+// to use the MCP tools (continue/search/read/write/forget) instead of leaving them as passive buttons.
+// The Codex hooks installed below add mechanical triggers for SessionStart + UserPromptSubmit; this
+// AGENTS loop keeps the agent's own behavior aligned with the memory protocol.
+const CODEX_MEMORY_MARKER = 'iHow Memory — Codex proactive memory loop';
+const CODEX_MEMORY_SECTION = `
+## ${CODEX_MEMORY_MARKER}
+
+- At the start of a new task, after compaction/reset, or when the user says "继续", "resume", or asks about prior progress: call \`memory.continue\` first. Treat its narrative as UNVERIFIED and verify the git/file anchors before acting.
+- Before answering about prior work, decisions, preferences, TODOs, bugs, configs, release state, or handoff context: call \`memory.search\` with 2-3 query phrasings, then \`memory.read\` the cited files before relying on a result.
+- After meaningful progress, write a concise memory update. Prefer \`memory.write_candidate\` with provenance metadata (repo, git head, command/result, artifact path) for durable facts; use \`memory.journal\` for low-weight handoff notes.
+- If the user says a remembered fact is wrong, outdated, or should be forgotten: call \`memory.forget\` with the user's wording. If it is ambiguous, show the matches and ask; set \`yes:true\` only after explicit confirmation for a reviewed entry.
+- Never store secrets, tokens, cookies, auth headers, credentials, or complete account lists in memory.
+`;
+
+async function maybeInstallCodexMemoryLoop(): Promise<'installed' | 'already' | 'skipped' | 'failed'> {
+  const file = path.join(codexHomeDir(), 'AGENTS.md');
+  let existing = '';
+  let existed = true;
+  try {
+    existing = await fs.readFile(file, 'utf8');
+  } catch {
+    existed = false;
+  }
+  if (existing.includes(CODEX_MEMORY_MARKER)) return 'already';
+  try {
+    if (existed) await fs.writeFile(`${file}.ihow-bak-${Date.now()}`, existing, 'utf8');
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, existed ? `${existing.trimEnd()}\n${CODEX_MEMORY_SECTION}` : `# Codex Instructions${CODEX_MEMORY_SECTION}`, 'utf8');
+    return 'installed';
+  } catch {
+    return 'failed';
+  }
+}
+
+type HookInstallOutcome = 'installed' | 'already' | 'skipped' | 'failed';
+
+type CommandHookEntry = {
+  type: 'command';
+  command: string;
+  timeout?: number;
+  statusMessage?: string;
+};
+
+type HookGroup = {
+  matcher?: string;
+  hooks?: CommandHookEntry[];
+};
+
+function ensureCommandHook(
+  hooks: Record<string, unknown>,
+  event: string,
+  marker: string,
+  command: string,
+  hook: Omit<CommandHookEntry, 'type' | 'command'> = {},
+  matcher?: string,
+): boolean {
+  const list = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
+  const present = list.some((group) => {
+    const entries = (group as { hooks?: unknown[] })?.hooks;
+    return Array.isArray(entries) && entries.some((entry) => {
+      const cmd = (entry as { command?: string })?.command;
+      return typeof cmd === 'string' && cmd.includes(marker) && cmd.includes('ihow-memory');
+    });
+  });
+  if (present) return false;
+  const group: HookGroup = { hooks: [{ type: 'command', command, ...hook }] };
+  if (matcher) group.matcher = matcher;
+  list.push(group);
+  hooks[event] = list;
+  return true;
+}
+
+// Codex hook installer. Codex supports hooks.json at ~/.codex/hooks.json with SessionStart and
+// UserPromptSubmit events. We install only low-noise hooks here:
+//   - SessionStart: resume-awareness hint + deterministic cross-runtime floor trigger
+//   - UserPromptSubmit: relevant curated-memory recall
+// Stop is intentionally not installed yet: Codex documents Stop as turn-scope, not necessarily
+// process-exit/session-end, so using the Claude session-end nudge there could interrupt normal turns.
+async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<HookInstallOutcome> {
+  if (options.installHook === false) return 'skipped';
+  const dest = path.join(codexHomeDir(), 'hooks.json');
+  let config: Record<string, unknown> = {};
+  let existed = false;
+  try {
+    const raw = await fs.readFile(dest, 'utf8');
+    existed = true;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not_object');
+    config = parsed as Record<string, unknown>;
+  } catch {
+    if (existed) return 'failed';
+  }
+
+  if (config.hooks !== undefined && (typeof config.hooks !== 'object' || config.hooks === null || Array.isArray(config.hooks))) {
+    return 'failed';
+  }
+  const hooks = (config.hooks ?? {}) as Record<string, unknown>;
+  if ((hooks.SessionStart !== undefined && !Array.isArray(hooks.SessionStart)) ||
+    (hooks.UserPromptSubmit !== undefined && !Array.isArray(hooks.UserPromptSubmit))) {
+    return 'failed';
+  }
+  const addedStart = ensureCommandHook(
+    hooks,
+    'SessionStart',
+    'hook-session-start',
+    sessionStartHookCommand(options),
+    { timeout: 30, statusMessage: 'Checking iHow Memory handoff' },
+    'startup|resume|clear|compact',
+  );
+  const addedRecall = options.recall !== false ? ensureCommandHook(
+    hooks,
+    'UserPromptSubmit',
+    'hook-user-prompt-submit',
+    recallHookCommand(options),
+    { timeout: 30, statusMessage: 'Searching iHow Memory' },
+  ) : false;
+
+  if (!addedStart && !addedRecall) return 'already';
+  config.hooks = hooks;
+  try {
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    if (existed) await fs.copyFile(dest, `${dest}.ihow-bak-${Date.now()}`);
+    const tmp = `${dest}.ihow-tmp-${process.pid}`;
+    await fs.writeFile(tmp, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    await fs.rename(tmp, dest);
+    return 'installed';
+  } catch {
+    return 'failed';
+  }
+}
+
 // Proactive-resume guidance for the runtimes NOT covered by Claude(skill/hook) / WorkBuddy(BOOTSTRAP).
 // Cursor has no global rules file we can safely auto-write (User Rules are app-managed) -> not-applicable.
 async function injectResumeGuidance(runtime: string): Promise<'installed' | 'already' | 'skipped' | 'failed' | 'not-applicable'> {
   const home = os.homedir();
+  if (runtime === 'codex') return maybeInstallCodexMemoryLoop();
   if (runtime === 'openclaw') return maybeInjectMarkdownResume(path.join(home, '.openclaw', 'workspace', 'AGENTS.md'), { create: false });
   if (runtime === 'hermes') return maybeInjectMarkdownResume(path.join(home, '.hermes', 'SOUL.md'), { create: true });
   if (runtime === 'opencode') return maybeInstallOpenCodeResume();
@@ -903,10 +1045,29 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     }
   }
 
+  // 3/4 (cont.) Codex has native hooks. Install the low-noise pair: SessionStart (resume hint + Codex
+  // floor trigger) and UserPromptSubmit (curated recall). Keep the AGENTS.md loop below as the model's
+  // explicit memory-use discipline.
+  const hasCodex = present.some((d) => d.runtime === 'codex');
+  let codexHooks = 'not-applicable';
+  if (hasCodex) {
+    if (dryRun) {
+      line(`       · would install Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+      codexHooks = 'dry-run';
+    } else if (options.installHook === false) {
+      codexHooks = 'skipped';
+    } else {
+      try { codexHooks = await maybeInstallCodexHooks({ ...options, runtime: 'codex' }); } catch { codexHooks = 'failed'; }
+      if (codexHooks === 'installed') line(`       ✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+      else if (codexHooks === 'already') line(`       · Codex hooks already present → ${codexConfigLabel('hooks.json')}`);
+      else if (codexHooks === 'failed') line(`       ⚠ Codex hooks failed to install → ${codexConfigLabel('hooks.json')}`);
+    }
+  }
+
   // 3/4 (cont.) proactive resume guidance for the markdown/config runtimes (OpenClaw AGENTS.md,
   // Hermes SOUL.md, OpenCode instructions). Same intent as the Claude hook / WorkBuddy BOOTSTRAP: make the
   // agent call memory.continue at a context boundary. Non-fatal, idempotent, backed up.
-  const guidanceRuntimes = ['openclaw', 'hermes', 'opencode'].filter((rt) => present.some((d) => d.runtime === rt));
+  const guidanceRuntimes = ['codex', 'openclaw', 'hermes', 'opencode'].filter((rt) => present.some((d) => d.runtime === rt));
   const resumeGuidance: Record<string, string> = {};
   for (const rt of guidanceRuntimes) {
     if (dryRun) { line(`       · would add memory.continue resume guidance → ${rt}`); resumeGuidance[rt] = 'dry-run'; continue; }
@@ -952,7 +1113,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
 
   const allFailed = connected.length === 0; // nothing reachable-verified (direct-write + server round-trip counts)
   const doctorRed = !!doctorResult && doctorResult.ok === false;
-  const installFailed = skill === 'failed' || hook === 'failed' || workbuddyResume === 'failed'; // a helper no-op'd / threw despite being asked
+  const installFailed = skill === 'failed' || hook === 'failed' || workbuddyResume === 'failed' || codexHooks === 'failed'; // a helper no-op'd / threw despite being asked
   if (!dryRun && (allFailed || doctorRed || installFailed)) process.exitCode = 1;
   // ok must never contradict a non-zero exit a sub-step already set (e.g. unparseable settings)
   const ok = !dryRun && !allFailed && !doctorRed && !installFailed && process.exitCode !== 1;
@@ -970,6 +1131,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
       hook,
       hookScope: hasClaude ? (options.globalHook ? 'global' : 'project') : null,
       workbuddyResume: hasWorkbuddy ? workbuddyResume : null,
+      codexHooks: hasCodex ? codexHooks : null,
+      codexGuidance: hasCodex ? resumeGuidance.codex ?? null : null,
       doctor: doctorResult ? { ok: doctorResult.ok, checks: doctorResult.checks } : null,
       nextSteps: hasClaude ? ['restart-claude-code', 'say-continue-after-clear'] : ['restart-runtime', 'run-continue'],
     });
@@ -985,6 +1148,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     const probs: string[] = [];
     if (skill === 'failed') probs.push('memory skill — install did not land (see the message above)');
     if (hook === 'failed') probs.push('auto-capture hook — not wired (see the message above)');
+    if (codexHooks === 'failed') probs.push('Codex hooks — not wired (see the message above)');
     if (doctorResult) for (const c of doctorResult.checks.filter((c) => !c.ok && c.required !== false)) probs.push(`${c.name} — ${c.detail}${c.hint ? `\n    → ${c.hint}` : ''}`);
     line(`⚠ Set up partially — ${probs.length} thing${probs.length === 1 ? '' : 's'} need attention before memory works:`);
     for (const p of probs) line(`  ${p}`);
@@ -992,8 +1156,12 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     line('Already-written config (MCP / skill / hook) is kept. Fix the above, then re-run:  ihow-memory setup');
     return;
   }
-  const memOnTools = [hasClaude ? 'Claude Code' : null, hasWorkbuddy && workbuddyResume !== 'failed' ? 'WorkBuddy' : null].filter(Boolean);
-  const memOn = memOnTools.length ? ` · memory ON for ${memOnTools.join(' + ')}` : '';
+  const memOnTools = [
+    hasClaude ? 'Claude Code' : null,
+    hasWorkbuddy && workbuddyResume !== 'failed' ? 'WorkBuddy' : null,
+    hasCodex && codexHooks !== 'failed' && resumeGuidance.codex && !['failed', 'skipped'].includes(resumeGuidance.codex) ? 'Codex' : null,
+  ].filter(Boolean);
+  const memOn = memOnTools.length ? ` · memory loop ON for ${memOnTools.join(' + ')}` : '';
   const verifiedRt = connected.filter((c) => c.verified).map((c) => c.runtime);
   const pendingRt = connected.filter((c) => !c.verified).map((c) => c.runtime);
   line(`✓ iHow Memory is set up.  ${verifiedRt.length} runtime${verifiedRt.length === 1 ? '' : 's'} connected & verified${memOn}`);
@@ -1012,7 +1180,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     line('    2. Resume after a context boundary with:  ihow-memory continue');
   }
   line('');
-  line('  Local only: no cloud, nothing uploaded. Recall injects only 🟢 reviewed memory, relevant-only (off: --no-recall).');
+  line('  Local only: no cloud, nothing uploaded. Claude Code gets native hooks; Codex gets native SessionStart/UserPromptSubmit hooks + an AGENTS.md memory loop.');
+  line('  Recall injects only 🟢 reviewed memory, relevant-only (off: --no-recall).');
   line('  Re-check anytime: ihow-memory doctor   ·   re-running setup is safe (idempotent).');
 }
 
@@ -1074,14 +1243,14 @@ Usage:
   ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
-  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the skill + a project-local auto-capture hook, no prompts
+  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the runtime's proactive memory layer, no prompts
   ihow-memory connect --auto [--write] [--json]   # detect installed runtimes; default reports only, --write connects them all to one shared workspace
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
-  ihow-memory hook-stop                   # Claude Code Stop-hook handler (reads hook JSON on stdin; wired by the plugin) — emits a session-end capture instruction
-  ihow-memory hook-session-start          # Claude Code SessionStart-hook handler (reads hook JSON on stdin; wired by the plugin) — floors the previous session deterministically if it ended without a cooperative journal
-  ihow-memory hook-user-prompt-submit     # Claude Code UserPromptSubmit-hook handler (recall) — injects relevant 🟢 reviewed curated memory into a new prompt (relevant-only, tagged, bounded)
+  ihow-memory hook-stop                   # Stop-hook handler (Claude Code session-end nudge; reads hook JSON on stdin)
+  ihow-memory hook-session-start          # SessionStart-hook handler (Claude Code marker floor; Codex resume hint + Codex capture floor trigger)
+  ihow-memory hook-user-prompt-submit     # UserPromptSubmit-hook handler (recall) — injects relevant 🟢 reviewed curated memory into a new prompt (relevant-only, tagged, bounded)
   ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
-  ihow-memory install-hook [--global-hook] [--no-recall] [--no-install-hook]   # add the hooks: Stop (session-end nudge) + SessionStart (next-session floor) + UserPromptSubmit recall (ON by default, injects only 🟢 reviewed memory; --no-recall to skip; 🟡 auto tier opt-in via IHOW_RECALL_INCLUDE_AUTO=1). (default: this project's .claude/settings.local.json; --global-hook: ~/.claude/settings.json)
+  ihow-memory install-hook [--runtime claude-code|codex] [--global-hook] [--no-recall] [--no-install-hook]   # Claude Code: Stop + SessionStart + UserPromptSubmit hooks (project-local by default; --global-hook for ~/.claude/settings.json). Codex: SessionStart + UserPromptSubmit hooks in ~/.codex/hooks.json. Recall is ON by default; --no-recall skips it.
 
 Defaults:
   root: ${defaultRoot()}
@@ -1675,6 +1844,7 @@ function stopHookCommand(options: ParsedArgs['options']): string {
 function sessionStartHookCommand(options: ParsedArgs['options']): string {
   const bin = path.join(packageDir(), 'bin', 'ihow-memory.mjs');
   const parts = [JSON.stringify(process.execPath), JSON.stringify(bin), 'hook-session-start'];
+  if (options.runtime) parts.push('--runtime', JSON.stringify(options.runtime));
   if (options.root) parts.push('--root', JSON.stringify(options.root));
   if (options.space) parts.push('--space', JSON.stringify(options.space));
   if (options.memoryRoot) parts.push('--memory-root', JSON.stringify(options.memoryRoot));
@@ -2133,6 +2303,26 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
       // awareness is best-effort — never disrupt the floor or the session
     }
   }
+
+  // Codex SessionStart hook: run the cross-runtime deterministic floor sweep at Codex thread boundaries.
+  // The MCP server still runs the same floor on startup, but a lifecycle hook is a better trigger cadence.
+  // Keep the normal idle gate: another Codex thread can still be active, so lowering it to zero would floor
+  // a paused-but-live session. If Codex gives us the current session id, exclude only that live session.
+  if (options.runtime === 'codex' && process.env.IHOW_CAPTURE_FLOOR !== '0') {
+    try {
+      const effective = applySemanticEngine(resolveWorkspace({ ...options, cwd }), { ...options, cwd });
+      const engineConfig = resolveEngineConfig(effective);
+      await runCaptureFloorSweep(workspace, {
+        now: Date.now(),
+        excludeSessionId: currentSessionId || undefined,
+        runtimes: new Set(['codex']),
+        reindex: () => indexWithEngineFallback(workspace, engineConfig),
+      });
+    } catch {
+      // Codex hook must never disrupt thread start.
+    }
+  }
+  if (options.runtime === 'codex') return;
 
   const markerDir = path.join(workspace.spaceDir, '.hooks');
   let files: string[];
@@ -2722,7 +2912,18 @@ async function main(): Promise<void> {
   }
 
   if (command === 'install-hook') {
-    await maybeInstallStopHook({ ...options, installHook: options.installHook !== false });
+    if (options.runtime === 'codex') {
+      const outcome = await maybeInstallCodexHooks({ ...options, installHook: options.installHook !== false });
+      if (outcome === 'installed') console.log(`✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+      else if (outcome === 'already') console.log(`✓ Codex hooks already present in ${codexConfigLabel('hooks.json')}`);
+      else if (outcome === 'skipped') console.log('Skipped Codex hooks. (Add them later with install-hook --runtime codex.)');
+      else {
+        console.error(`refusing to modify ${codexConfigLabel('hooks.json')} — fix invalid JSON or permissions, then re-run install-hook --runtime codex.`);
+        process.exitCode = 1;
+      }
+    } else {
+      await maybeInstallStopHook({ ...options, installHook: options.installHook !== false });
+    }
     return;
   }
 
@@ -2775,13 +2976,15 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    // Easy mode (`--easy` / `--yes`): one command does the whole Claude Code setup — MCP + skill +
-    // a project-local auto-capture hook — with no per-step prompts (the flag IS the consent, so it
-    // is also safe in non-TTY/agent use). Explicit --no-install-skill / --no-install-hook still win,
-    // and the bare `connect` defaults (skill/hook OFF unless opted in) are unchanged.
+    // Easy mode (`--easy` / `--yes`): one command does the whole proactive setup for the selected
+    // runtime. Claude Code gets MCP + skill + native hooks. Codex gets MCP + native SessionStart /
+    // UserPromptSubmit hooks + an AGENTS.md memory loop (continue/search/read/write/forget discipline).
+    // Explicit --no-install-* still wins.
     if (options.easy) {
-      if (options.runtime === 'claude-code' && !options.dryRun) {
+      if (options.runtime === 'claude-code' && !options.dryRun && !options.json) {
         console.log('easy setup: MCP + skill + a project-local auto-capture hook (no prompts; --global-hook for user-wide)');
+      } else if (options.runtime === 'codex' && !options.dryRun && !options.json) {
+        console.log('easy setup: MCP + Codex hooks + AGENTS.md proactive memory loop (no prompts)');
       }
       if (options.installSkill === undefined) options.installSkill = true;
       if (options.installHook === undefined) options.installHook = true;
@@ -2797,8 +3000,31 @@ async function main(): Promise<void> {
     // Non-zero exit when the configured server isn't reachable — the same contract the text path honors,
     // and what CHANGELOG promises to --json callers (who are exactly the scripts that check exit codes).
     if (verification && !verification.reachable) process.exitCode = 1;
+    const silently = async (fn: () => Promise<void>): Promise<void> => {
+      if (!options.json) return fn();
+      const orig = console.log;
+      console.log = () => {};
+      try { await fn(); } finally { console.log = orig; }
+    };
+    if (!result.dryRun && options.runtime === 'claude-code' && options.json) {
+      if (options.installSkill === true) {
+        try { await silently(() => maybeInstallClaudeSkill(options)); } catch { process.exitCode = 1; }
+      }
+      if (options.installHook === true) {
+        try { await silently(() => maybeInstallStopHook(options)); } catch { process.exitCode = 1; }
+      }
+    }
+    let codexHooks: HookInstallOutcome | null = null;
+    let codexGuidance: HookInstallOutcome | null = null;
+    if (!result.dryRun && options.runtime === 'codex' && options.easy && options.installHook !== false) {
+      codexHooks = await maybeInstallCodexHooks(options);
+      codexGuidance = await maybeInstallCodexMemoryLoop();
+      if (codexHooks === 'failed' || codexGuidance === 'failed') process.exitCode = 1;
+    }
     if (options.json) {
-      printJson(verification ? { ...result, reachable: verification.reachable, verified: verification.verified, detail: verification.detail } : result);
+      printJson(verification
+        ? { ...result, reachable: verification.reachable, verified: verification.verified, detail: verification.detail, codexHooks, codexGuidance }
+        : result);
     } else {
       console.log('cloud: disabled / local only');
       if (result.dryRun) {
@@ -2820,12 +3046,25 @@ async function main(): Promise<void> {
         if (options.runtime === 'claude-code') {
           await maybeInstallClaudeSkill(options);
           await maybeInstallStopHook(options);
+        } else if (options.runtime === 'codex' && options.easy && options.installHook !== false) {
+          if (codexHooks === 'installed') console.log(`✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+          else if (codexHooks === 'already') console.log(`· Codex hooks already present → ${codexConfigLabel('hooks.json')}`);
+          else if (codexHooks === 'failed') {
+            console.log(`⚠ Codex hooks failed to install → ${codexConfigLabel('hooks.json')}`);
+            process.exitCode = 1;
+          }
+          if (codexGuidance === 'installed') console.log(`✓ added Codex proactive memory loop → ${codexConfigLabel('AGENTS.md')}`);
+          else if (codexGuidance === 'already') console.log(`· Codex proactive memory loop already present → ${codexConfigLabel('AGENTS.md')}`);
+          else if (codexGuidance === 'failed') {
+            console.log(`⚠ Codex proactive memory loop failed to install → ${codexConfigLabel('AGENTS.md')}`);
+            process.exitCode = 1;
+          }
         }
       }
     }
     if (!result.dryRun) {
       await telemetry.track('connect', { runtime: options.runtime });
-      await maybeAskTelemetry();
+      if (!options.json) await maybeAskTelemetry();
     }
     return;
   }

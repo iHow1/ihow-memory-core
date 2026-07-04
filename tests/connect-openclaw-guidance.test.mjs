@@ -71,3 +71,40 @@ test('setup --runtime opencode injects instructions + creates the resume guide f
   assert.ok(exists, 'ihow-resume.md guide file created');
   assert.match(await fs.readFile(guide, 'utf8'), /memory\.continue/, 'guide tells the agent to call memory.continue');
 });
+
+test('setup --runtime codex installs hooks + proactive AGENTS loop (idempotent, content kept)', async (t) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-home-'));
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-bin-'));
+  t.after(async () => {
+    await fs.rm(home, { recursive: true, force: true });
+    await fs.rm(bin, { recursive: true, force: true });
+  });
+  const codex = path.join(bin, 'codex');
+  await fs.writeFile(codex, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory"; exit 0; fi\nexit 0\n', 'utf8');
+  await fs.chmod(codex, 0o755);
+  await fs.mkdir(path.join(home, '.codex'), { recursive: true });
+  const agents = path.join(home, '.codex', 'AGENTS.md');
+  await fs.writeFile(agents, '# Existing Codex Rules\n\nKEEP-CODEX-CONTENT\n', 'utf8');
+
+  const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, IHOW_HANDOFF_METRICS: '0' };
+  execFileSync(process.execPath, [CLI, 'setup', '--runtime', 'codex'], { encoding: 'utf8', env });
+  let body = await fs.readFile(agents, 'utf8');
+  assert.match(body, /iHow Memory — Codex proactive memory loop/, 'Codex memory loop injected');
+  assert.match(body, /memory\.continue/, 'loop tells Codex to call memory.continue');
+  assert.match(body, /memory\.search/, 'loop tells Codex to search memory proactively');
+  assert.match(body, /memory\.write_candidate/, 'loop tells Codex to write durable facts');
+  assert.match(body, /memory\.forget/, 'loop tells Codex how to correct wrong memories');
+  assert.match(body, /KEEP-CODEX-CONTENT/, 'pre-existing AGENTS.md content preserved');
+  let hooks = JSON.parse(await fs.readFile(path.join(home, '.codex', 'hooks.json'), 'utf8'));
+  const startCmds = (hooks.hooks?.SessionStart ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
+  const recallCmds = (hooks.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
+  assert.ok(startCmds.some((c) => c.includes('hook-session-start') && c.includes('--runtime') && c.includes('codex')), 'Codex SessionStart hook installed');
+  assert.ok(recallCmds.some((c) => c.includes('hook-user-prompt-submit')), 'Codex UserPromptSubmit hook installed');
+
+  execFileSync(process.execPath, [CLI, 'setup', '--runtime', 'codex'], { encoding: 'utf8', env });
+  body = await fs.readFile(agents, 'utf8');
+  assert.equal(body.match(/iHow Memory — Codex proactive memory loop/g).length, 1, 'loop injected exactly once');
+  hooks = JSON.parse(await fs.readFile(path.join(home, '.codex', 'hooks.json'), 'utf8'));
+  assert.equal(JSON.stringify(hooks).match(/hook-session-start/g).length, 1, 'SessionStart hook injected exactly once');
+  assert.equal(JSON.stringify(hooks).match(/hook-user-prompt-submit/g).length, 1, 'UserPromptSubmit hook injected exactly once');
+});

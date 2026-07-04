@@ -8,6 +8,28 @@ with pre-release tags.
 
 ## [Unreleased]
 
+### Added
+
+- **Codex native hook parity (planned for alpha.21).** `setup --runtime codex`,
+  `connect --runtime codex --easy` / `--yes`, and `install-hook --runtime codex`
+  now install Codex `SessionStart` + `UserPromptSubmit` hooks into
+  `~/.codex/hooks.json`, preserving existing hooks and refusing invalid JSON.
+  `SessionStart` emits the resume-awareness pointer and triggers a Codex-only
+  deterministic capture-floor sweep at thread boundaries (still protected by
+  the normal idle gate so active/paused sessions are not captured prematurely);
+  `UserPromptSubmit` runs the same bounded, relevance-gated recall path used by
+  Claude Code. Codex `Stop` is intentionally not installed by default yet
+  because Codex documents `Stop` as turn-scoped, so treating it as session-end
+  needs a separate low-noise design pass.
+
+### Changed
+
+- **Codex setup now has both mechanics and policy.** Codex keeps the proactive
+  `~/.codex/AGENTS.md` memory loop for continue/search/read/write/forget
+  discipline, but no longer relies on instructions alone: the lifecycle hooks
+  provide the mechanical trigger layer. README runtime-support/status language
+  was updated to remove the stale "Codex lacks native lifecycle hooks" claim.
+
 ## [0.1.0-alpha.17] — 2026-06-30
 
 The **first-run + standard-evidence** release: the README's governed-loop quickstart now copy-pastes

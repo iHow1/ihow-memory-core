@@ -29,7 +29,7 @@ iHow Memory is a local, shared-memory runtime for heterogeneous coding agents �
 npx ihow-memory@next setup
 ```
 
-`setup` detects your installed agents, registers the `ihow-memory` MCP server with each, installs the Claude Code skill + auto-capture hook, injects a "call `memory.continue` on resume" instruction for the agents whose config supports it (WorkBuddy, OpenClaw, Hermes, OpenCode), and verifies with `doctor`. It is idempotent (safe to re-run), reversible (every edited config is backed up), and local-only. Prefer step-by-step? Use `connect` below.
+`setup` detects your installed agents, registers the `ihow-memory` MCP server with each, installs proactive memory behavior where the runtime exposes a stable surface (Claude Code skill + hooks, Codex hooks + `AGENTS.md`, WorkBuddy/OpenClaw/Hermes/OpenCode resume guidance), and verifies with `doctor`. It is idempotent (safe to re-run), reversible (every edited config is backed up), and local-only. Prefer step-by-step? Use `connect` below.
 
 ### 1. Connect a single runtime
 
@@ -108,7 +108,7 @@ npx ihow-memory@next continue            # or pass a repo keyword: continue <nam
 | Runtime | connect | resume reader | Notes |
 | --- | --- | --- | --- |
 | Claude Code | ✓ (`claude mcp add-json`) | ✓ | real-app + ongoing dogfood; skill + auto-capture hooks |
-| Codex | ✓ (`codex mcp add`) | ✓ | single-machine real-app smoke |
+| Codex | ✓ (`codex mcp add`) | ✓ | native SessionStart/UserPromptSubmit hooks + proactive `~/.codex/AGENTS.md` memory loop; single-machine real-app smoke |
 | OpenClaw | ✓ (`~/.openclaw/openclaw.json`) | ✓ | single-machine real-app smoke (memory.continue + git preflight) |
 | Hermes | ✓ (`hermes mcp add`) | ✓ (JSON + `state.db`) | single-machine real-app smoke |
 | OpenCode | ✓ (`~/.config/opencode`) | ✓ (`opencode.db`) | single-machine real-app smoke |
@@ -119,7 +119,7 @@ npx ihow-memory@next continue            # or pass a repo keyword: continue <nam
 | Gemini CLI | ✓ (`~/.gemini/settings.json`) | ✓ (`~/.gemini/tmp/*/logs.json`) | passive reader of Gemini's on-disk **user-prompt log** (Gemini records no assistant turns) → session topic + git anchors; manual `GEMINI.md` nudge. Verified against real local data |
 | Cline (VS Code) | — (add via Cline's own MCP settings) | ✓ (`globalStorage` / `~/.cline/data`) | passive reader of `tasks/<id>/api_conversation_history.json`; cwd from `environment_details`. Fixture-tested, not yet real-app smoke |
 
-The MCP tools and governed loop are runtime-agnostic. The proactive skill + auto-capture hooks are Claude Code-specific; the resume nudge is auto-injected for the runtimes whose config exposes an instructions file (Claude Code, WorkBuddy, OpenClaw, Hermes, OpenCode).
+The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / UserPromptSubmit hooks. Codex uses native SessionStart / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the Codex capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
 
 ### Runtimes wired without an auto-injected resume nudge (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
 
@@ -208,10 +208,10 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 ```text
 ihow-memory setup            zero-config: detect runtimes -> wire MCP + skill + auto-capture/recall hooks -> verify (recommended; idempotent, local-only) [--dry-run] [--json]
 ihow-memory init             create a managed workspace, print the MCP config snippet
-ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw | vscode | gemini) [--dry-run]
+ihow-memory connect          auto-configure a runtime (claude-code | codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw | vscode | gemini) [--easy] [--dry-run] [--json]
 ihow-memory continue         resume after a context boundary — verify-first handoff with live git anchors (GREEN/YELLOW/RED) [project-keyword] [--list] [--json]
 ihow-memory install-skill    copy the Claude Code proactive-memory skill into ~/.claude/skills/
-ihow-memory install-hook     add the hooks — Stop (cooperative nudge) + SessionStart (deterministic floor) + UserPromptSubmit recall (🟢 reviewed, on by default; --no-recall to skip) (Claude Code; --global-hook for user-wide)
+ihow-memory install-hook     add runtime hooks — Claude Code: Stop + SessionStart + UserPromptSubmit (project-local by default; --global-hook for user-wide). Codex: SessionStart + UserPromptSubmit in ~/.codex/hooks.json. Recall is on by default; --no-recall skips it.
 ihow-memory doctor           environment + setup checks [--share-diagnostics for a redacted report]
 ihow-memory verify           reproducible self-proof receipt: local store + each runtime's reachability + this checkout's resume verdict, every line re-runnable [--runtime name] [--json]
 ihow-memory status           workspace, engine, index and sync state [--json]
@@ -285,26 +285,27 @@ In that mode the write boundary is strict: existing durable Markdown is read-onl
 - **`search` finds nothing you just wrote.** The FTS index rebuilds on write, but if it looks stale run `npx ihow-memory@next reindex` to rebuild from Markdown. Confirm the index status with `npx ihow-memory@next status`.
 - **`doctor` flags `node:sqlite`.** You need Node.js ≥ 22.12 (the version that ships `node:sqlite`). Check with `node -v`.
 - **Hook installed but nothing captured (Claude Code).** Restart Claude Code after `install-hook` so it loads the settings. The cooperative Stop hook depends on the agent honoring the prompt; the deterministic SessionStart floor only fires for a *previous* session that ended without a cooperative journal (so a session that already journaled is correctly skipped). Inspect outcomes with `npx ihow-memory@next audit`.
+- **Codex hooks installed but not firing.** Restart Codex after `connect --runtime codex --easy` / `install-hook --runtime codex`. If Codex asks you to review hooks, open `/hooks` and trust the iHow Memory command hooks; writing `hooks.json` is the installation step, while Codex still owns the trust gate.
 - **`connect --auto` across projects only backs up one.** Floor capture is single-cwd (see Limitations).
 - **npx cache cleared / hook command broke.** Installing from an `npx` cache path can be wiped; for a durable hook install globally (`npm i -g ihow-memory`) then re-run `install-hook`.
 - **Windows.** Use WSL; native Windows is experimental.
 
-## Proactive memory (Claude Code)
+## Proactive memory
 
 The MCP tools are available to any client, but agents use memory only if they decide to. iHow Memory
-adds two layers to raise that on Claude Code:
+adds runtime-specific layers where the host exposes stable hooks or instruction files:
 
 - **Skill — recall + record discipline.** `ihow-memory install-skill` (or `connect --runtime
   claude-code --install-skill`) installs a thin policy layer ([`skills/ihow-memory/SKILL.md`](./skills/ihow-memory/SKILL.md))
   that nudges Claude Code to search at the start of a task and record a candidate after a decision or
   handoff. It changes *when* memory is used, not the mechanism. Other runtimes get the same nudge from
   the MCP tool descriptions.
-- **Session-end auto-capture (cooperative) — experimental.** `connect --runtime claude-code --install-hook` adds a
+- **Claude Code session-end auto-capture (cooperative) — experimental.** `connect --runtime claude-code --install-hook` adds a
   Stop hook that, at session end, asks the in-session agent to record a handoff into the low-weight
   `journal` lane via `memory.journal`. It is best-effort (re-prompts as the session grows, stops once
   an entry is recorded), **project-scoped by default** (`--global-hook` for user-wide), and reversible
   (`ihow-memory audit` / `rollback`).
-- **Next-session floor (deterministic) — experimental, `next` only.** The same `install-hook` also wires a
+- **Next-session floor (deterministic) — experimental, `next` only.** The same Claude Code `install-hook` also wires a
   SessionStart hook: when a new session starts, it floors the **previous** session deterministically *iff*
   that session ended without a cooperative journal. It parses the prior transcript, composes a
   last-substantive-segment summary within a **locked scope** (assistant text + file paths + command binary
@@ -313,6 +314,13 @@ adds two layers to raise that on Claude Code:
   silent (it only captures — the floor itself injects nothing), and never throws. Offline evaluation on 22 real
   historical transcripts passed the backstop quality gate; live *natural* floor hits remain under dogfood
   because cooperative capture currently covers all observed sessions.
+- **Codex native hooks — experimental.** `connect --runtime codex --easy` (or `install-hook --runtime codex`)
+  writes `~/.codex/hooks.json` with SessionStart + UserPromptSubmit hooks. SessionStart adds the same
+  resumable-session pointer and triggers the Codex capture-floor sweep at thread boundaries while keeping
+  the normal idle gate; UserPromptSubmit runs the same bounded, relevance-gated recall path. Codex Stop is
+  not installed by default yet because Codex documents Stop as turn-scoped, so treating it as "session end"
+  would be too noisy. After install, restart Codex and use `/hooks` to review/trust the command hooks if
+  Codex prompts for approval.
 
 > **Experimental & Claude Code-first.** Auto-capture is two layers: a cooperative Stop-hook nudge (whether
 > an entry is written depends on the agent following the prompt) and a deterministic SessionStart floor
@@ -337,7 +345,7 @@ A hosted runtime is not included in this npm package or this repository.
 
 ## Status
 
-Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: only Claude Code is dogfooded daily; the other runtimes are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they can call the tools but cannot resume). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated daily on macOS and Linux; native Windows is **experimental** — the `packageDir` path bug is fixed and a `windows-latest` CI lane covers build + a connect/doctor reachability smoke + the full test suite, with WSL as the supported path. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
+Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex now has native SessionStart/UserPromptSubmit hooks plus a proactive AGENTS memory loop; the other runtimes are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they can call the tools but cannot resume). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated daily on macOS and Linux; native Windows is **experimental** — the `packageDir` path bug is fixed and a `windows-latest` CI lane covers build + a connect/doctor reachability smoke + the full test suite, with WSL as the supported path. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
 
 **Which version has what (dist-tags).** Prereleases publish under the `next` dist-tag; `npm install ihow-memory` resolves `latest`.
 
