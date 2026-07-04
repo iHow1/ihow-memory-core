@@ -12,3 +12,6 @@ tmp-floor-quality/
 docs/external-validation-kit.md
 docs/verify-benchmark.md
 docs/release-runbook.md
+
+# Also ignore node_modules symlinks in staging worktrees
+node_modules

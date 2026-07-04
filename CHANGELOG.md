@@ -8,9 +8,11 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.21] — 2026-07-04
+
 ### Added
 
-- **Codex native hook parity (planned for alpha.21).** `setup --runtime codex`,
+- **Codex native hook parity.** `setup --runtime codex`,
   `connect --runtime codex --easy` / `--yes`, and `install-hook --runtime codex`
   now install Codex `SessionStart` + `UserPromptSubmit` hooks into
   `~/.codex/hooks.json`, preserving existing hooks and refusing invalid JSON.
