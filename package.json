@@ -31,7 +31,8 @@
     "TRADEMARK.md",
     "README.md",
     "README.zh-CN.md",
-    "skills/"
+    "skills/",
+    "docs/harness-contract.md"
   ],
   "bin": {
     "ihow-memory": "bin/ihow-memory.mjs",
