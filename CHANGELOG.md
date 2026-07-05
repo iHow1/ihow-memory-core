@@ -35,6 +35,9 @@ with pre-release tags.
 - **No-hook continuity protocol documented.** README now documents the alpha.22 continuity protocol:
   call `context_probe` at thread start, on continuation-style prompts, and at task completion; forgetting
   to call it does not corrupt memory, but doctor/metrics can reveal that automation is not actually firing.
+- **Harness contract documented.** Added `docs/harness-contract.md` for Planner / Generator / Evaluator
+  workflows: explicit role matrix, WorkBuddy/no-hook boundaries, review packet template, run ledger
+  contents, and evaluator stop conditions.
 
 ## [0.1.0-alpha.21] — 2026-07-04
 

@@ -332,7 +332,7 @@ adds runtime-specific layers where the host exposes stable hooks or instruction 
 4. If you forgot steps 1-3, no data loss — next `session_start` will detect stale marker and catch up.
 5. `context_probe` does NOT auto-write for no-hook runtimes. You must call `memory.journal` yourself when `action='journal'`.
 
-For no-hook runtimes, `session_end` means task completion or delivery, not process close.
+For no-hook runtimes, `session_end` means task completion or delivery, not process close. For multi-agent work, use the [Harness Contract](./docs/harness-contract.md): OpenClaw/human as Planner, Codex-style runtimes as Generators, Hermes-style reviewers as Evaluators, and WorkBuddy-style no-hook runtimes as cooperative reviewers that return structured review packets instead of being assumed callable.
 
 > **Experimental & Claude Code-first.** Auto-capture is two layers: a cooperative Stop-hook nudge (whether
 > an entry is written depends on the agent following the prompt) and a deterministic SessionStart floor
