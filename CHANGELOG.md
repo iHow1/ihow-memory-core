@@ -8,6 +8,34 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.22] — 2026-07-05
+
+### Added
+
+- **Automation Reliability Pass.** Added `memory.context_probe`, a runtime-agnostic MCP trigger for
+  no-hook and partial-hook agents. It supports `session_start`, `prompt`, `session_end`, and `tick`
+  events; records append-only probe audit events; updates a freshness marker; and returns explicit
+  actions such as `verify_anchors`, `journal`, or `none` instead of pretending every runtime has a
+  native lifecycle hook.
+- **Reviewed prompt recall for `context_probe(prompt)`.** Prompt probes can now return a bounded
+  `<recalled-memory>` block with up to three cited reviewed/curated snippets. The path is fail-closed:
+  flagged entries, `reviewed:false`, `tier:auto-promoted`, and journal/floor lanes are excluded by
+  default, and empty prompt digests no-op.
+- **Automation doctor matrix and metrics.** `doctor --json` now reports a cross-runtime automation
+  matrix for Claude Code, Codex, OpenClaw, Hermes, and generic no-hook runtimes, plus audit-derived
+  probe metrics such as probe calls by runtime, journal suggestions, probe→journal conversion, and
+  floor capture sources.
+
+### Changed
+
+- **No-hook runtime write boundary is explicit.** WorkBuddy/OpenCode/Gemini-style runtimes never receive
+  `floor_journaled` from `context_probe`; `session_end` returns `action: "journal"` so the agent must
+  explicitly call `memory.journal` with a cooperative handoff. Automatic floor writing remains reserved
+  for runtimes with a reliable transcript source and the existing redaction/audit/rollback path.
+- **No-hook continuity protocol documented.** README now documents the alpha.22 continuity protocol:
+  call `context_probe` at thread start, on continuation-style prompts, and at task completion; forgetting
+  to call it does not corrupt memory, but doctor/metrics can reveal that automation is not actually firing.
+
 ## [0.1.0-alpha.21] — 2026-07-04
 
 ### Added
