@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildHandoffPacket } from '../handoff.ts';
 import { runCaptureFloorSweep } from '../floor.ts';
+import { contextProbe } from '../context-probe.ts';
 
 type JsonRpcRequest = {
   jsonrpc?: '2.0';
@@ -194,6 +195,21 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    name: 'memory.context_probe',
+    description: 'Automation trigger probe for runtimes without native hooks. Returns verify-first handoff text, prompt recall diagnostics, or a cooperative journal instruction. No-hook runtimes (WorkBuddy/OpenCode/Gemini/unknown) never receive action=floor_journaled; session_end returns action=journal so the agent must call memory.journal explicitly.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string' },
+        runtime: { type: 'string' },
+        sessionHint: { type: 'string' },
+        promptDigest: { type: 'string' },
+        eventHint: { type: 'string', enum: ['session_start', 'prompt', 'session_end', 'tick'] },
+      },
+      required: ['cwd', 'eventHint'],
+    },
+  },
 ] as const;
 
 async function main(): Promise<void> {
@@ -288,6 +304,14 @@ async function main(): Promise<void> {
             projectHint: typeof args.projectHint === 'string' ? args.projectHint : undefined,
             limit: Number.isFinite(args.limit as number) ? Number(args.limit) : undefined,
             excludeSessionId: typeof args.excludeSessionId === 'string' ? args.excludeSessionId : undefined,
+          });
+        } else if (name === 'memory.context_probe') {
+          payload = await contextProbe(core.workspace, {
+            cwd: typeof args.cwd === 'string' && args.cwd.trim() ? args.cwd : process.cwd(),
+            runtime: typeof args.runtime === 'string' ? args.runtime : undefined,
+            sessionHint: typeof args.sessionHint === 'string' ? args.sessionHint : undefined,
+            promptDigest: typeof args.promptDigest === 'string' ? args.promptDigest : undefined,
+            eventHint: args.eventHint as 'session_start' | 'prompt' | 'session_end' | 'tick',
           });
         } else {
           throw new Error('unknown_tool');

@@ -40,6 +40,7 @@ import {
 } from './semantic.ts';
 import * as telemetry from './telemetry.ts';
 import { runCaptureFloorSweep } from './floor.ts';
+import { automationMatrix, type AutomationMatrixRow } from './automation-doctor.ts';
 
 // Suppress only Node's node:sqlite ExperimentalWarning (Node >= 22.12 is our supported runtime); all other warnings pass through unchanged.
 const _emitWarning = process.emitWarning.bind(process);
@@ -92,6 +93,8 @@ type DoctorResult = {
   ok: boolean;
   checks: DoctorCheck[];
   status?: Record<string, unknown>;
+  automationMatrix?: AutomationMatrixRow[];
+  automationMetrics?: Record<string, unknown>;
 };
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -1383,6 +1386,8 @@ async function doctor(
 ): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
   const workspace = resolveWorkspace(options);
+  const mcpSpec = mcpServerSpec(workspace);
+  const automation = await automationMatrix(workspace, mcpSpec);
   const nodeOk = nodeVersionAtLeast(process.versions.node, '22.12.0');
   const sqliteStatus = sqliteRuntimeStatus();
   const writable = await isWritable(workspace.memoryDir);
@@ -1423,7 +1428,7 @@ async function doctor(
   // the same verify-after-connect contract setup uses, and make it a REQUIRED check so `doctor: ok` can't
   // mean "healthy" while the runtime's mcp list is empty (the first-user Hermes incident).
   if (options.runtime) {
-    const v = await verifyConnection(mcpServerSpec(workspace), options.runtime);
+    const v = await verifyConnection(mcpSpec, options.runtime);
     checks.push({
       name: 'runtime',
       ok: v.reachable,
@@ -1448,6 +1453,16 @@ async function doctor(
       required: false,
     });
   }
+
+  const matrixBroken = automation.rows.some((row) => row.status === 'BROKEN');
+  checks.push({
+    name: 'automation-matrix',
+    ok: !matrixBroken,
+    detail: automation.rows.map((row) => `${row.runtime}:${row.status}`).join(' · '),
+    hint: matrixBroken ? 'Fix the broken MCP/hook command path, then rerun ihow-memory doctor.' : undefined,
+    severity: matrixBroken ? 'error' : 'info',
+    required: true,
+  });
 
   const installedVersion = packageVersion();
   const bundleVersion = await runtimeBundleVersion(workspace);
@@ -1568,7 +1583,21 @@ async function doctor(
     });
   }
 
-  return { ok: checks.every((check) => check.ok || check.required === false), checks, status };
+  return {
+    ok: checks.every((check) => check.ok || check.required === false),
+    checks,
+    status,
+    automationMatrix: automation.rows,
+    automationMetrics: {
+      probeCallsByRuntime: automation.metrics.probeCallsByRuntime,
+      journalSuggestionsByRuntime: automation.metrics.journalSuggestionsByRuntime,
+      probeToJournalConversionRate: automation.metrics.probeToJournalConversionRate,
+      floorCaptureSources: automation.metrics.floorCaptureSources,
+      cooperativeJournalCount: automation.metrics.cooperativeJournalCount,
+      pathStatus: automation.path.status,
+      pathNotes: automation.path.notes,
+    },
+  };
 }
 
 async function packageInfo(): Promise<{ name: string; version: string }> {
@@ -3462,6 +3491,12 @@ async function main(): Promise<void> {
         const label = check.ok ? 'ok' : check.required === false ? 'action' : 'fail';
         console.log(`- ${label} ${check.name}: ${check.detail}`);
         if (check.hint) console.log(`  hint: ${check.hint}`);
+      }
+      if (result.automationMatrix?.length) {
+        console.log('automation matrix:');
+        for (const row of result.automationMatrix) {
+          console.log(`- ${row.status} ${row.runtime}: start=${row.sessionStartResume}; prompt=${row.promptRecall}; end=${row.sessionEndCapture}; floor=${row.floorFallback}; probes=${row.probeCalls}; notes=${row.notes}`);
+        }
       }
     }
     process.exitCode = result.ok ? 0 : 1;

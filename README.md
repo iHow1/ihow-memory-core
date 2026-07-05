@@ -189,7 +189,7 @@ Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://githu
 
 ## MCP tools
 
-The stdio MCP server (registered by `connect`, or manually via the `init` snippet) exposes seven tools:
+The stdio MCP server (registered by `connect`, or manually via the `init` snippet) exposes these tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -202,6 +202,8 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 | `memory.forget` | One-gesture correction: tombstone the matching memory so it stops surfacing in search and recall everywhere. Reversible, audited, file untouched; human-reviewed entries need explicit confirmation. |
 | `memory.remember` | Reverse a `memory.forget` — the entry surfaces again. |
 | `memory.status` | Report workspace, retrieval provider, index and sync status. |
+| `memory.continue` | Return a verify-first handoff packet with live anchors and an UNVERIFIED prior narrative. |
+| `memory.context_probe` | Automation trigger probe for no-hook runtimes. It can return verify-first handoff text or `action: "journal"`; it does not auto-write for WorkBuddy/OpenCode/Gemini/unknown. |
 
 ## CLI reference
 
@@ -321,6 +323,16 @@ adds runtime-specific layers where the host exposes stable hooks or instruction 
   not installed by default yet because Codex documents Stop as turn-scoped, so treating it as "session end"
   would be too noisy. After install, restart Codex and use `/hooks` to review/trust the command hooks if
   Codex prompts for approval.
+
+## iHow Memory — continuity protocol (alpha.22)
+
+1. Thread start: call `memory.context_probe({eventHint:'session_start', cwd, runtime:'workbuddy'})`. Read returned packet. Treat narrative as UNVERIFIED — verify anchors before acting.
+2. User says 继续/进度/上次/接手/之前/Codex/Claude/OpenClaw: call `memory.context_probe({eventHint:'prompt', cwd, promptDigest:'<summary>'})` before answering.
+3. Task done: call `memory.context_probe({eventHint:'session_end', cwd})`. If `action='journal'`, call `memory.journal` with a brief entry.
+4. If you forgot steps 1-3, no data loss — next `session_start` will detect stale marker and catch up.
+5. `context_probe` does NOT auto-write for no-hook runtimes. You must call `memory.journal` yourself when `action='journal'`.
+
+For no-hook runtimes, `session_end` means task completion or delivery, not process close.
 
 > **Experimental & Claude Code-first.** Auto-capture is two layers: a cooperative Stop-hook nudge (whether
 > an entry is written depends on the agent following the prompt) and a deterministic SessionStart floor
