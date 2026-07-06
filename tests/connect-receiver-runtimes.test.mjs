@@ -61,7 +61,7 @@ test('vscode connect uses the `servers` container with a stdio entry, preserves 
   const e = out.servers['ihow-memory'];
   assert.equal(e.type, 'stdio', 'VS Code stdio entry carries an explicit type');
   assert.ok(path.isAbsolute(e.command), 'absolute node path (GUI app, no shell PATH)');
-  assert.ok(Array.isArray(e.args) && e.args.some((a) => a.includes('mcp/server.js')), 'args array includes the server entry');
+  assert.ok(Array.isArray(e.args) && e.args.some((a) => a.replace(/\\/g, '/').includes('mcp/server.js')), 'args array includes the server entry');
   assert.ok(fs.readdirSync(path.dirname(cfg)).some((f) => f.includes('.ihow-bak-')), 'backed up');
 });
 
@@ -106,7 +106,7 @@ test('gemini connect adds mcpServers/implicit-stdio, preserves existing keys, ba
   const e = out.mcpServers['ihow-memory'];
   assert.equal(e.type, undefined, 'Gemini implicit-stdio entry has no type field');
   assert.ok(path.isAbsolute(e.command), 'absolute node path');
-  assert.ok(Array.isArray(e.args) && e.args.some((a) => a.includes('mcp/server.js')), 'args array includes the server entry');
+  assert.ok(Array.isArray(e.args) && e.args.some((a) => a.replace(/\\/g, '/').includes('mcp/server.js')), 'args array includes the server entry');
   assert.ok(fs.readdirSync(path.dirname(cfg)).some((f) => f.includes('.ihow-bak-')), 'backed up');
 });
 

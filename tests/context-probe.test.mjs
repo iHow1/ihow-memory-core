@@ -233,3 +233,23 @@ test('doctor matrix includes runtime rows and path classifier warns/breaks obvio
   assert.ok(doc.automationMatrix.every((row) => ['OK', 'WARN', 'BROKEN'].includes(row.status)), 'every row has a status');
   assert.ok(doc.checks.some((check) => check.name === 'automation-matrix'), 'doctor emits an automation-matrix check');
 });
+
+test('fresh-root doctor keeps unmaterialized runtime bundle as a warning, not a failed first screen', async (t) => {
+  const root = await mkdtemp('ihow-doctor-fresh-');
+  const home = await mkdtemp('ihow-doctor-fresh-home-');
+  t.after(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(home, { recursive: true, force: true });
+  });
+  const out = execFileSync(process.execPath, [CLI, 'doctor', '--root', root, '--space', 'fresh', '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, HOME: home, IHOW_CAPTURE_FLOOR: '0' },
+  });
+  const doc = JSON.parse(out);
+  const matrix = doc.checks.find((check) => check.name === 'automation-matrix');
+  assert.equal(doc.ok, true, 'fresh local doctor should pass overall');
+  assert.equal(matrix.ok, true, 'automation matrix warning is non-blocking');
+  assert.equal(matrix.required, false, 'warning is not required');
+  assert.equal(matrix.severity, 'warning');
+  assert.ok(doc.automationMatrix.every((row) => row.status !== 'BROKEN'), 'fresh runtime bundle is not BROKEN');
+});

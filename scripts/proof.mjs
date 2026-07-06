@@ -28,6 +28,9 @@ try {
     title: 'agent-a-proof-memory',
     text: 'Agent A durable proof memory: blue-copper-river marker for A0.1 local FTS citation.',
     sourceAgent: 'agent-a',
+    // This proof demonstrates the explicit governed loop: propose a candidate,
+    // verify it is not searchable yet, then promote through the manual gate.
+    autoPromote: false,
     metadata: {
       proof: 'A0.1',
       cloud: false,
@@ -74,7 +77,7 @@ try {
   assert(finalStatus.provider.cloud === false, 'proof must remain no-cloud');
   assert(finalStatus.provider.model === null, 'proof must remain no-model');
 
-  console.log('\nPASS ihow-memory-core A0.1 10-second proof: local candidate -> promote -> FTS citation/read');
+  console.log('\nPASS ihow-memory-core A0.1 10-second proof: local candidate (autoPromote:false) -> promote -> FTS citation/read');
 } finally {
   if (process.env.IHOW_MEMORY_KEEP_PROOF !== '1') {
     await fs.rm(root, { recursive: true, force: true });

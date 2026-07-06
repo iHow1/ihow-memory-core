@@ -24,6 +24,20 @@ export type PathClassification = {
   notes: string[];
 };
 
+export function automationStatusRank(status: AutomationStatus): number {
+  if (status === 'BROKEN') return 2;
+  if (status === 'WARN') return 1;
+  return 0;
+}
+
+export function worstAutomationStatus(statuses: AutomationStatus[]): AutomationStatus {
+  let worst: AutomationStatus = 'OK';
+  for (const status of statuses) {
+    if (automationStatusRank(status) > automationStatusRank(worst)) worst = status;
+  }
+  return worst;
+}
+
 const ROWS: Array<Omit<AutomationMatrixRow, 'status' | 'notes' | 'probeCalls'>> = [
   {
     runtime: 'Claude Code',
@@ -79,8 +93,8 @@ function isMissingExecutable(command: string): boolean {
 }
 
 function isDeadTmpPath(value: string): boolean {
-  const resolved = path.resolve(value);
-  return resolved === '/tmp' || resolved.startsWith('/tmp/') || resolved === '/private/tmp' || resolved.startsWith('/private/tmp/');
+  const resolved = path.resolve(value).replace(/\\/g, '/');
+  return /(?:^|^[A-Za-z]:)\/(?:private\/)?tmp(?:\/|$)/.test(resolved);
 }
 
 export function classifyAutomationPath(spec: { command?: string; args?: string[] }): PathClassification {
@@ -90,15 +104,16 @@ export function classifyAutomationPath(spec: { command?: string; args?: string[]
   const all = [command, ...args].filter(Boolean);
   if (!command) notes.push('missing MCP command');
   for (const item of all) {
-    if (path.isAbsolute(item) && isDeadTmpPath(item)) notes.push(`dead tmp path: ${item}`);
+    if (path.isAbsolute(item) && isDeadTmpPath(item)) notes.push(`temporary MCP path (may disappear after restart): ${item}`);
   }
   if (command && isMissingExecutable(command)) notes.push(`missing MCP command: ${command}`);
   for (const arg of args) {
-    if (path.isAbsolute(arg) && /(?:^|\/)(?:server\.js|mcp\/server\.js)$/.test(arg) && !fs.existsSync(arg)) {
+    const normalizedArg = arg.replace(/\\/g, '/');
+    if (path.isAbsolute(arg) && /(?:^|\/)(?:server\.js|mcp\/server\.js)$/.test(normalizedArg) && !fs.existsSync(arg)) {
       notes.push(`runtime bundle not materialized: ${arg}`);
     }
   }
-  if (notes.some((n) => /dead tmp path|missing MCP command/.test(n))) {
+  if (notes.some((n) => /missing MCP command/.test(n))) {
     return { status: 'BROKEN', notes };
   }
   return { status: notes.length ? 'WARN' : 'OK', notes };
@@ -117,13 +132,14 @@ export async function automationMatrix(
 ): Promise<{ rows: AutomationMatrixRow[]; metrics: ProbeMetrics; path: PathClassification }> {
   const metrics = await probeMetrics(workspace);
   const pathStatus = classifyAutomationPath(spec);
+  const aggregateStatus = pathStatus.status === 'BROKEN' ? 'BROKEN' : 'OK';
   const rows = ROWS.map((row) => {
     const key = runtimeKey(row.runtime);
     const probeCalls = key === 'no-hook' ? noHookCalls(metrics) : (metrics.probeCallsByRuntime[key] ?? 0);
     const notes: string[] = [];
     let status: AutomationStatus = 'OK';
-    if (pathStatus.status === 'BROKEN') {
-      status = 'BROKEN';
+    if (aggregateStatus === 'BROKEN') {
+      status = aggregateStatus;
       notes.push(...pathStatus.notes);
     }
     if (key === 'no-hook' && probeCalls === 0) {
