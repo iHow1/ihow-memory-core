@@ -93,8 +93,8 @@ function isMissingExecutable(command: string): boolean {
 }
 
 function isDeadTmpPath(value: string): boolean {
-  const resolved = path.resolve(value);
-  return resolved === '/tmp' || resolved.startsWith('/tmp/') || resolved === '/private/tmp' || resolved.startsWith('/private/tmp/');
+  const resolved = path.resolve(value).replace(/\\/g, '/');
+  return /(?:^|^[A-Za-z]:)\/(?:private\/)?tmp(?:\/|$)/.test(resolved);
 }
 
 export function classifyAutomationPath(spec: { command?: string; args?: string[] }): PathClassification {
@@ -108,7 +108,8 @@ export function classifyAutomationPath(spec: { command?: string; args?: string[]
   }
   if (command && isMissingExecutable(command)) notes.push(`missing MCP command: ${command}`);
   for (const arg of args) {
-    if (path.isAbsolute(arg) && /(?:^|\/)(?:server\.js|mcp\/server\.js)$/.test(arg) && !fs.existsSync(arg)) {
+    const normalizedArg = arg.replace(/\\/g, '/');
+    if (path.isAbsolute(arg) && /(?:^|\/)(?:server\.js|mcp\/server\.js)$/.test(normalizedArg) && !fs.existsSync(arg)) {
       notes.push(`runtime bundle not materialized: ${arg}`);
     }
   }
