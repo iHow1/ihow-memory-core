@@ -61,8 +61,12 @@ jobs:
           if (-not $out.reachable) { Write-Error "configured MCP server did NOT round-trip on Windows"; exit 1 }
       - name: Doctor runtime-reachability smoke (required check, B3)
         run: node bin/ihow-memory.mjs doctor --runtime claude-code
-      - name: Tests
-        run: npm test
+      - name: Windows smoke tests
+        # Keep Windows coverage focused on supported cross-platform behavior:
+        # package-dir resolution, governed-loop CLI flow, automation doctor, and
+        # receiver-runtime config writes. The full suite currently contains many
+        # POSIX/local-agent transcript assumptions and is exercised on Linux.
+        run: node --test tests/windows-packagedir.test.mjs tests/quickstart-governed-loop.test.mjs tests/automation-doctor.test.mjs tests/connect-receiver-runtimes.test.mjs
 
   secret-scan:
     runs-on: ubuntu-latest
