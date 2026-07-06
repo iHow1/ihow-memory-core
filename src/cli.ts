@@ -75,6 +75,11 @@ type ParsedArgs = {
     update?: boolean;
     autoPromote?: boolean;
     from?: string;
+    fromDraft?: string;
+    scope?: string;
+    since?: string;
+    draft?: boolean;
+    format?: 'markdown';
     importSource?: 'claude-code' | 'markdown';
   };
   rest: string[];
@@ -145,6 +150,23 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--update') options.update = true;
     else if (arg === '--no-auto-promote') options.autoPromote = false;
     else if (arg === '--from') options.from = tail[++index];
+    else if (arg === '--from-draft') options.fromDraft = tail[++index];
+    else if (arg === '--scope') {
+      const value = tail[++index];
+      options.scope = value;
+      if (command !== 'organize') rest.push('--scope', value);
+    }
+    else if (arg === '--since') {
+      const value = tail[++index];
+      options.since = value;
+      if (command !== 'organize') rest.push('--since', value);
+    }
+    else if (arg === '--draft') options.draft = true;
+    else if (arg === '--format') {
+      const format = tail[++index];
+      if (format === 'markdown') options.format = format;
+      else throw new Error('unsupported_export_format');
+    }
     else if (arg === '--source') {
       const src = tail[++index];
       if (src === 'claude-code' || src === 'markdown') options.importSource = src;
@@ -1227,6 +1249,8 @@ Usage:
   ihow-memory proof [--root path] [--space name] [--engine fts|vector-gguf]
   ihow-memory benchmark [--json]   # deterministic LOCAL proof of the verify-first guarantees: the three-color resume verdict discriminates (GREEN narrow · drift→RED · uncertainty→YELLOW) and the no-false-green floor isolates unverified/standing-rule content while blocking secret/fabricated-anchor content. Re-run for the same result; exit non-zero if any guarantee fails.
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
+  ihow-memory organize --scope project [--since 7d] --draft --json   # Safe Memory Gardener MVP: review-first JSON draft with evidence pointers, duplicate/stale flags, safety status, and audit event. Never rewrites curated memory.
+  ihow-memory export-vault --from-draft <draft_id> --format markdown [--json]   # export a gardener draft to Obsidian-compatible Markdown view artifact with evidence links + export audit event.
   ihow-memory enable-semantic [--host url] [--model name] [--space name] [--json]   # OPT-IN: turn on the additive semantic lane for this space. Probes a LOCAL Ollama (default http://localhost:11434, model nomic-embed-text) and only enables if it is reachable AND the model is pulled; persists <space>/.runtime/semantic.json so connect/setup launch the MCP server with the spawned embedding sidecar. The default install stays zero-dependency FTS5 (capabilities.semantic=false) until you run this; the lane is additive — search falls back to FTS if the provider is down. Re-run setup/connect + restart the runtime to apply.
   ihow-memory disable-semantic [--space name] [--json]   # reverse enable-semantic: remove the opt-in marker and return to the default FTS5 engine (re-run setup/connect + restart to apply)
   ihow-memory search <query> [--limit n] [--include-flagged]
@@ -3841,6 +3865,33 @@ async function main(): Promise<void> {
     else {
       console.log(`reindexed: documents=${documents}`);
       console.log(`index: ${status.index.path}`);
+    }
+    return;
+  }
+  if (command === 'organize') {
+    const draft = await core.organize({ scope: options.scope || 'project', since: options.since, actor: options.actor || 'cli' });
+    if (options.json) printJson(draft);
+    else {
+      console.log(`organized draft: ${draft.draft_id}`);
+      console.log(`path: ${draft.draft_path}`);
+      console.log(`audit event: ${draft.audit_event_id}`);
+      console.log('mode: review-first (curated memory not rewritten)');
+    }
+    return;
+  }
+  if (command === 'export-vault') {
+    if (!options.fromDraft) {
+      console.error('export-vault requires --from-draft <draft_id>');
+      process.exitCode = 1;
+      return;
+    }
+    const result = await core.export_vault(options.fromDraft, { actor: options.actor || 'cli', format: options.format || 'markdown' });
+    if (options.json) printJson(result);
+    else {
+      console.log(`exported draft: ${result.draft_id}`);
+      console.log(`path: ${result.path}`);
+      console.log(`audit event: ${result.audit_event_id}`);
+      console.log('source of truth: view/export artifact only');
     }
     return;
   }
