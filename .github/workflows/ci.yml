@@ -69,26 +69,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Scan for credentials and private content
-        # Patterns: common credential shapes plus internal/customer markers that
-        # must never appear in this public repository.
-        run: |
-          set -e
-          PATTERNS='ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|BEGIN[ A-Z]+PRIVATE KEY|yuntian|/Users/[a-z]+/'
-          HITS=$(grep -rnE "$PATTERNS" --include='*' . \
-            --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=dist \
-            --exclude=ci.yml --exclude=release.yml || true)
-          if [ -n "$HITS" ]; then
-            echo "Secret scan failed:"
-            echo "$HITS"
-            exit 1
-          fi
-          echo "secret scan clean"
-          # No machine-local backup / agent config may ever be tracked in this public repo
-          # (a .claude/settings.local.json.ihow-bak-* reached history this way once).
-          FORBIDDEN=$(git ls-files | grep -E '(^|/)\.claude/|\.ihow-bak-' || true)
-          if [ -n "$FORBIDDEN" ]; then
-            echo "Forbidden tracked paths (machine-local backup / .claude):"
-            echo "$FORBIDDEN"
-            exit 1
-          fi
-          echo "path scan clean"
+        run: npm run secret-scan

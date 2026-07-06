@@ -40,7 +40,7 @@ import {
 } from './semantic.ts';
 import * as telemetry from './telemetry.ts';
 import { runCaptureFloorSweep } from './floor.ts';
-import { automationMatrix, type AutomationMatrixRow } from './automation-doctor.ts';
+import { automationMatrix, worstAutomationStatus, type AutomationMatrixRow } from './automation-doctor.ts';
 
 // Suppress only Node's node:sqlite ExperimentalWarning (Node >= 22.12 is our supported runtime); all other warnings pass through unchanged.
 const _emitWarning = process.emitWarning.bind(process);
@@ -1454,14 +1454,19 @@ async function doctor(
     });
   }
 
-  const matrixBroken = automation.rows.some((row) => row.status === 'BROKEN');
+  const matrixStatus = worstAutomationStatus(automation.rows.map((row) => row.status));
+  const matrixBroken = matrixStatus === 'BROKEN';
   checks.push({
     name: 'automation-matrix',
     ok: !matrixBroken,
     detail: automation.rows.map((row) => `${row.runtime}:${row.status}`).join(' · '),
-    hint: matrixBroken ? 'Fix the broken MCP/hook command path, then rerun ihow-memory doctor.' : undefined,
-    severity: matrixBroken ? 'error' : 'info',
-    required: true,
+    hint: matrixBroken
+      ? 'Fix the broken MCP/hook command path, then rerun ihow-memory doctor.'
+      : matrixStatus === 'WARN'
+        ? 'Connect a runtime or run ihow-memory upgrade to materialize the runtime bundle; warnings do not block local setup.'
+        : undefined,
+    severity: matrixBroken ? 'error' : matrixStatus === 'WARN' ? 'warning' : 'info',
+    required: matrixBroken,
   });
 
   const installedVersion = packageVersion();
