@@ -54,7 +54,7 @@ export type GardenerDraft = {
   decisions_facts: GardenerItem[];
   next_actions_open_questions: GardenerItem[];
   duplicate_stale_flags: GardenerFlag[];
-  sources: Array<{ source: string; sha256: string; lines: number; visibility: 'project' | 'private' | 'audit-only' }>;
+  sources: Array<{ source: string; sha256: string; lines: number; visibility: 'project' | 'private' | 'audit-only' | 'source-local' | 'source-shared' }>;
   safety: {
     secret_redaction: 'passed' | 'redacted';
     redacted_items: number;
@@ -136,18 +136,36 @@ function stripFrontMatter(content: string): { body: string; frontMatter: string 
   return { body: content.slice(match[0].length), frontMatter: match[1] };
 }
 
-function visibilityFor(memoryRelativePath: string, frontMatter: string): 'project' | 'private' | 'audit-only' {
+function visibilityFor(memoryRelativePath: string, frontMatter: string): GardenerDraft['sources'][number]['visibility'] {
   const p = memoryRelativePath.toLowerCase();
   const fm = frontMatter.toLowerCase();
   if (p.startsWith('_events/') || p.includes('/_events/') || p.includes('/audit/') || /\b(visibility|scope)\s*:\s*["']?audit/.test(fm)) return 'audit-only';
+  if (p.startsWith('sources/local/') || p.includes('/source-local/') || /\b(source_visibility|visibility|scope)\s*:\s*["']?(source[-_ ]?local|local[-_ ]?source)/.test(fm)) return 'source-local';
+  if (p.startsWith('sources/shared/') || p.includes('/source-shared/') || /\b(source_visibility|visibility|scope)\s*:\s*["']?(source[-_ ]?shared|shared[-_ ]?source)/.test(fm)) return 'source-shared';
   if (p.includes('/private/') || p.startsWith('private/') || /\b(visibility|scope)\s*:\s*["']?private/.test(fm)) return 'private';
   return 'project';
 }
 
-function includeVisibility(scope: string, visibility: 'project' | 'private' | 'audit-only'): boolean {
+function includeVisibility(scope: string, visibility: GardenerDraft['sources'][number]['visibility']): boolean {
   if (visibility === 'audit-only') return false;
-  if ((scope === 'project' || scope === 'public') && visibility === 'private') return false;
-  return true;
+  if (scope === 'all') return true;
+  if (scope === 'source') return visibility === 'source-local' || visibility === 'source-shared';
+  if (scope === 'private') return visibility === 'private';
+  if (visibility === 'source-local') return false;
+  if (visibility === 'source-shared') return scope !== 'public';
+  if (visibility === 'private') return false;
+  return visibility === 'project';
+}
+
+function genericScope(scope: string): boolean {
+  return ['project', 'public', 'private', 'source', 'all'].includes(scope);
+}
+
+function namespaceMatches(scope: string, memoryRelativePath: string): boolean {
+  if (genericScope(scope)) return true;
+  const ns = safeFileSlug(scope, 'scope').toLowerCase();
+  const p = memoryRelativePath.toLowerCase();
+  return p.startsWith(`scopes/${ns}/`) || p.startsWith(`sources/shared/${ns}/`) || p.startsWith(`sources/local/${ns}/`);
 }
 
 function normalizeClaim(text: string): string {
@@ -208,6 +226,10 @@ async function readSourceCandidates(workspace: Workspace, opts: OrganizeDraftOpt
   for (const file of files) {
     const relMemory = path.relative(workspace.memoryDir, file).split(path.sep).join('/');
     if (relMemory.startsWith('_events/') || relMemory.startsWith('history/') || relMemory.includes('/history/')) continue;
+    if (!namespaceMatches(scope, relMemory)) {
+      outOfScopeExcluded += 1;
+      continue;
+    }
     const stat = await fs.stat(file);
     if (sinceMs !== null && stat.mtimeMs < sinceMs) continue;
     const raw = await fs.readFile(file, 'utf8');
