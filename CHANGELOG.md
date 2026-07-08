@@ -8,6 +8,30 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.24] — 2026-07-08
+
+### Added
+
+- **Safe Memory Gardener RC proof fixture.** Added a deterministic, desensitized enterprise-style fixture
+  that proves synthetic workflow events flowing into candidate/project memory state, then a review-first
+  organize draft, an evidence-linked digest, a redaction-checked Markdown/Obsidian export, and
+  organize/export audit events. The fixture uses generic Project Orchard content only and avoids customer
+  data, private identifiers, production endpoints, and hardcoded customer ontology.
+- **Safe Memory Gardener user docs.** Added `docs/safe-memory-gardener.md` plus README/README.zh-CN CLI
+  references for `organize` and `export-vault`, including the source-of-truth boundary: exported Markdown
+  is a view/editor artifact, not authoritative memory.
+
+### Changed
+
+- **alpha.24 package prep.** Local package metadata is bumped to `0.1.0-alpha.24` for RC readiness only;
+  no tag, publish, push, release, or deploy is part of this change.
+
+### Notes
+
+- Safe Memory Gardener remains a narrow alpha MVP: review-first organize/export with safety checks and
+  audit trail. It does not claim full enterprise policy automation such as RBAC/ABAC, namespace leak
+  matrices, adapter frameworks, admin UI, or durable retention automation.
+
 ## [0.1.0-alpha.22] — 2026-07-05
 
 ### Added

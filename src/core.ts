@@ -27,6 +27,8 @@ import { countIndexedDocuments } from './engine/fts.ts';
 import { engineStatus, indexWithEngineFallback, resolveEngineConfig, searchWithEngineFallback } from './engine/retrieval.ts';
 import { filterForgotten, forgetPath, listForgotten, rememberPath } from './forget.ts';
 import type { ForgetOutcome, RememberOutcome } from './forget.ts';
+import { organizeDraft, exportVaultFromDraft } from './gardener.ts';
+import type { ExportVaultResult, GardenerDraft, OrganizeDraftOptions } from './gardener.ts';
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -44,6 +46,8 @@ export type MemoryCore = {
   forget(needle: string, opts?: { actor?: string; yes?: boolean; reason?: string }): Promise<ForgetOutcome>;
   remember(needle: string, opts?: { actor?: string }): Promise<RememberOutcome>;
   forgotten(): Promise<Array<{ path: string; snippet: string }>>;
+  organize(opts?: OrganizeDraftOptions): Promise<GardenerDraft>;
+  export_vault(fromDraft: string, opts?: { actor?: string; format?: 'markdown' }): Promise<ExportVaultResult>;
 };
 
 function excerpt(content: string, max = 300): string {
@@ -229,6 +233,12 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     },
     async forgotten() {
       return await listForgotten(workspace);
+    },
+    async organize(opts = {}) {
+      return await organizeDraft(workspace, opts);
+    },
+    async export_vault(fromDraft, opts = {}) {
+      return await exportVaultFromDraft(workspace, fromDraft, opts);
     },
   };
 }

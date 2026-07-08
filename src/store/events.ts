@@ -15,6 +15,8 @@ export type MemoryEvent = {
     | 'memory.promoted.durable'
     | 'memory.journal.appended'
     | 'memory.context_probe'
+    | 'memory.organized'
+    | 'memory.exported'
     | 'memory.rolledback'
     | 'memory.flagged.expired'
     // C4 tombstones: forget hides an entry from search/recall everywhere (file untouched); remember

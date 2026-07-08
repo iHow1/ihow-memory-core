@@ -53,4 +53,4 @@ for (const name of providerScripts) {
   await fs.chmod(dest, 0o755);
 }
 
-console.log(`built ${outputDir}`);
+console.error(`built ${outputDir}`);
