@@ -55,6 +55,23 @@ The deterministic test fixture asserts:
 - raw email/secret-like values are redacted from export;
 - organize/export audit records are present.
 
+## Audit completeness baseline v0
+
+The alpha.25 v0 audit baseline asserts that each governance action leaves enough append-only event data to reconstruct what happened without trusting the draft/export artifact alone.
+
+Covered in v0:
+
+| Action | Required audit evidence |
+|---|---|
+| candidate write | `candidate.created` event with candidate path and redacted actor/metadata surfaces |
+| promote | `memory.promoted` event with durable target path |
+| journal append | `memory.journal.appended` event with reversible entry metadata |
+| rollback | `memory.rolledback` event with `rolledBackEventId` and removal status |
+| organize | `memory.organized` event with draft id, scope, item counts, out-of-scope exclusions, `curatedRewrite:false` |
+| export | `memory.exported` event with draft id, format, export path, and source-of-truth marker |
+
+All event surfaces must be detector-clean: raw PII/secret-like values must not appear in event JSON, draft JSON, or Markdown export.
+
 ## Out of scope for alpha.25 v0
 
 - full RBAC/ABAC engine;
