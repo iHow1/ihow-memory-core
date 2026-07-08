@@ -180,6 +180,8 @@ ihow-memory write-candidate  提出记忆 candidate（进入沙箱 inbox）
 ihow-memory promote          升级 candidate（显式、留审计）
 ihow-memory durable-promote  持久写入——必须传 --dry-run 或 --real-write
 ihow-memory journal          追加一条低权重 journal 条目（自动捕获通道）
+ihow-memory organize         Safe Memory Gardener：生成 review-first JSON 草稿，包含来源证据、安全状态、重复/陈旧 review 标记与 organize 审计事件 [--scope project] [--since 7d] [--draft] [--json]
+ihow-memory export-vault     将 gardener 草稿导出为 Obsidian 兼容 Markdown 视图，保留证据链接并记录 export 审计事件；导出不是信源 [--from-draft <draft_id>] [--format markdown]
 ihow-memory import           导入你在别处写的记忆（Claude Code MEMORY.md、ai-memory markdown、任意 .md 目录）进可搜索 journal 通道 [--from path] [--apply] [--update]
 ihow-memory audit            列出只追加的审计事件日志 [--since]
 ihow-memory rollback         撤销一条自动捕获的 journal 条目（--event <id>）
@@ -216,6 +218,19 @@ ihow-memory telemetry        on | off | status——匿名计数，默认关闭
 - **下一会话 floor 兜底（确定式）——实验性，仅 `next`。** 同一个 `install-hook` 还会装一个 SessionStart hook：新会话启动时，**若上一会话没有协作式 journal**，就确定式地把上一会话兜底——解析其 transcript，在**锁死的范围**内（assistant 文本 + 文件路径 + 命令二进制名 + 首个 prompt；绝不含工具输出、绝不含原始 shell）取"最后实质段"摘要，脱敏后写为一条低权重、可审计、可回滚的 journal 条目。它是协作式提示之下的安全网：**单 cwd**、静默（floor 只捕获、自身不注入任何内容）、永不抛错。已在 22 个真实历史 transcript 上离线评分通过 backstop 质量门；真实的自然 floor 命中仍在 dogfood 中（因为目前协作式捕获覆盖了所有观察到的会话）。
 
 > **实验性、且 Claude Code 优先。** 自动捕获 = 协作式 Stop-hook 提示（是否写入取决于 agent 是否照做）+ 确定式 SessionStart floor 兜底（仅 `next`，在提示没被照做时捕获上一会话）。两者都写**低权重、未经审阅**的笔记——可信长期记忆请用 `promote` / `durable-promote`。floor 仅作离线验证过的 backstop，尚未升为 primary/默认权重路径；`recall`（把记忆读回新会话）默认**开启**——只注入 🟢 reviewed（人审晋升）记忆、按相关性门控、带标签；机器判的 🟡 auto 档需 opt-in（`IHOW_RECALL_INCLUDE_AUTO=1`），关闭用 `--no-recall` 或 `IHOW_RECALL_OFF=1`。完整说明以英文 README 为准。
+
+## Safe Memory Gardener（alpha.24）
+
+Safe Memory Gardener 是一个 review-first 的本地整理/导出路径：
+
+```bash
+npx ihow-memory@next organize --scope project --draft --json
+npx ihow-memory@next export-vault --from-draft <draft_id> --format markdown
+```
+
+`organize` 会扫描 scope 内的 Markdown memory，在 `gardener/drafts/` 下写入确定性的 JSON 草稿，为每条有证据的项目保留源文件与行号，给疑似重复/陈旧内容打“仅供 review”的非破坏性标记，记录 `memory.organized` 审计事件，并且不会改写 curated memory。`export-vault` 会把草稿渲染成 Obsidian 兼容 Markdown digest，放在 `gardener/exports/` 下，对渲染后的 Markdown 跑脱敏/密钥检测，保留证据链接，并记录 `memory.exported` 审计事件。
+
+导出的 Markdown **只是视图/编辑器工件**：它不是 source of truth，编辑它不会更新受治理的 memory。信源仍然是受治理的 Markdown memory store 与 append-only 审计轨迹。alpha.24 的范围刻意收窄；它不声称已经实现完整企业记忆策略自动化（没有 RBAC/ABAC、namespace leak matrix、adapter framework、admin UI 或持久 retention automation）。详见 [`docs/safe-memory-gardener.md`](./docs/safe-memory-gardener.md)。
 
 ## 记忆布局与写入边界
 

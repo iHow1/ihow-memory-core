@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openCore } from '../src/core.ts';
 import { containsSecretLikeContent } from '../src/governance.ts';
+import { seedEnterpriseGardenerFixture, WORKFLOW_EVENTS } from './fixtures/enterprise-gardener.mjs';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
 
@@ -137,20 +138,71 @@ visibility: audit-only
   assert.ok(draft.safety.out_of_scope_sources_excluded >= 2);
 });
 
+test('enterprise-style fixture proves workflow events through digest/export audit chain', async (t) => {
+  const core = await coreFor(t);
+  const seeded = await seedEnterpriseGardenerFixture(core);
+
+  assert.equal(seeded.workflowEvents.length, WORKFLOW_EVENTS.length, 'workflow event fixture is deterministic');
+  assert.match(seeded.candidate.path, /memory\/candidate\/inbox\//, 'workflow state includes a candidate-stage artifact');
+  assert.match(seeded.promoted.path, /memory\/scopes\/project-orchard\//, 'workflow state includes promoted project memory');
+
+  const draft = await core.organize({ scope: 'project', actor: 'enterprise-fixture-test' });
+  const draftJson = JSON.stringify(draft);
+  assert.equal(draft.schema_version, 'alpha24.gardener.v1');
+  assert.equal(draft.mode, 'review-first');
+  assert.equal(draft.safety.export_safe, true);
+  assert.equal(containsSecretLikeContent(draftJson), false, 'draft is detector-clean');
+  assert.match(draftJson, /Project Orchard will keep approvals review-first/);
+  assert.match(draftJson, /candidate queue captures synthetic workflow evidence/);
+  assert.doesNotMatch(draftJson, /private staffing notes/);
+  assert.doesNotMatch(draftJson, /audit-only routing details/);
+  assert.ok(draft.duplicate_stale_flags.some((flag) => flag.kind === 'duplicate_candidate' && flag.destructive === false));
+  assert.ok(draft.duplicate_stale_flags.some((flag) => flag.kind === 'stale_candidate' && flag.destructive === false));
+
+  for (const item of [...draft.decisions_facts, ...draft.next_actions_open_questions]) {
+    assert.ok(item.evidence.length > 0, `${item.id} has linked evidence`);
+    for (const evidence of item.evidence) {
+      assert.match(evidence.source, /^memory\//, 'evidence links point back to source memory');
+      assert.ok(evidence.lineStart >= 1 && evidence.lineEnd >= evidence.lineStart, 'evidence has line numbers');
+    }
+  }
+
+  const out = await core.export_vault(draft.draft_id, { actor: 'enterprise-fixture-test' });
+  const md = await fs.readFile(path.join(core.workspace.spaceDir, out.path), 'utf8');
+  assert.match(md, /Export artifact only/);
+  assert.match(md, /not source of truth/);
+  assert.match(md, /memory\/scopes\/project-orchard\/workflow-state\.md:L\d+/);
+  assert.match(md, /memory\/scopes\/project-orchard\/review-backlog\.md:L\d+/);
+  assert.match(md, /memory\/scopes\/project-orchard\/\d{8}T\d{6}Z-candidate-queue-captured-synthetic-workflow-evidence\.md:L\d+/);
+  assert.equal(containsSecretLikeContent(md), false, 'Markdown export passes redaction/secret detector');
+
+  const events = await core.audit();
+  assert.ok(events.some((event) => event.type === 'candidate.created' && event.path === seeded.candidate.path));
+  assert.ok(events.some((event) => event.type === 'memory.promoted' && event.targetPath === seeded.promoted.path));
+  assert.ok(events.some((event) => event.type === 'memory.organized' && event.id === draft.audit_event_id));
+  assert.ok(events.some((event) => event.type === 'memory.exported' && event.id === out.audit_event_id));
+});
+
 test('CLI organize/export surfaces work with JSON', async (t) => {
   const root = await mkdtempReal('ihow-gardener-cli-');
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
   const core = await openCore({ root, space: 'cli' });
-  await writeMemory(core, 'scopes/project/cli.md', '- Decision: CLI gardener command emits JSON draft.\n');
+  await seedEnterpriseGardenerFixture(core);
 
   const env = { ...process.env, IHOW_MEMORY_HOME: root };
   const out = execFileSync(process.execPath, [CLI, 'organize', '--root', root, '--space', 'cli', '--scope', 'project', '--draft', '--json'], { encoding: 'utf8', env });
   const draft = JSON.parse(out);
   assert.ok(draft.draft_id);
   assert.equal(draft.audit_event_id.length > 0, true);
+  assert.ok(draft.sources.some((source) => source.source === 'memory/scopes/project-orchard/workflow-state.md'));
+  assert.equal(containsSecretLikeContent(out), false, 'CLI draft JSON is detector-clean');
 
   const exp = execFileSync(process.execPath, [CLI, 'export-vault', '--root', root, '--space', 'cli', '--from-draft', draft.draft_id, '--format', 'markdown', '--json'], { encoding: 'utf8', env });
   const result = JSON.parse(exp);
   assert.equal(result.ok, true);
   assert.match(result.path, /memory-gardener-digest\.md$/);
+  const md = await fs.readFile(path.join(core.workspace.spaceDir, result.path), 'utf8');
+  assert.match(md, /Project Orchard/);
+  assert.match(md, /Evidence:/);
+  assert.equal(containsSecretLikeContent(md), false, 'CLI export Markdown is detector-clean');
 });

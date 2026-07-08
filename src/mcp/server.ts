@@ -196,6 +196,31 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'memory.organize',
+    description: 'Safe Memory Gardener alpha.24: create a review-first JSON organize draft with evidence pointers, duplicate/stale review flags, redaction safety status, and an organize audit event. Never rewrites curated memory. This is not full enterprise memory policy automation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', description: 'Scope label to organize. Default project; project/public exclude private and audit-only sources.' },
+        since: { type: 'string', description: 'Optional source mtime window, e.g. 7d, 24h, or an ISO date.' },
+        actor: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'memory.export_vault',
+    description: 'Export a Safe Memory Gardener draft to an Obsidian-compatible Markdown view/editor artifact with evidence links and an export audit event. The exported Markdown is not source of truth; draft/source memory remain authoritative.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fromDraft: { type: 'string', description: 'Draft id returned by memory.organize.' },
+        format: { type: 'string', enum: ['markdown'] },
+        actor: { type: 'string' },
+      },
+      required: ['fromDraft'],
+    },
+  },
+  {
     name: 'memory.context_probe',
     description: 'Automation trigger probe for runtimes without native hooks. Returns verify-first handoff text, prompt recall diagnostics, or a cooperative journal instruction. No-hook runtimes (WorkBuddy/OpenCode/Gemini/unknown) never receive action=floor_journaled; session_end returns action=journal so the agent must call memory.journal explicitly.',
     inputSchema: {
@@ -294,6 +319,17 @@ async function main(): Promise<void> {
           payload = await core.remember(String(args.needle || ''), { actor: 'mcp' });
         } else if (name === 'memory.journal') {
           payload = await core.journal(args);
+        } else if (name === 'memory.organize') {
+          payload = await core.organize({
+            scope: typeof args.scope === 'string' ? args.scope : 'project',
+            since: typeof args.since === 'string' ? args.since : undefined,
+            actor: typeof args.actor === 'string' ? args.actor : 'mcp',
+          });
+        } else if (name === 'memory.export_vault') {
+          payload = await core.export_vault(String(args.fromDraft || ''), {
+            actor: typeof args.actor === 'string' ? args.actor : 'mcp',
+            format: args.format === 'markdown' ? 'markdown' : undefined,
+          });
         } else if (name === 'memory.status') {
           payload = await core.status();
         } else if (name === 'memory.continue') {

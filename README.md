@@ -223,6 +223,8 @@ ihow-memory write-candidate  propose a memory candidate (sandbox inbox)
 ihow-memory promote          promote a candidate (explicit, audited)
 ihow-memory durable-promote  durable write — requires --dry-run or --real-write
 ihow-memory journal <text>   append a low-weight auto-capture entry (searchable, ranked below curated)
+ihow-memory organize         Safe Memory Gardener: create a review-first JSON draft with source evidence, safety status, duplicate/stale review flags, and an organize audit event [--scope project] [--since 7d] [--draft] [--json]
+ihow-memory export-vault     export a gardener draft to an Obsidian-compatible Markdown view artifact with evidence links and an export audit event; the export is not source of truth [--from-draft <draft_id>] [--format markdown]
 ihow-memory import           import existing memory you wrote elsewhere (Claude Code MEMORY.md, ai-memory markdown, any .md folder) into the searchable journal lane [--from path] [--apply] [--update]
 ihow-memory audit            list the append-only event log [--since YYYY-MM-DD]
 ihow-memory rollback         undo one auto-captured journal entry (--event <id>)
@@ -242,6 +244,21 @@ ihow-memory telemetry        on | off | status — anonymous counters, OFF by de
 Defaults: root `~/.ihow-memory`; space derived from the current directory unless `--space` is given. Run `npx ihow-memory@next --help` for full flags.
 
 The `console` is **read-only, loopback-only, and single-user / trusted-machine by design** — there is no auth token yet, so do not run it on a shared or multi-user host.
+
+## Safe Memory Gardener (alpha.24)
+
+Safe Memory Gardener adds a review-first organize/export path for local workspaces:
+
+```bash
+npx ihow-memory@next organize --scope project --draft --json
+npx ihow-memory@next export-vault --from-draft <draft_id> --format markdown
+```
+
+`organize` scans in-scope Markdown memory, writes a deterministic JSON draft under `gardener/drafts/`, links every evidence-backed item to source files and line numbers, flags duplicate/stale-looking claims for manual review, records a `memory.organized` audit event, and never rewrites curated memory. `export-vault` renders that draft as an Obsidian-compatible Markdown digest under `gardener/exports/`, runs the redaction/secret detector on the rendered Markdown, preserves evidence links, and records a `memory.exported` audit event.
+
+The exported Markdown is a **view/editor artifact only**: it is not the source of truth, and editing it does not update governed memory. The source of truth remains the governed Markdown memory store plus the append-only audit trail. This alpha.24 feature is deliberately narrow; it does not claim full enterprise memory policy automation (no RBAC/ABAC, namespace leak matrix, adapter framework, admin UI, or durable retention automation).
+
+See [`docs/safe-memory-gardener.md`](./docs/safe-memory-gardener.md) for the command contract and the sanitized enterprise-style fixture.
 
 ## Memory layout and write boundaries
 
