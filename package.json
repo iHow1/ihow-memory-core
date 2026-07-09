@@ -1,6 +1,6 @@
 {
   "name": "ihow-memory",
-  "version": "0.1.0-alpha.24",
+  "version": "0.1.0-alpha.25",
   "type": "module",
   "description": "Local-first shared memory for AI agents with zero-dependency FTS, citations, governance, and MCP.",
   "keywords": [
@@ -32,6 +32,7 @@
     "README.md",
     "README.zh-CN.md",
     "skills/",
+    "docs/enterprise-quality-gates.md",
     "docs/harness-contract.md",
     "docs/safe-memory-gardener.md"
   ],

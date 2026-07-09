@@ -54,7 +54,7 @@ export type GardenerDraft = {
   decisions_facts: GardenerItem[];
   next_actions_open_questions: GardenerItem[];
   duplicate_stale_flags: GardenerFlag[];
-  sources: Array<{ source: string; sha256: string; lines: number; visibility: 'project' | 'private' | 'audit-only' }>;
+  sources: Array<{ source: string; sha256: string; lines: number; visibility: 'project' | 'private' | 'audit-only' | 'source-local' | 'source-shared' }>;
   safety: {
     secret_redaction: 'passed' | 'redacted';
     redacted_items: number;
@@ -72,6 +72,14 @@ export type OrganizeDraftOptions = {
   actor?: string;
 };
 
+export type ExportVaultBlockedItemsPolicy = 'fail-closed';
+
+export type ExportVaultOptions = {
+  actor?: string;
+  format?: 'markdown';
+  blockedItemsPolicy?: ExportVaultBlockedItemsPolicy;
+};
+
 export type ExportVaultResult = {
   ok: true;
   draft_id: string;
@@ -81,9 +89,28 @@ export type ExportVaultResult = {
   safety: {
     secret_redaction: 'passed';
     export_safe: true;
+    blocked_items: 0;
+    blocked_items_policy: ExportVaultBlockedItemsPolicy;
   };
   source_of_truth: 'view/export artifact only; draft and source memory remain authoritative';
 };
+
+export class ExportBlockedItemsError extends Error {
+  readonly code = 'export_blocked_items_fail_closed';
+  readonly draft_id: string;
+  readonly blocked_items: number;
+  readonly audit_event_id: string;
+
+  constructor(draftId: string, blockedItems: number, auditEventId: string) {
+    super(`export_blocked_items_fail_closed: draft ${draftId} has blocked_items=${blockedItems}; export refused by fail-closed policy`);
+    this.name = 'ExportBlockedItemsError';
+    this.draft_id = draftId;
+    this.blocked_items = blockedItems;
+    this.audit_event_id = auditEventId;
+  }
+}
+
+const EXPORT_BLOCKED_ITEMS_POLICY: ExportVaultBlockedItemsPolicy = 'fail-closed';
 
 type CandidateLine = {
   type: GardenerItemType;
@@ -136,18 +163,36 @@ function stripFrontMatter(content: string): { body: string; frontMatter: string 
   return { body: content.slice(match[0].length), frontMatter: match[1] };
 }
 
-function visibilityFor(memoryRelativePath: string, frontMatter: string): 'project' | 'private' | 'audit-only' {
+function visibilityFor(memoryRelativePath: string, frontMatter: string): GardenerDraft['sources'][number]['visibility'] {
   const p = memoryRelativePath.toLowerCase();
   const fm = frontMatter.toLowerCase();
   if (p.startsWith('_events/') || p.includes('/_events/') || p.includes('/audit/') || /\b(visibility|scope)\s*:\s*["']?audit/.test(fm)) return 'audit-only';
+  if (p.startsWith('sources/local/') || p.includes('/source-local/') || /\b(source_visibility|visibility|scope)\s*:\s*["']?(source[-_ ]?local|local[-_ ]?source)/.test(fm)) return 'source-local';
+  if (p.startsWith('sources/shared/') || p.includes('/source-shared/') || /\b(source_visibility|visibility|scope)\s*:\s*["']?(source[-_ ]?shared|shared[-_ ]?source)/.test(fm)) return 'source-shared';
   if (p.includes('/private/') || p.startsWith('private/') || /\b(visibility|scope)\s*:\s*["']?private/.test(fm)) return 'private';
   return 'project';
 }
 
-function includeVisibility(scope: string, visibility: 'project' | 'private' | 'audit-only'): boolean {
+function includeVisibility(scope: string, visibility: GardenerDraft['sources'][number]['visibility']): boolean {
   if (visibility === 'audit-only') return false;
-  if ((scope === 'project' || scope === 'public') && visibility === 'private') return false;
-  return true;
+  if (scope === 'all') return true;
+  if (scope === 'source') return visibility === 'source-local' || visibility === 'source-shared';
+  if (scope === 'private') return visibility === 'private';
+  if (visibility === 'source-local') return false;
+  if (visibility === 'source-shared') return scope !== 'public';
+  if (visibility === 'private') return false;
+  return visibility === 'project';
+}
+
+function genericScope(scope: string): boolean {
+  return ['project', 'public', 'private', 'source', 'all'].includes(scope);
+}
+
+function namespaceMatches(scope: string, memoryRelativePath: string): boolean {
+  if (genericScope(scope)) return true;
+  const ns = safeFileSlug(scope, 'scope').toLowerCase();
+  const p = memoryRelativePath.toLowerCase();
+  return p.startsWith(`scopes/${ns}/`) || p.startsWith(`sources/shared/${ns}/`) || p.startsWith(`sources/local/${ns}/`);
 }
 
 function normalizeClaim(text: string): string {
@@ -208,6 +253,10 @@ async function readSourceCandidates(workspace: Workspace, opts: OrganizeDraftOpt
   for (const file of files) {
     const relMemory = path.relative(workspace.memoryDir, file).split(path.sep).join('/');
     if (relMemory.startsWith('_events/') || relMemory.startsWith('history/') || relMemory.includes('/history/')) continue;
+    if (!namespaceMatches(scope, relMemory)) {
+      outOfScopeExcluded += 1;
+      continue;
+    }
     const stat = await fs.stat(file);
     if (sinceMs !== null && stat.mtimeMs < sinceMs) continue;
     const raw = await fs.readFile(file, 'utf8');
@@ -391,9 +440,28 @@ function renderFlag(workspace: Workspace, exportDir: string, flag: GardenerFlag)
   return `- \`${flag.kind}\` ${flag.reason}\n  - Targets: ${flag.targetIds.join(', ')}\n  - Non-destructive: ${flag.destructive === false ? 'yes' : 'no'}\n  - Evidence: ${ev}`;
 }
 
-export async function exportVaultFromDraft(workspace: Workspace, draftId: string, opts: { actor?: string; format?: 'markdown' } = {}): Promise<ExportVaultResult> {
+export async function exportVaultFromDraft(workspace: Workspace, draftId: string, opts: ExportVaultOptions = {}): Promise<ExportVaultResult> {
   if (opts.format && opts.format !== 'markdown') throw new Error('unsupported_export_format');
+  if (opts.blockedItemsPolicy && opts.blockedItemsPolicy !== EXPORT_BLOCKED_ITEMS_POLICY) throw new Error('unsupported_blocked_items_policy');
   const draft = await readDraft(workspace, draftId);
+  const blockedItems = Number(draft.safety?.blocked_items ?? 0);
+  if (blockedItems > 0 || draft.safety?.export_safe === false) {
+    const event = await appendEvent(workspace, {
+      type: 'memory.exported',
+      actor: opts.actor || 'gardener',
+      metadata: {
+        draftId: draft.draft_id,
+        format: 'markdown',
+        exportPath: null,
+        sourceOfTruth: 'view/export artifact only',
+        status: 'refused',
+        reason: 'blocked_items_present',
+        blockedItems,
+        blockedItemsPolicy: EXPORT_BLOCKED_ITEMS_POLICY,
+      } as JsonRecord,
+    });
+    throw new ExportBlockedItemsError(draft.draft_id, blockedItems, event.id);
+  }
   const outDir = path.join(exportRoot(workspace), safeFileSlug(draft.draft_id, 'draft'));
   const outPath = path.join(outDir, 'memory-gardener-digest.md');
   const lines = [
@@ -439,6 +507,9 @@ export async function exportVaultFromDraft(workspace: Workspace, draftId: string
       format: 'markdown',
       exportPath: relativeToSpace(workspace, outPath),
       sourceOfTruth: 'view/export artifact only',
+      status: 'exported',
+      blockedItems: 0,
+      blockedItemsPolicy: EXPORT_BLOCKED_ITEMS_POLICY,
     } as JsonRecord,
   });
   return {
@@ -447,7 +518,7 @@ export async function exportVaultFromDraft(workspace: Workspace, draftId: string
     format: 'markdown',
     path: relativeToSpace(workspace, outPath),
     audit_event_id: event.id,
-    safety: { secret_redaction: 'passed', export_safe: true },
+    safety: { secret_redaction: 'passed', export_safe: true, blocked_items: 0, blocked_items_policy: EXPORT_BLOCKED_ITEMS_POLICY },
     source_of_truth: 'view/export artifact only; draft and source memory remain authoritative',
   };
 }

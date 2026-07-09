@@ -456,6 +456,111 @@ function durableAppendContent(candidateContent: string): string {
     .replace(/^---\n/, `---\npromoted_at: "${new Date().toISOString()}"\n`);
 }
 
+function stripMarkdownFrontmatter(content: string): string {
+  return content.replace(/^\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+}
+
+function durableWriteFingerprint(content: string): string {
+  const normalized = stripMarkdownFrontmatter(content)
+    .replace(/\r\n/g, '\n')
+    // Candidate titles are operator-facing labels, not the durable claim. Ignore one leading H1 so a
+    // retitled duplicate/supersede candidate is still surfaced for review instead of becoming false truth.
+    .replace(/^\s*#\s+[^\n]*\n+/, '')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\s+$/u, '')
+    .trim();
+  return crypto.createHash('sha256').update(normalized, 'utf8').digest('hex');
+}
+
+function durableWritePolicyFrontmatter(policy: DurableWritePolicy): string {
+  const duplicatePaths = policy.duplicateCandidates.map((d) => d.path);
+  const reviewFlags = policy.flags.map((f) => f.kind).join(',');
+  return [
+    `durable_write_policy: ${JSON.stringify(policy.schema_version)}`,
+    `durable_write_mode: ${JSON.stringify(policy.mode)}`,
+    `durable_write_review_required: ${policy.reviewRequired ? 'true' : 'false'}`,
+    `durable_write_destructive: false`,
+    `durable_write_fingerprint: ${JSON.stringify(policy.candidateFingerprint)}`,
+    `durable_write_flags: ${JSON.stringify(policy.flags.map((f) => f.kind))}`,
+    `durable_write_duplicate_paths: ${JSON.stringify(duplicatePaths)}`,
+    ...(reviewFlags ? [`durable_write_review_flags: ${JSON.stringify(reviewFlags)}`] : []),
+  ].join('\n');
+}
+
+function injectDurableWritePolicyFrontmatter(content: string, policy: DurableWritePolicy): string {
+  const policyLines = `${durableWritePolicyFrontmatter(policy)}\n`;
+  // Keep pre-existing safety tier markers (especially flagged:true) near the top. Some review backlog
+  // scans intentionally read only a bounded frontmatter prefix; policy metadata must not hide them.
+  if (/^flag_reason:\s*/m.test(content)) return content.replace(/^(flag_reason:\s*.*)$/m, `$1\n${policyLines}`);
+  return content.replace(/^---\n/, `---\n${policyLines}`);
+}
+
+async function evaluateDurableWritePolicy(workspace: Workspace, candidateContent: string, targetRelative?: string): Promise<DurableWritePolicy> {
+  const candidateFingerprint = durableWriteFingerprint(candidateContent);
+  const duplicateCandidates: Array<{ path: string; sha256: string }> = [];
+  let files: string[] = [];
+  try {
+    files = await listMarkdownFiles(workspace.memoryDir);
+  } catch {
+    files = [];
+  }
+
+  for (const filePath of files) {
+    const relative = relativeToSpace(workspace, filePath);
+    if (relative.startsWith('memory/_mcp/_events/') || relative.startsWith('memory/_mcp/history/')
+      || relative.startsWith('memory/_mcp/candidates/') || relative.startsWith('memory/candidate/')
+      || relative.includes('/history/')) continue;
+    let existing: string;
+    try {
+      existing = await fs.readFile(filePath, 'utf8');
+    } catch {
+      continue;
+    }
+    const existingFingerprint = durableWriteFingerprint(existing);
+    if (existingFingerprint === candidateFingerprint) {
+      duplicateCandidates.push({ path: safeAuditPath(relative), sha256: existingFingerprint });
+    }
+  }
+
+  const flags: DurableWritePolicyFlag[] = [];
+  if (duplicateCandidates.length) {
+    flags.push({
+      kind: 'duplicate_candidate',
+      reason: 'Same normalized durable body already exists. Review manually; no existing memory is rewritten or deleted.',
+      destructive: false,
+      targetPaths: duplicateCandidates.map((d) => d.path),
+    });
+  }
+  if (/\b(stale|deprecated|superseded|outdated|obsolete|replaced by|no longer)\b/i.test(stripMarkdownFrontmatter(candidateContent))) {
+    flags.push({
+      kind: 'stale_candidate',
+      reason: 'Candidate text is self-labeled stale/deprecated/superseded. Keep review-first; do not promote as fresh durable truth without review.',
+      destructive: false,
+      targetPaths: targetRelative ? [safeAuditPath(targetRelative)] : [],
+    });
+  }
+  if (targetRelative && duplicateCandidates.some((d) => d.path !== safeAuditPath(targetRelative))) {
+    flags.push({
+      kind: 'supersede_candidate',
+      reason: 'Write may supersede an existing durable memory, but alpha.25 v0 only marks the candidate and audit metadata; it never deletes or overwrites the old source of truth silently.',
+      destructive: false,
+      targetPaths: duplicateCandidates.map((d) => d.path),
+    });
+  }
+
+  return {
+    schema_version: 'alpha25.durable-write-policy.v0',
+    mode: 'review-first',
+    source_of_truth: 'audit/frontmatter metadata only; no durable memory is rewritten or deleted',
+    destructive: false,
+    reviewRequired: flags.length > 0,
+    candidateFingerprint,
+    targetPath: targetRelative ? safeAuditPath(targetRelative) : undefined,
+    duplicateCandidates,
+    flags,
+  };
+}
+
 async function durableTargetContent(targetPath: string, appendContent: string): Promise<string> {
   try {
     const existing = await fs.readFile(targetPath, 'utf8');
@@ -780,6 +885,27 @@ export type PromoteOptions = {
   provenance?: WriteCandidatePayload['metadata'];
 };
 
+export type DurableWritePolicyFlagKind = 'duplicate_candidate' | 'stale_candidate' | 'supersede_candidate';
+
+export type DurableWritePolicyFlag = {
+  kind: DurableWritePolicyFlagKind;
+  reason: string;
+  destructive: false;
+  targetPaths: string[];
+};
+
+export type DurableWritePolicy = {
+  schema_version: 'alpha25.durable-write-policy.v0';
+  mode: 'review-first';
+  source_of_truth: 'audit/frontmatter metadata only; no durable memory is rewritten or deleted';
+  destructive: false;
+  reviewRequired: boolean;
+  candidateFingerprint: string;
+  targetPath?: string;
+  duplicateCandidates: Array<{ path: string; sha256: string }>;
+  flags: DurableWritePolicyFlag[];
+};
+
 // Standing-rule / policy / access / identity / destructive markers — content that must stay
 // human-gated even when it reads "low risk". A denylist can be evaded, so this is one of THREE
 // gates (secret-clean + not-governance + has-provenance) and the safe failure is "stays a
@@ -987,7 +1113,7 @@ export async function expireStaleFlagged(
       || relative.startsWith('memory/_mcp/candidates/') || relative.startsWith('memory/candidate/')) continue;
     let content: string;
     try {
-      content = (await fs.readFile(filePath, 'utf8')).slice(0, 1024);
+      content = (await fs.readFile(filePath, 'utf8')).slice(0, 8192);
     } catch {
       continue;
     }
@@ -1043,7 +1169,7 @@ export async function pendingFlaggedReview(
       || relative.startsWith('memory/_mcp/candidates/') || relative.startsWith('memory/candidate/')) continue;
     let front = '';
     try {
-      const c = (await fs.readFile(filePath, 'utf8')).slice(0, 512);
+      const c = (await fs.readFile(filePath, 'utf8')).slice(0, 8192);
       const m = c.match(/^---\n([\s\S]*?)\n---/);
       front = m ? m[1] : '';
     } catch {
@@ -1138,10 +1264,12 @@ export async function promoteCandidate(
     const autoFrontmatter = options.auto
       ? `tier: "auto-promoted"\nreviewed: false\nauto_tier: ${JSON.stringify(options.tier || 'verified')}\npromoted_by: ${JSON.stringify(safeActorId(options.actor || 'agent-auto'))}\n${provenanceKindFrontmatter}${flaggedFrontmatter}`
       : '';
-    const body = candidate.content
+    let body = candidate.content
       .replace(/^status:\s*"candidate"\s*$/m, 'status: "promoted"')
       .replace(/^type:\s*"memory_candidate"\s*$/m, 'type: "memory"')
       .replace(/^---\n/, `---\npromoted_at: "${new Date().toISOString()}"\n${autoFrontmatter}`);
+    const durableWritePolicy = await evaluateDurableWritePolicy(workspace, body, targetRelative);
+    body = injectDurableWritePolicyFrontmatter(body, durableWritePolicy);
     // EVERY promote (not just auto) must clear the durable secret check — a backstop on the FULL file content
     // (title + metadata + body + the frontmatter candidate_id). An out-of-band candidate can carry raw
     // PII/secret in a frontmatter field (e.g. candidate_id) that would otherwise flow into the _events
@@ -1175,6 +1303,7 @@ export async function promoteCandidate(
         flagReason: options.flagReason,
         reviewed: options.auto ? false : undefined,
         provenance: safeAuditMetadata(options.provenance), // r2 Blocker 1: no raw PII/secret in the audit log
+        durableWritePolicy: safeAuditMetadata(durableWritePolicy),
       },
     });
     return {
@@ -1224,7 +1353,9 @@ export async function durablePromoteCandidate(
     if (isForbiddenDurableTargetPath(targetRelative)) throw new Error('durable_target_forbidden');
     if (!isAllowedDurableTargetPath(targetRelative)) throw new Error('durable_target_not_whitelisted');
 
-    const appendContent = durableAppendContent(candidate.content);
+    let appendContent = durableAppendContent(candidate.content);
+    const durableWritePolicy = await evaluateDurableWritePolicy(workspace, appendContent, targetRelative);
+    appendContent = injectDurableWritePolicyFrontmatter(appendContent, durableWritePolicy);
     assertNoSecretLikeDurableCandidate(appendContent);
 
     const at = new Date().toISOString();
@@ -1270,6 +1401,7 @@ export async function durablePromoteCandidate(
           dryRun,
           source: 'candidate/inbox',
           archiveCandidateTo,
+          durableWritePolicy,
         },
       },
       writeGuards,
@@ -1312,6 +1444,7 @@ export async function durablePromoteCandidate(
         dryRun: false,
         source: 'candidate/inbox',
         archiveCandidateTo,
+        durableWritePolicy: safeAuditMetadata(durableWritePolicy),
       },
     });
 
