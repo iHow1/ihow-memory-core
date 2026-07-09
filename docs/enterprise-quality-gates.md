@@ -18,6 +18,7 @@ This is still not a complete RBAC/ABAC product. The goal is to prove the memory 
 | Redaction | raw secret/PII-like content must not appear in draft/export | Export artifacts are higher-blast-radius views and must be detector-clean. |
 | Blocked export | draft export fails closed when `safety.blocked_items > 0` or `export_safe:false` | alpha.25 v0 does not silently emit a sanitized subset; any future sanitized export must be an explicit named policy/flag with audit metadata. |
 | Audit | organize/export must emit audit events | The draft/export itself is not source of truth; refused blocked exports are audited with `status:refused`, `reason:blocked_items_present`, and `blockedItemsPolicy:fail-closed`. |
+| Durable duplicate/stale/supersede | write/promote/durable-promote surfaces attach review-first policy metadata | alpha.25 v0 marks `duplicate_candidate`, `stale_candidate`, and `supersede_candidate` in audit/frontmatter/plan metadata. It does not delete sources, rewrite old durable memory, or silently choose the new claim as authoritative. |
 
 ## Namespace conventions
 
@@ -71,6 +72,20 @@ The first alpha.25 source-adapter code surface is intentionally local and fixtur
 
 This gives Feishu/Obsidian/ima a typed, testable target without shipping real adapters or reading external credentials in alpha.25 v0.
 
+## Durable write dedupe / supersede baseline v0
+
+alpha.25 adds a deterministic `alpha25.durable-write-policy.v0` guard on promote/durable-promote write surfaces. It is intentionally a metadata/audit baseline, not an automatic merge engine:
+
+- durable write candidates receive a normalized body fingerprint (`durable_write_fingerprint`) in frontmatter;
+- existing durable memory with the same normalized body is reported as `duplicate_candidate` and is referenced in audit metadata;
+- self-labeled stale/deprecated/superseded/obsolete text is reported as `stale_candidate`;
+- a duplicate write that would make a newer durable entry beside an older durable entry is also marked `supersede_candidate`;
+- all flags are `destructive:false`, `mode:review-first`, and `reviewRequired:true` when present;
+- `durable-promote --dry-run` exposes the same policy in the plan before any write;
+- real writes remain append/create-only. Existing curated memory and source files are not rewritten or deleted by this baseline.
+
+The baseline is deliberately conservative: it makes duplicate/stale/supersede candidates auditable and testable so a reviewer can decide what to keep, supersede, forget, or archive later.
+
 ## Audit completeness baseline v0
 
 The alpha.25 v0 audit baseline asserts that each governance action leaves enough append-only event data to reconstruct what happened without trusting the draft/export artifact alone.
@@ -80,7 +95,8 @@ Covered in v0:
 | Action | Required audit evidence |
 |---|---|
 | candidate write | `candidate.created` event with candidate path and redacted actor/metadata surfaces |
-| promote | `memory.promoted` event with durable target path |
+| promote | `memory.promoted` event with durable target path and `durableWritePolicy` metadata |
+| durable promote | `memory.promoted.durable` event or dry-run plan with append target, archive path, and `durableWritePolicy` metadata |
 | journal append | `memory.journal.appended` event with reversible entry metadata |
 | rollback | `memory.rolledback` event with `rolledBackEventId` and removal status |
 | organize | `memory.organized` event with draft id, scope, item counts, out-of-scope exclusions, `curatedRewrite:false` |
