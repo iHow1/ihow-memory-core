@@ -55,6 +55,19 @@ The deterministic test fixture asserts:
 - raw email/secret-like values are redacted from export;
 - organize/export audit records are present.
 
+## Source Adapter Layer contract v0
+
+The first alpha.25 source-adapter code surface is intentionally local and fixture-only. It does **not** connect to Feishu, Obsidian, ima, or any external service. The contract now validates adapter-produced documents before they can be rendered as source-lane Markdown fixtures:
+
+- adapter documents must declare `adapter.id`, `adapter.kind`, `adapter.version`, `source_id`, `scope`, `visibility`, `title`, and `text`;
+- `visibility` is constrained to `source-local` or `source-shared`, so adapter output cannot masquerade as curated project/private/audit memory;
+- `scope` must already be a slug and determines `memory/sources/<local|shared>/<scope>/...` placement;
+- persisted provenance fields are one-line, detector-clean values;
+- body/title content is redacted before Markdown rendering and must pass the same secret detector as gardener export;
+- fixture-rendered source docs participate in the existing gardener gate matrix: source-shared can support named project review, source-local stays out until explicit source review.
+
+This gives Feishu/Obsidian/ima a typed, testable target without shipping real adapters or reading external credentials in alpha.25 v0.
+
 ## Audit completeness baseline v0
 
 The alpha.25 v0 audit baseline asserts that each governance action leaves enough append-only event data to reconstruct what happened without trusting the draft/export artifact alone.
