@@ -217,6 +217,21 @@ export type CoreStatus = {
     lexical: true;
     semantic: boolean;
   };
+  // Alpha.26 readiness/status for fallback honesty. This is descriptive only: it never changes recall
+  // eligibility. `semanticAvailable` means a vector provider is active/ready; `semanticReady` additionally
+  // requires a measured semantic recall floor for the configured model.
+  recallReadiness: {
+    lexicalReady: boolean;
+    semanticAvailable: boolean;
+    semanticReady: boolean;
+    provider: 'fts/lexical' | 'vector-gguf';
+    requestedProvider: string;
+    model: string | null;
+    measuredSemanticModel: boolean;
+    semanticRecallFloor: number | null;
+    reason: string;
+    warnings: string[];
+  };
   sync: {
     enabled: false;
   };

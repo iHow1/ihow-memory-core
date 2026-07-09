@@ -1550,6 +1550,14 @@ async function doctor(
       severity: provider.ready ? 'info' : 'error',
       required: true,
     });
+    const readiness = status.recallReadiness as Record<string, unknown>;
+    checks.push({
+      name: 'recall-readiness',
+      ok: readiness.semanticReady === true,
+      detail: `lexicalReady=${readiness.lexicalReady} semanticAvailable=${readiness.semanticAvailable} semanticReady=${readiness.semanticReady} provider=${readiness.provider} reason=${readiness.reason}`,
+      severity: readiness.semanticReady === true ? 'info' : 'warning',
+      required: false,
+    });
     checks.push({
       name: 'vector',
       ok: true,
@@ -3149,6 +3157,8 @@ async function main(): Promise<void> {
       }
       console.log(`index: ${status.index.status}, documents=${status.index.documents}`);
       console.log(`index path: ${status.index.path}`);
+      console.log(`recall readiness: lexicalReady=${status.recallReadiness.lexicalReady}, semanticAvailable=${status.recallReadiness.semanticAvailable}, semanticReady=${status.recallReadiness.semanticReady}, provider=${status.recallReadiness.provider}`);
+      console.log(`recall readiness reason: ${status.recallReadiness.reason}`);
       console.log(`sync: enabled=${status.sync.enabled}`);
       console.log(
         process.env.IHOW_AUTO_PROMOTE === '0'

@@ -25,6 +25,7 @@ import { readEventsAllLanes, mcpLaneWorkspace } from './store/events.ts';
 import type { MemoryEvent } from './store/events.ts';
 import { countIndexedDocuments } from './engine/fts.ts';
 import { engineStatus, indexWithEngineFallback, resolveEngineConfig, searchWithEngineFallback } from './engine/retrieval.ts';
+import { recallReadiness } from './recall-readiness.ts';
 import { filterForgotten, forgetPath, listForgotten, rememberPath } from './forget.ts';
 import type { ForgetOutcome, RememberOutcome } from './forget.ts';
 import { organizeDraft, exportVaultFromDraft } from './gardener.ts';
@@ -168,6 +169,7 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
           lexical: true,
           semantic: semanticActive,
         },
+        recallReadiness: recallReadiness(options, providerStatus.provider),
         sync: {
           enabled: false,
         },

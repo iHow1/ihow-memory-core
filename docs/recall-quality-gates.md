@@ -27,6 +27,25 @@ The boundary is shared by Claude/Codex style `hook-user-prompt-submit` recall an
 - Off-topic prompts inject nothing.
 - Recall remains bounded and redacts secret-like content on the read path.
 
+## Semantic provider readiness / fallback honesty v0
+
+Alpha.26 exposes a descriptive readiness object on `status` / `memory.status` and a non-required `doctor` check named `recall-readiness`.
+
+Fields:
+
+- `lexicalReady`: true when the mandatory local FTS floor is available. This is the default path.
+- `semanticAvailable`: true only when a configured vector provider is the active ready engine, not an FTS fallback.
+- `semanticReady`: true only when `semanticAvailable` is true **and** the configured model has a measured recall floor for semantic bypass decisions.
+- `provider`: `fts/lexical` for default or fallback states; `vector-gguf` only for an active ready vector provider.
+- `reason` / `warnings`: human-readable and machine-testable explanation for lexical-only fallback, provider failure, or unmeasured-model fail-closed behavior.
+
+Fallback honesty rules:
+
+- Default / no config reports `semanticAvailable=false`, `semanticReady=false`, `provider=fts/lexical`, with a no-semantic-provider/config reason.
+- Configured but unavailable providers report lexical FTS-only fallback. This is a warning, not a local-health failure, because semantic search is additive and not load-bearing.
+- Configured providers using unmeasured models may be `semanticAvailable=true` but must keep `semanticReady=false`; prompt-recall semantic bypass stays fail-closed until the model has a measured floor or an explicit local calibration override.
+- The readiness object is status-only. It must not change actual recall eligibility or connect a new provider.
+
 ## Future work
 
-A later alpha.26 step may add explicit semantic-provider readiness metrics and cross-runtime parity probes, but those must remain honest about provider availability and must not widen prompt-injection eligibility.
+A later alpha.26 step may add cross-runtime parity probes, but those must remain honest about provider availability and must not widen prompt-injection eligibility.
