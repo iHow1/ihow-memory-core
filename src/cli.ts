@@ -42,6 +42,7 @@ import {
 import * as telemetry from './telemetry.ts';
 import { runCaptureFloorSweep } from './floor.ts';
 import { automationMatrix, worstAutomationStatus, type AutomationMatrixRow } from './automation-doctor.ts';
+import { explainPromptRecall } from './recall-explanation.ts';
 
 // Suppress only Node's node:sqlite ExperimentalWarning (Node >= 22.12 is our supported runtime); all other warnings pass through unchanged.
 const _emitWarning = process.emitWarning.bind(process);
@@ -57,6 +58,7 @@ type ParsedArgs = {
   command: string;
   options: WorkspaceOptions & {
     json?: boolean;
+    explain?: boolean;
     limit?: number;
     includeFlagged?: boolean;
     list?: boolean;
@@ -141,6 +143,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--auto') options.auto = true;
     else if (arg === '--write') options.write = true;
     else if (arg === '--json') options.json = true;
+    else if (arg === '--explain') options.explain = true;
+    else if (arg === '--no-explain') options.explain = false;
     else if (arg === '--list') options.list = true;
     else if (arg === '--limit') options.limit = Number(tail[++index]);
     else if (arg === '--include-flagged') options.includeFlagged = true;
@@ -1255,6 +1259,7 @@ Usage:
   ihow-memory enable-semantic [--host url] [--model name] [--space name] [--json]   # OPT-IN: turn on the additive semantic lane for this space. Probes a LOCAL Ollama (default http://localhost:11434, model nomic-embed-text) and only enables if it is reachable AND the model is pulled; persists <space>/.runtime/semantic.json so connect/setup launch the MCP server with the spawned embedding sidecar. The default install stays zero-dependency FTS5 (capabilities.semantic=false) until you run this; the lane is additive — search falls back to FTS if the provider is down. Re-run setup/connect + restart the runtime to apply.
   ihow-memory disable-semantic [--space name] [--json]   # reverse enable-semantic: remove the opt-in marker and return to the default FTS5 engine (re-run setup/connect + restart to apply)
   ihow-memory search <query> [--limit n] [--include-flagged]
+  ihow-memory recall-preview <prompt> [--limit n] [--json]   # alpha.26 local diagnostic: explain why default prompt recall would include/exclude candidates (counts only for excluded/private content; no telemetry/upload)
   ihow-memory read <memory/path.md>
   ihow-memory write-candidate <text> [--space name] [--no-auto-promote]
   ihow-memory journal <text> [--title t] [--actor name] [--space name]   # append a low-weight auto-capture entry (searchable but ranked below curated memory)
@@ -2943,7 +2948,19 @@ async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
   const additionalContext = lines.join('\n').slice(0, RECALL_MAX_CHARS);
   try {
     // UserPromptSubmit context injection (documented JSON form). Exit 0, never block the prompt.
-    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext } })}\n`);
+    const out: Record<string, unknown> = { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext } };
+    if (options.explain === true || process.env.IHOW_RECALL_EXPLAIN === '1') {
+      try {
+        out.structuredContent = await explainPromptRecall({ ...options, cwd }, prompt, {
+          searchLimit: RECALL_SEARCH_LIMIT,
+          includeLimit: RECALL_MAX_INJECT,
+          maxChars: RECALL_MAX_CHARS,
+        });
+      } catch {
+        // Explanation is diagnostic-only; it must never suppress the already-built recall block.
+      }
+    }
+    process.stdout.write(`${JSON.stringify(out)}\n`);
   } catch {
     return;
   }
@@ -3137,6 +3154,38 @@ async function main(): Promise<void> {
     if (!result.dryRun) {
       await telemetry.track('connect', { runtime: options.runtime });
       if (!options.json) await maybeAskTelemetry();
+    }
+    return;
+  }
+
+  if (command === 'recall-preview') {
+    const prompt = rest.join(' ').trim();
+    if (!prompt) {
+      console.error('recall-preview requires a prompt string');
+      process.exitCode = 1;
+      return;
+    }
+    const explanation = await explainPromptRecall(options, prompt, { includeLimit: options.limit });
+    if (options.json) printJson(explanation);
+    else {
+      console.log(`Recall preview: ${explanation.summary}`);
+      console.log(`mode: ${explanation.modeLabel} (${explanation.mode})`);
+      console.log(`bounded: searchLimit=${explanation.bounded.searchLimit}, includeLimit=${explanation.bounded.includeLimit}, considered=${explanation.bounded.considered}, included=${explanation.bounded.included}`);
+      if (explanation.included.length) {
+        console.log('included:');
+        for (const item of explanation.included) {
+          const terms = item.matchedTerms.length ? `; matched=${item.matchedTerms.join(',')}` : '';
+          console.log(`  - ${item.path} [${item.tier}] ${item.reason}${terms}`);
+        }
+      } else {
+        console.log('included: none');
+      }
+      if (explanation.excluded.reasons.length) {
+        console.log(`excluded: ${explanation.excluded.reasons.map((r) => `${r.reason}=${r.count}`).join(', ')}`);
+      } else {
+        console.log('excluded: none');
+      }
+      console.log('excluded content is never printed by this preview.');
     }
     return;
   }

@@ -44,6 +44,30 @@ Because each surface returns a different shape, the parity check asserts eligibl
 - Off-topic prompts inject nothing.
 - Recall remains bounded and redacts secret-like content on the read path.
 
+## Recall explanation / preview v0
+
+Alpha.26 also adds a small user/agent experience layer for explaining prompt recall without making the default injected prompt block noisy.
+
+Surfaces:
+
+- `ihow-memory recall-preview <prompt> [--json]`: local CLI diagnostic for a prompt against a chosen `--memory-root` / `--state-root` or normal workspace.
+- `ihow-memory hook-user-prompt-submit --explain` or `IHOW_RECALL_EXPLAIN=1`: opt-in `structuredContent` on the hook response. The default `additionalContext` body remains the same concise recall block.
+
+The explanation metadata is machine-readable and deterministic:
+
+- `mode`: `lexical/FTS only` or `semantic-ready`, derived from `recallReadiness`.
+- `included[]`: safe citation path, snippet, tier, lightweight reason, and matched terms for items that would pass recall gates.
+- `excluded.counts`: counts by reason such as `flagged`, `private`, `audit-only`, `not-curated`, `irrelevant`, `secret`, `unreadable`, or `over-budget`.
+- `bounded`: search/include/character limits and considered/included counts.
+- `noRelevantRecall` / `summary`: a short explanation when recall is empty, including lexical-only mode when semantic is not ready.
+
+Privacy and governance boundaries:
+
+- This is **not telemetry**. The preview is local-only and does not upload prompts, memory, counts, or snippets.
+- Excluded entries are reported as counts/reasons only. Their snippets, body text, and private/flagged/audit-only content must not appear in explanation output.
+- Explanation does not replace the governance/read boundary. It calls the same default prompt-recall boundary and must not widen eligibility.
+- The CLI tests use temporary memory roots; they must not depend on or inspect real private memory.
+
 ## Semantic provider readiness / fallback honesty v0
 
 Alpha.26 exposes a descriptive readiness object on `status` / `memory.status` and a non-required `doctor` check named `recall-readiness`.
