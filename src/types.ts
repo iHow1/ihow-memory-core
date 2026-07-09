@@ -229,6 +229,11 @@ export type CoreStatus = {
     model: string | null;
     measuredSemanticModel: boolean;
     semanticRecallFloor: number | null;
+    // Stable UX fields for human status and automation display. These summarize the readiness state and
+    // suggest the next safe action without changing recall eligibility.
+    modeLabel: string;
+    summary: string;
+    nextAction: string;
     reason: string;
     warnings: string[];
   };

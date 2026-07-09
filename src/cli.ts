@@ -1551,11 +1551,14 @@ async function doctor(
       required: true,
     });
     const readiness = status.recallReadiness as Record<string, unknown>;
+    const readinessSemanticReady = readiness.semanticReady === true;
+    const readinessSemanticRequested = readiness.requestedProvider === 'vector-gguf';
     checks.push({
       name: 'recall-readiness',
-      ok: readiness.semanticReady === true,
-      detail: `lexicalReady=${readiness.lexicalReady} semanticAvailable=${readiness.semanticAvailable} semanticReady=${readiness.semanticReady} provider=${readiness.provider} reason=${readiness.reason}`,
-      severity: readiness.semanticReady === true ? 'info' : 'warning',
+      ok: readinessSemanticReady,
+      detail: `Recall mode: ${String(readiness.modeLabel || readiness.provider)}; ${String(readiness.summary || readiness.reason)}. nextAction=${String(readiness.nextAction || 'No action available.')}`,
+      hint: typeof readiness.nextAction === 'string' ? readiness.nextAction : undefined,
+      severity: readinessSemanticReady ? 'info' : readinessSemanticRequested ? 'warning' : 'info',
       required: false,
     });
     checks.push({
@@ -3157,8 +3160,10 @@ async function main(): Promise<void> {
       }
       console.log(`index: ${status.index.status}, documents=${status.index.documents}`);
       console.log(`index path: ${status.index.path}`);
+      console.log(`Recall mode: ${status.recallReadiness.modeLabel}; ${status.recallReadiness.summary}`);
       console.log(`recall readiness: lexicalReady=${status.recallReadiness.lexicalReady}, semanticAvailable=${status.recallReadiness.semanticAvailable}, semanticReady=${status.recallReadiness.semanticReady}, provider=${status.recallReadiness.provider}`);
       console.log(`recall readiness reason: ${status.recallReadiness.reason}`);
+      console.log(`recall readiness next action: ${status.recallReadiness.nextAction}`);
       console.log(`sync: enabled=${status.sync.enabled}`);
       console.log(
         process.env.IHOW_AUTO_PROMOTE === '0'

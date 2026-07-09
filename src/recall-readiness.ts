@@ -12,6 +12,9 @@ export type RecallReadiness = {
   model: string | null;
   measuredSemanticModel: boolean;
   semanticRecallFloor: number | null;
+  modeLabel: string;
+  summary: string;
+  nextAction: string;
   reason: string;
   warnings: string[];
 };
@@ -68,6 +71,48 @@ function semanticReason(
   };
 }
 
+function semanticGuidance(
+  state: {
+    requestedProvider: string;
+    semanticAvailable: boolean;
+    semanticReady: boolean;
+    model: string | null;
+    warnings: string[];
+  },
+): { modeLabel: string; summary: string; nextAction: string } {
+  if (state.semanticReady) {
+    return {
+      modeLabel: 'semantic-ready + lexical fallback',
+      summary: `semantic recall ready with measured model "${state.model}"; lexical FTS remains the availability fallback`,
+      nextAction: 'No action needed. Keep semantic provider reachable; lexical fallback remains available if it goes down.',
+    };
+  }
+
+  if (state.semanticAvailable && state.warnings.includes('semantic_model_unmeasured')) {
+    return {
+      modeLabel: 'semantic provider available; recall gate fail-closed',
+      summary: `semantic provider is available, but model "${state.model || 'unknown'}" has no measured recall floor`,
+      nextAction: 'Add a measured recall floor via calibration/override (for example IHOW_RECALL_SEMANTIC_MIN) or switch to a measured model such as bge-m3; semantic bypass stays fail-closed until then.',
+    };
+  }
+
+  if (state.requestedProvider === 'vector-gguf') {
+    return {
+      modeLabel: 'lexical/FTS fallback',
+      summary: 'semantic recall was requested but is not ready; using lexical FTS only',
+      nextAction: state.warnings.includes('vector_model_missing')
+        ? 'Configure a vector model, for example: ihow-memory enable-semantic --model bge-m3'
+        : 'Start/fix the configured semantic provider, then rerun ihow-memory reindex; or run ihow-memory disable-semantic to return to lexical-only mode.',
+    };
+  }
+
+  return {
+    modeLabel: 'lexical/FTS only',
+    summary: 'semantic recall not enabled',
+    nextAction: 'Optional: run ihow-memory enable-semantic --model bge-m3 to enable measured semantic recall; no action is required for the default local FTS mode.',
+  };
+}
+
 // Alpha.26 recall-readiness is status-only: it describes whether the semantic lane is truly present and
 // whether its model is measured for prompt-recall bypass decisions. It does NOT widen recall eligibility.
 export function recallReadiness(options: WorkspaceOptions, providerStatus: ProviderStatus): RecallReadiness {
@@ -88,6 +133,13 @@ export function recallReadiness(options: WorkspaceOptions, providerStatus: Provi
     requestedId: engine.requestedId,
     floor,
   });
+  const guidance = semanticGuidance({
+    requestedProvider: engine.requestedId,
+    semanticAvailable,
+    semanticReady,
+    model,
+    warnings,
+  });
 
   return {
     lexicalReady: true,
@@ -98,6 +150,7 @@ export function recallReadiness(options: WorkspaceOptions, providerStatus: Provi
     model,
     measuredSemanticModel,
     semanticRecallFloor: floor,
+    ...guidance,
     reason,
     warnings,
   };

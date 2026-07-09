@@ -54,15 +54,20 @@ Fields:
 - `semanticAvailable`: true only when a configured vector provider is the active ready engine, not an FTS fallback.
 - `semanticReady`: true only when `semanticAvailable` is true **and** the configured model has a measured recall floor for semantic bypass decisions.
 - `provider`: `fts/lexical` for default or fallback states; `vector-gguf` only for an active ready vector provider.
+- `modeLabel`: stable short label for status cards and CLI display, e.g. `lexical/FTS only`, `semantic-ready + lexical fallback`, or `semantic provider available; recall gate fail-closed`.
+- `summary`: stable one-sentence UX summary, e.g. `semantic recall not enabled` or `semantic recall ready with measured model "bge-m3"; lexical FTS remains the availability fallback`.
+- `nextAction`: stable operator guidance. Default lexical-only points to optional `ihow-memory enable-semantic --model bge-m3`; unmeasured semantic providers point to a measured floor/calibration/override instead of pretending semantic recall is ready.
 - `reason` / `warnings`: human-readable and machine-testable explanation for lexical-only fallback, provider failure, or unmeasured-model fail-closed behavior.
 
 Fallback honesty rules:
 
-- Default / no config reports `semanticAvailable=false`, `semanticReady=false`, `provider=fts/lexical`, with a no-semantic-provider/config reason.
+- Default / no config reports `semanticAvailable=false`, `semanticReady=false`, `provider=fts/lexical`, `modeLabel=lexical/FTS only`, and `summary=semantic recall not enabled`. Doctor keeps this non-required and `info` severity so ordinary local FTS users do not read it as a broken system.
 - Configured but unavailable providers report lexical FTS-only fallback. This is a warning, not a local-health failure, because semantic search is additive and not load-bearing.
-- Configured providers using unmeasured models may be `semanticAvailable=true` but must keep `semanticReady=false`; prompt-recall semantic bypass stays fail-closed until the model has a measured floor or an explicit local calibration override.
+- Configured providers using unmeasured models may be `semanticAvailable=true` but must keep `semanticReady=false`; prompt-recall semantic bypass stays fail-closed until the model has a measured floor or an explicit local calibration override. Their `nextAction` must mention measured floor/calibration/override.
+- Human `ihow-memory status` prints a first-line readiness sentence: `Recall mode: <modeLabel>; <summary>`, followed by the detailed booleans/reason and `nextAction` for operators/agents.
+- JSON `status` / MCP `memory.status` expose the same stable readiness fields for automation: `modeLabel`, `summary`, `nextAction`, plus the existing booleans and warnings.
 - The readiness object is status-only. It must not change actual recall eligibility or connect a new provider.
 
 ## Future work
 
-A later alpha.26 step may add cross-runtime parity probes, but those must remain honest about provider availability and must not widen prompt-injection eligibility.
+Later alpha.26 work may add richer calibration tooling and provider setup helpers, but those must remain honest about provider availability and must not widen prompt-injection eligibility.
