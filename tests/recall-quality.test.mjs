@@ -9,14 +9,20 @@ test('alpha26 recall boundary allows plain reviewed memory', () => {
   assert.deepEqual(decision, { allowed: true });
 });
 
-test('alpha26 recall boundary excludes flagged memory by frontmatter', () => {
-  const decision = defaultPromptRecallBoundary('---\nflagged: true\n---\n\nNeeds human review.', 'scopes/team/flagged.md');
-  assert.deepEqual(decision, { allowed: false, reason: 'flagged' });
+test('alpha26 recall boundary excludes flagged memory by frontmatter and path', () => {
+  assert.deepEqual(
+    defaultPromptRecallBoundary('---\nflagged: true\n---\n\nNeeds human review.', 'scopes/team/flagged.md'),
+    { allowed: false, reason: 'flagged' },
+  );
+  assert.deepEqual(
+    defaultPromptRecallBoundary('---\nstatus: promoted\n---\n\nQuarantined note.', 'scopes/flagged/manual-review.md'),
+    { allowed: false, reason: 'flagged' },
+  );
 });
 
-test('alpha26 recall boundary excludes private memory by frontmatter and path', () => {
+test('alpha26 recall boundary accepts BOM/whitespace frontmatter and excludes private memory by frontmatter and path', () => {
   assert.deepEqual(
-    defaultPromptRecallBoundary('---\nvisibility: private\n---\n\nPrivate note.', 'scopes/team/private.md'),
+    defaultPromptRecallBoundary('\ufeff  --- \r\nvisibility: private\r\n---\r\n\r\nPrivate note.', 'scopes/team/private.md'),
     { allowed: false, reason: 'private' },
   );
   assert.deepEqual(

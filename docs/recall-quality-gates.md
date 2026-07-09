@@ -11,6 +11,7 @@ This is not a full semantic engine release. The v0 gate is model-free and protec
 Default prompt recall must fail closed for memory that should not be injected into a prompt without an explicit future audited scope option:
 
 - `flagged: true`
+- quarantine/flagged lanes such as `memory/flagged/**`, `memory/quarantine/**`, or `memory/scopes/flagged/**`
 - `visibility: private` / `scope: private`
 - private lanes such as `memory/private/**` or `memory/scopes/private/**`
 - `visibility: audit-only` / `scope: audit-only`

@@ -13,7 +13,7 @@ export type RecallBoundaryDecision = {
 };
 
 function frontmatter(content: string): string {
-  const match = String(content || '').match(/^﻿?\s*---\r?\n([\s\S]*?)\r?\n---/);
+  const match = String(content || '').match(/^\ufeff?\s*---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
   return match ? match[1] : '';
 }
 
@@ -25,6 +25,11 @@ function scalar(front: string, key: 'visibility' | 'scope'): string | undefined 
 function normalizedMemoryPath(relativePath: string | undefined): string {
   const normalized = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
   return normalized.startsWith('memory/') ? normalized.slice('memory/'.length) : normalized;
+}
+
+function flaggedPath(relativePath: string | undefined): boolean {
+  const mem = normalizedMemoryPath(relativePath);
+  return mem.startsWith('flagged/') || mem.startsWith('quarantine/') || mem.startsWith('scopes/flagged/') || mem.includes('/flagged/');
 }
 
 function privatePath(relativePath: string | undefined): boolean {
@@ -41,7 +46,7 @@ function auditOnlyPath(relativePath: string | undefined): boolean {
 // private, or audit-only memory unless a future explicit, audited scope option asks for that surface.
 export function defaultPromptRecallBoundary(content: string, relativePath?: string): RecallBoundaryDecision {
   const front = frontmatter(content);
-  if (/^\s*flagged\s*:\s*["']?true\b/im.test(front)) return { allowed: false, reason: 'flagged' };
+  if (/^\s*flagged\s*:\s*["']?true\b/im.test(front) || flaggedPath(relativePath)) return { allowed: false, reason: 'flagged' };
 
   const visibility = scalar(front, 'visibility');
   const scope = scalar(front, 'scope');

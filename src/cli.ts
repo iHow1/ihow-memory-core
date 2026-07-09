@@ -2688,10 +2688,11 @@ function recallTier(
   relPath: string,
 ): { tier: 'reviewed' | 'auto' | 'flagged'; provenance?: string } {
   try {
-    const head = readFileSync(absoluteFromMemoryPath(workspace, relPath), 'utf8').slice(0, 1024);
-    const boundary = defaultPromptRecallBoundary(head, relPath);
+    const raw = readFileSync(absoluteFromMemoryPath(workspace, relPath), 'utf8');
+    const boundary = defaultPromptRecallBoundary(raw, relPath);
     if (!boundary.allowed) return { tier: 'flagged' };
-    const fm = head.match(/^---\n([\s\S]*?)\n---/);
+    const head = raw.slice(0, 8192);
+    const fm = head.match(/^\ufeff?\s*---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
     const front = fm ? fm[1] : head;
     // Case-insensitive + quote-tolerant: a shared multi-agent vault means an entry can be written by ANY
     // runtime / by hand, so `reviewed: "false"` / `Reviewed: False` / `tier: 'auto-promoted'` all count.
