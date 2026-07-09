@@ -19,6 +19,23 @@ Default prompt recall must fail closed for memory that should not be injected in
 
 The boundary is shared by Claude/Codex style `hook-user-prompt-submit` recall and no-hook `memory.context_probe(prompt)` recall.
 
+## Cross-runtime parity smoke v0
+
+Alpha.26 adds a deterministic local smoke for cross-runtime recall parity. It uses temporary `--memory-root` / `--state-root` fixtures and does **not** launch real Claude Code, Codex, OpenClaw, or other external clients.
+
+The smoke compares the boundary behavior of:
+
+- Claude-style `hook-user-prompt-submit` prompt recall.
+- Codex/no-hook `memory.context_probe(prompt)` prompt recall.
+- OpenClaw/CLI `status` / `doctor` recall-readiness reporting for the same memory root.
+
+Because each surface returns a different shape, the parity check asserts eligible content and boundary outcomes rather than byte-identical output:
+
+- A reviewed, relevant curated memory is visible on both prompt-recall surfaces.
+- `flagged`, `private`, and `audit-only` memory are absent from both prompt-recall surfaces.
+- Off-topic prompts inject nothing on both prompt-recall surfaces.
+- CLI readiness remains descriptive/status-only and must not widen recall eligibility.
+
 ## Existing quality invariants kept in alpha.26
 
 - No semantic provider means lexical/FTS behavior only; do not claim semantic recall.
