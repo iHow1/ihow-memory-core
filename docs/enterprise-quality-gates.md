@@ -16,7 +16,8 @@ This is still not a complete RBAC/ABAC product. The goal is to prove the memory 
 | Source-local lane | excluded from normal project/public digest | Adapter scratch/source-local notes must be reviewed before becoming curated memory. |
 | Source-shared lane | allowed in named project and source review, excluded from public digest | Shared source material can support a project review without becoming default public output. |
 | Redaction | raw secret/PII-like content must not appear in draft/export | Export artifacts are higher-blast-radius views and must be detector-clean. |
-| Audit | organize/export must emit audit events | The draft/export itself is not source of truth. |
+| Blocked export | draft export fails closed when `safety.blocked_items > 0` or `export_safe:false` | alpha.25 v0 does not silently emit a sanitized subset; any future sanitized export must be an explicit named policy/flag with audit metadata. |
+| Audit | organize/export must emit audit events | The draft/export itself is not source of truth; refused blocked exports are audited with `status:refused`, `reason:blocked_items_present`, and `blockedItemsPolicy:fail-closed`. |
 
 ## Namespace conventions
 
@@ -53,6 +54,8 @@ The deterministic test fixture asserts:
 - source review output includes source lanes without leaking private/audit content;
 - Markdown export preserves the same boundary invariants as the JSON draft;
 - raw email/secret-like values are redacted from export;
+- drafts with `blocked_items` fail closed by default and do not write a Markdown export;
+- blocked-export refusals leave audit metadata identifying the `fail-closed` policy;
 - organize/export audit records are present.
 
 ## Source Adapter Layer contract v0
@@ -81,7 +84,7 @@ Covered in v0:
 | journal append | `memory.journal.appended` event with reversible entry metadata |
 | rollback | `memory.rolledback` event with `rolledBackEventId` and removal status |
 | organize | `memory.organized` event with draft id, scope, item counts, out-of-scope exclusions, `curatedRewrite:false` |
-| export | `memory.exported` event with draft id, format, export path, and source-of-truth marker |
+| export | `memory.exported` event with draft id, format, export path or refusal status, source-of-truth marker, and blocked-items policy |
 
 All event surfaces must be detector-clean: raw PII/secret-like values must not appear in event JSON, draft JSON, or Markdown export.
 

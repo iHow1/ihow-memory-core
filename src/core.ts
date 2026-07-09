@@ -28,7 +28,7 @@ import { engineStatus, indexWithEngineFallback, resolveEngineConfig, searchWithE
 import { filterForgotten, forgetPath, listForgotten, rememberPath } from './forget.ts';
 import type { ForgetOutcome, RememberOutcome } from './forget.ts';
 import { organizeDraft, exportVaultFromDraft } from './gardener.ts';
-import type { ExportVaultResult, GardenerDraft, OrganizeDraftOptions } from './gardener.ts';
+import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraftOptions } from './gardener.ts';
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -47,7 +47,7 @@ export type MemoryCore = {
   remember(needle: string, opts?: { actor?: string }): Promise<RememberOutcome>;
   forgotten(): Promise<Array<{ path: string; snippet: string }>>;
   organize(opts?: OrganizeDraftOptions): Promise<GardenerDraft>;
-  export_vault(fromDraft: string, opts?: { actor?: string; format?: 'markdown' }): Promise<ExportVaultResult>;
+  export_vault(fromDraft: string, opts?: ExportVaultOptions): Promise<ExportVaultResult>;
 };
 
 function excerpt(content: string, max = 300): string {

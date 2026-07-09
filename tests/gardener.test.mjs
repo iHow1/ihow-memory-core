@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openCore } from '../src/core.ts';
 import { containsSecretLikeContent } from '../src/governance.ts';
+import { gardenerDraftPath } from '../src/gardener.ts';
 import { seedEnterpriseGardenerFixture, WORKFLOW_EVENTS } from './fixtures/enterprise-gardener.mjs';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
@@ -121,6 +122,69 @@ test('secret/PII fixture is redacted in draft/export and raw value does not leak
   assert.doesNotMatch(md, /person@example\.com/);
   assert.match(md, /\[redacted\]/);
   assert.equal(containsSecretLikeContent(md), false);
+});
+
+test('export fails closed when a draft reports blocked items and audits the policy', async (t) => {
+  const core = await coreFor(t);
+  await fixture(core);
+  const draft = await core.organize({ scope: 'project', actor: 'test' });
+  const draftPath = gardenerDraftPath(core.workspace, draft.draft_id);
+  const tampered = {
+    ...draft,
+    safety: {
+      ...draft.safety,
+      blocked_items: 1,
+      export_safe: false,
+    },
+  };
+  await fs.writeFile(draftPath, `${JSON.stringify(tampered, null, 2)}\n`, 'utf8');
+
+  await assert.rejects(
+    core.export_vault(draft.draft_id, { actor: 'blocked-export-test' }),
+    (error) => {
+      assert.equal(error?.code, 'export_blocked_items_fail_closed');
+      assert.equal(error?.draft_id, draft.draft_id);
+      assert.equal(error?.blocked_items, 1);
+      assert.match(error?.audit_event_id, /^[0-9a-f-]+$/);
+      return true;
+    },
+  );
+
+  const exportPath = path.join(core.workspace.spaceDir, 'gardener', 'exports', draft.draft_id, 'memory-gardener-digest.md');
+  await assert.rejects(fs.stat(exportPath), /ENOENT/, 'blocked export does not write Markdown');
+
+  const events = await core.audit();
+  const refused = events.find((event) => event.type === 'memory.exported' && event.metadata?.draftId === draft.draft_id && event.metadata?.status === 'refused');
+  assert.ok(refused, 'refused export is audited');
+  assert.equal(refused.metadata?.reason, 'blocked_items_present');
+  assert.equal(refused.metadata?.blockedItems, 1);
+  assert.equal(refused.metadata?.blockedItemsPolicy, 'fail-closed');
+  assert.equal(refused.metadata?.exportPath, null);
+});
+
+test('successful export records explicit fail-closed blocked-items policy metadata', async (t) => {
+  const core = await coreFor(t);
+  await fixture(core);
+  const draft = await core.organize({ scope: 'project', actor: 'test' });
+  const out = await core.export_vault(draft.draft_id, { actor: 'policy-test' });
+
+  assert.deepEqual(out.safety, {
+    secret_redaction: 'passed',
+    export_safe: true,
+    blocked_items: 0,
+    blocked_items_policy: 'fail-closed',
+  });
+
+  const md = await fs.readFile(path.join(core.workspace.spaceDir, out.path), 'utf8');
+  assert.doesNotMatch(md, /api[_-]?key\s*[:=]/i, 'successful export has no blocked secret assignment');
+  assert.equal(containsSecretLikeContent(md), false, 'successful export is detector-clean');
+
+  const events = await core.audit();
+  const exported = events.find((event) => event.id === out.audit_event_id);
+  assert.ok(exported, 'successful export is audited');
+  assert.equal(exported.metadata?.status, 'exported');
+  assert.equal(exported.metadata?.blockedItems, 0);
+  assert.equal(exported.metadata?.blockedItemsPolicy, 'fail-closed');
 });
 
 test('project/public scope smoke excludes private and audit-only content', async (t) => {

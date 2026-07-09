@@ -72,6 +72,14 @@ export type OrganizeDraftOptions = {
   actor?: string;
 };
 
+export type ExportVaultBlockedItemsPolicy = 'fail-closed';
+
+export type ExportVaultOptions = {
+  actor?: string;
+  format?: 'markdown';
+  blockedItemsPolicy?: ExportVaultBlockedItemsPolicy;
+};
+
 export type ExportVaultResult = {
   ok: true;
   draft_id: string;
@@ -81,9 +89,28 @@ export type ExportVaultResult = {
   safety: {
     secret_redaction: 'passed';
     export_safe: true;
+    blocked_items: 0;
+    blocked_items_policy: ExportVaultBlockedItemsPolicy;
   };
   source_of_truth: 'view/export artifact only; draft and source memory remain authoritative';
 };
+
+export class ExportBlockedItemsError extends Error {
+  readonly code = 'export_blocked_items_fail_closed';
+  readonly draft_id: string;
+  readonly blocked_items: number;
+  readonly audit_event_id: string;
+
+  constructor(draftId: string, blockedItems: number, auditEventId: string) {
+    super(`export_blocked_items_fail_closed: draft ${draftId} has blocked_items=${blockedItems}; export refused by fail-closed policy`);
+    this.name = 'ExportBlockedItemsError';
+    this.draft_id = draftId;
+    this.blocked_items = blockedItems;
+    this.audit_event_id = auditEventId;
+  }
+}
+
+const EXPORT_BLOCKED_ITEMS_POLICY: ExportVaultBlockedItemsPolicy = 'fail-closed';
 
 type CandidateLine = {
   type: GardenerItemType;
@@ -413,9 +440,28 @@ function renderFlag(workspace: Workspace, exportDir: string, flag: GardenerFlag)
   return `- \`${flag.kind}\` ${flag.reason}\n  - Targets: ${flag.targetIds.join(', ')}\n  - Non-destructive: ${flag.destructive === false ? 'yes' : 'no'}\n  - Evidence: ${ev}`;
 }
 
-export async function exportVaultFromDraft(workspace: Workspace, draftId: string, opts: { actor?: string; format?: 'markdown' } = {}): Promise<ExportVaultResult> {
+export async function exportVaultFromDraft(workspace: Workspace, draftId: string, opts: ExportVaultOptions = {}): Promise<ExportVaultResult> {
   if (opts.format && opts.format !== 'markdown') throw new Error('unsupported_export_format');
+  if (opts.blockedItemsPolicy && opts.blockedItemsPolicy !== EXPORT_BLOCKED_ITEMS_POLICY) throw new Error('unsupported_blocked_items_policy');
   const draft = await readDraft(workspace, draftId);
+  const blockedItems = Number(draft.safety?.blocked_items ?? 0);
+  if (blockedItems > 0 || draft.safety?.export_safe === false) {
+    const event = await appendEvent(workspace, {
+      type: 'memory.exported',
+      actor: opts.actor || 'gardener',
+      metadata: {
+        draftId: draft.draft_id,
+        format: 'markdown',
+        exportPath: null,
+        sourceOfTruth: 'view/export artifact only',
+        status: 'refused',
+        reason: 'blocked_items_present',
+        blockedItems,
+        blockedItemsPolicy: EXPORT_BLOCKED_ITEMS_POLICY,
+      } as JsonRecord,
+    });
+    throw new ExportBlockedItemsError(draft.draft_id, blockedItems, event.id);
+  }
   const outDir = path.join(exportRoot(workspace), safeFileSlug(draft.draft_id, 'draft'));
   const outPath = path.join(outDir, 'memory-gardener-digest.md');
   const lines = [
@@ -461,6 +507,9 @@ export async function exportVaultFromDraft(workspace: Workspace, draftId: string
       format: 'markdown',
       exportPath: relativeToSpace(workspace, outPath),
       sourceOfTruth: 'view/export artifact only',
+      status: 'exported',
+      blockedItems: 0,
+      blockedItemsPolicy: EXPORT_BLOCKED_ITEMS_POLICY,
     } as JsonRecord,
   });
   return {
@@ -469,7 +518,7 @@ export async function exportVaultFromDraft(workspace: Workspace, draftId: string
     format: 'markdown',
     path: relativeToSpace(workspace, outPath),
     audit_event_id: event.id,
-    safety: { secret_redaction: 'passed', export_safe: true },
+    safety: { secret_redaction: 'passed', export_safe: true, blocked_items: 0, blocked_items_policy: EXPORT_BLOCKED_ITEMS_POLICY },
     source_of_truth: 'view/export artifact only; draft and source memory remain authoritative',
   };
 }

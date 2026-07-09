@@ -122,6 +122,53 @@ test('alpha25 gate matrix: source scope includes source lanes without leaking cu
   assert.ok(draft.sources.every((s) => s.visibility === 'source-local' || s.visibility === 'source-shared'));
 });
 
+test('alpha25 gate matrix: blocked_items export fails closed with auditable policy metadata', async (t) => {
+  const core = await coreFor(t);
+  await seedEnterpriseGateMatrix(core);
+
+  const draft = await core.organize({ scope: 'project-orchard', actor: 'enterprise-gate-test' });
+  const draftPath = path.join(core.workspace.spaceDir, draft.draft_path);
+  const blockedDraft = {
+    ...draft,
+    decisions_facts: [
+      ...draft.decisions_facts,
+      {
+        id: 'item_blocked_placeholder',
+        type: 'fact',
+        text: '[blocked item intentionally omitted]',
+        claim_kind: 'evidence',
+        evidence: [],
+        flags: [],
+      },
+    ],
+    safety: {
+      ...draft.safety,
+      blocked_items: 1,
+      export_safe: false,
+    },
+  };
+  await fs.writeFile(draftPath, `${JSON.stringify(blockedDraft, null, 2)}\n`, 'utf8');
+
+  await assert.rejects(
+    core.export_vault(draft.draft_id, { actor: 'enterprise-gate-test' }),
+    (error) => {
+      assert.equal(error?.code, 'export_blocked_items_fail_closed');
+      assert.equal(error?.blocked_items, 1);
+      return true;
+    },
+  );
+
+  const exportsDir = path.join(core.workspace.spaceDir, 'gardener', 'exports', draft.draft_id);
+  await assert.rejects(fs.readdir(exportsDir), /ENOENT/, 'no sanitized subset is silently exported');
+
+  const events = await core.audit();
+  const refused = events.find((event) => event.type === 'memory.exported' && event.metadata?.draftId === draft.draft_id && event.metadata?.status === 'refused');
+  assert.ok(refused, 'blocked export refusal is audited');
+  assert.equal(refused.metadata?.blockedItemsPolicy, 'fail-closed');
+  assert.equal(refused.metadata?.reason, 'blocked_items_present');
+  assert.equal(containsSecretLikeContent(JSON.stringify(refused)), false, 'refusal audit metadata is detector-clean');
+});
+
 test('alpha25 gate matrix: export preserves the same boundary and redaction invariants', async (t) => {
   const core = await coreFor(t);
   await seedEnterpriseGateMatrix(core);
