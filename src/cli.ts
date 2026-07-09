@@ -14,6 +14,7 @@ import { indexWithEngineFallback, resolveEngineConfig, semanticRecallFloor } fro
 import { sqliteRuntimeStatus } from './engine/fts.ts';
 import { readEventsAllLanes } from './store/events.ts';
 import { appendJournal, containsSecretLikeContent, expireStaleFlagged, pendingFlaggedReview, redactSecretLikeContent } from './governance.ts';
+import { defaultPromptRecallBoundary } from './recall-quality.ts';
 import { parseTranscript, summarizeTranscript } from './transcript.ts';
 import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { assembleEnvelope, formatAge } from './envelope.ts';
@@ -2688,9 +2689,10 @@ function recallTier(
 ): { tier: 'reviewed' | 'auto' | 'flagged'; provenance?: string } {
   try {
     const head = readFileSync(absoluteFromMemoryPath(workspace, relPath), 'utf8').slice(0, 1024);
+    const boundary = defaultPromptRecallBoundary(head, relPath);
+    if (!boundary.allowed) return { tier: 'flagged' };
     const fm = head.match(/^---\n([\s\S]*?)\n---/);
     const front = fm ? fm[1] : head;
-    if (/^\s*flagged:\s*["']?true\b/im.test(front)) return { tier: 'flagged' };
     // Case-insensitive + quote-tolerant: a shared multi-agent vault means an entry can be written by ANY
     // runtime / by hand, so `reviewed: "false"` / `Reviewed: False` / `tier: 'auto-promoted'` all count.
     const isAuto = /^\s*reviewed:\s*["']?false\b/im.test(front) || /^\s*tier:\s*["']?auto-promoted\b/im.test(front);

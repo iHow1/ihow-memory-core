@@ -13,6 +13,7 @@ import { buildHandoffPacket, type HandoffPacket } from './handoff.ts';
 import { searchWithEngineFallback, resolveEngineConfig } from './engine/retrieval.ts';
 import { absoluteFromMemoryPath, isCuratedMemoryPath } from './workspace.ts';
 import { containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
+import { defaultPromptRecallBoundary } from './recall-quality.ts';
 
 export type ContextProbeInput = {
   cwd: string;
@@ -127,9 +128,10 @@ function frontmatter(content: string): string {
   return match ? match[1] : '';
 }
 
-function isReviewedRecallEntry(content: string): boolean {
+function isReviewedRecallEntry(content: string, relativePath?: string): boolean {
+  const boundary = defaultPromptRecallBoundary(content, relativePath);
+  if (!boundary.allowed) return false;
   const front = frontmatter(content);
-  if (/^\s*flagged:\s*["']?true\b/im.test(front)) return false;
   if (/^\s*reviewed:\s*["']?false\b/im.test(front)) return false;
   if (/^\s*tier:\s*["']?auto-promoted\b/im.test(front)) return false;
   return true;
@@ -164,7 +166,7 @@ async function promptRecall(workspace: Workspace, promptDigest?: string): Promis
     } catch {
       continue;
     }
-    if (!isReviewedRecallEntry(raw)) continue;
+    if (!isReviewedRecallEntry(raw, hit.path)) continue;
     const body = stripFrontmatter(raw);
     const snippet = cleanRecallSnippet(String(hit.snippet || body));
     if (!snippet || containsSecretLikeContent(snippet)) continue;
