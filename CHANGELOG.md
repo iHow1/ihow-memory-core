@@ -8,6 +8,43 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.25] — 2026-07-08
+
+### Added
+
+- **Enterprise Gate Matrix v0 for Safe Memory Gardener.** Added deterministic local tests and docs for
+  project, public, private, source, audit-only, source-local, and source-shared boundaries. The matrix
+  checks that organize/export drafts stay inside the requested scope, redaction is applied before
+  export, and organize/export audit events exist.
+- **Blocked export fail-closed policy v0.** Markdown export now refuses drafts with `blocked_items` or
+  `export_safe:false` instead of emitting a partial/sanitized subset silently, and records auditable
+  refusal metadata with `status:refused`, `reason:blocked_items_present`, and
+  `blockedItemsPolicy:fail-closed`.
+- **Source Adapter Contract v0.** Added a local, fixture-only source-adapter contract for validating and
+  rendering source-lane Markdown from adapter-produced documents. It requires typed adapter/source
+  metadata, restricts visibility to `source-local` or `source-shared`, requires slug scopes, redacts
+  content before rendering, and keeps source fixtures inside the Safe Memory Gardener boundary matrix.
+- **Audit completeness baseline v0.** Added coverage expectations for candidate write, promote,
+  durable-promote, journal append, rollback, organize, and export events so governance actions can be
+  reconstructed from append-only audit data rather than trusting exported artifacts alone.
+- **Durable write dedupe/stale/supersede baseline v0.** Write/promote/durable-promote surfaces now attach
+  review-first policy metadata for duplicate body fingerprints, self-labeled stale/deprecated content,
+  and possible supersede candidates; dry-run plans expose the same policy before writes.
+
+### Changed
+
+- **alpha.25 package prep.** Local package metadata is bumped to `0.1.0-alpha.25` for RC readiness only;
+  no tag, publish, push, release, or deploy is part of this change.
+
+### Notes
+
+- alpha.25 remains an alpha release candidate. These are local governance gates and typed contracts, not
+  an enterprise-ready RBAC/ABAC product.
+- The source-adapter layer is fixture-only in this release: there are no real Feishu, Obsidian, ima, or
+  other external adapters, no customer-data import, and no external credentials are read.
+- Durable duplicate/stale/supersede handling is intentionally metadata/audit-only and review-first; it
+  does not delete, merge, rewrite, or silently choose a new authoritative memory.
+
 ## [0.1.0-alpha.24] — 2026-07-08
 
 ### Added
