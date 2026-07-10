@@ -46,7 +46,7 @@ if (argv[0] !== 'mcp') process.exit(0);
 if (argv[1] === 'get') {
   if (!state) process.exit(1);
   console.log('ihow-memory:');
-  console.log('  Scope: User config (available in all your projects)');
+  console.log('  Scope: ' + (process.env.IHOW_CLAUDE_MCP_SCOPE || 'User config (available in all your projects)'));
   console.log('  Status: ✓ Connected');
   console.log('  Type: stdio');
   console.log('  Command: ' + state.command);
@@ -213,6 +213,84 @@ function runJson({ runtime, home, bin, statePath, logPath, root, cwd, command = 
   }
   return JSON.parse(stdout);
 }
+
+async function makeClaudeFixture(t, prefix) {
+  const home = await realTemp(`ihow-claude-${prefix}-home-`);
+  const bin = await realTemp(`ihow-claude-${prefix}-bin-`);
+  const root = await realTemp(`ihow-claude-${prefix}-root-`);
+  const cwd = await realTemp(`ihow-claude-${prefix}-cwd-`);
+  const statePath = path.join(home, '.stub', 'claude-state.json');
+  const logPath = path.join(home, '.stub', 'claude-mutations.jsonl');
+  await fs.mkdir(path.dirname(logPath), { recursive: true });
+  await makeClaudeStub(bin);
+  t.after(async () => {
+    for (const dir of [home, bin, root, cwd]) await fs.rm(dir, { recursive: true, force: true });
+  });
+  return { runtime: 'claude-code', home, bin, root, cwd, statePath, logPath };
+}
+
+async function primeClaudeFixture(fixture) {
+  const first = runJson(fixture);
+  assert.equal(first.applied, true);
+  const desired = JSON.parse(await fs.readFile(fixture.statePath, 'utf8'));
+  await fs.writeFile(fixture.logPath, '', 'utf8');
+  return desired;
+}
+
+function assertConservativeClaudeReplacement(result, entries) {
+  assert.equal(result.applied, true, 'parser uncertainty is applied conservatively');
+  assert.notEqual(result.unchanged, true, 'setup never claims unchanged under parser uncertainty');
+  assert.equal(result.restart.required, true, 'replacement requires restart');
+  assert.deepEqual(result.restart.runtimes, ['claude-code']);
+  assert.deepEqual(entries.map((entry) => entry.op), ['remove', 'add'], 'uncertainty triggers exactly one remove/add');
+}
+
+test('Claude canonical config missing cannot prove unchanged from ambiguous joined argv', async (t) => {
+  const fixture = await makeClaudeFixture(t, 'ambiguous-argv');
+  const desired = await primeClaudeFixture(fixture);
+  assert.ok(desired.args.length >= 2);
+  const ambiguous = {
+    ...desired,
+    args: [`${desired.args[0]} ${desired.args[1]}`, ...desired.args.slice(2)],
+  };
+  assert.equal(ambiguous.args.join(' '), desired.args.join(' '), 'human rendering is deliberately identical');
+  assert.notDeepEqual(ambiguous.args, desired.args, 'actual argv boundaries differ');
+  await fs.writeFile(fixture.statePath, JSON.stringify(ambiguous), 'utf8');
+  await fs.rm(path.join(fixture.home, '.claude.json'), { force: true });
+
+  const result = runJson(fixture);
+  assertConservativeClaudeReplacement(result, await mutations(fixture.logPath));
+});
+
+test('Claude malformed canonical config plus project/local scope cannot prove user-scope unchanged', async (t) => {
+  const fixture = await makeClaudeFixture(t, 'project-scope');
+  await primeClaudeFixture(fixture);
+  await fs.writeFile(path.join(fixture.home, '.claude.json'), '{ not readable canonical JSON', 'utf8');
+
+  const result = runJson({
+    ...fixture,
+    extraEnv: { IHOW_CLAUDE_MCP_SCOPE: 'Project config (shared via .mcp.json)' },
+  });
+  assertConservativeClaudeReplacement(result, await mutations(fixture.logPath));
+});
+
+test('Claude human parser uncertainty performs one replacement and never reports unchanged', async (t) => {
+  const fixture = await makeClaudeFixture(t, 'human-output');
+  await primeClaudeFixture(fixture);
+  const canonicalPath = path.join(fixture.home, '.claude.json');
+  await fs.rm(canonicalPath, { force: true });
+
+  const connectResult = runJson({ ...fixture, command: 'connect' });
+  assert.equal(connectResult.unchanged, false, 'explicit connect cannot claim human-output equality');
+  assert.equal(connectResult.changed, true);
+  assert.equal(connectResult.replaced, true);
+  assert.deepEqual((await mutations(fixture.logPath)).map((entry) => entry.op), ['remove', 'add']);
+
+  await fs.rm(canonicalPath, { force: true });
+  await fs.writeFile(fixture.logPath, '', 'utf8');
+  const setupResult = runJson(fixture);
+  assertConservativeClaudeReplacement(setupResult, await mutations(fixture.logPath));
+});
 
 test('Hermes official CLI compares command/argv/env and replaces environment drift', async (t) => {
   const home = await realTemp('ihow-hermes-home-');

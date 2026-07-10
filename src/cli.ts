@@ -375,26 +375,6 @@ function desiredMcpSpec(
   return normalizeMcpSpec({ command: spec.command, args: spec.args, env, envVars: [] })!;
 }
 
-function parseClaudeMcpGet(stdout: string, desired: NormalizedMcpSpec): NormalizedMcpSpec | null {
-  const command = stdout.match(/^\s*Command:\s*(.*)$/m)?.[1];
-  const renderedArgs = stdout.match(/^\s*Args:\s*(.*)$/m)?.[1] ?? '';
-  if (command === undefined) return null;
-  const env: Record<string, string> = {};
-  const envBlock = stdout.match(/^\s*Environment:\s*\n((?:\s{4}.*\n?)*)/m)?.[1] || '';
-  for (const line of envBlock.split(/\r?\n/)) {
-    const assignment = line.trim();
-    if (!assignment || !assignment.includes('=')) continue;
-    const split = assignment.indexOf('=');
-    env[assignment.slice(0, split)] = assignment.slice(split + 1);
-  }
-  // Claude's human output does not quote argument boundaries. Only treat it as an exact match when
-  // its rendered form equals the desired argv; otherwise conservatively replace the entry.
-  if (command === desired.command && renderedArgs === desired.args.join(' ')) {
-    return normalizeMcpSpec({ command, args: desired.args, env, envVars: [] });
-  }
-  return normalizeMcpSpec({ command, args: renderedArgs ? [renderedArgs] : [], env, envVars: [] });
-}
-
 function claudeConfigPath(): string {
   const configuredDir = process.env.CLAUDE_CONFIG_DIR?.trim();
   return path.join(configuredDir || os.homedir(), '.claude.json');
@@ -639,9 +619,12 @@ function connectViaClaudeCli(
   const get = spawnSync('claude', ['mcp', 'get', 'ihow-memory'], { encoding: 'utf8' });
   const exists = get.status === 0;
   const desired = desiredMcpSpec(spec);
-  const existing = exists
-    ? readClaudeUserMcpSpec() || parseClaudeMcpGet(get.stdout || '', desired)
-    : null;
+  // `claude mcp get` is human-readable only: argv is space-joined without boundary quoting, the
+  // environment listing is not a completeness contract, and the selected scope cannot be proven
+  // reliably. It may establish that a name exists, but canonical user-scope JSON is the sole source
+  // allowed to prove an exact unchanged spec. Missing/unreadable canonical config therefore replaces
+  // conservatively rather than risking a false unchanged result for a project/local entry.
+  const existing = exists ? readClaudeUserMcpSpec() : null;
   const unchanged = existing !== null && isDeepStrictEqual(existing, desired);
   if (options.dryRun) {
     return {
