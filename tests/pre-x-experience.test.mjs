@@ -55,7 +55,35 @@ test('proof --json exposes the same handoff verdicts without prose parsing', () 
   assert.equal(result.audit.event.type, 'memory.promoted');
 });
 
-test('continue --json with no history is structured, honest, and points to proof', async (t) => {
+test('proof --root uses and cleans only a proof-owned temporary child on success', async (t) => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-proof-parent-'));
+  const sentinel = path.join(parent, 'keep-me.txt');
+  await fs.writeFile(sentinel, 'caller-owned\n', 'utf8');
+  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+
+  const result = JSON.parse(run(['proof', '--root', parent, '--json']));
+  assert.equal(result.isolated.workspace, true);
+  assert.equal(result.isolated.suppliedParent, parent);
+  assert.equal(path.dirname(result.workspace.root), parent, 'temporary workspace was placed under the supplied parent');
+  assert.equal(await fs.readFile(sentinel, 'utf8'), 'caller-owned\n', 'caller-owned data is preserved');
+  assert.deepEqual(await fs.readdir(parent), ['keep-me.txt'], 'proof-owned child is cleaned after success');
+});
+
+test('proof --root cleans its proof-owned temporary child after a forced mid-proof failure', async (t) => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-proof-failure-parent-'));
+  const sentinel = path.join(parent, 'keep-me.txt');
+  await fs.writeFile(sentinel, 'caller-owned\n', 'utf8');
+  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+
+  assert.throws(
+    () => run(['proof', '--root', parent], { IHOW_MEMORY_PROOF_FORCE_FAILURE: 'after-workspace' }),
+    /proof_forced_failure_after_workspace/,
+  );
+  assert.equal(await fs.readFile(sentinel, 'utf8'), 'caller-owned\n', 'caller-owned data survives failure cleanup');
+  assert.deepEqual(await fs.readdir(parent), ['keep-me.txt'], 'proof-owned child is cleaned after failure');
+});
+
+test('continue --json with no history is structured, honest, and diagnoses missing capture setup', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-first-run-root-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-first-run-cwd-'));
   t.after(async () => {
@@ -66,6 +94,31 @@ test('continue --json with no history is structured, honest, and points to proof
   assert.equal(result.resumed, false);
   assert.equal(result.firstRun, true);
   assert.equal(result.status, 'first-run');
+  assert.equal(result.capture.status, 'setup-not-detected');
+  assert.equal(result.capture.nextStep, 'ihow-memory setup');
+  assert.deepEqual(result.nextSteps, ['ihow-memory proof', 'ihow-memory setup']);
+  assert.equal(result.quotedBody, '');
+
+  const human = run(['continue', '--root', root, '--space', 'fresh', '--cwd', cwd]);
+  assert.match(human, /No captured prior session to continue yet/);
+  assert.match(human, /Capture setup: not detected/);
+  assert.match(human, /ihow-memory setup \(then ihow-memory doctor\)/);
+});
+
+test('continue no-history recognizes an existing local setup marker without restoring an empty handoff', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-first-run-setup-root-'));
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-first-run-setup-cwd-'));
+  const marker = path.join(root, 'fresh', '.runtime', 'mcp', 'server.js');
+  await fs.mkdir(path.dirname(marker), { recursive: true });
+  await fs.writeFile(marker, '// setup marker\n', 'utf8');
+  t.after(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(cwd, { recursive: true, force: true });
+  });
+
+  const result = JSON.parse(run(['continue', '--root', root, '--space', 'fresh', '--cwd', cwd, '--json']));
+  assert.equal(result.resumed, false);
+  assert.equal(result.capture.status, 'setup-detected');
   assert.deepEqual(result.nextSteps, ['ihow-memory proof']);
   assert.equal(result.quotedBody, '');
 });
