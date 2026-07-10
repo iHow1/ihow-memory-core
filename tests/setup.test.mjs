@@ -55,9 +55,10 @@ async function countBackups(...roots) {
 test('setup --runtime claude-code: writes MCP + skill + hook and reports success', async (t) => {
   const { home, root, proj } = await dirs(t);
   const out = run(['setup', '--runtime', 'claude-code', '--root', root, '--space', 't', '--cwd', proj], home);
-  assert.match(out, /✓ iHow Memory is set up/, 'success banner');
+  assert.match(out, /Setup result — COMPLETE/, 'success result card');
   assert.match(out, /verifying \(doctor\)/, 'ran the doctor verification step');
-  assert.match(out, /Restart Claude Code once/, 'tells the user the one next action');
+  assert.match(out, /restart: required once for claude-code/, 'states the restart requirement');
+  assert.match(out, /next: ihow-memory proof/, 'gives one next action');
   assert.ok(await exists(path.join(home, '.claude', 'skills', 'ihow-memory', 'SKILL.md')), 'memory skill installed');
   const settings = await fs.readFile(path.join(proj, '.claude', 'settings.local.json'), 'utf8');
   assert.match(settings, /hook-stop/, 'Stop hook wired into the project settings');
@@ -73,7 +74,7 @@ test('setup is idempotent — re-running changes nothing and adds no new backups
   // The skill + hook are content-idempotent: a re-run re-affirms them in place, no duplicate install.
   assert.match(out2, /memory skill already current/, 'skill re-affirmed, not reinstalled');
   assert.match(out2, /hooks already present/, 'hooks re-affirmed, not duplicated');
-  assert.match(out2, /✓ iHow Memory is set up/, 'still succeeds on re-run');
+  assert.match(out2, /Setup result — COMPLETE/, 'still succeeds on re-run');
 });
 
 test('setup --dry-run writes NOTHING', async (t) => {
@@ -151,5 +152,6 @@ test('setup with no runtime detected is an honest exit-0 no-op', async (t) => {
   const { home, root } = await dirs(t); // empty HOME, hermetic PATH -> nothing detected
   const out = run(['setup', '--root', root, '--space', 't'], home);
   assert.match(out, /No AI runtime detected/, 'honest about finding nothing');
-  assert.match(out, /re-run: ihow-memory setup/, 'tells the user what to do next');
+  assert.match(out, /copy-paste: ihow-memory setup/, 'tells the user how to retry after installing a runtime');
+  assert.match(out, /next: ihow-memory proof/, 'still offers an immediate product proof');
 });

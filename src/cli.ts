@@ -19,7 +19,7 @@ import { parseTranscript, summarizeTranscript } from './transcript.ts';
 import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anchors.ts';
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
-import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, referencedHead, buildHandoffPacket, type ResumableSession } from './handoff.ts';
+import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, buildHandoffPacket, type ResumableSession } from './handoff.ts';
 import { probeMcpServer, verifyConnection } from './mcp/probe.ts';
 import { migrateLocalDay } from './migrate.ts';
 import { planImport, applyImport, collectExistingImports, type ImportPlan } from './import.ts';
@@ -123,7 +123,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--runtime') {
       const runtime = tail[++index];
       if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw', 'vscode', 'gemini'].includes(runtime)) options.runtime = runtime as ParsedArgs['options']['runtime'];
-      else throw new Error('unsupported_runtime: use claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini');
+      else throw new Error(`unsupported_runtime: "${runtime || ''}". Copy-paste one of: ihow-memory setup --runtime claude-code  OR  ihow-memory setup --runtime codex`);
     }
     else if (arg === '--share-diagnostics') options.shareDiagnostics = true;
     else if (arg === '--install-skill') options.installSkill = true;
@@ -960,13 +960,36 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
 
   // empty short-circuit: ready the local store, then stop (exit 0 — not an error, just nothing to wire)
   if (present.length === 0) {
-    let space: string | undefined;
-    try { space = (dryRun ? resolveWorkspace(options) : await ensureWorkspace(resolveWorkspace(options))).space; } catch { /* store is best-effort here */ }
+    let emptyWorkspace: ReturnType<typeof resolveWorkspace> | undefined;
+    try { emptyWorkspace = dryRun ? resolveWorkspace(options) : await ensureWorkspace(resolveWorkspace(options)); } catch { /* store is best-effort here */ }
     line('');
     line('No AI runtime detected — nothing to connect.');
-    if (space) line(`Workspace is ready at ${space} (local only).`);
-    line('Install Claude Code or Codex, then re-run: ihow-memory setup');
-    if (json) printJson({ ok: true, dryRun, detected: [], connected: [], skipped: [], skill: 'not-applicable', hook: 'not-applicable', hookScope: null, doctor: null, nextSteps: ['install-a-runtime'] });
+    line('');
+    line('Setup result');
+    line('  connection: none detected');
+    line('  verification: not run — there is no runtime to verify');
+    line('  pending: install Claude Code or Codex, then copy-paste: ihow-memory setup');
+    line('  restart: not required — no runtime config changed');
+    if (emptyWorkspace) line(`  local data: ${emptyWorkspace.memoryDir} (${dryRun ? 'not created; dry-run preview' : 'created locally'})`);
+    line('  cloud state: disabled — no upload or sync');
+    line('  next: ihow-memory proof');
+    if (json) printJson({
+      ok: true,
+      applied: !dryRun && !!emptyWorkspace,
+      dryRun,
+      detected: [],
+      connected: [],
+      unverified: [],
+      skipped: [],
+      skill: 'not-applicable',
+      hook: 'not-applicable',
+      hookScope: null,
+      doctor: null,
+      localData: emptyWorkspace ? { path: emptyWorkspace.memoryDir, state: dryRun ? 'not-created-preview' : 'created-local' } : null,
+      cloud: { enabled: false, sync: false },
+      restart: { required: false, runtimes: [] },
+      nextSteps: ['ihow-memory proof'],
+    });
     return;
   }
 
@@ -979,7 +1002,13 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     if (!dryRun) await installRuntimeBundle(workspace);
   } catch (caught) {
     const err = caught instanceof Error ? caught.message : String(caught);
-    if (json) printJson({ ok: false, dryRun, error: `workspace-unwritable: ${err}` });
+    if (json) printJson({
+      ok: false,
+      applied: false,
+      dryRun,
+      error: `workspace-unwritable: ${err}`,
+      restart: { required: false, runtimes: [], reason: 'setup stopped before any runtime config was written' },
+    });
     else console.error(`setup: could not prepare the workspace (${err}). Re-run with a writable --root <dir>.`);
     process.exitCode = 1;
     return;
@@ -989,13 +1018,18 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   line('');
   line(`2/4  connecting runtimes to workspace ${workspace.space}`);
   const spec = mcpServerSpec(workspace);
+  const planned: string[] = [];
   const connected: Array<{ runtime: string; verified: boolean }> = [];
   const unverified: Array<{ runtime: string; detail: string }> = [];
   const skipped: Array<{ runtime: string; error: string }> = [];
   for (const d of present) {
     try {
       const r = await connectRuntime(workspace, d.runtime, { dryRun });
-      if (dryRun) { line(`       · ${d.runtime}  [dry-run] would register MCP via ${r.method}`); continue; }
+      if (dryRun) {
+        planned.push(d.runtime);
+        line(`       · ${d.runtime}  [dry-run] would register MCP via ${r.method}`);
+        continue;
+      }
       // Verify-after-connect: a runtime is "verified" only once the configured server answers a real
       // round-trip AND its OWN CLI confirms registration. A direct-write runtime (no CLI) is reachable
       // but UNVERIFIED — never print "verified" for it; say so and let first launch confirm. This is the
@@ -1146,14 +1180,27 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   const installFailed = skill === 'failed' || hook === 'failed' || workbuddyResume === 'failed' || codexHooks === 'failed'; // a helper no-op'd / threw despite being asked
   if (!dryRun && (allFailed || doctorRed || installFailed)) process.exitCode = 1;
   // ok must never contradict a non-zero exit a sub-step already set (e.g. unparseable settings)
-  const ok = !dryRun && !allFailed && !doctorRed && !installFailed && process.exitCode !== 1;
+  const ok = dryRun ? skipped.length === 0 : !allFailed && !doctorRed && !installFailed && process.exitCode !== 1;
+  const applied = !dryRun;
+  const restartRuntimes = [...connected.map((entry) => entry.runtime), ...unverified.map((entry) => entry.runtime)];
+  const restart = dryRun
+    ? { required: false, runtimes: [] as string[], reason: 'dry-run changed nothing' }
+    : restartRuntimes.length > 0
+      ? { required: true, runtimes: restartRuntimes, reason: 'runtime config was written; restart once to load or refresh MCP tools' }
+      : { required: false, runtimes: [] as string[], reason: 'no runtime config was written' };
+  const localData = {
+    path: workspace.memoryDir,
+    state: dryRun ? 'not-created-preview' : 'local-on-disk',
+  };
 
   if (json) {
     printJson({
       ok,
+      applied,
       dryRun,
       workspace: workspace.space,
       detected: detectedNames,
+      planned,
       connected,
       unverified,
       skipped,
@@ -1164,26 +1211,56 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
       codexHooks: hasCodex ? codexHooks : null,
       codexGuidance: hasCodex ? resumeGuidance.codex ?? null : null,
       doctor: doctorResult ? { ok: doctorResult.ok, checks: doctorResult.checks } : null,
-      nextSteps: hasClaude ? ['restart-claude-code', 'say-continue-after-clear'] : ['restart-runtime', 'run-continue'],
+      localData,
+      cloud: { enabled: false, sync: false },
+      restart,
+      nextSteps: dryRun
+        ? [`ihow-memory setup${options.runtime ? ` --runtime ${options.runtime}` : ''}`]
+        : ['ihow-memory proof'],
+      afterSetup: dryRun ? 'ihow-memory proof' : null,
     });
     return;
   }
 
-  // human banner
+  // Human result card: progress above is diagnostic; this final block answers the cold-start questions
+  // at a glance. Keep exactly one adoption next-step (`proof`); repairs/apply commands are labeled as
+  // such rather than competing "next" actions.
   const sep = '─'.repeat(56);
   line('');
   line(sep);
-  if (dryRun) { line('Dry run — nothing was written. Run for real:  ihow-memory setup'); return; }
-  if (doctorRed || installFailed) {
+  if (dryRun) {
+    line(`Setup result — ${ok ? 'PREVIEW READY' : 'PREVIEW BLOCKED'}`);
+    line(`  connection: ${planned.length ? `would configure ${planned.join(', ')}` : 'no runnable connection plan'}`);
+    line('  verification: not run — verification requires a real connection');
+    line(`  pending: ${planned.length ? `${planned.join(', ')} (planned, not written)` : skipped.map((entry) => `${entry.runtime} (${entry.error})`).join(', ') || 'none'}`);
+    line('  restart: not required — dry-run changed nothing');
+    line(`  local data: ${workspace.memoryDir} (not created)`);
+    line('  cloud state: disabled — no upload or sync');
+    line(`  next: ihow-memory setup${options.runtime ? ` --runtime ${options.runtime}` : ''}`);
+    line('  after setup: ihow-memory proof');
+    return;
+  }
+  if (!ok) {
     const probs: string[] = [];
+    if (allFailed) probs.push('runtime connection — no configured runtime answered the local MCP round-trip');
     if (skill === 'failed') probs.push('memory skill — install did not land (see the message above)');
     if (hook === 'failed') probs.push('auto-capture hook — not wired (see the message above)');
     if (codexHooks === 'failed') probs.push('Codex hooks — not wired (see the message above)');
+    for (const entry of unverified) probs.push(`${entry.runtime} — config was written but the local server was not reachable (${entry.detail})`);
+    for (const entry of skipped) probs.push(`${entry.runtime} — connection was skipped (${entry.error})`);
     if (doctorResult) for (const c of doctorResult.checks.filter((c) => !c.ok && c.required !== false)) probs.push(`${c.name} — ${c.detail}${c.hint ? `\n    → ${c.hint}` : ''}`);
-    line(`⚠ Set up partially — ${probs.length} thing${probs.length === 1 ? '' : 's'} need attention before memory works:`);
+    line(`Setup result — PARTIAL (${probs.length} thing${probs.length === 1 ? '' : 's'} need attention)`);
+    line(`  connection: ${connected.map((c) => c.runtime).join(', ') || 'none reachable'}`);
+    line(`  verification: ${connected.filter((c) => c.verified).map((c) => c.runtime).join(', ') || 'none runtime-confirmed'}`);
+    line(`  pending: ${[...connected.filter((c) => !c.verified).map((c) => c.runtime), ...unverified.map((u) => u.runtime), ...skipped.map((s) => s.runtime)].join(', ') || 'none'}`);
+    line(`  restart: ${restart.required ? `required after repair for ${restart.runtimes.join(', ')}` : 'not required'}`);
+    line(`  local data: ${localData.path} (local on disk)`);
+    line('  cloud state: disabled — no upload or sync');
+    line('');
+    line('  Problems:');
     for (const p of probs) line(`  ${p}`);
     line('');
-    line('Already-written config (MCP / skill / hook) is kept. Fix the above, then re-run:  ihow-memory setup');
+    line('  Already-written config is kept. After fixing the item above, copy-paste: ihow-memory setup');
     return;
   }
   const memOnTools = [
@@ -1191,28 +1268,17 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     hasWorkbuddy && workbuddyResume !== 'failed' ? 'WorkBuddy' : null,
     hasCodex && codexHooks !== 'failed' && resumeGuidance.codex && !['failed', 'skipped'].includes(resumeGuidance.codex) ? 'Codex' : null,
   ].filter(Boolean);
-  const memOn = memOnTools.length ? ` · memory loop ON for ${memOnTools.join(' + ')}` : '';
   const verifiedRt = connected.filter((c) => c.verified).map((c) => c.runtime);
   const pendingRt = connected.filter((c) => !c.verified).map((c) => c.runtime);
-  line(`✓ iHow Memory is set up.  ${verifiedRt.length} runtime${verifiedRt.length === 1 ? '' : 's'} connected & verified${memOn}`);
-  if (pendingRt.length) line(`  • ${pendingRt.length} configured, server reachable — verify on first launch: ${pendingRt.join(', ')} (restart the runtime, then run: ihow-memory continue)`);
-  if (unverified.length) line(`  ⚠ ${unverified.length} written but NOT reachable: ${unverified.map((p) => p.runtime).join(', ')} — check each runtime's config, then re-run: ihow-memory setup`);
-  if (skipped.length) line(`  (${skipped.length} skipped: ${skipped.map((s) => s.runtime).join(', ')} — fix its CLI, then re-run; setup is idempotent)`);
-  line('');
-  line('  Next:');
-  if (hasClaude) {
-    line('    1. Restart Claude Code once → loads the MCP tools + memory skill.');
-    line('       (The auto-capture hooks take effect from your next Claude Code session.)');
-    line('    2. Work normally — at session end a hook prompts the agent to save a short handoff (decisions, results, blockers). You can also save anytime via the memory tools.');
-    line('    3. After /clear or in a new session, say "继续" (or run: ihow-memory continue) to pick up where you left off — a fresh session even reminds you it can.');
-  } else {
-    line('    1. Restart your runtime(s) to load the memory tools.');
-    line('    2. Resume after a context boundary with:  ihow-memory continue');
-  }
-  line('');
-  line('  Local only: no cloud, nothing uploaded. Claude Code gets native hooks; Codex gets native SessionStart/UserPromptSubmit hooks + an AGENTS.md memory loop.');
-  line('  Recall injects only 🟢 reviewed memory, relevant-only (off: --no-recall).');
-  line('  Re-check anytime: ihow-memory doctor   ·   re-running setup is safe (idempotent).');
+  line('Setup result — COMPLETE');
+  line(`  connection: ${connected.map((c) => c.runtime).join(', ') || 'none'}`);
+  line(`  verification: ${verifiedRt.join(', ') || 'server reachable; runtime confirmation pending'}`);
+  line(`  pending: ${[...pendingRt, ...unverified.map((u) => u.runtime), ...skipped.map((s) => s.runtime)].join(', ') || 'none'}`);
+  line(`  memory loop: ${memOnTools.length ? `enabled for ${memOnTools.join(', ')}` : 'runtime tools connected; no native capture loop for this runtime'}`);
+  line(`  restart: ${restart.required ? `required once for ${restart.runtimes.join(', ')}` : 'not required'}`);
+  line(`  local data: ${localData.path} (Markdown + local index)`);
+  line('  cloud state: disabled — no upload or sync');
+  line('  next: ihow-memory proof');
 }
 
 // Auto-detect Claude Code's native auto-memory directories (~/.claude/projects/<slug>/memory with a
@@ -1238,10 +1304,29 @@ async function detectClaudeMemoryDirs(): Promise<string[]> {
   return found.sort();
 }
 
-function help(): void {
+function help(full = false): void {
+  if (!full) {
+    console.log(`iHow Memory v${packageVersion()} — local, verify-first handoff for coding agents
+
+Start here (about 3 minutes):
+  1. SET UP     ihow-memory setup
+                 Detect runtimes, connect locally, and verify what is reachable.
+  2. SEE PROOF  ihow-memory proof
+                 Watch an UNVERIFIED prior claim earn GREEN from live git anchors,
+                 then turn RED after drift — in an isolated temporary repo.
+  3. CONTINUE   ihow-memory continue
+                 Resume real work without trusting the previous agent's narrative.
+  4. CORRECT    ihow-memory forget "text or memory/path.md"
+                 Stop a wrong memory surfacing; reversible with: ihow-memory remember
+
+Safe preview:  ihow-memory setup --dry-run
+Full command reference:  ihow-memory help --all
+Local by default: Markdown on disk, no account, no cloud sync, telemetry off.`);
+    return;
+  }
   console.log(`iHow Memory Core v${packageVersion()}
 
-New here? One command does everything:  ihow-memory setup
+Complete command reference (new here? start with: ihow-memory setup → ihow-memory proof)
 
 Usage:
   ihow-memory setup [--runtime name] [--global-hook] [--dry-run] [--json]   # zero-config: detect your AI runtimes → wire MCP + memory skill + auto-capture hook → verify. No prompts, idempotent (safe to re-run), local only.
@@ -1753,69 +1838,85 @@ async function resetSpace(options: WorkspaceOptions): Promise<Record<string, unk
 async function runProof(options: WorkspaceOptions & { json?: boolean }): Promise<Record<string, unknown>> {
   const root = options.root ? path.resolve(options.root) : await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-memory-proof-cli-'));
   const space = options.space || 'proof-local';
-  const core = await openCore({ ...options, root, space });
-  const marker = `blue-copper-river-${Date.now()}`;
-
-  const initialStatus = await core.status();
-  const candidate = await core.write_candidate({
-    title: 'agent-a-proof-memory',
-    text: `Agent A proof memory marker ${marker}. Local-only citation and audit demo.`,
-    sourceAgent: 'agent-a',
-    autoPromote: false, // this proof demonstrates the explicit write→promote two-step
-    metadata: {
-      proof: 'ToC-1B',
-      cloud: false,
-      model: null,
-    },
-  });
-  const promoted = await core.promote(candidate.path, {
-    scope: 'proof',
-    title: 'agent-a-proof-memory',
-  });
-
-  const agentB = await openCore({ ...options, root, space });
-  const hits = await agentB.search(marker, { limit: 5 });
-  if (hits.length === 0) throw new Error('proof_search_miss');
-  const read = await agentB.read(hits[0].path);
-  const finalStatus = await agentB.status();
-  const audit = await latestAuditSummary(agentB.workspace.eventsDir);
-
-  const result = {
-    ok: true,
-    cloud: 'disabled / local only',
-    workspace: {
-      root,
-      space,
-      path: agentB.workspace.spaceDir,
-    },
-    initialStatus: {
-      provider: initialStatus.provider,
-      index: initialStatus.index,
-    },
-    agentA: {
-      candidate,
-      promoted,
-    },
-    agentB: {
-      query: marker,
-      hit: hits[0],
-      read: {
-        path: read.path,
-        citation: read.citation,
-        containsMarker: read.content.includes(marker),
-      },
-    },
-    audit,
-    finalStatus: {
-      provider: finalStatus.provider,
-      index: finalStatus.index,
-    },
+  const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-memory-handoff-proof-'));
+  const git = (...args: string[]): string => {
+    const ran = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (ran.status !== 0) {
+      throw new Error(`proof_requires_git: install Git, then copy-paste: ihow-memory proof (${(ran.stderr || ran.stdout || 'git command failed').trim()})`);
+    }
+    return (ran.stdout || '').trim();
   };
+  try {
+    // Keep the original local governed-memory check, but make the public proof lead with the product's
+    // differentiator: the SAME verdict code used by continue, against a real throwaway git checkout.
+    const core = await openCore({ ...options, root, space });
+    const marker = `blue-copper-river-${Date.now()}`;
+    const initialStatus = await core.status();
+    const candidate = await core.write_candidate({
+      title: 'agent-a-proof-memory',
+      text: `Agent A proof memory marker ${marker}. Local-only citation and audit demo.`,
+      sourceAgent: 'agent-a',
+      autoPromote: false,
+      metadata: { proof: 'verify-first', cloud: false, model: null },
+    });
+    const promoted = await core.promote(candidate.path, { scope: 'proof', title: 'agent-a-proof-memory' });
+    const agentB = await openCore({ ...options, root, space });
+    const hits = await agentB.search(marker, { limit: 5 });
+    if (hits.length === 0) throw new Error('proof_search_miss: copy-paste repair: ihow-memory proof');
+    const read = await agentB.read(hits[0].path);
+    const finalStatus = await agentB.status();
+    const audit = await latestAuditSummary(agentB.workspace.eventsDir);
 
-  if (!options.root && process.env.IHOW_MEMORY_KEEP_PROOF !== '1') {
-    await fs.rm(root, { recursive: true, force: true });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'proof@local.invalid');
+    git('config', 'user.name', 'iHow Proof');
+    git('config', 'commit.gpgsign', 'false');
+    await fs.writeFile(path.join(repo, 'handoff.txt'), 'parser migration: work in progress\n', 'utf8');
+    git('add', 'handoff.txt');
+    git('commit', '-qm', 'baseline for handoff');
+
+    const narrative = 'Prior agent says: parser migration is complete and tests pass. Next step: continue with the smallest local change.';
+    const recorded = gitAnchors(repo);
+    const liveBefore = gitAnchors(repo);
+    const green = computeContinueVerdict(recorded, repo, narrative, { cwd: repo });
+    if (green.state !== 'GREEN') throw new Error(`proof_expected_green_got_${green.state}: copy-paste repair: ihow-memory proof`);
+
+    await fs.writeFile(path.join(repo, 'drift.txt'), 'a later agent changed the checkout\n', 'utf8');
+    git('add', 'drift.txt');
+    git('commit', '-qm', 'simulate later drift');
+    const liveAfter = gitAnchors(repo);
+    const red = computeContinueVerdict(recorded, repo, narrative, { cwd: repo });
+    if (red.state !== 'RED') throw new Error(`proof_expected_red_got_${red.state}: copy-paste repair: ihow-memory proof`);
+
+    return {
+      ok: true,
+      cloud: 'disabled / local only',
+      isolated: { git: true, workspace: !options.root },
+      workspace: { root, space, path: agentB.workspace.spaceDir },
+      handoff: {
+        narrative: { text: narrative, trust: 'UNVERIFIED' },
+        recordedAnchors: recorded,
+        liveAnchorsBeforeDrift: liveBefore,
+        green,
+        liveAnchorsAfterDrift: liveAfter,
+        red,
+      },
+      initialStatus: { provider: initialStatus.provider, index: initialStatus.index },
+      agentA: { candidate, promoted },
+      agentB: {
+        query: marker,
+        hit: hits[0],
+        read: { path: read.path, citation: read.citation, containsMarker: read.content.includes(marker) },
+      },
+      audit,
+      finalStatus: { provider: finalStatus.provider, index: finalStatus.index },
+    };
+  } finally {
+    if (process.env.IHOW_MEMORY_KEEP_PROOF !== '1') {
+      await fs.rm(repo, { recursive: true, force: true });
+      if (!options.root) await fs.rm(root, { recursive: true, force: true });
+    }
   }
-  return result;
 }
 
 // First-run opt-in prompt. Interactive: ask [y/N] (default N). Non-interactive (agent/CI):
@@ -2971,7 +3072,7 @@ async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   const { command, options, rest } = parsed;
   if (command === 'help' || command === '--help' || command === '-h') {
-    help();
+    help(rest.includes('--all'));
     return;
   }
 
@@ -3334,30 +3435,40 @@ async function main(): Promise<void> {
         }
       }
     }
-    // FIRST-RUN fallback (C1): no prior agent session, but the project has a hand-written STATE doc.
-    // Use it as the narrative + live git so even a brand-new user gets a verified handoff for their OWN
-    // project on the first `continue` — the onboarding "aha". A git SHA referenced near HEAD/baseline in
-    // the doc becomes the verdict baseline (live HEAD matches it → GREEN; drifted → RED).
-    let fromStateDoc: string | undefined;
-    if (!body) {
-      const projDir = projectDir ?? cwd;
-      for (const name of ['PROJECT_STATE.md', 'PROJECT_SUSPEND_MEMO.md', 'STATE.md', '.ihow/STATE.md', 'README.md']) {
-        try {
-          const raw = await fs.readFile(path.join(projDir, name), 'utf8');
-          if (!raw.trim()) continue;
-          body = redactSecretLikeContent(raw.slice(0, 4000));
-          projectDir = projDir;
-          fromStateDoc = name;
-          // Single attribution (red-team ③): the doc now supplies the narrative — clear any session
-          // metadata a broken/empty-summary capture left behind, so the envelope can't self-contradict.
-          sourceSessionId = undefined;
-          transcriptRef = undefined;
-          sourceAgeMs = undefined;
-          const rh = referencedHead(body);
-          if (rh) recordedAnchors = { isRepo: true, head: rh };
-          break;
-        } catch { /* not present — try the next candidate */ }
+    // First run / no-history is not a handoff. Do not print an empty transport envelope or quietly turn
+    // README/STATE prose into a substitute agent narrative; give one short, honest next action instead.
+    // JSON keeps the established fields so callers can distinguish "nothing to resume" without parsing
+    // human text, and adds an explicit status/resumed pair for new callers.
+    if (!body.trim()) {
+      const anchors = gitAnchors(cwd);
+      if (anchors.headSubject) anchors.headSubject = redactSecretLikeContent(anchors.headSubject);
+      if (anchors.branch) anchors.branch = redactSecretLikeContent(anchors.branch);
+      if (anchors.repo) anchors.repo = redactSecretLikeContent(anchors.repo);
+      if (anchors.dirtyFiles) anchors.dirtyFiles = anchors.dirtyFiles.map(redactSecretLikeContent);
+      const status = hint ? 'no-match' : transcriptRef ? 'no-substantive-history' : 'first-run';
+      if (options.json) {
+        printJson({
+          cwd,
+          projectDir: null,
+          verdict: null,
+          anchors,
+          quotedBody: '',
+          transcriptRef: transcriptRef ?? null,
+          sourceSession: sourceSessionId ?? null,
+          stateDoc: null,
+          status,
+          resumed: false,
+          firstRun: status === 'first-run',
+          nextSteps: ['ihow-memory proof'],
+        });
+      } else {
+        console.log(hint
+          ? `No captured prior session matched "${hint}".`
+          : 'No captured prior session to continue yet (no substantive prior-session summary is available).');
+        console.log('See the verify-first handoff once:  ihow-memory proof');
+        console.log('Then work normally; a future `ihow-memory continue` can resume captured work.');
       }
+      return;
     }
     // Anchors come from the INFERRED PROJECT (where the work landed on disk), not the session cwd —
     // this keeps the handoff project-aware when every session runs from one terminal dir. The FREE-TEXT
@@ -3375,9 +3486,7 @@ async function main(): Promise<void> {
     }
     // Code-computed verdict (only when we have the recorded baseline, i.e. continue <N>/keyword):
     // re-read live git and compare to the anchors captured when the session was recorded.
-    // fromStateDoc → the baseline was grepped from a doc, not a recorded session: mark it inferred so
-    // the verdict caps at YELLOW (a doc hash must never produce a confident GREEN).
-    const verdict = recordedAnchors ? computeContinueVerdict(recordedAnchors, projectDir, body, { inferred: !!fromStateDoc, cwd }) : undefined;
+    const verdict = recordedAnchors ? computeContinueVerdict(recordedAnchors, projectDir, body, { cwd }) : undefined;
     const envelope = assembleEnvelope({
       cwd,
       producerAgent: sourceSessionId ? `${sourceTool}:${sourceSessionId.slice(0, 8)}` : 'ihow-continue',
@@ -3388,23 +3497,20 @@ async function main(): Promise<void> {
       sourceSessionId,
       transcriptRef,
       sourceAgeMs,
-      stateDocName: fromStateDoc,
     });
     // B② grooming-decay measurement (opt-out via IHOW_HANDOFF_METRICS=0): append one derived, hashed,
     // content-free row per handoff so the anchor-conflict trend can be read over weeks. Fully
     // fault-tolerant — never throws, never blocks the handoff, never touches the network.
     await recordHandoffMetric({ projectDir, anchors, narrative: body, sourceSessionId, sourceAgeMs });
     if (options.json) {
-      printJson({ cwd, projectDir: projectDir ?? null, verdict: verdict ?? null, anchors, quotedBody: body, transcriptRef: transcriptRef ?? null, sourceSession: sourceSessionId ?? null, stateDoc: fromStateDoc ?? null });
+      printJson({ cwd, projectDir: projectDir ?? null, verdict: verdict ?? null, anchors, quotedBody: body, transcriptRef: transcriptRef ?? null, sourceSession: sourceSessionId ?? null, stateDoc: null });
     } else {
       if (verdict) {
         const icon = verdict.state === 'GREEN' ? '🟢' : verdict.state === 'YELLOW' ? '🟡' : '🔴';
         console.log(`${icon} ${verdict.state} — ${verdict.reason}\n`);
       }
       console.log(envelope);
-      if (!transcriptRef && fromStateDoc) {
-        console.log(`\n(handoff built from ${fromStateDoc} + live git — no prior agent session recorded yet. Work normally; future sessions leave their own handoff.)`);
-      } else if (!transcriptRef) {
+      if (!transcriptRef) {
         console.log(
           hint
             ? `\n(no recent session matching "${hint}" found. Try \`ihow-memory continue\` with no keyword, or a different one.)`
@@ -3644,7 +3750,24 @@ async function main(): Promise<void> {
     else {
       console.log('iHow Memory 10-second proof');
       console.log('cloud: disabled / local only');
-      console.log(`workspace: ${(result.workspace as { path: string }).path}`);
+      console.log('isolation: temporary git repo + temporary memory workspace');
+      const handoff = result.handoff as {
+        narrative: { text: string; trust: string };
+        recordedAnchors: GitAnchors;
+        liveAnchorsBeforeDrift: GitAnchors;
+        green: { state: string; reasons: string[] };
+        liveAnchorsAfterDrift: GitAnchors;
+        red: { state: string; reasons: string[] };
+      };
+      console.log(`prior narrative: ${handoff.narrative.trust} — ${handoff.narrative.text}`);
+      console.log(`recorded git HEAD: ${handoff.recordedAnchors.head || 'missing'}`);
+      console.log(`live git HEAD before drift: ${handoff.liveAnchorsBeforeDrift.head || 'missing'}`);
+      console.log(`receiver verdict before drift: ${handoff.green.state}`);
+      console.log(`live git HEAD after drift: ${handoff.liveAnchorsAfterDrift.head || 'missing'}`);
+      console.log(`receiver verdict after drift: ${handoff.red.state}`);
+      console.log('The narrative never became a fact; only the live anchors earned GREEN, and later drift forced RED.');
+      console.log('');
+      console.log('Governed local-memory proof:');
       console.log(
         `agent A wrote candidate: ${(result.agentA as Record<string, Record<string, string>>).candidate.path}`,
       );
@@ -3662,7 +3785,7 @@ async function main(): Promise<void> {
       const audit = result.audit as Record<string, unknown> | null;
       const event = audit?.event as Record<string, unknown> | undefined;
       console.log(`audit event: ${event?.type || 'missing'} ${event?.id || ''}`);
-      console.log('PASS proof: A write -> promote -> B search/read with citation and audit');
+      console.log('PASS proof: UNVERIFIED handoff -> live anchors GREEN -> drift RED; governed write/search/read stayed cited + audited');
     }
     return;
   }

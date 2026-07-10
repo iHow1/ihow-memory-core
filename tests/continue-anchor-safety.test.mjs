@@ -38,10 +38,11 @@ test('continue: a secret in the git commit subject does not leak through the anc
   g(['add', '-A']);
   g(['commit', '-q', '-m', 'wire token sk-ABCDEFGH12345678ZZ into build']);
 
-  const out = execFileSync(process.execPath, [CLI, 'continue', '--root', root, '--space', 'h', '--cwd', repo], { encoding: 'utf8' });
-  assert.match(out, /MACHINE ANCHORS/);
-  assert.doesNotMatch(out, /sk-ABCDEFGH12345678ZZ/, 'secret in the commit subject must not leak through anchors');
-  assert.match(out, /\[redacted\]/, 'the secret degrades to [redacted] in the anchor block');
+  const out = execFileSync(process.execPath, [CLI, 'continue', '--root', root, '--space', 'h', '--cwd', repo, '--json'], { encoding: 'utf8' });
+  assert.doesNotMatch(out, /sk-ABCDEFGH12345678ZZ/, 'secret in the commit subject must not leak through structured anchors');
+  const result = JSON.parse(out);
+  assert.match(result.anchors.headSubject, /\[redacted\]/, 'the secret degrades to [redacted] in the structured anchor');
+  assert.equal(result.resumed, false, 'no-history remains an honest first-run result');
 });
 
 test('continue: a Stop marker with null cwd is not matched to a specific cwd', async (t) => {

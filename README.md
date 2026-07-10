@@ -21,45 +21,74 @@ iHow Memory is a local, shared-memory runtime for heterogeneous coding agents �
 3. **Safe writes + governance.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event.
 4. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
 
-## Quickstart
+## Quickstart — first success in about 3 minutes
 
-### Fastest start — one command
+### 1. Set up locally
 
 ```bash
 npx ihow-memory@next setup
 ```
 
-`setup` detects your installed agents, registers the `ihow-memory` MCP server with each, installs proactive memory behavior where the runtime exposes a stable surface (Claude Code skill + hooks, Codex hooks + `AGENTS.md`, WorkBuddy/OpenClaw/Hermes/OpenCode resume guidance), and verifies with `doctor`. It is idempotent (safe to re-run), reversible (every edited config is backed up), and local-only. Prefer step-by-step? Use `connect` below.
+`setup` detects installed runtimes, connects the local MCP server, installs proactive memory behavior only where the runtime exposes a stable surface, and runs `doctor`. It is idempotent, backs up edited config, and ends with one result card: what connected, what is verified or pending, whether a restart is required, where local data lives, and the one next command.
 
-### 1. Connect a single runtime
+Want a zero-write preview first?
 
 ```bash
-npx ihow-memory@next connect --runtime claude-code   # or: codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw | vscode | gemini
+npx ihow-memory@next setup --dry-run
 ```
 
-`connect` provisions a managed workspace under `~/.ihow-memory` (space name derived from the current directory unless you pass `--space`) and registers the `ihow-memory` MCP server with the selected runtime:
+### 2. See the verify-first difference immediately
 
-- Claude Code and Codex are configured through their official CLIs (`claude mcp add-json`, `codex mcp add`).
-- Cursor is configured by merging `~/.cursor/mcp.json`, with a timestamped backup of the existing file first; an unparseable config is never overwritten.
-- To preview without changing anything, append `--dry-run`:
+```bash
+npx ihow-memory@next proof
+```
+
+The proof runs in a throwaway git repo and temporary memory workspace. It shows:
+
+```text
+prior agent narrative: UNVERIFIED
+recorded anchors == live anchors  -> GREEN
+checkout changes after recording  -> RED
+```
+
+It also proves the governed local-memory path — candidate → promote → search/read with citation + audit — without touching your project or runtime configuration. The default retrieval lane is honest zero-dependency lexical FTS; optional semantic recall is separate and is not presented as state of the art.
+
+### 3. Resume real work
+
+After `/clear`, a new session, or a switch to another supported runtime:
+
+```bash
+npx ihow-memory@next continue            # optional repo keyword: continue <name>
+```
+
+`continue` carries the previous narrative as **UNVERIFIED** and gives the receiver machine anchors to re-check before acting. GREEN is deliberately narrow; drift or conflict forces RED. If this is your first run and there is no captured session yet, the CLI says that plainly and points back to `proof` instead of printing an empty handoff envelope. In Claude Code you can simply say “continue” / “继续”.
+
+### 4. Correct a wrong memory
+
+```bash
+npx ihow-memory@next forget "text or memory/path.md"
+# reversible:
+npx ihow-memory@next remember "text or memory/path.md"
+```
+
+`forget` tombstones one unambiguous match so it stops surfacing in search and recall; the file is untouched and the action is reversible and audited.
+
+### What `setup` connects
+
+Claude Code is the daily-dogfooded path. Codex, OpenClaw, Hermes, OpenCode and WorkBuddy have single-machine real-app smoke. Cursor, Claude Desktop and VS Code are receiver-only because they do not expose a resumable local session store. See [Runtime support](#runtime-support) before making production assumptions.
+
+To connect only one runtime, or to inspect the exact config instead of applying it:
 
 ```bash
 npx ihow-memory@next connect --runtime claude-code --dry-run
-```
-
-If you prefer to edit runtime config by hand, `npx ihow-memory@next init --runtime <runtime>` prints the exact MCP snippet instead of applying it.
-
-### 2. Verify
-
-```bash
+npx ihow-memory@next connect --runtime claude-code
+npx ihow-memory@next init --runtime claude-code       # print the MCP snippet only
 npx ihow-memory@next doctor --runtime claude-code
 ```
 
-`doctor` checks the Node version, `node:sqlite` availability, memory-root writability, runtime setup, retrieval-engine readiness and the index manifest, and confirms cloud/sync are disabled.
+### The governed loop, explicitly
 
-### 3. The governed loop in 60 seconds
-
-This is the same flow agents use over MCP, run from your shell. The block is copy-pasteable as a whole:
+Agents use the same path over MCP. This shell version makes the review gate visible:
 
 ```bash
 npx ihow-memory@next init --space demo
@@ -67,35 +96,10 @@ CAND=$(npx ihow-memory@next write-candidate "Decision: ship weekly release notes
 PROMOTED=$(npx ihow-memory@next promote "$CAND" --scope team --title "Release notes cadence" --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
 npx ihow-memory@next search "release notes" --space demo
 npx ihow-memory@next read "$PROMOTED" --space demo
-```
-
-What you should see:
-
-- `write-candidate` returns a candidate path under `memory/candidate/inbox/` — proposed, not yet durable. The `--no-auto-promote` flag makes the **two-step gate explicit** so you can see it; **without it, clean writes auto-promote in one step** (the engine floor picks the yellow sub-tier), and `write-candidate` then returns the already-durable path directly;
-- `promote` returns the promoted path under `memory/scopes/team/` plus an `eventId` — the audit event;
-- `search` and `read` return JSON whose `citation` field points at the exact Markdown file behind the answer.
-
-Clean up the demo space when done:
-
-```bash
 npx ihow-memory@next reset --space demo
 ```
 
-One-command version of the same proof, in a throwaway space:
-
-```bash
-npx ihow-memory@next proof
-```
-
-### 4. Resume without re-briefing — the payoff
-
-After a `/clear`, or in a brand-new session, pick up the previous session's work instead of re-explaining it:
-
-```bash
-npx ihow-memory@next continue            # or pass a repo keyword: continue <name>
-```
-
-`continue` finds the project you were in (from the files you edited last session) and prints a handoff: the project's **live git anchors** — branch / HEAD / dirty, the only facts — plus the previous session's own summary, quoted and marked **UNVERIFIED**. The receiver re-checks those anchors against the live repo before trusting anything: **GREEN** (they match) → continue smoothly with a small step; **RED** (they conflict, or the narrative asks for a risky/irreversible action) → stop and diagnose. In Claude Code you can simply say "继续" — a fresh session even reminds you it can resume.
+Without `--no-auto-promote`, a clean write can auto-promote into a durable yellow tier; secrets and falsified anchors are still blocked. Search/read results cite the exact Markdown source, and promote creates an audit event.
 
 ### Updating
 
