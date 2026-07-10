@@ -336,6 +336,214 @@ function mcpServerSpec(
   };
 }
 
+type NormalizedMcpSpec = {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  envVars: string[];
+};
+
+function normalizeMcpSpec(value: unknown): NormalizedMcpSpec | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as { command?: unknown; args?: unknown; env?: unknown; env_vars?: unknown; envVars?: unknown };
+  if (typeof candidate.command !== 'string') return null;
+  if (candidate.args !== undefined && !Array.isArray(candidate.args)) return null;
+  const args = (candidate.args || []).map((arg) => typeof arg === 'string' ? arg : String(arg));
+  const env: Record<string, string> = {};
+  if (candidate.env !== undefined && candidate.env !== null) {
+    if (typeof candidate.env !== 'object' || Array.isArray(candidate.env)) return null;
+    for (const [key, raw] of Object.entries(candidate.env as Record<string, unknown>)) {
+      if (typeof raw !== 'string') return null;
+      env[key] = raw;
+    }
+  }
+  const rawEnvVars = candidate.env_vars ?? candidate.envVars ?? [];
+  if (!Array.isArray(rawEnvVars)) return null;
+  const envVars = rawEnvVars.map((key) => typeof key === 'string' ? key : String(key)).sort();
+  return {
+    command: candidate.command,
+    args,
+    env: Object.fromEntries(Object.entries(env).sort(([a], [b]) => a.localeCompare(b))),
+    envVars,
+  };
+}
+
+function desiredMcpSpec(
+  spec: { command: string; args: string[] },
+  env: Record<string, string> = {},
+): NormalizedMcpSpec {
+  return normalizeMcpSpec({ command: spec.command, args: spec.args, env, envVars: [] })!;
+}
+
+function parseClaudeMcpGet(stdout: string, desired: NormalizedMcpSpec): NormalizedMcpSpec | null {
+  const command = stdout.match(/^\s*Command:\s*(.*)$/m)?.[1];
+  const renderedArgs = stdout.match(/^\s*Args:\s*(.*)$/m)?.[1] ?? '';
+  if (command === undefined) return null;
+  const env: Record<string, string> = {};
+  const envBlock = stdout.match(/^\s*Environment:\s*\n((?:\s{4}.*\n?)*)/m)?.[1] || '';
+  for (const line of envBlock.split(/\r?\n/)) {
+    const assignment = line.trim();
+    if (!assignment || !assignment.includes('=')) continue;
+    const split = assignment.indexOf('=');
+    env[assignment.slice(0, split)] = assignment.slice(split + 1);
+  }
+  // Claude's human output does not quote argument boundaries. Only treat it as an exact match when
+  // its rendered form equals the desired argv; otherwise conservatively replace the entry.
+  if (command === desired.command && renderedArgs === desired.args.join(' ')) {
+    return normalizeMcpSpec({ command, args: desired.args, env, envVars: [] });
+  }
+  return normalizeMcpSpec({ command, args: renderedArgs ? [renderedArgs] : [], env, envVars: [] });
+}
+
+function claudeConfigPath(): string {
+  const configuredDir = process.env.CLAUDE_CONFIG_DIR?.trim();
+  return path.join(configuredDir || os.homedir(), '.claude.json');
+}
+
+function readClaudeUserMcpSpec(): NormalizedMcpSpec | null {
+  try {
+    const config = JSON.parse(readFileSync(claudeConfigPath(), 'utf8')) as {
+      mcpServers?: Record<string, unknown>;
+    };
+    return normalizeMcpSpec(config.mcpServers?.['ihow-memory']);
+  } catch {
+    return null;
+  }
+}
+
+function parseCodexMcpGet(stdout: string): NormalizedMcpSpec | null {
+  try {
+    const parsed = JSON.parse(stdout) as { transport?: unknown };
+    return normalizeMcpSpec(parsed.transport);
+  } catch {
+    return null;
+  }
+}
+
+function parseYamlScalar(raw: string): string {
+  const value = raw.trim();
+  if (value.startsWith('"')) {
+    try { return JSON.parse(value) as string; } catch { return value.slice(1, -1); }
+  }
+  if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1).replace(/''/g, "'");
+  return value.replace(/\s+#.*$/, '').trim();
+}
+
+function parseYamlFlowList(raw: string): string[] | null {
+  const value = raw.trim();
+  if (!value.startsWith('[') || !value.endsWith(']')) return null;
+  const body = value.slice(1, -1).trim();
+  if (!body) return [];
+  const items: string[] = [];
+  let current = '';
+  let quote = '';
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (quote) {
+      current += char;
+      if (char === quote && (quote === "'" || body[index - 1] !== '\\')) quote = '';
+    } else if (char === '"' || char === "'") {
+      quote = char;
+      current += char;
+    } else if (char === ',') {
+      items.push(parseYamlScalar(current));
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  items.push(parseYamlScalar(current));
+  return items;
+}
+
+function parseHermesMcpConfig(raw: string): NormalizedMcpSpec | null {
+  try {
+    const parsed = JSON.parse(raw) as { mcp_servers?: Record<string, unknown> };
+    return normalizeMcpSpec(parsed.mcp_servers?.['ihow-memory']);
+  } catch { /* config.yaml is normally YAML; JSON support keeps the parser hermetic-test friendly */ }
+
+  const lines = raw.split(/\r?\n/);
+  const indent = (line: string): number => line.match(/^\s*/)?.[0].length || 0;
+  const keyOf = (line: string): string | null => {
+    const match = line.trim().match(/^((?:"(?:\\.|[^"])*")|(?:'(?:''|[^'])*')|[^:]+):(?:\s|$)/);
+    return match ? parseYamlScalar(match[1]) : null;
+  };
+  const mcpIndex = lines.findIndex((line) => keyOf(line) === 'mcp_servers');
+  if (mcpIndex < 0) return null;
+  const mcpIndent = indent(lines[mcpIndex]);
+  let serverIndex = -1;
+  for (let index = mcpIndex + 1; index < lines.length; index += 1) {
+    if (!lines[index].trim() || lines[index].trim().startsWith('#')) continue;
+    if (indent(lines[index]) <= mcpIndent) break;
+    if (keyOf(lines[index]) === 'ihow-memory') { serverIndex = index; break; }
+  }
+  if (serverIndex < 0) return null;
+  const serverIndent = indent(lines[serverIndex]);
+  let command: string | undefined;
+  let args: string[] = [];
+  const env: Record<string, string> = {};
+  for (let index = serverIndex + 1; index < lines.length;) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) { index += 1; continue; }
+    const fieldIndent = indent(line);
+    if (fieldIndent <= serverIndent) break;
+    const match = trimmed.match(/^([^:]+):(?:\s*(.*))?$/);
+    if (!match) { index += 1; continue; }
+    const field = parseYamlScalar(match[1]);
+    const value = match[2] || '';
+    if (field === 'command') {
+      command = parseYamlScalar(value);
+      index += 1;
+      continue;
+    }
+    if (field === 'args') {
+      const flow = parseYamlFlowList(value);
+      if (flow) {
+        args = flow;
+        index += 1;
+        continue;
+      }
+      args = [];
+      index += 1;
+      while (index < lines.length) {
+        const item = lines[index];
+        const itemTrimmed = item.trim();
+        if (!itemTrimmed || itemTrimmed.startsWith('#')) { index += 1; continue; }
+        if (indent(item) < fieldIndent || !itemTrimmed.startsWith('- ')) break;
+        args.push(parseYamlScalar(itemTrimmed.slice(2)));
+        index += 1;
+      }
+      continue;
+    }
+    if (field === 'env') {
+      index += 1;
+      while (index < lines.length) {
+        const envLine = lines[index];
+        const envTrimmed = envLine.trim();
+        if (!envTrimmed || envTrimmed.startsWith('#')) { index += 1; continue; }
+        if (indent(envLine) <= fieldIndent) break;
+        const envMatch = envTrimmed.match(/^([^:]+):(?:\s*(.*))?$/);
+        if (!envMatch) break;
+        env[parseYamlScalar(envMatch[1])] = parseYamlScalar(envMatch[2] || '');
+        index += 1;
+      }
+      continue;
+    }
+    index += 1;
+  }
+  return command === undefined ? null : normalizeMcpSpec({ command, args, env, envVars: [] });
+}
+
+function hermesConfigPath(): string {
+  const configuredHome = process.env.HERMES_HOME?.trim();
+  return path.join(configuredHome || path.join(os.homedir(), '.hermes'), 'config.yaml');
+}
+
+function readHermesMcpSpec(): NormalizedMcpSpec | null {
+  try { return parseHermesMcpConfig(readFileSync(hermesConfigPath(), 'utf8')); } catch { return null; }
+}
+
 // Safe direct-write for runtimes without an official CLI (cursor), or as a claude-cli fallback.
 // Guards: distinguish ENOENT (new file) vs parse-failure (refuse to overwrite — would destroy the
 // user's config) / backup existing / atomic temp+rename.
@@ -428,12 +636,33 @@ function connectViaClaudeCli(
   options: { dryRun?: boolean },
 ): Record<string, unknown> | null {
   if (!commandExists('claude')) return null;
-  const exists = spawnSync('claude', ['mcp', 'get', 'ihow-memory'], { encoding: 'utf8' }).status === 0;
+  const get = spawnSync('claude', ['mcp', 'get', 'ihow-memory'], { encoding: 'utf8' });
+  const exists = get.status === 0;
+  const desired = desiredMcpSpec(spec);
+  const existing = exists
+    ? readClaudeUserMcpSpec() || parseClaudeMcpGet(get.stdout || '', desired)
+    : null;
+  const unchanged = existing !== null && isDeepStrictEqual(existing, desired);
   if (options.dryRun) {
-    return { ok: true, runtime: 'claude-code', method: 'official-cli:claude', alreadyExists: exists, dryRun: true };
+    return {
+      ok: true, runtime: 'claude-code', method: 'official-cli:claude',
+      alreadyExists: exists, unchanged, changed: !unchanged, dryRun: true,
+    };
   }
-  // idempotent: add-json errors on an existing name, so remove first, then re-add with the latest spec
-  if (exists) spawnSync('claude', ['mcp', 'remove', 'ihow-memory', '--scope', 'user'], { encoding: 'utf8' });
+  if (unchanged) {
+    return {
+      ok: true, runtime: 'claude-code', method: 'official-cli:claude',
+      target: `${claudeConfigPath()} (claude mcp add-json --scope user)`,
+      alreadyExists: true, unchanged: true, changed: false, replaced: false,
+    };
+  }
+  // add-json errors on an existing name. Replace only when the normalized command/argv/env differ.
+  if (exists) {
+    const remove = spawnSync('claude', ['mcp', 'remove', 'ihow-memory', '--scope', 'user'], { encoding: 'utf8' });
+    if (remove.status !== 0) {
+      throw new Error(`claude_mcp_remove_failed: ${(remove.stderr || remove.stdout || '').slice(0, 300)}`);
+    }
+  }
   const json = JSON.stringify({ type: 'stdio', command: spec.command, args: spec.args });
   const add = spawnSync('claude', ['mcp', 'add-json', '--scope', 'user', 'ihow-memory', json], { encoding: 'utf8' });
   if (add.status !== 0) {
@@ -441,12 +670,13 @@ function connectViaClaudeCli(
   }
   return {
     ok: true, runtime: 'claude-code', method: 'official-cli:claude',
-    target: '~/.claude.json (claude mcp add-json --scope user)', replaced: exists,
+    target: `${claudeConfigPath()} (claude mcp add-json --scope user)`,
+    alreadyExists: exists, unchanged: false, changed: true, replaced: exists,
   };
 }
 
 // codex uses the official CLI (codex mcp add). It has no cwd field -> rely on the absolute entry path.
-// An existing entry must NOT be bare-added (codex would drop the .tools subsection) -> remove then add.
+// `mcp get --json` gives an exact command/argv/env comparison; only a differing entry is removed/re-added.
 function connectViaCodexCli(
   spec: { command: string; args: string[] },
   options: { dryRun?: boolean },
@@ -454,18 +684,38 @@ function connectViaCodexCli(
   if (!commandExists('codex')) {
     throw new Error('codex_cli_not_found: install the Codex CLI to connect codex (or run init for manual TOML).');
   }
-  const exists = spawnSync('codex', ['mcp', 'get', 'ihow-memory'], { encoding: 'utf8' }).status === 0;
+  const get = spawnSync('codex', ['mcp', 'get', 'ihow-memory', '--json'], { encoding: 'utf8' });
+  const exists = get.status === 0;
+  const desired = desiredMcpSpec(spec);
+  const existing = exists ? parseCodexMcpGet(get.stdout || '') : null;
+  const unchanged = existing !== null && isDeepStrictEqual(existing, desired);
   if (options.dryRun) {
-    return { ok: true, runtime: 'codex', method: 'official-cli:codex', alreadyExists: exists, dryRun: true };
+    return {
+      ok: true, runtime: 'codex', method: 'official-cli:codex',
+      alreadyExists: exists, unchanged, changed: !unchanged, dryRun: true,
+    };
   }
-  if (exists) spawnSync('codex', ['mcp', 'remove', 'ihow-memory'], { encoding: 'utf8' });
+  if (unchanged) {
+    return {
+      ok: true, runtime: 'codex', method: 'official-cli:codex',
+      target: `${codexConfigLabel('config.toml')} (codex mcp add)`,
+      alreadyExists: true, unchanged: true, changed: false, replaced: false,
+    };
+  }
+  if (exists) {
+    const remove = spawnSync('codex', ['mcp', 'remove', 'ihow-memory'], { encoding: 'utf8' });
+    if (remove.status !== 0) {
+      throw new Error(`codex_mcp_remove_failed: ${(remove.stderr || remove.stdout || '').slice(0, 300)}`);
+    }
+  }
   const add = spawnSync('codex', ['mcp', 'add', 'ihow-memory', '--', spec.command, ...spec.args], { encoding: 'utf8' });
   if (add.status !== 0) {
     throw new Error(`codex_mcp_add_failed: ${(add.stderr || add.stdout || '').slice(0, 300)}`);
   }
   return {
     ok: true, runtime: 'codex', method: 'official-cli:codex',
-    target: `${codexConfigLabel('config.toml')} (codex mcp add)`, replaced: exists,
+    target: `${codexConfigLabel('config.toml')} (codex mcp add)`,
+    alreadyExists: exists, unchanged: false, changed: true, replaced: exists,
   };
 }
 
@@ -473,7 +723,8 @@ function connectViaCodexCli(
 // is the safe path (no YAML writer needed). `hermes mcp add --args` is argparse nargs="*", which would
 // collide with our --memory-root/--state-root flags, so pass the roots via --env (the server reads
 // MEMORY_ROOT / IHOW_MEMORY_STATE_ROOT) and let --args carry only the server entry path. No `mcp get`;
-// use `mcp list` to check, remove-then-add for idempotency. timeout guards against any interactive hang.
+// use `mcp list` for registration and parse the existing config.yaml spec before deciding to replace it.
+// timeout guards against any interactive hang.
 function connectViaHermesCli(
   workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
   spec: { command: string; args: string[] },
@@ -484,17 +735,38 @@ function connectViaHermesCli(
   }
   const SP = { encoding: 'utf8' as const, timeout: 20000 };
   const exists = /\bihow-memory\b/.test(spawnSync('hermes', ['mcp', 'list'], SP).stdout || '');
-  if (options.dryRun) {
-    return { ok: true, runtime: 'hermes', method: 'official-cli:hermes', alreadyExists: exists, dryRun: true };
-  }
-  if (exists) spawnSync('hermes', ['mcp', 'remove', 'ihow-memory'], SP);
   const serverEntry = spec.args[0];
+  const desired = desiredMcpSpec(
+    { command: spec.command, args: [serverEntry] },
+    { MEMORY_ROOT: workspace.memoryDir, IHOW_MEMORY_STATE_ROOT: workspace.root },
+  );
+  const existing = exists ? readHermesMcpSpec() : null;
+  const unchanged = existing !== null && isDeepStrictEqual(existing, desired);
+  if (options.dryRun) {
+    return {
+      ok: true, runtime: 'hermes', method: 'official-cli:hermes',
+      alreadyExists: exists, unchanged, changed: !unchanged, dryRun: true,
+    };
+  }
+  if (unchanged) {
+    return {
+      ok: true, runtime: 'hermes', method: 'official-cli:hermes',
+      target: `${hermesConfigPath()} (hermes mcp add + gateway start)`,
+      alreadyExists: true, unchanged: true, changed: false, replaced: false,
+    };
+  }
+  if (exists) {
+    const remove = spawnSync('hermes', ['mcp', 'remove', 'ihow-memory'], SP);
+    if (remove.status !== 0) {
+      throw new Error(`hermes_mcp_remove_failed: ${(remove.stderr || remove.stdout || '').slice(0, 300)}`);
+    }
+  }
+  // argparse declares --args as REMAINDER, so --env must come first and --args must be last.
   const add = spawnSync('hermes', [
     'mcp', 'add', 'ihow-memory',
     '--command', spec.command,
+    '--env', `MEMORY_ROOT=${workspace.memoryDir}`, `IHOW_MEMORY_STATE_ROOT=${workspace.root}`,
     '--args', serverEntry,
-    '--env', `MEMORY_ROOT=${workspace.memoryDir}`,
-    '--env', `IHOW_MEMORY_STATE_ROOT=${workspace.root}`,
   ], SP);
   if (add.status !== 0) {
     throw new Error(`hermes_mcp_add_failed: ${(add.stderr || add.stdout || '').slice(0, 300)}`);
@@ -505,7 +777,11 @@ function connectViaHermesCli(
   // `gateway start` can't block setup for the full timeout and then get killed; verify-after-
   // connect catches whether it actually took effect.
   try { spawn('hermes', ['gateway', 'start'], { detached: true, stdio: 'ignore' }).unref(); } catch { /* best-effort */ }
-  return { ok: true, runtime: 'hermes', method: 'official-cli:hermes', target: '~/.hermes/config.yaml (hermes mcp add + gateway start)', replaced: exists };
+  return {
+    ok: true, runtime: 'hermes', method: 'official-cli:hermes',
+    target: `${hermesConfigPath()} (hermes mcp add + gateway start)`,
+    alreadyExists: exists, unchanged: false, changed: true, replaced: exists,
+  };
 }
 
 async function connectRuntime(
