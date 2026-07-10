@@ -45,8 +45,16 @@ const state = load();
 if (argv[0] !== 'mcp') process.exit(0);
 if (argv[1] === 'get') {
   if (!state) process.exit(1);
+  const scope = state.scope || 'user';
+  const scopeLabel = scope === 'project'
+    ? 'Project config (shared via .mcp.json)'
+    : scope === 'local'
+      ? 'Local config (private to this project)'
+      : scope === 'unknown'
+        ? 'Inherited configuration (scope unavailable)'
+        : 'User config (available in all your projects)';
   console.log('ihow-memory:');
-  console.log('  Scope: ' + (process.env.IHOW_CLAUDE_MCP_SCOPE || 'User config (available in all your projects)'));
+  console.log('  Scope: ' + scopeLabel);
   console.log('  Status: ✓ Connected');
   console.log('  Type: stdio');
   console.log('  Command: ' + state.command);
@@ -62,6 +70,12 @@ if (argv[1] === 'list') {
   process.exit(0);
 }
 if (argv[1] === 'remove') {
+  const scopeIndex = argv.indexOf('--scope');
+  const requestedScope = scopeIndex >= 0 ? argv[scopeIndex + 1] : null;
+  if (requestedScope === 'user' && state?.scope && state.scope !== 'user') {
+    process.stderr.write('No user-scoped MCP server found with name: ihow-memory\\n');
+    process.exit(1);
+  }
   log('remove', state);
   save(null);
   const configPath = path.join(process.env.HOME, '.claude.json');
@@ -76,7 +90,7 @@ if (argv[1] === 'add-json') {
   const spec = JSON.parse(argv.at(-1));
   const normalized = { command: spec.command, args: spec.args || [], env: spec.env || {} };
   log('add', normalized);
-  save(normalized);
+  save({ ...normalized, scope: 'user' });
   const configPath = path.join(process.env.HOME, '.claude.json');
   let config = {};
   try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
@@ -262,16 +276,34 @@ test('Claude canonical config missing cannot prove unchanged from ambiguous join
   assertConservativeClaudeReplacement(result, await mutations(fixture.logPath));
 });
 
-test('Claude malformed canonical config plus project/local scope cannot prove user-scope unchanged', async (t) => {
+test('Claude project/local-only entry installs user scope without an invalid user removal', async (t) => {
   const fixture = await makeClaudeFixture(t, 'project-scope');
-  await primeClaudeFixture(fixture);
+  const desired = await primeClaudeFixture(fixture);
+  await fs.writeFile(fixture.statePath, JSON.stringify({ ...desired, scope: 'project' }), 'utf8');
   await fs.writeFile(path.join(fixture.home, '.claude.json'), '{ not readable canonical JSON', 'utf8');
 
-  const result = runJson({
-    ...fixture,
-    extraEnv: { IHOW_CLAUDE_MCP_SCOPE: 'Project config (shared via .mcp.json)' },
-  });
-  assertConservativeClaudeReplacement(result, await mutations(fixture.logPath));
+  const result = runJson(fixture);
+  assert.equal(result.applied, true, 'project-only visibility installs the missing user entry');
+  assert.notEqual(result.unchanged, true, 'project scope never proves user-scope unchanged');
+  assert.equal(result.restart.required, true);
+  assert.deepEqual(result.restart.runtimes, ['claude-code']);
+  assert.deepEqual((await mutations(fixture.logPath)).map((entry) => entry.op), ['add'], 'project-only state skips invalid user removal and adds user scope');
+  assert.equal(JSON.parse(await fs.readFile(fixture.statePath, 'utf8')).scope, 'user', 'stub models a successfully installed user entry');
+});
+
+test('Claude unknown effective scope tolerates a real user-scope-missing result and adds user scope', async (t) => {
+  const fixture = await makeClaudeFixture(t, 'unknown-scope');
+  const desired = await primeClaudeFixture(fixture);
+  await fs.writeFile(fixture.statePath, JSON.stringify({ ...desired, scope: 'unknown' }), 'utf8');
+  await fs.rm(path.join(fixture.home, '.claude.json'), { force: true });
+
+  const result = runJson(fixture);
+  assert.equal(result.applied, true, 'unknown effective scope still completes user installation');
+  assert.notEqual(result.unchanged, true);
+  assert.equal(result.restart.required, true);
+  assert.deepEqual(result.restart.runtimes, ['claude-code']);
+  assert.deepEqual((await mutations(fixture.logPath)).map((entry) => entry.op), ['add'], 'a user-scope-missing remove is tolerated and only user add mutates');
+  assert.equal(JSON.parse(await fs.readFile(fixture.statePath, 'utf8')).scope, 'user');
 });
 
 test('Claude human parser uncertainty performs one replacement and never reports unchanged', async (t) => {

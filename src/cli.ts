@@ -391,6 +391,21 @@ function readClaudeUserMcpSpec(): NormalizedMcpSpec | null {
   }
 }
 
+type ClaudeVisibleScope = 'user' | 'project' | 'local' | 'unknown';
+
+function parseClaudeVisibleScope(stdout: string): ClaudeVisibleScope {
+  const rendered = stdout.match(/^\s*Scope:\s*(.*)$/mi)?.[1]?.trim().toLowerCase() || '';
+  if (rendered.startsWith('user')) return 'user';
+  if (rendered.startsWith('project')) return 'project';
+  if (rendered.startsWith('local')) return 'local';
+  return 'unknown';
+}
+
+function claudeUserScopeMissing(result: { stdout?: string | null; stderr?: string | null }): boolean {
+  const output = `${result.stderr || ''}\n${result.stdout || ''}`;
+  return /no user(?:-scoped| scoped)? mcp server found/i.test(output);
+}
+
 function parseCodexMcpGet(stdout: string): NormalizedMcpSpec | null {
   try {
     const parsed = JSON.parse(stdout) as { transport?: unknown };
@@ -618,6 +633,7 @@ function connectViaClaudeCli(
   if (!commandExists('claude')) return null;
   const get = spawnSync('claude', ['mcp', 'get', 'ihow-memory'], { encoding: 'utf8' });
   const exists = get.status === 0;
+  const visibleScope = exists ? parseClaudeVisibleScope(get.stdout || '') : 'unknown';
   const desired = desiredMcpSpec(spec);
   // `claude mcp get` is human-readable only: argv is space-joined without boundary quoting, the
   // environment listing is not a completeness contract, and the selected scope cannot be proven
@@ -639,10 +655,18 @@ function connectViaClaudeCli(
       alreadyExists: true, unchanged: true, changed: false, replaced: false,
     };
   }
-  // add-json errors on an existing name. Replace only when the normalized command/argv/env differ.
-  if (exists) {
+  // A visible project/local entry does not imply that a removable user entry exists. The real
+  // Claude CLI permits adding the same name at user scope alongside a narrower-scope entry, while
+  // `remove --scope user` fails when only project/local exists. Remove only when canonical config
+  // proves a user entry, the CLI reports user scope, or scope is unknown. Under unknown scope, the
+  // real "No user-scoped MCP server found" result is safe evidence to continue with the user add.
+  let removedUserEntry = false;
+  const shouldTryUserRemove = existing !== null || visibleScope === 'user' || visibleScope === 'unknown';
+  if (exists && shouldTryUserRemove) {
     const remove = spawnSync('claude', ['mcp', 'remove', 'ihow-memory', '--scope', 'user'], { encoding: 'utf8' });
-    if (remove.status !== 0) {
+    if (remove.status === 0) {
+      removedUserEntry = true;
+    } else if (!claudeUserScopeMissing(remove)) {
       throw new Error(`claude_mcp_remove_failed: ${(remove.stderr || remove.stdout || '').slice(0, 300)}`);
     }
   }
@@ -654,7 +678,7 @@ function connectViaClaudeCli(
   return {
     ok: true, runtime: 'claude-code', method: 'official-cli:claude',
     target: `${claudeConfigPath()} (claude mcp add-json --scope user)`,
-    alreadyExists: exists, unchanged: false, changed: true, replaced: exists,
+    alreadyExists: exists, unchanged: false, changed: true, replaced: removedUserEntry,
   };
 }
 
