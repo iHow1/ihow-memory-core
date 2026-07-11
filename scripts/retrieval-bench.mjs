@@ -23,7 +23,6 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { openCore } from '../src/core.ts';
 
 // ── Fixture: in-repo, representative, labeled. Each doc has a stable `id` used as its scope, so a
@@ -96,44 +95,6 @@ function pathMatchesDoc(resultPath, docId) {
   return resultPath.includes(`/scopes/${docId}/`);
 }
 
-// Invoke a vector provider's `index` method directly over its one-shot stdio protocol (identical to
-// src/engine/retrieval.ts → VectorProcessEngine.callProvider), with NO timeout cap. Used only to warm
-// the sidecar before the measured search run — see the call site for why the engine's capped rebuild()
-// can't do this for a slow real model. Returns the provider's reported indexed-doc count.
-function buildSidecarDirect(providerCommand, workspace, vectorModel) {
-  const parts = providerCommand.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((p) => p.replace(/^["']|["']$/g, '')) || [];
-  const [command, ...baseArgs] = parts;
-  if (!command) throw new Error('buildSidecarDirect: empty provider command');
-  const request = {
-    method: 'index',
-    workspace: {
-      root: workspace.root,
-      space: workspace.space,
-      memoryDir: workspace.memoryDir,
-      indexPath: workspace.indexPath,
-      indexManifestPath: workspace.indexManifestPath,
-    },
-    provider: { id: 'vector-gguf', model: vectorModel || null },
-  };
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, [...baseArgs, 'index'], { stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (c) => (stdout += String(c)));
-    child.stderr.on('data', (c) => (stderr += String(c)));
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code !== 0) return reject(new Error(`provider_index_exit_${code}:${stderr.trim().slice(0, 200)}`));
-      try {
-        resolve(JSON.parse(stdout.trim() || '{}'));
-      } catch {
-        reject(new Error('provider_index_invalid_json'));
-      }
-    });
-    child.stdin.end(`${JSON.stringify(request)}\n`);
-  });
-}
-
 // Run the benchmark against the DEFAULT FTS5 engine. Returns the full scorecard (no console output),
 // so tests can assert on it and the CLI can render it.
 //
@@ -159,25 +120,11 @@ export async function runRetrievalBench({ fixture = FIXTURE, engineOptions = nul
     // In semantic mode, re-open the SAME workspace with the vector engine and build its index ONCE.
     const core = semanticMode ? await openCore({ root, space, ...engineOptions }) : seedCore;
     if (semanticMode) {
-      // Build the vector sidecar by invoking the provider's `index` method DIRECTLY (the same one-shot
-      // stdio protocol the engine uses), with NO timeout cap. WHY bypass core.rebuild() here: the engine
-      // applies a single `vectorTimeoutMs` (hard-capped at 30s) to EVERY provider call, including the
-      // long index op. A REAL local embedding model serializes requests, so indexing even ~20 docs can
-      // exceed 30s → the engine SIGTERMs index, the sidecar is never written, and search silently
-      // degrades to FTS-only (a measured 2/5 paraphrase no-op that masquerades as "the lane ran").
-      // Building the sidecar here, uncapped, means the SEARCH + RRF FUSION we then measure is still the
-      // exact real engine path (`core.search` → searchWithEngineFallback → fuseRrf) reading the same
-      // sidecar the engine would. Only the one-time index latency is taken off the engine's stopwatch.
-      // (The architecture-proof oracle indexes in milliseconds, so this is a no-op for it.)
-      //
-      // BEST-EFFORT: a provider that can't even index (broken command, unreachable service) is exactly
-      // the case the honesty guard must catch — don't crash here. Fall back to the engine's own capped
-      // rebuild(); the downstream `semanticActive` check then correctly reports ran:false and no gain.
-      try {
-        await buildSidecarDirect(engineOptions.vectorProviderCommand, core.workspace, engineOptions.vectorModel);
-      } catch {
-        await core.rebuild();
-      }
+      // Build through the product path. index() has its own `vectorIndexTimeoutMs` budget (10 minutes
+      // by default, configurable up to 1 hour), separate from the interactive status/search
+      // `vectorTimeoutMs` (default 1.5s, capped at 30s). Provider identity or readiness alone does not
+      // establish retrieval quality; only the measured before/after delta below can do that.
+      await core.rebuild();
     }
 
     const status = await core.status();
@@ -270,7 +217,8 @@ export async function runRetrievalBench({ fixture = FIXTURE, engineOptions = nul
 //   - `proofKind` MUST be declared by the caller and is echoed into the result so a reader can never
 //     mistake an architecture demo for a model benchmark:
 //       'real-model'        → numbers came from a REAL learned embedding model (e.g. nomic-embed-text
-//                             via the ollama sidecar). The paraphrase gain is a genuine quality signal.
+//                             via the ollama sidecar). Model identity alone implies no quality gain;
+//                             only a positive measured delta supports that conclusion.
 //       'architecture-proof' → numbers came from the controlled synonym-oracle sidecar. The gain proves
 //                             the WIRING (RRF pulls a true-synonym doc into top-K), NOT model quality.
 //   - If the provider never actually ran (unreachable Ollama, bad command), the semantic engine reports
@@ -281,6 +229,7 @@ export async function runSemanticComparison({
   vectorProviderCommand,
   vectorModel = null,
   vectorTimeoutMs = 30000,
+  vectorIndexTimeoutMs = 600000,
   proofKind, // 'real-model' | 'architecture-proof'  (required — no silent default)
 } = {}) {
   if (!vectorProviderCommand) throw new Error('runSemanticComparison: vectorProviderCommand is required');
@@ -291,7 +240,7 @@ export async function runSemanticComparison({
   const ftsOnly = await runRetrievalBench({ fixture });
   const fused = await runRetrievalBench({
     fixture,
-    engineOptions: { engine: 'vector', vectorProviderCommand, vectorModel, vectorTimeoutMs },
+    engineOptions: { engine: 'vector', vectorProviderCommand, vectorModel, vectorTimeoutMs, vectorIndexTimeoutMs },
   });
 
   // Did the semantic lane actually run? If the sidecar fell back to FTS, the two runs would be
@@ -315,9 +264,15 @@ export async function runSemanticComparison({
     };
   }
 
+  const paraphrase = byKindDelta.paraphrase || null;
+  // Stable claim-honesty field: a ready/running provider is necessary but not sufficient. Fallback,
+  // zero delta, and negative delta are all explicitly false.
+  const observedQualityLift = ran && (paraphrase?.delta_hit5 || 0) > 0;
+
   return {
     proofKind, // 'real-model' | 'architecture-proof' — the load-bearing honesty label
     ran, // false ⇒ the semantic lane did NOT run (fallback); deltas are not trustworthy
+    observedQualityLift,
     semanticEngine: { id: fused.engine.id, model: fused.engine.model, fallback: fused.engine.fallback, lastError: fused.engine.lastError },
     fixture: ftsOnly.fixture,
     fts: { metrics: ftsOnly.metrics, byKind: ftsOnly.byKind },
@@ -329,11 +284,11 @@ export async function runSemanticComparison({
     },
     byKindDelta,
     // The headline this whole task is about: paraphrase/synonym recall before vs after.
-    paraphrase: byKindDelta.paraphrase || null,
+    paraphrase,
   };
 }
 
-function renderComparison(cmp) {
+export function renderComparison(cmp) {
   const lines = [];
   const bar = '═'.repeat(78);
   const isReal = cmp.proofKind === 'real-model';
@@ -341,7 +296,7 @@ function renderComparison(cmp) {
   lines.push('iHow Memory — semantic-lane comparison · DEFAULT FTS5  vs  FTS5 + semantic (RRF-fused)');
   lines.push(
     isReal
-      ? 'mode: REAL-MODEL BENCHMARK — numbers are a genuine retrieval-quality signal from a learned model'
+      ? 'mode: REAL-MODEL BENCHMARK — quality conclusions require a positive measured fixture delta'
       : 'mode: ARCHITECTURE PROOF — numbers prove the RRF WIRING, NOT model quality (real-model number is separate)',
   );
   lines.push(bar);
@@ -376,16 +331,16 @@ function renderComparison(cmp) {
       `HEADLINE — paraphrase / synonym recall@5: ${p.fts_hit5}/${p.n}  →  ${p.fused_hit5}/${p.n}  (${sign(p.delta_hit5)})`,
     );
   }
-  lines.push(
-    isReal
-      ? 'This is a REAL-MODEL gain on a labeled fixture: the learned embedding lane recovers paraphrase'
-      : 'This is an ARCHITECTURE PROOF: a controlled synonym oracle shows RRF pulls the true-synonym doc',
-  );
-  lines.push(
-    isReal
-      ? 'hits that share no surface tokens with the answer — the gap pure FTS5 leaves open.'
-      : 'into top-K. It is NOT a model-quality number — for that, run the real-model (ollama) comparison.',
-  );
+  if (!isReal) {
+    lines.push('This is an ARCHITECTURE PROOF: a controlled synonym oracle shows RRF pulls the true-synonym doc');
+    lines.push('into top-K. It proves wiring only and is NOT a model-quality number.');
+  } else if (cmp.observedQualityLift) {
+    lines.push('Observed real-model lift on this labeled fixture: the measured paraphrase recall@5 delta is positive.');
+    lines.push('This result is fixture/model/version specific; re-measure before making broader quality claims.');
+  } else {
+    lines.push('The real model ran successfully, but this fixture shows no observed lift in paraphrase recall@5.');
+    lines.push('Provider readiness and real-model identity alone do not support a retrieval-quality claim.');
+  }
   lines.push(bar);
   return lines.join('\n');
 }
@@ -431,7 +386,7 @@ function flagValue(name) {
 //   node scripts/retrieval-bench.mjs --semantic "node examples/synonym-oracle-provider.mjs" \
 //        --proof architecture
 //
-//   # Real-model benchmark (needs local Ollama + `ollama pull nomic-embed-text` — REAL quality gain):
+//   # Real-model benchmark (needs local Ollama; reports quality lift only from an observed delta):
 //   node scripts/retrieval-bench.mjs --semantic "node examples/ollama-embedding-provider.mjs" \
 //        --proof real --model nomic-embed-text
 if (import.meta.url === `file://${process.argv[1]}`) {

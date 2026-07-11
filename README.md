@@ -155,7 +155,7 @@ The headline numbers are the ones you actually get out of the box — the **defa
 
 This is a deterministic, stranger-reproducible harness: `node scripts/retrieval-bench.mjs` seeds a labeled fixture through the same `write → promote → search` path the product uses and scores R@5/R@10/MRR + tokens-per-query, with no cloud, no LLM and no third-party deps.
 
-**The honest floor: paraphrase recall is the weak spot.** Keyword and partial-keyword queries recall well (15/15 in the fixture), but **paraphrase / synonym queries that share no surface tokens score 2/5 = 0.40** — a reworded query exposes a lexical engine's lack of semantics. That gap is exactly what an optional semantic provider is meant to lift.
+**The honest floor: paraphrase recall is the weak spot.** Keyword and partial-keyword queries recall well (15/15 in the fixture), but **paraphrase / synonym queries that share no surface tokens score 2/5 = 0.40** — a reworded query exposes a lexical engine's lack of semantics. An optional semantic provider is intended to address that gap, but its quality must be measured rather than inferred from provider readiness or model identity.
 
 The fixture above is a **self-authored 20-doc / 20-query** set. So that the numbers don't rest on our own data, there is also a stranger-reproducible run on a **public, MIT-licensed standard dataset** — LongMemEval (oracle variant, [arXiv:2410.10813](https://arxiv.org/abs/2410.10813)) — on the **same default FTS5 binary**:
 
@@ -187,7 +187,7 @@ npx ihow-memory@next enable-semantic    # probes Ollama; writes <space>/.runtime
 # re-run `setup`/`connect` + restart your runtime to apply · reverse anytime: disable-semantic
 ```
 
-`enable-semantic` **refuses** (non-zero, with guidance) if Ollama is unreachable or the model isn't pulled — it never enables a lane that would only fall back. `doctor` then reports semantic health as a **warning, never a failure** (the lane is additive). On the in-repo fixture this lifts paraphrase recall from **2/5 → 5/5** (fused R@5 0.85 → 1.0); the default binary stays lexical-only with `capabilities.semantic=false` until you opt in.
+`enable-semantic` **refuses** (non-zero, with guidance) if Ollama is unreachable or the model isn't pulled — it never enables a lane that would only fall back. `doctor` then reports semantic health as a **warning, never a failure** (the lane is additive). A successful `nomic-embed-text` probe means the ranking sidecar can run; it does **not** establish a quality lift. In the current 20-doc / 20-query fixture recheck, the real Ollama provider ran without fallback but paraphrase recall stayed **2/5 → 2/5** and headline metric deltas were **0**. Prompt recall therefore remains fail-closed for this model because it has no measured semantic floor. The separately labeled, deterministic synonym-oracle run reaches **2/5 → 5/5** (R@5 **0.85 → 1.0**), but that is a controlled **architecture proof of RRF wiring, not learned-model quality evidence**. The default binary stays lexical-only with `capabilities.semantic=false` until you opt in.
 
 Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md).
 

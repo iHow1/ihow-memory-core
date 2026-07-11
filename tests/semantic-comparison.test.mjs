@@ -10,16 +10,17 @@
 //     benchmark);
 //   - if the provider never ran (fallback), `ran:false` and no gain is claimed;
 //   - keyword/partial recall is NOT degraded by adding the lane (fusion is additive, not destructive).
-// The REAL-MODEL number (ollama + nomic-embed-text) is intentionally NOT asserted here — it depends on
-// a running local service and is documented/reproduced via the CLI, not the test suite.
+// A live REAL-MODEL run (ollama + nomic-embed-text) is intentionally NOT asserted here — it depends on
+// a running local service. A deterministic ready-provider double pins ran:true + zero-delta behavior.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runSemanticComparison } from '../scripts/retrieval-bench.mjs';
+import { renderComparison, runSemanticComparison } from '../scripts/retrieval-bench.mjs';
 
 const EXAMPLES = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'examples');
 const ORACLE_CMD = `node ${path.join(EXAMPLES, 'synonym-oracle-provider.mjs')}`;
+const ZERO_DELTA_CMD = `node ${path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'ready-zero-delta-provider.mjs')}`;
 
 test('semantic comparison: refuses to run without an honest proofKind label', async () => {
   await assert.rejects(
@@ -60,6 +61,7 @@ test('ARCHITECTURE PROOF: the synonym-oracle lane lifts paraphrase recall via RR
   // THE PROOF: with the semantic lane fused in, every paraphrase query is recalled.
   assert.equal(cmp.fused.byKind.paraphrase.hit5, 5, 'fused paraphrase recall@5 reaches 5/5 — RRF pulled the synonym docs into top-K');
   assert.equal(cmp.paraphrase.delta_hit5, 3, 'the paraphrase delta is +3 (the three FTS-missed synonym queries)');
+  assert.equal(cmp.observedQualityLift, true, 'a running provider with positive paraphrase delta marks observed lift');
   assert.ok(cmp.delta.recall_at_5 > 0, 'overall recall@5 strictly improves');
 });
 
@@ -83,7 +85,26 @@ test('HONESTY GUARD: a provider that falls back to FTS reports ran:false and cla
     vectorTimeoutMs: 2000,
   });
   assert.equal(cmp.ran, false, 'a non-running provider must surface ran:false (no fake gain)');
+  assert.equal(cmp.observedQualityLift, false, 'fallback can never count as observed quality lift');
   // and the would-be deltas, if anyone reads them, are zero — the two runs were the same FTS floor.
   assert.equal(cmp.delta.recall_at_5, 0, 'a fallback run shows zero delta — there is nothing to claim');
   assert.equal(cmp.paraphrase.delta_hit5, 0, 'paraphrase recall is unchanged when the lane never ran');
+});
+
+test('HONESTY GUARD: a real-model lane can run with zero delta without a false quality claim', async () => {
+  // This deterministic provider double is ready, indexes successfully, and returns no semantic hits.
+  // It exercises the real-model claim branch without Ollama/network/model downloads.
+  const cmp = await runSemanticComparison({
+    vectorProviderCommand: ZERO_DELTA_CMD,
+    vectorModel: 'deterministic-zero-delta-model',
+    proofKind: 'real-model',
+  });
+
+  assert.equal(cmp.ran, true, 'the provider is ready/running rather than a fallback');
+  assert.equal(cmp.semanticEngine.fallback, false);
+  assert.equal(cmp.paraphrase.delta_hit5, 0, 'the running lane produces no paraphrase improvement');
+  assert.equal(cmp.observedQualityLift, false, 'zero paraphrase delta must be false');
+  const output = renderComparison(cmp);
+  assert.match(output, /no observed lift/i);
+  assert.doesNotMatch(output, /\bgain\b|recovers paraphrase/i);
 });
