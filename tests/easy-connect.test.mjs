@@ -121,10 +121,9 @@ test('--easy --no-install-hook respects the explicit opt-out (skill yes, hook no
   assert.equal(await exists(path.join(proj, '.claude', 'settings.local.json')), false, 'hook opt-out respected');
 });
 
-test('connect --easy wires recall by default (reviewed tier); --no-recall opts out', async (t) => {
-  // 2026-06-26 recall-quality eval (reviewed ~88% signal / 0 harmful) relaxed the 2026-06-17 default-off
-  // guard: recall (UserPromptSubmit, reviewed tier only) now installs by default on the easy path, and
-  // --no-recall skips it. The machine-judged auto tier still stays opt-in (IHOW_RECALL_INCLUDE_AUTO=1).
+test('connect --easy wires recall by default; --no-recall opts out', async (t) => {
+  // Recall (UserPromptSubmit) installs by default on the easy path; reviewed memory is preferred and
+  // guarded relevant auto soft facts may surface. --no-recall skips hook installation.
   const proj = await mkdtempReal('ihow-proj-');
   const home = await mkdtempReal('ihow-home-');
   const bin = await makeClaudeShim();

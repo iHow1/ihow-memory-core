@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 iHow Memory
 //
-// Recall (UserPromptSubmit hook) tests — the OpenClaw-GATED reading path. Recall is default-off and
-// safety-first; these lock the contract:
+// Recall (UserPromptSubmit hook) tests — the shared prompt-recall reading path. Recall installs by
+// default and is safety-first; these lock the contract:
 //   - SAFETY: injects ONLY curated/promoted memory; NEVER the low-weight journal/floor lanes (the
 //     recall-harm guard) — even when a low-weight entry matches the query.
 //   - bounded (top-N), valid UserPromptSubmit additionalContext JSON, never blocks, never throws.
 //   - no-op (no output) when there is no relevant curated memory.
 //   - kill-switch: IHOW_RECALL_OFF disables injection.
-//   - DEFAULT-OFF install: plain `install-hook` adds NO UserPromptSubmit hook; only `--recall` does.
+//   - DEFAULT-ON install: plain `install-hook` adds UserPromptSubmit; `--no-recall` skips it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -40,7 +40,7 @@ async function seed(root, space) {
   cli(['journal', 'passing aside: someone mentioned zetaframework once, unverified low-weight note.', '--actor', 'claude-code-hook'], root, space);
 }
 
-test('recall: NEVER injects an unreviewed auto-promoted entry (machine-judged, not human-reviewed)', async (t) => {
+test('recall: ambient auto status is held back while reviewed memory still surfaces', async (t) => {
   const root = await mkdtempReal('ihow-recall-auto-');
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
   const space = 'h';
@@ -95,7 +95,7 @@ test('recall: a forged provenance_kind:anchor file (no engine promote event) is 
   cli(['reindex'], root, space);
   const prompt = 'remind me about the zetaframework, kappaframework and muframework decisions';
 
-  // DEFAULT (no opt-in): both auto entries excluded (the OpenClaw guard), reviewed entry tagged 🟢.
+  // DEFAULT: both status-shaped auto entries are excluded; the reviewed entry surfaces seamlessly.
   const off = recall(prompt, root, space);
   const offCtx = off.stdout.trim() ? JSON.parse(off.stdout).hookSpecificOutput.additionalContext : '';
   assert.ok(!/🟢|🟡/.test(offCtx), 'C2 seamless: no tier-emoji badge in the recall block');
@@ -244,10 +244,10 @@ test('recall: bounded — at most 3 curated entries injected, within the char bu
   assert.ok(ctx.length <= 1200, 'within the char budget');
 });
 
-test('install: recall is DEFAULT-ON (reviewed tier) — plain install-hook adds it; --no-recall skips it', async (t) => {
+test('install: recall is DEFAULT-ON (reviewed-first + guarded auto) — plain install-hook adds it; --no-recall skips it', async (t) => {
   const userPromptHooks = (s) => (s.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
 
-  // default: recall hook IS installed (reviewed tier; basis = 2026-06-26 recall-quality eval, ~88% signal / 0 harmful)
+  // default: recall hook IS installed; the runtime selector prefers reviewed memory and gates auto facts.
   const proj = await mkdtempReal('ihow-proj-');
   t.after(async () => { await fs.rm(proj, { recursive: true, force: true }); });
   const dest = path.join(proj, '.claude', 'settings.local.json');
@@ -385,7 +385,7 @@ test('recall: an ENGINE-anchored auto entry (real promote event) IS recalled und
 
   // create the entry through the ENGINE so a memory.promoted event with provenanceKind:anchor is recorded
   const core = await openCore({ root, space });
-  const r = await core.write_candidate({ text: 'The omegaframework migration was anchored and verified on this checkout.', sourceAgent: 'agent-auto', metadata: { repoPath: repo, head } });
+  const r = await core.write_candidate({ text: 'The team prefers omegaframework for migration tooling on this checkout.', sourceAgent: 'agent-auto', metadata: { repoPath: repo, head } });
   assert.equal(r.autoPromote.tier, 'verified', 'a live-verified anchor lands verified');
   cli(['reindex'], root, space);
 
@@ -649,10 +649,9 @@ test('recall (knob-①): a status-claim auto entry surfaces ONLY on an explicit 
 
 // --- Red-team blocker (2026-07-01): the bypass-prior gate holds on EVERY auto path — including the
 // explicit IHOW_RECALL_INCLUDE_AUTO + engine-anchored admit, which live-reproduced injecting a
-// "skip approval" note before the fix. An anchor proves repo state, not behavioral safety. The anchored
-// opt-in stays otherwise unguarded BY DESIGN (a status claim with a live-verified anchor is engine-checked
-// provenance) — both sides locked here. ---
-test('recall (red-team): an ANCHORED bypass-prior entry is NOT injected even under IHOW_RECALL_INCLUDE_AUTO=1; an anchored status claim IS (by design)', async (t) => {
+// "skip approval" note before the fix. An anchor proves repo state, not behavioral safety or status intent.
+// Anchored status still requires an explicit status prompt; both sides are locked here. ---
+test('recall (red-team): anchored auto cannot bypass behavior or ambient-status gates under IHOW_RECALL_INCLUDE_AUTO=1', async (t) => {
   const root = await mkdtempReal('ihow-recall-anchbp-');
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
   const space = 'h';
@@ -671,10 +670,14 @@ test('recall (red-team): an ANCHORED bypass-prior entry is NOT injected even und
   cli(['reindex'], root, space);
 
   const env = { IHOW_RECALL_INCLUDE_AUTO: '1', IHOW_RECALL_AUTO_DEFAULT: '0' };
+  const ambientOut = recall('what do we know about zeusservice deploys?', root, space, env);
+  const ambient = ambientOut.stdout.trim() ? JSON.parse(ambientOut.stdout).hookSpecificOutput.additionalContext : '';
+  assert.ok(!ambient.includes('ZBYP'), 'bypass prior stays OUT on the anchored opt-in path too');
+  assert.ok(!ambient.includes('ZSTA'), 'anchored status remains OUT without explicit status intent');
   const out = recall('what is the status of zeusservice deploys?', root, space, env);
   const ctx = out.stdout.trim() ? JSON.parse(out.stdout).hookSpecificOutput.additionalContext : '';
-  assert.ok(!ctx.includes('ZBYP'), 'bypass prior stays OUT on the anchored opt-in path too (no path admits "skip approval")');
-  assert.ok(ctx.includes('ZSTA'), 'an anchor-verified status claim IS admitted under the explicit opt-in — the one "green" with engine-checked provenance (locked as design)');
+  assert.ok(!ctx.includes('ZBYP'), 'no auto path admits "skip approval"');
+  assert.ok(ctx.includes('ZSTA'), 'anchor-verified status is admitted only when status was explicitly asked');
 });
 
 // --- Knob-② companion: the C1 recall vocab now also catches sign-off-shaped ZH/EN status claims the

@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { buildHandoffPacket } from '../handoff.ts';
 import { runCaptureFloorSweep } from '../floor.ts';
 import { contextProbe } from '../context-probe.ts';
+import { resolveEngineConfig, semanticRecallFloor } from '../engine/retrieval.ts';
 
 type JsonRpcRequest = {
   jsonrpc?: '2.0';
@@ -244,7 +245,9 @@ async function main(): Promise<void> {
   // the runtime sidecar talks to the SAME host that was verified, not a silent localhost default.
   const hostIndex = argv.indexOf('--vector-host');
   if (hostIndex >= 0 && argv[hostIndex + 1]) process.env.OLLAMA_HOST = argv[hostIndex + 1];
-  const core = await openCore(parseWorkspaceArgs(argv));
+  const workspaceOptions = parseWorkspaceArgs(argv);
+  const core = await openCore(workspaceOptions);
+  const promptRecallSemanticFloor = semanticRecallFloor(resolveEngineConfig(workspaceOptions).vectorModel);
 
   // Cross-runtime capture FLOOR (automation v2.1). The MCP server is the one touchpoint EVERY connected
   // runtime shares, so its startup is where the deterministic capture floor reaches runtimes with no
@@ -342,13 +345,20 @@ async function main(): Promise<void> {
             excludeSessionId: typeof args.excludeSessionId === 'string' ? args.excludeSessionId : undefined,
           });
         } else if (name === 'memory.context_probe') {
-          payload = await contextProbe(core.workspace, {
-            cwd: typeof args.cwd === 'string' && args.cwd.trim() ? args.cwd : process.cwd(),
-            runtime: typeof args.runtime === 'string' ? args.runtime : undefined,
-            sessionHint: typeof args.sessionHint === 'string' ? args.sessionHint : undefined,
-            promptDigest: typeof args.promptDigest === 'string' ? args.promptDigest : undefined,
-            eventHint: args.eventHint as 'session_start' | 'prompt' | 'session_end' | 'tick',
-          });
+          payload = await contextProbe(
+            core.workspace,
+            {
+              cwd: typeof args.cwd === 'string' && args.cwd.trim() ? args.cwd : process.cwd(),
+              runtime: typeof args.runtime === 'string' ? args.runtime : undefined,
+              sessionHint: typeof args.sessionHint === 'string' ? args.sessionHint : undefined,
+              promptDigest: typeof args.promptDigest === 'string' ? args.promptDigest : undefined,
+              eventHint: args.eventHint as 'session_start' | 'prompt' | 'session_end' | 'tick',
+            },
+            {
+              search: (query, searchOptions) => core.search(query, searchOptions),
+              semanticFloor: promptRecallSemanticFloor,
+            },
+          );
         } else {
           throw new Error('unknown_tool');
         }
