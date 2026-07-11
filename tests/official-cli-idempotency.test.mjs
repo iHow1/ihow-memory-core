@@ -46,13 +46,14 @@ if (argv[0] !== 'mcp') process.exit(0);
 if (argv[1] === 'get') {
   if (!state) process.exit(1);
   const scope = state.scope || 'user';
-  const scopeLabel = scope === 'project'
+  const defaultScopeLabel = scope === 'project'
     ? 'Project config (shared via .mcp.json)'
     : scope === 'local'
       ? 'Local config (private to this project)'
       : scope === 'unknown'
         ? 'Inherited configuration (scope unavailable)'
         : 'User config (available in all your projects)';
+  const scopeLabel = state.scopeLabel || defaultScopeLabel;
   console.log('ihow-memory:');
   console.log('  Scope: ' + scopeLabel);
   console.log('  Status: ✓ Connected');
@@ -72,6 +73,10 @@ if (argv[1] === 'list') {
 if (argv[1] === 'remove') {
   const scopeIndex = argv.indexOf('--scope');
   const requestedScope = scopeIndex >= 0 ? argv[scopeIndex + 1] : null;
+  if (requestedScope === 'user' && state?.removeFailure) {
+    process.stderr.write(String(state.removeFailure) + '\\n');
+    process.exit(1);
+  }
   if (requestedScope === 'user' && state?.scope && state.scope !== 'user') {
     process.stderr.write('No user-scoped MCP server found with name: ihow-memory\\n');
     process.exit(1);
@@ -202,7 +207,7 @@ async function mutations(logPath) {
   }
 }
 
-function runJson({ runtime, home, bin, statePath, logPath, root, cwd, command = 'setup', extraEnv = {} }) {
+function runJson({ runtime, home, bin, statePath, logPath, root, cwd, command = 'setup', extraEnv = {}, allowFailure = false }) {
   const args = [command, '--runtime', runtime, '--json', '--root', root, '--space', 'official-cli-idempotency'];
   if (cwd) args.push('--cwd', cwd);
   if (runtime === 'claude-code') args.push('--no-install-skill', '--no-install-hook');
@@ -223,6 +228,7 @@ function runJson({ runtime, home, bin, statePath, logPath, root, cwd, command = 
       },
     });
   } catch (error) {
+    if (allowFailure && error.stdout) return JSON.parse(error.stdout);
     throw new Error(`CLI failed: ${error.stderr || ''}\n${error.stdout || ''}`);
   }
   return JSON.parse(stdout);
@@ -291,6 +297,20 @@ test('Claude project/local-only entry installs user scope without an invalid use
   assert.equal(JSON.parse(await fs.readFile(fixture.statePath, 'utf8')).scope, 'user', 'stub models a successfully installed user entry');
 });
 
+test('Claude local-only entry installs user scope without an invalid user removal', async (t) => {
+  const fixture = await makeClaudeFixture(t, 'local-scope');
+  const desired = await primeClaudeFixture(fixture);
+  await fs.writeFile(fixture.statePath, JSON.stringify({ ...desired, scope: 'local' }), 'utf8');
+  await fs.writeFile(path.join(fixture.home, '.claude.json'), '{ not readable canonical JSON', 'utf8');
+
+  const result = runJson(fixture);
+  assert.equal(result.applied, true, 'local-only visibility installs the missing user entry');
+  assert.notEqual(result.unchanged, true, 'local scope never proves user-scope unchanged');
+  assert.equal(result.restart.required, true);
+  assert.deepEqual((await mutations(fixture.logPath)).map((entry) => entry.op), ['add'], 'local-only state skips invalid user removal and adds user scope');
+  assert.equal(JSON.parse(await fs.readFile(fixture.statePath, 'utf8')).scope, 'user');
+});
+
 test('Claude unknown effective scope tolerates a real user-scope-missing result and adds user scope', async (t) => {
   const fixture = await makeClaudeFixture(t, 'unknown-scope');
   const desired = await primeClaudeFixture(fixture);
@@ -305,6 +325,30 @@ test('Claude unknown effective scope tolerates a real user-scope-missing result 
   assert.deepEqual((await mutations(fixture.logPath)).map((entry) => entry.op), ['add'], 'a user-scope-missing remove is tolerated and only user add mutates');
   assert.equal(JSON.parse(await fs.readFile(fixture.statePath, 'utf8')).scope, 'user');
 });
+
+for (const [name, scopeLabel, removeFailure] of [
+  ['unrelated remove failure', 'Inherited configuration (scope unavailable)', 'permission denied'],
+  ['near-match absence text', 'Inherited configuration (scope unavailable)', 'No user MCP server found'],
+  ['unfamiliar scope heading', 'Projected configuration (unrecognized)', 'permission denied'],
+]) {
+  test(`Claude ${name} fails closed before add`, async (t) => {
+    const fixture = await makeClaudeFixture(t, name.replace(/\s+/g, '-'));
+    const desired = await primeClaudeFixture(fixture);
+    await fs.writeFile(
+      fixture.statePath,
+      JSON.stringify({ ...desired, scope: 'unknown', scopeLabel, removeFailure }),
+      'utf8',
+    );
+    await fs.rm(path.join(fixture.home, '.claude.json'), { force: true });
+
+    const result = runJson({ ...fixture, allowFailure: true });
+    assert.equal(result.ok, false, 'setup reports the connector failure');
+    assert.equal(result.applied, false, 'failed removal never marks setup applied');
+    assert.notEqual(result.unchanged, true, 'uncertain state never claims unchanged');
+    assert.deepEqual(await mutations(fixture.logPath), [], 'a non-official failure must prevent add');
+    assert.match(result.skipped[0].error, /claude_mcp_remove_failed/i);
+  });
+}
 
 test('Claude human parser uncertainty performs one replacement and never reports unchanged', async (t) => {
   const fixture = await makeClaudeFixture(t, 'human-output');

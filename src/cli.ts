@@ -394,16 +394,21 @@ function readClaudeUserMcpSpec(): NormalizedMcpSpec | null {
 type ClaudeVisibleScope = 'user' | 'project' | 'local' | 'unknown';
 
 function parseClaudeVisibleScope(stdout: string): ClaudeVisibleScope {
-  const rendered = stdout.match(/^\s*Scope:\s*(.*)$/mi)?.[1]?.trim().toLowerCase() || '';
-  if (rendered.startsWith('user')) return 'user';
-  if (rendered.startsWith('project')) return 'project';
-  if (rendered.startsWith('local')) return 'local';
+  const rendered = stdout.match(/^\s*Scope:\s*(.*)$/mi)?.[1]?.trim() || '';
+  // `claude mcp get` is descriptive human output, not a general parser contract. Recognize only
+  // the documented headings (optionally followed by the familiar `config (...)` explanation).
+  // Anything else is deliberately unknown so it follows the conservative removal/error path.
+  const match = rendered.match(/^(user|project|local)(?:\s+config)?(?:\s+\([^\r\n()]*\))?$/i);
+  if (match) return match[1].toLowerCase() as ClaudeVisibleScope;
   return 'unknown';
 }
 
 function claudeUserScopeMissing(result: { stdout?: string | null; stderr?: string | null }): boolean {
-  const output = `${result.stderr || ''}\n${result.stdout || ''}`;
-  return /no user(?:-scoped| scoped)? mcp server found/i.test(output);
+  // This is the sole removal failure that may continue to an add: the official Claude CLI says
+  // there is no *user-scoped* entry. Keep the grammar exact and line-anchored; a vague or
+  // unfamiliar failure must not be reinterpreted as a harmless absence.
+  const officialMessage = /^No user-scoped MCP server found(?: with name:[ \t]*ihow-memory)?$/i;
+  return [result.stderr || '', result.stdout || ''].some((stream) => officialMessage.test(stream.trim()));
 }
 
 function parseCodexMcpGet(stdout: string): NormalizedMcpSpec | null {
