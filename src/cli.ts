@@ -403,12 +403,42 @@ function parseClaudeVisibleScope(stdout: string): ClaudeVisibleScope {
   return 'unknown';
 }
 
-function claudeUserScopeMissing(result: { stdout?: string | null; stderr?: string | null }): boolean {
+function claudeUserScopeMissing(result: {
+  status?: number | null;
+  signal?: NodeJS.Signals | null;
+  error?: Error;
+  stdout?: string | null;
+  stderr?: string | null;
+}): boolean {
   // This is the sole removal failure that may continue to an add: the official Claude CLI says
-  // there is no *user-scoped* entry. Keep the grammar exact and line-anchored; a vague or
-  // unfamiliar failure must not be reinterpreted as a harmless absence.
-  const officialMessage = /^No user-scoped MCP server found(?: with name:[ \t]*ihow-memory)?$/i;
-  return [result.stderr || '', result.stdout || ''].some((stream) => officialMessage.test(stream.trim()));
+  // there is no *user-scoped* entry. Treat stdout+stderr as one contract: exactly one stream may
+  // contain exactly one official line (with at most its normal terminal newline). Mixed output,
+  // extra lines, and near matches must not be reinterpreted as a harmless absence.
+  const stdout = result.stdout || '';
+  const stderr = result.stderr || '';
+  if (result.status !== 1 || result.signal !== null || result.error !== undefined) return false;
+  if ((stdout.length === 0) === (stderr.length === 0)) return false;
+  const populated = stdout || stderr;
+  return [
+    'No user-scoped MCP server found',
+    'No user-scoped MCP server found with name: ihow-memory',
+  ].some((message) => populated === message || populated === `${message}\n` || populated === `${message}\r\n`);
+}
+
+function claudeMcpGetMissing(result: {
+  status?: number | null;
+  signal?: NodeJS.Signals | null;
+  error?: Error;
+  stdout?: string | null;
+  stderr?: string | null;
+}): boolean {
+  // Claude Code 2.1.158's observed missing-name result. Unlike remove, this gate deliberately
+  // accepts only the complete real result (exit 1, empty stdout, exact stderr including its LF).
+  return result.status === 1
+    && result.signal === null
+    && result.error === undefined
+    && (result.stdout || '') === ''
+    && (result.stderr || '') === 'No MCP server found with name: "ihow-memory". No MCP servers are configured.\n';
 }
 
 function parseCodexMcpGet(stdout: string): NormalizedMcpSpec | null {
@@ -636,28 +666,39 @@ function connectViaClaudeCli(
   options: { dryRun?: boolean },
 ): Record<string, unknown> | null {
   if (!commandExists('claude')) return null;
-  const get = spawnSync('claude', ['mcp', 'get', 'ihow-memory'], { encoding: 'utf8' });
-  const exists = get.status === 0;
-  const visibleScope = exists ? parseClaudeVisibleScope(get.stdout || '') : 'unknown';
   const desired = desiredMcpSpec(spec);
+  const existing = readClaudeUserMcpSpec();
+  const canonicalUserEntry = existing !== null;
   // `claude mcp get` is human-readable only: argv is space-joined without boundary quoting, the
   // environment listing is not a completeness contract, and the selected scope cannot be proven
   // reliably. It may establish that a name exists, but canonical user-scope JSON is the sole source
-  // allowed to prove an exact unchanged spec. Missing/unreadable canonical config therefore replaces
-  // conservatively rather than risking a false unchanged result for a project/local entry.
-  const existing = exists ? readClaudeUserMcpSpec() : null;
+  // allowed to prove an exact unchanged spec or a changed user entry. Read it independently of `get`:
+  // exact canonical equality is always a no-op, while a changed canonical entry is always replaced
+  // through user scope even if the descriptive `get` command would fail.
   const unchanged = existing !== null && isDeepStrictEqual(existing, desired);
-  if (options.dryRun) {
-    return {
-      ok: true, runtime: 'claude-code', method: 'official-cli:claude',
-      alreadyExists: exists, unchanged, changed: !unchanged, dryRun: true,
-    };
-  }
   if (unchanged) {
     return {
       ok: true, runtime: 'claude-code', method: 'official-cli:claude',
       target: `${claudeConfigPath()} (claude mcp add-json --scope user)`,
       alreadyExists: true, unchanged: true, changed: false, replaced: false,
+      ...(options.dryRun ? { dryRun: true } : {}),
+    };
+  }
+
+  let exists = canonicalUserEntry;
+  let visibleScope: ClaudeVisibleScope = canonicalUserEntry ? 'user' : 'unknown';
+  if (!canonicalUserEntry) {
+    const get = spawnSync('claude', ['mcp', 'get', 'ihow-memory'], { encoding: 'utf8' });
+    exists = get.status === 0;
+    if (!exists && !claudeMcpGetMissing(get)) {
+      throw new Error(`claude_mcp_get_failed: ${(get.stderr || get.stdout || `exit ${get.status ?? 'unknown'}`).slice(0, 300)}`);
+    }
+    visibleScope = exists ? parseClaudeVisibleScope(get.stdout || '') : 'unknown';
+  }
+  if (options.dryRun) {
+    return {
+      ok: true, runtime: 'claude-code', method: 'official-cli:claude',
+      alreadyExists: exists, unchanged, changed: !unchanged, dryRun: true,
     };
   }
   // A visible project/local entry does not imply that a removable user entry exists. The real
@@ -666,8 +707,9 @@ function connectViaClaudeCli(
   // proves a user entry, the CLI reports user scope, or scope is unknown. Under unknown scope, the
   // real "No user-scoped MCP server found" result is safe evidence to continue with the user add.
   let removedUserEntry = false;
-  const shouldTryUserRemove = existing !== null || visibleScope === 'user' || visibleScope === 'unknown';
-  if (exists && shouldTryUserRemove) {
+  const shouldTryUserRemove = canonicalUserEntry
+    || (exists && (visibleScope === 'user' || visibleScope === 'unknown'));
+  if (shouldTryUserRemove) {
     const remove = spawnSync('claude', ['mcp', 'remove', 'ihow-memory', '--scope', 'user'], { encoding: 'utf8' });
     if (remove.status === 0) {
       removedUserEntry = true;

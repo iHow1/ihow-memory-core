@@ -26,7 +26,7 @@ async function mkdtempReal(prefix) {
 async function makeClaudeShim() {
   const bin = await mkdtempReal('ihow-bin-');
   const shim = path.join(bin, 'claude');
-  await fs.writeFile(shim, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory: connected"; exit 0; fi\nexit 0\n', 'utf8');
+  await fs.writeFile(shim, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then printf \'%s\\n\' \'No MCP server found with name: "ihow-memory". No MCP servers are configured.\' >&2; exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory: connected"; exit 0; fi\nexit 0\n', 'utf8');
   await fs.chmod(shim, 0o755);
   return bin;
 }

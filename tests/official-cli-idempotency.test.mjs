@@ -44,7 +44,18 @@ async function makeClaudeStub(bin) {
 const state = load();
 if (argv[0] !== 'mcp') process.exit(0);
 if (argv[1] === 'get') {
-  if (!state) process.exit(1);
+  if (state?.getFailure) {
+    const failure = typeof state.getFailure === 'object'
+      ? state.getFailure
+      : { stderr: String(state.getFailure) + '\\n' };
+    if (failure.stdout) process.stdout.write(String(failure.stdout));
+    if (failure.stderr) process.stderr.write(String(failure.stderr));
+    process.exit(Number.isInteger(failure.status) ? failure.status : 1);
+  }
+  if (!state || state.getMissing) {
+    process.stderr.write('No MCP server found with name: "ihow-memory". No MCP servers are configured.\\n');
+    process.exit(1);
+  }
   const scope = state.scope || 'user';
   const defaultScopeLabel = scope === 'project'
     ? 'Project config (shared via .mcp.json)'
@@ -74,8 +85,12 @@ if (argv[1] === 'remove') {
   const scopeIndex = argv.indexOf('--scope');
   const requestedScope = scopeIndex >= 0 ? argv[scopeIndex + 1] : null;
   if (requestedScope === 'user' && state?.removeFailure) {
-    process.stderr.write(String(state.removeFailure) + '\\n');
-    process.exit(1);
+    const failure = typeof state.removeFailure === 'object'
+      ? state.removeFailure
+      : { stderr: String(state.removeFailure) + '\\n' };
+    if (failure.stdout) process.stdout.write(String(failure.stdout));
+    if (failure.stderr) process.stderr.write(String(failure.stderr));
+    process.exit(Number.isInteger(failure.status) ? failure.status : 1);
   }
   if (requestedScope === 'user' && state?.scope && state.scope !== 'user') {
     process.stderr.write('No user-scoped MCP server found with name: ihow-memory\\n');
@@ -329,6 +344,24 @@ test('Claude unknown effective scope tolerates a real user-scope-missing result 
 for (const [name, scopeLabel, removeFailure] of [
   ['unrelated remove failure', 'Inherited configuration (scope unavailable)', 'permission denied'],
   ['near-match absence text', 'Inherited configuration (scope unavailable)', 'No user MCP server found'],
+  ['no-space absence suffix', 'Inherited configuration (scope unavailable)', 'No user-scoped MCP server found with name:ihow-memory'],
+  ['mixed-stream absence and error', 'Inherited configuration (scope unavailable)', {
+    stdout: 'permission denied\n',
+    stderr: 'No user-scoped MCP server found with name: ihow-memory\n',
+  }],
+  ['extra line after absence', 'Inherited configuration (scope unavailable)', {
+    stderr: 'No user-scoped MCP server found with name: ihow-memory\nunrelated error\n',
+  }],
+  ['extra blank line after absence', 'Inherited configuration (scope unavailable)', {
+    stderr: 'No user-scoped MCP server found with name: ihow-memory\n\n',
+  }],
+  ['embedded absence text', 'Inherited configuration (scope unavailable)', {
+    stderr: 'error: No user-scoped MCP server found with name: ihow-memory\n',
+  }],
+  ['wrong-status absence', 'Inherited configuration (scope unavailable)', {
+    stderr: 'No user-scoped MCP server found with name: ihow-memory\n',
+    status: 2,
+  }],
   ['unfamiliar scope heading', 'Projected configuration (unrecognized)', 'permission denied'],
 ]) {
   test(`Claude ${name} fails closed before add`, async (t) => {
@@ -349,6 +382,75 @@ for (const [name, scopeLabel, removeFailure] of [
     assert.match(result.skipped[0].error, /claude_mcp_remove_failed/i);
   });
 }
+
+test('Claude exact canonical user spec remains a setup no-op when get would fail arbitrarily', async (t) => {
+  const fixture = await makeClaudeFixture(t, 'canonical-exact-get-failure');
+  const desired = await primeClaudeFixture(fixture);
+  await fs.writeFile(
+    fixture.statePath,
+    JSON.stringify({ ...desired, scope: 'user', getFailure: { stderr: 'permission denied\n' } }),
+    'utf8',
+  );
+
+  const connectResult = runJson({ ...fixture, command: 'connect' });
+  assert.equal(connectResult.unchanged, true, 'canonical equality is authoritative despite get failure');
+  assert.equal(connectResult.changed, false);
+  assert.equal(connectResult.replaced, false);
+
+  const result = runJson(fixture);
+  assert.equal(result.applied, false, 'exact canonical equality remains a zero-mutation setup rerun');
+  assert.equal(result.restart.required, false, 'an unchanged canonical entry never requests restart');
+  assert.deepEqual(result.restart.runtimes, []);
+  assert.deepEqual(await mutations(fixture.logPath), [], 'arbitrary get failure cannot trigger remove/add');
+});
+
+test('Claude changed canonical user spec is replaced even when get would fail', async (t) => {
+  const fixture = await makeClaudeFixture(t, 'canonical-changed-get-failure');
+  const desired = await primeClaudeFixture(fixture);
+  const canonicalPath = path.join(fixture.home, '.claude.json');
+  const canonical = JSON.parse(await fs.readFile(canonicalPath, 'utf8'));
+  canonical.mcpServers['ihow-memory'].args = ['/stale/server.js'];
+  await fs.writeFile(canonicalPath, JSON.stringify(canonical), 'utf8');
+  await fs.writeFile(
+    fixture.statePath,
+    JSON.stringify({ ...desired, scope: 'user', getFailure: { stderr: 'permission denied\n' } }),
+    'utf8',
+  );
+
+  const result = runJson(fixture);
+  assert.equal(result.applied, true);
+  assert.equal(result.restart.required, true);
+  assert.deepEqual(result.restart.runtimes, ['claude-code']);
+  assert.deepEqual((await mutations(fixture.logPath)).map((entry) => entry.op), ['remove', 'add']);
+});
+
+test('Claude canonical absence plus the exact real get-missing result permits add', async (t) => {
+  const fixture = await makeClaudeFixture(t, 'canonical-absent-get-missing');
+  await fs.writeFile(fixture.statePath, JSON.stringify({ getMissing: true }), 'utf8');
+  await fs.rm(path.join(fixture.home, '.claude.json'), { force: true });
+
+  const result = runJson(fixture);
+  assert.equal(result.applied, true);
+  assert.equal(result.restart.required, true);
+  assert.deepEqual((await mutations(fixture.logPath)).map((entry) => entry.op), ['add']);
+});
+
+test('Claude canonical absence plus arbitrary get failure fails before add', async (t) => {
+  const fixture = await makeClaudeFixture(t, 'canonical-absent-get-failure');
+  await fs.writeFile(
+    fixture.statePath,
+    JSON.stringify({ getFailure: { stderr: 'permission denied\n' } }),
+    'utf8',
+  );
+  await fs.rm(path.join(fixture.home, '.claude.json'), { force: true });
+
+  const result = runJson({ ...fixture, allowFailure: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.applied, false);
+  assert.equal(result.restart.required, false);
+  assert.deepEqual(await mutations(fixture.logPath), [], 'unrecognized get failure must prevent add');
+  assert.match(result.skipped[0].error, /claude_mcp_get_failed/i);
+});
 
 test('Claude human parser uncertainty performs one replacement and never reports unchanged', async (t) => {
   const fixture = await makeClaudeFixture(t, 'human-output');
