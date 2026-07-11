@@ -8,6 +8,23 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.26] — 2026-07-11
+
+### Added
+
+- **Recall Quality Gates v1.** Added reviewed-first, bounded, relevance-gated prompt recall with a shared fail-closed selector across Claude hooks, Codex/no-hook `context_probe`, and recall preview/explanation. Deleted, unreadable, malformed, stale-rewritten, and symlink-replaced sources are excluded from injection.
+- **Semantic readiness and benchmark honesty.** Added explicit lexical fallback/readiness boundaries, optional additive semantic RRF, measured-floor gating, and separate machine/reporting fields for real-model quality, neutral paraphrase lift, and architecture proof. Real-model results remain fixture/model/version/path-specific observations.
+- **Runtime and setup parity.** Added guarded auto-soft-fact behavior, status/behavior-bypass gates, recency/supersession collapse, safe empty-explain diagnostics, Claude official-CLI whole-result/idempotency handling, and packed CLI clean-room coverage.
+
+### Changed
+
+- **alpha.26 package prep.** Local package metadata is bumped to `0.1.0-alpha.26` for RC readiness only; no tag, publish, push, release, or deploy is part of this change.
+
+### Notes
+
+- The default retrieval engine remains local zero-dependency FTS5; the semantic sidecar is opt-in and additive.
+- This release does not claim universal semantic quality, production certification, or complete classifier coverage for status/behavior heuristics.
+
 ## [0.1.0-alpha.25] — 2026-07-08
 
 ### Added
