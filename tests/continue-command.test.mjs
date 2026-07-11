@@ -83,9 +83,10 @@ test('continue: honest refusal when there is no prior session for this cwd', asy
   await fs.mkdir(cwd, { recursive: true });
 
   const out = runContinue(root, space, cwd);
-  assert.match(out, /attributed transport envelope/, 'still prints the envelope frame');
-  assert.match(out, /no substantive prior-session summary/, 'empty narrative is stated honestly');
-  assert.match(out, /no captured prior session/i, 'points the user to install-hook');
+  assert.doesNotMatch(out, /attributed transport envelope/, 'does not wrap an absent narrative in a fake handoff');
+  assert.match(out, /no captured prior session/i, 'empty history is stated honestly');
+  assert.match(out, /ihow-memory proof/, 'gives one runnable first-success path');
+  assert.ok(out.length < 500, 'first-run output stays concise');
 });
 
 test('continue: a Stop marker for a different cwd is not used', async (t) => {

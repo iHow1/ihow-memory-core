@@ -55,9 +55,10 @@ async function countBackups(...roots) {
 test('setup --runtime claude-code: writes MCP + skill + hook and reports success', async (t) => {
   const { home, root, proj } = await dirs(t);
   const out = run(['setup', '--runtime', 'claude-code', '--root', root, '--space', 't', '--cwd', proj], home);
-  assert.match(out, /✓ iHow Memory is set up/, 'success banner');
+  assert.match(out, /Setup result — COMPLETE/, 'success result card');
   assert.match(out, /verifying \(doctor\)/, 'ran the doctor verification step');
-  assert.match(out, /Restart Claude Code once/, 'tells the user the one next action');
+  assert.match(out, /restart: required once for claude-code/, 'states the restart requirement');
+  assert.match(out, /next: ihow-memory proof/, 'gives one next action');
   assert.ok(await exists(path.join(home, '.claude', 'skills', 'ihow-memory', 'SKILL.md')), 'memory skill installed');
   const settings = await fs.readFile(path.join(proj, '.claude', 'settings.local.json'), 'utf8');
   assert.match(settings, /hook-stop/, 'Stop hook wired into the project settings');
@@ -69,11 +70,19 @@ test('setup is idempotent — re-running changes nothing and adds no new backups
   const { home, root, proj } = await dirs(t);
   const args = ['setup', '--runtime', 'claude-code', '--root', root, '--space', 't', '--cwd', proj];
   run(args, home); // first run
+  const backupsAfterFirstRun = await countBackups(home, proj);
   const out2 = run(args, home); // second run
   // The skill + hook are content-idempotent: a re-run re-affirms them in place, no duplicate install.
   assert.match(out2, /memory skill already current/, 'skill re-affirmed, not reinstalled');
   assert.match(out2, /hooks already present/, 'hooks re-affirmed, not duplicated');
-  assert.match(out2, /✓ iHow Memory is set up/, 'still succeeds on re-run');
+  assert.match(out2, /Setup result — COMPLETE/, 'still succeeds on re-run');
+  assert.match(out2, /restart: not required/, 'does not request a restart when no setup configuration changed');
+  assert.equal(await countBackups(home, proj), backupsAfterFirstRun, 're-run adds no config backups');
+
+  const json2 = JSON.parse(run([...args, '--json'], home));
+  assert.equal(json2.applied, false, 'idempotent re-run truthfully reports that nothing was applied');
+  assert.equal(json2.restart.required, false, 'idempotent re-run truthfully reports no restart');
+  assert.deepEqual(json2.restart.runtimes, [], 'no runtime is listed for restart on an idempotent re-run');
 });
 
 test('setup --dry-run writes NOTHING', async (t) => {
@@ -108,6 +117,9 @@ test('setup --json emits clean parseable output (install prints suppressed)', as
   assert.equal(j.skill, 'installed');
   assert.equal(j.hook, 'installed');
   assert.equal(j.doctor.ok, true, 'doctor verified clean');
+  assert.equal(j.applied, true, 'first run reports that setup configuration changed');
+  assert.equal(j.restart.required, true, 'first run requests restart after applying setup configuration');
+  assert.deepEqual(j.restart.runtimes, ['claude-code']);
 });
 
 test('setup --json is honest when the hook fails to wire (unparseable settings → ok:false, hook:failed)', async (t) => {
@@ -151,5 +163,6 @@ test('setup with no runtime detected is an honest exit-0 no-op', async (t) => {
   const { home, root } = await dirs(t); // empty HOME, hermetic PATH -> nothing detected
   const out = run(['setup', '--root', root, '--space', 't'], home);
   assert.match(out, /No AI runtime detected/, 'honest about finding nothing');
-  assert.match(out, /re-run: ihow-memory setup/, 'tells the user what to do next');
+  assert.match(out, /copy-paste: ihow-memory setup/, 'tells the user how to retry after installing a runtime');
+  assert.match(out, /next: ihow-memory proof/, 'still offers an immediate product proof');
 });

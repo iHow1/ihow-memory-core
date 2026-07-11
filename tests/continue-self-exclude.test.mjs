@@ -60,7 +60,7 @@ test('continue: when only THIS session exists, reports an honest no-capture (nev
     encoding: 'utf8',
     env: { ...process.env, HOME: home, CLAUDE_CODE_SESSION_ID: 'onlyme' },
   });
-  assert.match(out, /no captured prior session/, 'honest about having no prior session to resume');
+  assert.match(out, /no captured prior session/i, 'honest about having no prior session to resume');
   assert.doesNotMatch(out, /source_session:/, 'no source session is claimed');
   assert.doesNotMatch(out, /ONLY-SELF/, 'the live session is not surfaced as a handoff');
 });

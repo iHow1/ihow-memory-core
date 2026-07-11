@@ -21,45 +21,74 @@ iHow Memory is a local, shared-memory runtime for heterogeneous coding agents �
 3. **Safe writes + governance.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event.
 4. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
 
-## Quickstart
+## Quickstart — first success in about 3 minutes
 
-### Fastest start — one command
+### 1. Set up locally
 
 ```bash
 npx ihow-memory@next setup
 ```
 
-`setup` detects your installed agents, registers the `ihow-memory` MCP server with each, installs proactive memory behavior where the runtime exposes a stable surface (Claude Code skill + hooks, Codex hooks + `AGENTS.md`, WorkBuddy/OpenClaw/Hermes/OpenCode resume guidance), and verifies with `doctor`. It is idempotent (safe to re-run), reversible (every edited config is backed up), and local-only. Prefer step-by-step? Use `connect` below.
+`setup` detects installed runtimes, connects the local MCP server, installs proactive memory behavior only where the runtime exposes a stable surface, and runs `doctor`. It is idempotent, backs up edited config, and ends with one result card: what connected, what is verified or pending, whether a restart is required, where local data lives, and the one next command.
 
-### 1. Connect a single runtime
+Want a zero-write preview first?
 
 ```bash
-npx ihow-memory@next connect --runtime claude-code   # or: codex | cursor | workbuddy | claude-desktop | opencode | hermes | openclaw | vscode | gemini
+npx ihow-memory@next setup --dry-run
 ```
 
-`connect` provisions a managed workspace under `~/.ihow-memory` (space name derived from the current directory unless you pass `--space`) and registers the `ihow-memory` MCP server with the selected runtime:
+### 2. See the verify-first difference immediately
 
-- Claude Code and Codex are configured through their official CLIs (`claude mcp add-json`, `codex mcp add`).
-- Cursor is configured by merging `~/.cursor/mcp.json`, with a timestamped backup of the existing file first; an unparseable config is never overwritten.
-- To preview without changing anything, append `--dry-run`:
+```bash
+npx ihow-memory@next proof
+```
+
+The proof runs in a throwaway git repo and temporary memory workspace. It shows:
+
+```text
+prior agent narrative: UNVERIFIED
+recorded anchors == live anchors  -> GREEN
+checkout changes after recording  -> RED
+```
+
+It also proves the governed local-memory path — candidate → promote → search/read with citation + audit — without touching your project or runtime configuration. The default retrieval lane is honest zero-dependency lexical FTS; optional semantic recall is separate and is not presented as state of the art.
+
+### 3. Resume real work
+
+After `/clear`, a new session, or a switch to another supported runtime:
+
+```bash
+npx ihow-memory@next continue            # optional repo keyword: continue <name>
+```
+
+`continue` carries the previous narrative as **UNVERIFIED** and gives the receiver machine anchors to re-check before acting. GREEN is deliberately narrow; drift or conflict forces RED. If this is your first run and there is no captured session yet, the CLI says that plainly and points back to `proof` instead of printing an empty handoff envelope. In Claude Code you can simply say “continue” / “继续”.
+
+### 4. Correct a wrong memory
+
+```bash
+npx ihow-memory@next forget "text or memory/path.md"
+# reversible:
+npx ihow-memory@next remember "text or memory/path.md"
+```
+
+`forget` tombstones one unambiguous match so it stops surfacing in search and recall; the file is untouched and the action is reversible and audited.
+
+### What `setup` connects
+
+Claude Code is the daily-dogfooded path. Codex, OpenClaw, Hermes, OpenCode and WorkBuddy have single-machine real-app smoke. Cursor, Claude Desktop and VS Code are receiver-only because they do not expose a resumable local session store. See [Runtime support](#runtime-support) before making production assumptions.
+
+To connect only one runtime, or to inspect the exact config instead of applying it:
 
 ```bash
 npx ihow-memory@next connect --runtime claude-code --dry-run
-```
-
-If you prefer to edit runtime config by hand, `npx ihow-memory@next init --runtime <runtime>` prints the exact MCP snippet instead of applying it.
-
-### 2. Verify
-
-```bash
+npx ihow-memory@next connect --runtime claude-code
+npx ihow-memory@next init --runtime claude-code       # print the MCP snippet only
 npx ihow-memory@next doctor --runtime claude-code
 ```
 
-`doctor` checks the Node version, `node:sqlite` availability, memory-root writability, runtime setup, retrieval-engine readiness and the index manifest, and confirms cloud/sync are disabled.
+### The governed loop, explicitly
 
-### 3. The governed loop in 60 seconds
-
-This is the same flow agents use over MCP, run from your shell. The block is copy-pasteable as a whole:
+Agents use the same path over MCP. This shell version makes the review gate visible:
 
 ```bash
 npx ihow-memory@next init --space demo
@@ -67,35 +96,10 @@ CAND=$(npx ihow-memory@next write-candidate "Decision: ship weekly release notes
 PROMOTED=$(npx ihow-memory@next promote "$CAND" --scope team --title "Release notes cadence" --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
 npx ihow-memory@next search "release notes" --space demo
 npx ihow-memory@next read "$PROMOTED" --space demo
-```
-
-What you should see:
-
-- `write-candidate` returns a candidate path under `memory/candidate/inbox/` — proposed, not yet durable. The `--no-auto-promote` flag makes the **two-step gate explicit** so you can see it; **without it, clean writes auto-promote in one step** (the engine floor picks the yellow sub-tier), and `write-candidate` then returns the already-durable path directly;
-- `promote` returns the promoted path under `memory/scopes/team/` plus an `eventId` — the audit event;
-- `search` and `read` return JSON whose `citation` field points at the exact Markdown file behind the answer.
-
-Clean up the demo space when done:
-
-```bash
 npx ihow-memory@next reset --space demo
 ```
 
-One-command version of the same proof, in a throwaway space:
-
-```bash
-npx ihow-memory@next proof
-```
-
-### 4. Resume without re-briefing — the payoff
-
-After a `/clear`, or in a brand-new session, pick up the previous session's work instead of re-explaining it:
-
-```bash
-npx ihow-memory@next continue            # or pass a repo keyword: continue <name>
-```
-
-`continue` finds the project you were in (from the files you edited last session) and prints a handoff: the project's **live git anchors** — branch / HEAD / dirty, the only facts — plus the previous session's own summary, quoted and marked **UNVERIFIED**. The receiver re-checks those anchors against the live repo before trusting anything: **GREEN** (they match) → continue smoothly with a small step; **RED** (they conflict, or the narrative asks for a risky/irreversible action) → stop and diagnose. In Claude Code you can simply say "继续" — a fresh session even reminds you it can resume.
+Without `--no-auto-promote`, a clean write can auto-promote into a durable yellow tier; secrets and falsified anchors are still blocked. Search/read results cite the exact Markdown source, and promote creates an audit event.
 
 ### Updating
 
@@ -151,7 +155,7 @@ The headline numbers are the ones you actually get out of the box — the **defa
 
 This is a deterministic, stranger-reproducible harness: `node scripts/retrieval-bench.mjs` seeds a labeled fixture through the same `write → promote → search` path the product uses and scores R@5/R@10/MRR + tokens-per-query, with no cloud, no LLM and no third-party deps.
 
-**The honest floor: paraphrase recall is the weak spot.** Keyword and partial-keyword queries recall well (15/15 in the fixture), but **paraphrase / synonym queries that share no surface tokens score 2/5 = 0.40** — a reworded query exposes a lexical engine's lack of semantics. That gap is exactly what an optional semantic provider is meant to lift.
+**The honest floor: paraphrase recall is the weak spot.** Keyword and partial-keyword queries recall well (15/15 in the fixture), but **paraphrase / synonym queries that share no surface tokens score 2/5 = 0.40** — a reworded query exposes a lexical engine's lack of semantics. An optional semantic provider is intended to address that gap, but its quality must be measured rather than inferred from provider readiness or model identity.
 
 The fixture above is a **self-authored 20-doc / 20-query** set. So that the numbers don't rest on our own data, there is also a stranger-reproducible run on a **public, MIT-licensed standard dataset** — LongMemEval (oracle variant, [arXiv:2410.10813](https://arxiv.org/abs/2410.10813)) — on the **same default FTS5 binary**:
 
@@ -161,7 +165,7 @@ The fixture above is a **self-authored 20-doc / 20-query** set. So that the numb
 | Recall@10 | **0.857** |
 | MRR | **0.651** |
 
-`node scripts/standard-bench.mjs --download` fetches + **sha256-verifies** the dataset and runs all 419 usable instances (831 session-docs) on the default engine; the vendored N=8 slice runs offline (`node scripts/standard-bench.mjs`). This is **global-corpus** retrieval — find the gold evidence session among *every* instance's sessions, which is **harder** than the paper's per-instance oracle setup. Recall@k is recall_any@k (the official reading); MRR is our own metric (LongMemEval reports NDCG), so it is **not** directly comparable to the paper's tables. The weak spots stay visible: assistant-answer and preference questions — where the evidence lives in the assistant's turn or is implicit, so the indexed user turns share little surface with the query — recall worst, the same lexical gap an optional semantic provider lifts.
+`node scripts/standard-bench.mjs --download` fetches + **sha256-verifies** the dataset and runs all 419 usable instances (831 session-docs) on the default engine; the vendored N=8 slice runs offline (`node scripts/standard-bench.mjs`). This is **global-corpus** retrieval — find the gold evidence session among *every* instance's sessions, which is **harder** than the paper's per-instance oracle setup. Recall@k is recall_any@k (the official reading); MRR is our own metric (LongMemEval reports NDCG), so it is **not** directly comparable to the paper's tables. The weak spots stay visible: assistant-answer and preference questions — where the evidence lives in the assistant's turn or is implicit, so the indexed user turns share little surface with the query — recall worst, the same lexical gap an optional semantic provider is intended to address and may lift only when a measured run shows a positive delta.
 
 #### Optional semantic sidecar (not the default binary)
 
@@ -183,7 +187,7 @@ npx ihow-memory@next enable-semantic    # probes Ollama; writes <space>/.runtime
 # re-run `setup`/`connect` + restart your runtime to apply · reverse anytime: disable-semantic
 ```
 
-`enable-semantic` **refuses** (non-zero, with guidance) if Ollama is unreachable or the model isn't pulled — it never enables a lane that would only fall back. `doctor` then reports semantic health as a **warning, never a failure** (the lane is additive). On the in-repo fixture this lifts paraphrase recall from **2/5 → 5/5** (fused R@5 0.85 → 1.0); the default binary stays lexical-only with `capabilities.semantic=false` until you opt in.
+`enable-semantic` **refuses** (non-zero, with guidance) if Ollama is unreachable or the model isn't pulled — it never enables a lane that would only fall back. `doctor` then reports semantic health as a **warning, never a failure** (the lane is additive). A successful `nomic-embed-text` probe means the ranking sidecar can run; it does **not** establish a quality lift. Real-model snapshots on the 20-doc / 20-query fixture currently conflict: an earlier direct-sidecar harness observed paraphrase recall **2/5 → 2/5** (Δ0), while a fresh run through the product's normal `rebuild()` path observed **2/5 → 5/5** (Δ+3). The fresh product-path snapshot is positive, but these results are fixture/model/version/path-sensitive and do **not** establish a stable, generalizable real-model floor; treat the output of your own rerun as authoritative. Prompt-bypass eligibility remains fail-closed absent a separately calibrated model floor. The independently labeled deterministic synonym-oracle also reaches **2/5 → 5/5**, but only as a controlled **architecture proof of RRF wiring, never learned-model quality evidence**. The default binary stays lexical-only with `capabilities.semantic=false` until you opt in.
 
 Evidence manifest: [LongMemEval_S retrieval-stage run, 2026-05-11](https://github.com/iHow1/ihow-memory-standard/blob/main/conformance/evidence/longmemeval-s-2026-05-11.md).
 
@@ -356,7 +360,7 @@ For no-hook runtimes, `session_end` means task completion or delivery, not proce
 > backstop (`next` only) that captures the prior session when the nudge was not honored. Both write
 > **low-weight, unreviewed** notes — use `promote` / `durable-promote` for trusted long-term memory. The
 > floor is offline-validated as a backstop; it is not yet promoted to a primary/default-weight path, and
-> `recall` (reading memory back into a new session) is **on** by default and relevance-gated (off-topic prompts get nothing). Since alpha.19 it surfaces reviewed decisions **and** auto-captured soft facts (preferences, configs) seamlessly, while unverified status claims ("all green") and risky behavior-priors ("skip approval") are excluded from the ambient default surface — ask about status explicitly and the unverified note is shown, fenced as reference. Remembered something wrong? `ihow-memory forget <what you'd say>` stops it surfacing everywhere, reversibly (`remember` undoes it). Disable recall with `--no-recall` or `IHOW_RECALL_OFF=1`; restore reviewed-only with `IHOW_RECALL_AUTO_DEFAULT=0`.
+> `recall` (reading memory back into a new session) is **on** by default and relevance-gated (off-topic prompts get nothing). Since alpha.19 it surfaces reviewed decisions **and** auto-captured soft facts (preferences, configs) seamlessly, while unverified status claims ("all green") and risky behavior-priors ("skip approval") are excluded from the ambient default surface — ask about status explicitly and the unverified note is shown. Output is one seamless bounded `<recalled-memory>` reference fence, not per-item trust tags. Remembered something wrong? `ihow-memory forget <what you'd say>` stops it surfacing everywhere, reversibly (`remember` undoes it). Skip hook installation with `--no-recall`, disable runtime injection with `IHOW_RECALL_OFF=1`, or restore reviewed-only with `IHOW_RECALL_AUTO_DEFAULT=0`. `IHOW_RECALL_INCLUDE_AUTO=1` additionally admits engine-anchored auto facts, but never bypasses behavior safety or status-intent gates.
 
 ## Examples
 

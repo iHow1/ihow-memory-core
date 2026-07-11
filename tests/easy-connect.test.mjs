@@ -26,7 +26,7 @@ async function mkdtempReal(prefix) {
 async function makeClaudeShim() {
   const bin = await mkdtempReal('ihow-bin-');
   const shim = path.join(bin, 'claude');
-  await fs.writeFile(shim, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory: connected"; exit 0; fi\nexit 0\n', 'utf8');
+  await fs.writeFile(shim, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then printf \'%s\\n\' \'No MCP server found with name: "ihow-memory". No MCP servers are configured.\' >&2; exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory: connected"; exit 0; fi\nexit 0\n', 'utf8');
   await fs.chmod(shim, 0o755);
   return bin;
 }
@@ -121,10 +121,9 @@ test('--easy --no-install-hook respects the explicit opt-out (skill yes, hook no
   assert.equal(await exists(path.join(proj, '.claude', 'settings.local.json')), false, 'hook opt-out respected');
 });
 
-test('connect --easy wires recall by default (reviewed tier); --no-recall opts out', async (t) => {
-  // 2026-06-26 recall-quality eval (reviewed ~88% signal / 0 harmful) relaxed the 2026-06-17 default-off
-  // guard: recall (UserPromptSubmit, reviewed tier only) now installs by default on the easy path, and
-  // --no-recall skips it. The machine-judged auto tier still stays opt-in (IHOW_RECALL_INCLUDE_AUTO=1).
+test('connect --easy wires recall by default; --no-recall opts out', async (t) => {
+  // Recall (UserPromptSubmit) installs by default on the easy path; reviewed memory is preferred and
+  // guarded relevant auto soft facts may surface. --no-recall skips hook installation.
   const proj = await mkdtempReal('ihow-proj-');
   const home = await mkdtempReal('ihow-home-');
   const bin = await makeClaudeShim();

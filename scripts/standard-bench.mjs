@@ -87,8 +87,9 @@ function render({ result, fixture }) {
   lines.push('─'.repeat(92));
   lines.push('Honest read: recall_any@k on a GLOBAL corpus of real LongMemEval sessions, DEFAULT lexical');
   lines.push('FTS5. Paraphrase / temporal-reasoning questions (little surface overlap with the evidence) are');
-  lines.push('where pure lexical misses — the gap the OPTIONAL semantic provider is meant to lift. MRR is our');
-  lines.push('own metric (LongMemEval reports NDCG), so it is not directly comparable to the paper tables.');
+  lines.push('where pure lexical misses — a gap the OPTIONAL semantic provider is intended to address, but');
+  lines.push('only a positive measured delta supports a lift claim. MRR is our own metric (LongMemEval reports');
+  lines.push('NDCG), so it is not directly comparable to the paper tables.');
   lines.push('─'.repeat(92));
   return lines.join('\n');
 }

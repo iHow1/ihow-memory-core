@@ -4,13 +4,14 @@
 //
 // REAL-MODEL semantic provider (opt-in sidecar) — a genuine learned embedding model via local Ollama.
 // ===================================================================================================
-// This is the HONEST quality path: it calls a REAL embedding model (default `nomic-embed-text`, a
+// This is the REAL-MODEL measurement path: it calls a learned embedding model (default
+// `nomic-embed-text`, a
 // learned-weights model, NOT a hashed-feature stand-in) running entirely on the user's machine via
 // Ollama's localhost HTTP API — $0, offline-after-pull, no cloud, no third-party Node deps (uses
-// only built-in `fetch`). Cosine similarity over its vectors captures TRUE synonymy/paraphrase
-// ("login credentials"↔"auth tokens", "kept on the filesystem"↔"stored on disk") that pure lexical
-// FTS5 cannot — so the gain it shows in the bench is a REAL retrieval-quality number, not an
-// architecture demo.
+// only built-in `fetch`). A real model and a ready provider do not automatically imply a retrieval
+// gain on any fixture: only an actual measured before/after delta may support a quality conclusion.
+// The comparison harness reports zero or negative deltas honestly and keeps architecture-oracle
+// results separate from learned-model evidence.
 //
 // REQUIREMENTS (this sidecar is OPT-IN precisely because it has them):
 //   - Ollama running locally:            https://ollama.com      (default http://localhost:11434)
@@ -117,12 +118,10 @@ function snippetFrom(content, query) {
   return (start > 0 ? '…' : '') + body.slice(start, end) + (end < body.length ? '…' : '');
 }
 
-// Bound concurrency for index embeds. The engine applies ONE timeout (vectorTimeoutMs, default 1.5s,
-// capped at 30s) to the WHOLE index call — so a sequential embed of N docs against a real network model
-// blows the budget on even a modest corpus (20 docs ≈ 37s > 30s → the engine SIGTERMs index and the
-// sidecar is never written, silently degrading search to FTS-only). Embedding concurrently brings a
-// 20-doc index well under the cap. Ollama serves concurrent /api/embeddings fine; keep the fan-out
-// modest so we don't thrash a small box.
+// Bound concurrency for index embeds. The engine gives index() an independent
+// `vectorIndexTimeoutMs` budget (10 minutes by default, configurable up to 1 hour), separate from the
+// interactive status/search timeout. Concurrency still keeps rebuild latency practical; keep the
+// fan-out modest so we don't thrash a small box.
 const INDEX_CONCURRENCY = Number(process.env.OLLAMA_EMBED_CONCURRENCY || 8);
 
 async function mapLimit(items, limit, fn) {

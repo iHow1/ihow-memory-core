@@ -57,7 +57,7 @@ test('continue: a handoff older than a day degrades LOUDLY as POSSIBLY STALE', a
   assert.match(out, /capture hook may have stopped firing/, 'tells the user why it might be stale');
 });
 
-test('continue: NO captured session degrades LOUDLY as EMPTY (never hands over silence)', async (t) => {
+test('continue: NO captured session gives a concise first-run path (never fabricates a handoff)', async (t) => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-home-'));
   t.after(async () => {
     await fs.rm(home, { recursive: true, force: true });
@@ -67,6 +67,8 @@ test('continue: NO captured session degrades LOUDLY as EMPTY (never hands over s
     encoding: 'utf8',
     env: { ...process.env, HOME: home, CLAUDE_CODE_SESSION_ID: 'unrelated', IHOW_HANDOFF_METRICS: '0' },
   });
-  assert.match(out, /⚠️ CAPTURE HEALTH: EMPTY/, 'an empty capture raises the loud empty banner');
-  assert.match(out, /NO handoff narrative to resume/, 'is explicit there is nothing to resume');
+  assert.match(out, /No captured prior session/i, 'is explicit there is nothing to resume');
+  assert.match(out, /ihow-memory proof/, 'gives one immediate verify-first demonstration');
+  assert.doesNotMatch(out, /attributed transport envelope/, 'does not print a fake empty handoff');
+  assert.ok(out.length < 500, 'first-run guidance stays concise');
 });
