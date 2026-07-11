@@ -45,23 +45,19 @@ node scripts/retrieval-bench.mjs --semantic "node examples/ollama-embedding-prov
      --proof real --model nomic-embed-text
 ```
 
-Current live recheck on this fixture (real `nomic-embed-text` vectors fused with FTS via the engine's
-`fuseRrf`; provider `ran:true`, `fallback:false`):
+The available live snapshots on this fixture conflict, so there is no promoted stable real-model floor:
 
-| metric | FTS-only | FTS + semantic (fused) | Δ |
-| --- | --- | --- | --- |
-| **paraphrase recall@5** | **2/5** | **2/5** | **0** |
-| overall R@5 | 0.85 | 0.85 | 0 |
-| overall R@10 | 0.85 | 0.85 | 0 |
-| overall MRR | 0.85 | 0.85 | 0 |
-| keyword recall@5 | 12/12 | 12/12 | 0 (floor preserved) |
-| partial recall@5 | 3/3 | 3/3 | 0 (floor preserved) |
+| real-model snapshot | measured path | paraphrase recall@5 | overall R@5 | interpretation |
+| --- | --- | --- | --- | --- |
+| earlier recheck | direct sidecar pre-indexing | **2/5 → 2/5 (Δ0)** | **0.85 → 0.85 (Δ0)** | running provider, no observed lift on that path |
+| fresh product-path recheck | normal `core.rebuild()` with independent index timeout | **2/5 → 5/5 (Δ+3)** | **0.85 → 1.0 (Δ+0.15)** | positive observed real-model lift on that snapshot |
 
-The provider ran successfully, but this recheck found **no observed paraphrase lift** and no headline
-metric delta. That is the quality conclusion for this model/fixture run; do not substitute the oracle's
-numbers below. The run is **not in CI** because it needs a live Ollama, and model version,
-quantization, hardware, and provider behavior may change results. Reproduce the machine-readable
-result with:
+The fresh product-path snapshot supersedes the old result as the current path measurement, but a single
+positive run is not a stable or generalizable model claim. Results remain fixture/model/version/path-
+sensitive; the live run is **not in CI** because it needs a local Ollama, and model version,
+quantization, hardware, provider behavior, and harness path may change the delta. Treat the machine-
+readable output of your own rerun as authoritative rather than substituting either snapshot or the
+architecture oracle's numbers below. Reproduce it with:
 
 ```bash
 node scripts/retrieval-bench.mjs --semantic "node examples/ollama-embedding-provider.mjs" \
@@ -71,8 +67,10 @@ node scripts/retrieval-bench.mjs --semantic "node examples/ollama-embedding-prov
 > **Engine timeout note:** index work uses the independent `vectorIndexTimeoutMs` budget — **10 minutes
 > by default**, configurable up to 1 hour — rather than the interactive `vectorTimeoutMs` used by
 > status/search (default 1.5 s, capped at 30 s). The harness calls the product's normal `rebuild()` path.
-> A provider that cannot become active reports `ran:false`; a provider that runs but produces a zero
-> paraphrase delta reports `observedQualityLift:false`.
+> A provider that cannot become active reports `ran:false`. `observedParaphraseLift` is the neutral
+> positive-delta field. `observedQualityLift` can be true only for a positive `real-model` run, while
+> `architectureProofPassed` can be true only for a positive `architecture-proof` run; zero and negative
+> deltas keep all applicable success fields false.
 
 ### (b) Architecture proof — deterministic, offline, **not** a model-quality number
 
@@ -87,9 +85,12 @@ node scripts/retrieval-bench.mjs --semantic "node examples/synonym-oracle-provid
      --proof architecture          # deterministic · offline · zero deps
 ```
 
-This produces **paraphrase recall@5: 2/5 → 5/5 (+3)** structurally, every run, with no network and no
-model. The number demonstrates wiring only; it must not be attributed to the default model, the real
-Ollama provider, or production quality. It is gated by `tests/semantic-comparison.test.mjs`.
+This controlled oracle produces **paraphrase recall@5: 2/5 → 5/5 (+3)** structurally, every run, with
+no network and no model, so `architectureProofPassed:true` while `observedQualityLift:false`. The number
+demonstrates wiring only; it must not be attributed to the default model, the real Ollama provider, or
+production quality. Any architecture-proof run with a zero or negative measured delta instead reports
+no observed architecture lift and does not pass the proof. These branches are gated by
+`tests/semantic-comparison.test.mjs`.
 
 > ### Honesty note — why not the bundled `local-embedding-provider.mjs`?
 > The repo's other reference sidecar, `examples/local-embedding-provider.mjs`, uses a **hashed

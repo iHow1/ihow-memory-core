@@ -219,8 +219,8 @@ export async function runRetrievalBench({ fixture = FIXTURE, engineOptions = nul
 //       'real-model'        → numbers came from a REAL learned embedding model (e.g. nomic-embed-text
 //                             via the ollama sidecar). Model identity alone implies no quality gain;
 //                             only a positive measured delta supports that conclusion.
-//       'architecture-proof' → numbers came from the controlled synonym-oracle sidecar. The gain proves
-//                             the WIRING (RRF pulls a true-synonym doc into top-K), NOT model quality.
+//       'architecture-proof' → numbers came from a controlled architecture sidecar. Only a positive
+//                             measured paraphrase delta passes the WIRING proof; it is never model quality.
 //   - If the provider never actually ran (unreachable Ollama, bad command), the semantic engine reports
 //     a silent FTS fallback. We DETECT that (`semanticActive===false`) and refuse to claim a gain —
 //     `ran:false` is returned so the CLI/README shows "lane did not run" instead of a fake delta.
@@ -265,14 +265,20 @@ export async function runSemanticComparison({
   }
 
   const paraphrase = byKindDelta.paraphrase || null;
-  // Stable claim-honesty field: a ready/running provider is necessary but not sufficient. Fallback,
-  // zero delta, and negative delta are all explicitly false.
-  const observedQualityLift = ran && (paraphrase?.delta_hit5 || 0) > 0;
+  // Claim-honesty fields deliberately separate the neutral observed delta from what kind of evidence
+  // produced it. A ready/running provider is necessary but not sufficient; fallback, zero delta, and
+  // negative delta are all explicitly false. Architecture-oracle output can pass the wiring proof but
+  // can never become learned-model quality evidence.
+  const observedParaphraseLift = ran && (paraphrase?.delta_hit5 || 0) > 0;
+  const observedQualityLift = proofKind === 'real-model' && observedParaphraseLift;
+  const architectureProofPassed = proofKind === 'architecture-proof' && observedParaphraseLift;
 
   return {
     proofKind, // 'real-model' | 'architecture-proof' — the load-bearing honesty label
     ran, // false ⇒ the semantic lane did NOT run (fallback); deltas are not trustworthy
-    observedQualityLift,
+    observedParaphraseLift, // neutral measured fact: an active lane produced a positive paraphrase Δ@5
+    observedQualityLift, // real-model evidence only; architecture-proof can never set this true
+    architectureProofPassed, // architecture-proof evidence only; never a learned-model quality claim
     semanticEngine: { id: fused.engine.id, model: fused.engine.model, fallback: fused.engine.fallback, lastError: fused.engine.lastError },
     fixture: ftsOnly.fixture,
     fts: { metrics: ftsOnly.metrics, byKind: ftsOnly.byKind },
@@ -297,7 +303,7 @@ export function renderComparison(cmp) {
   lines.push(
     isReal
       ? 'mode: REAL-MODEL BENCHMARK — quality conclusions require a positive measured fixture delta'
-      : 'mode: ARCHITECTURE PROOF — numbers prove the RRF WIRING, NOT model quality (real-model number is separate)',
+      : 'mode: ARCHITECTURE PROOF RUN — wiring passes only with a positive measured fixture delta; never model quality',
   );
   lines.push(bar);
   lines.push(`semantic engine: ${cmp.semanticEngine.id}  (model=${cmp.semanticEngine.model})`);
@@ -331,12 +337,15 @@ export function renderComparison(cmp) {
       `HEADLINE — paraphrase / synonym recall@5: ${p.fts_hit5}/${p.n}  →  ${p.fused_hit5}/${p.n}  (${sign(p.delta_hit5)})`,
     );
   }
-  if (!isReal) {
+  if (!isReal && cmp.architectureProofPassed) {
     lines.push('This is an ARCHITECTURE PROOF: a controlled synonym oracle shows RRF pulls the true-synonym doc');
     lines.push('into top-K. It proves wiring only and is NOT a model-quality number.');
   } else if (cmp.observedQualityLift) {
     lines.push('Observed real-model lift on this labeled fixture: the measured paraphrase recall@5 delta is positive.');
     lines.push('This result is fixture/model/version specific; re-measure before making broader quality claims.');
+  } else if (!isReal) {
+    lines.push('No observed architecture lift: this architecture-proof run produced no positive paraphrase recall@5 delta.');
+    lines.push('The controlled lane ran, but this result does not pass the RRF wiring proof and is NOT model-quality evidence.');
   } else {
     lines.push('The real model ran successfully, but this fixture shows no observed lift in paraphrase recall@5.');
     lines.push('Provider readiness and real-model identity alone do not support a retrieval-quality claim.');
@@ -365,8 +374,9 @@ function renderScorecard(result) {
   }
   lines.push('');
   lines.push('Honest read: keyword / partial queries recall well; PARAPHRASE queries (no shared surface');
-  lines.push('tokens) are where pure lexical FTS5 misses — that gap is the floor the optional semantic');
-  lines.push('provider is meant to lift. These are the DEFAULT-engine numbers on an in-repo fixture, NOT');
+  lines.push('tokens) are where pure lexical FTS5 misses — a gap the optional semantic provider is intended');
+  lines.push('to address, but only a positive measured delta supports lift. These are the DEFAULT-engine');
+  lines.push('numbers on an in-repo fixture, NOT');
   lines.push('the experimental hybrid LongMemEval_S figure (see README · Retrieval-quality evidence).');
   lines.push(bar);
   return lines.join('\n');
