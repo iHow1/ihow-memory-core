@@ -8,6 +8,14 @@ with pre-release tags.
 
 ## [Unreleased]
 
+### Changed
+
+- Claude Code and Codex hook commands now run the workspace-frozen `.runtime/cli.js` with a canonical workspace binding and explicit ownership marker. Reconciliation uses strict argv ownership, moves iHow entries into canonical matcher groups, removes duplicate managed entries, preserves third-party hooks/config, and makes `--no-recall` remove previously installed managed recall instead of only changing the setup message.
+- Hook argv now use POSIX-safe quoting for spaces, quotes, `$`, and backticks; native Windows fails closed on unsafe shell metacharacters. Malformed Claude hook shapes are preserved for user repair instead of being overwritten.
+- Frozen runtime bundles are integrity-stamped, health-checked, staged, validated, and atomically swapped only when stale or explicitly upgraded. Refresh preserves the per-space `semantic.json` opt-in, repairs same-version corruption, and setup counts a real bundle refresh as an applied change for runtimes whose registration survived setup.
+- Claude/Codex official-CLI replacement now restores the exact previous registration when add fails; if both replacement and rollback fail, setup reports the real mutation and required restart instead of claiming an unchanged system.
+- WorkBuddy is only shown as memory-loop enabled when its resume guidance was actually installed or already present.
+
 ## [0.1.0-alpha.26] — 2026-07-11
 
 ### Added

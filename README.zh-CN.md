@@ -233,8 +233,10 @@ ihow-memory telemetry        on | off | status——匿名计数，默认关闭
 - **`doctor` 报 `node:sqlite`。** 需要 Node.js ≥ 22.12（含 `node:sqlite` 的版本），用 `node -v` 检查。
 - **装了 hook 但没捕获（Claude Code）。** `install-hook` 后重启 Claude Code 以加载设置。协作式 Stop hook 取决于 agent 是否照提示做；确定式 SessionStart floor 只对「上一会话没有协作式 journal」时才出手（已 journal 的会话会被正确跳过）。用 `npx ihow-memory@next audit` 看结果。
 - **`connect --auto` 跨项目只兜底了一个。** Floor 捕获是单 cwd 的（见局限）。
-- **npx 缓存被清 / hook 命令失效。** 从 `npx` 缓存路径安装可能被清掉；要稳定的 hook，先全局安装（`npm i -g ihow-memory`）再跑 `install-hook`。
-- **Windows。** 请用 WSL；原生 Windows 为实验性。
+- **旧 hook 指向已清理的 `npx` 缓存。** 重新运行 `npx ihow-memory@next setup`（或对该 workspace 运行 `install-hook`）。它只认领结构严格匹配的 iHow entry，把它们迁到 canonical hook group、删除重复 iHow entry，并改指向 workspace 冻结的 `.runtime/cli.js`；第三方 hooks 不会被替换。Hook 参数使用真正的 shell escaping，路径里有空格、引号、`$` 或反引号也能安全执行。
+- **已经装过 prompt recall，现在想关闭。** 重新运行 `install-hook --no-recall`（或 `setup --no-recall`）；它会删除 iHow 自己管理的 `UserPromptSubmit` recall entry，同时保留第三方 prompt hooks。
+- **setup 刷新了冻结 runtime bundle。** 新 bundle 会写入完整性摘要，先在旁路目录复制和校验，再原子换入；每个 space 的 `semantic.json` opt-in 会被保留。setup 会诚实要求受影响且已注册的 Runtime reload/restart。如果 Claude/Codex 官方 CLI 的替换 add 失败，会尽量恢复原注册；若回滚也失败，则明确报告真实变更。
+- **Windows。** 请用 WSL；原生 Windows 为实验性。原生安装遇到不安全的 shell 元字符时会 fail closed，而不是生成可能被注入的 hook command。
 
 ## 主动记忆（Claude Code，实验性）
 

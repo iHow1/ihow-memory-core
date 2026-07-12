@@ -30,7 +30,11 @@ const path = require('node:path');
 const argv = process.argv.slice(2);
 const statePath = process.env.IHOW_OFFICIAL_CLI_STATE;
 const logPath = process.env.IHOW_OFFICIAL_CLI_LOG;
+const controlPath = process.env.IHOW_OFFICIAL_CLI_CONTROL;
 const load = () => { try { return JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch { return null; } };
+const loadControl = () => { try { return JSON.parse(fs.readFileSync(controlPath, 'utf8')); } catch { return {}; } };
+const saveControl = (value) => { if (!controlPath) return; fs.mkdirSync(path.dirname(controlPath), { recursive: true }); fs.writeFileSync(controlPath, JSON.stringify(value)); };
+const consumeAddFailure = () => { const control = loadControl(); if (!(control.addFailures > 0)) return false; control.addFailures -= 1; saveControl(control); return true; };
 const save = (value) => {
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
   if (value === null) { try { fs.unlinkSync(statePath); } catch {} return; }
@@ -109,6 +113,7 @@ if (argv[1] === 'remove') {
 if (argv[1] === 'add-json') {
   const spec = JSON.parse(argv.at(-1));
   const normalized = { command: spec.command, args: spec.args || [], env: spec.env || {} };
+  if (consumeAddFailure()) { log('add-failed', normalized); process.stderr.write('simulated add failure\\n'); process.exit(2); }
   log('add', normalized);
   save({ ...normalized, scope: 'user' });
   const configPath = path.join(process.env.HOME, '.claude.json');
@@ -130,9 +135,13 @@ const state = load();
 if (argv[0] !== 'mcp') process.exit(0);
 if (argv[1] === 'get') {
   if (!state) process.exit(1);
+  if (state.getRaw !== undefined) { process.stdout.write(String(state.getRaw)); process.exit(0); }
   console.log(JSON.stringify({
     name: 'ihow-memory', enabled: true, disabled_reason: null,
-    transport: { type: 'stdio', command: state.command, args: state.args, env: state.env || {}, env_vars: [], cwd: null },
+    transport: {
+      type: 'stdio', command: state.command, args: state.args, env: state.env || {},
+      env_vars: state.env_vars || [], cwd: state.cwd ?? null,
+    },
   }));
   process.exit(0);
 }
@@ -147,7 +156,16 @@ if (argv[1] === 'remove') {
 }
 if (argv[1] === 'add') {
   const separator = argv.indexOf('--');
-  const normalized = { command: argv[separator + 1], args: argv.slice(separator + 2), env: {} };
+  const env = {};
+  for (let index = 3; index < separator; index += 1) {
+    if (argv[index] === '--env' && argv[index + 1]) {
+      const split = argv[index + 1].indexOf('=');
+      env[argv[index + 1].slice(0, split)] = argv[index + 1].slice(split + 1);
+      index += 1;
+    }
+  }
+  const normalized = { command: argv[separator + 1], args: argv.slice(separator + 2), env };
+  if (consumeAddFailure()) { log('add-failed', normalized); process.stderr.write('simulated add failure\\n'); process.exit(2); }
   log('add', normalized);
   save(normalized);
   process.exit(0);
@@ -280,7 +298,7 @@ function assertConservativeClaudeReplacement(result, entries) {
   assert.deepEqual(entries.map((entry) => entry.op), ['remove', 'add'], 'uncertainty triggers exactly one remove/add');
 }
 
-test('Claude canonical config missing cannot prove unchanged from ambiguous joined argv', async (t) => {
+test('Claude canonical config missing refuses destructive replacement of ambiguous joined argv', async (t) => {
   const fixture = await makeClaudeFixture(t, 'ambiguous-argv');
   const desired = await primeClaudeFixture(fixture);
   assert.ok(desired.args.length >= 2);
@@ -293,15 +311,19 @@ test('Claude canonical config missing cannot prove unchanged from ambiguous join
   await fs.writeFile(fixture.statePath, JSON.stringify(ambiguous), 'utf8');
   await fs.rm(path.join(fixture.home, '.claude.json'), { force: true });
 
-  const result = runJson(fixture);
-  assertConservativeClaudeReplacement(result, await mutations(fixture.logPath));
+  const result = runJson({ ...fixture, allowFailure: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.applied, false);
+  assert.match(result.skipped[0].error, /visible_user_spec_unavailable_refusing_remove/);
+  assert.deepEqual(await mutations(fixture.logPath), [], 'no reversible snapshot means no remove/add mutation');
+  assert.deepEqual(JSON.parse(await fs.readFile(fixture.statePath, 'utf8')), ambiguous, 'existing visible registration remains untouched');
 });
 
 test('Claude project/local-only entry installs user scope without an invalid user removal', async (t) => {
   const fixture = await makeClaudeFixture(t, 'project-scope');
   const desired = await primeClaudeFixture(fixture);
   await fs.writeFile(fixture.statePath, JSON.stringify({ ...desired, scope: 'project' }), 'utf8');
-  await fs.writeFile(path.join(fixture.home, '.claude.json'), '{ not readable canonical JSON', 'utf8');
+  await fs.writeFile(path.join(fixture.home, '.claude.json'), JSON.stringify({ mcpServers: {} }), 'utf8');
 
   const result = runJson(fixture);
   assert.equal(result.applied, true, 'project-only visibility installs the missing user entry');
@@ -316,7 +338,7 @@ test('Claude local-only entry installs user scope without an invalid user remova
   const fixture = await makeClaudeFixture(t, 'local-scope');
   const desired = await primeClaudeFixture(fixture);
   await fs.writeFile(fixture.statePath, JSON.stringify({ ...desired, scope: 'local' }), 'utf8');
-  await fs.writeFile(path.join(fixture.home, '.claude.json'), '{ not readable canonical JSON', 'utf8');
+  await fs.writeFile(path.join(fixture.home, '.claude.json'), JSON.stringify({ mcpServers: {} }), 'utf8');
 
   const result = runJson(fixture);
   assert.equal(result.applied, true, 'local-only visibility installs the missing user entry');
@@ -326,19 +348,18 @@ test('Claude local-only entry installs user scope without an invalid user remova
   assert.equal(JSON.parse(await fs.readFile(fixture.statePath, 'utf8')).scope, 'user');
 });
 
-test('Claude unknown effective scope tolerates a real user-scope-missing result and adds user scope', async (t) => {
+test('Claude unknown effective scope without canonical snapshot refuses destructive replacement', async (t) => {
   const fixture = await makeClaudeFixture(t, 'unknown-scope');
   const desired = await primeClaudeFixture(fixture);
   await fs.writeFile(fixture.statePath, JSON.stringify({ ...desired, scope: 'unknown' }), 'utf8');
   await fs.rm(path.join(fixture.home, '.claude.json'), { force: true });
 
-  const result = runJson(fixture);
-  assert.equal(result.applied, true, 'unknown effective scope still completes user installation');
-  assert.notEqual(result.unchanged, true);
-  assert.equal(result.restart.required, true);
-  assert.deepEqual(result.restart.runtimes, ['claude-code']);
-  assert.deepEqual((await mutations(fixture.logPath)).map((entry) => entry.op), ['add'], 'a user-scope-missing remove is tolerated and only user add mutates');
-  assert.equal(JSON.parse(await fs.readFile(fixture.statePath, 'utf8')).scope, 'user');
+  const result = runJson({ ...fixture, allowFailure: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.applied, false);
+  assert.match(result.skipped[0].error, /visible_user_spec_unavailable_refusing_remove/);
+  assert.deepEqual(await mutations(fixture.logPath), [], 'unknown scope without exact snapshot is mutation-free');
+  assert.equal(JSON.parse(await fs.readFile(fixture.statePath, 'utf8')).scope, 'unknown');
 });
 
 for (const [name, scopeLabel, removeFailure] of [
@@ -376,10 +397,10 @@ for (const [name, scopeLabel, removeFailure] of [
 
     const result = runJson({ ...fixture, allowFailure: true });
     assert.equal(result.ok, false, 'setup reports the connector failure');
-    assert.equal(result.applied, false, 'failed removal never marks setup applied');
+    assert.equal(result.applied, false, 'missing reversible snapshot never marks setup applied');
     assert.notEqual(result.unchanged, true, 'uncertain state never claims unchanged');
-    assert.deepEqual(await mutations(fixture.logPath), [], 'a non-official failure must prevent add');
-    assert.match(result.skipped[0].error, /claude_mcp_remove_failed/i);
+    assert.deepEqual(await mutations(fixture.logPath), [], 'missing canonical snapshot prevents both remove and add');
+    assert.match(result.skipped[0].error, /visible_user_spec_unavailable_refusing_remove/i);
   });
 }
 
@@ -452,22 +473,17 @@ test('Claude canonical absence plus arbitrary get failure fails before add', asy
   assert.match(result.skipped[0].error, /claude_mcp_get_failed/i);
 });
 
-test('Claude human parser uncertainty performs one replacement and never reports unchanged', async (t) => {
+test('Claude human parser uncertainty without canonical snapshot is mutation-free and fail-closed', async (t) => {
   const fixture = await makeClaudeFixture(t, 'human-output');
   await primeClaudeFixture(fixture);
   const canonicalPath = path.join(fixture.home, '.claude.json');
   await fs.rm(canonicalPath, { force: true });
 
-  const connectResult = runJson({ ...fixture, command: 'connect' });
-  assert.equal(connectResult.unchanged, false, 'explicit connect cannot claim human-output equality');
-  assert.equal(connectResult.changed, true);
-  assert.equal(connectResult.replaced, true);
-  assert.deepEqual((await mutations(fixture.logPath)).map((entry) => entry.op), ['remove', 'add']);
-
-  await fs.rm(canonicalPath, { force: true });
-  await fs.writeFile(fixture.logPath, '', 'utf8');
-  const setupResult = runJson(fixture);
-  assertConservativeClaudeReplacement(setupResult, await mutations(fixture.logPath));
+  const setupResult = runJson({ ...fixture, allowFailure: true });
+  assert.equal(setupResult.ok, false);
+  assert.equal(setupResult.applied, false);
+  assert.match(setupResult.skipped[0].error, /visible_user_spec_unavailable_refusing_remove/);
+  assert.deepEqual(await mutations(fixture.logPath), [], 'setup remains mutation-free under parser uncertainty');
 });
 
 test('Hermes official CLI compares command/argv/env and replaces environment drift', async (t) => {
@@ -553,5 +569,142 @@ for (const runtime of ['claude-code', 'codex']) {
     const afterChanged = await mutations(logPath);
     assert.deepEqual(afterChanged.map((entry) => entry.op), ['add', 'remove', 'add'], 'changed spec is replaced exactly once');
     assert.notDeepEqual(afterChanged[0].spec.args, afterChanged[2].spec.args, 'replacement carries the new desired argv');
+  });
+
+  test(`${runtime} official CLI restores the previous registration when replacement add fails`, async (t) => {
+    const home = await realTemp(`ihow-${runtime}-rollback-home-`);
+    const bin = await realTemp(`ihow-${runtime}-rollback-bin-`);
+    const rootA = await realTemp(`ihow-${runtime}-rollback-root-a-`);
+    const rootB = await realTemp(`ihow-${runtime}-rollback-root-b-`);
+    const cwd = await realTemp(`ihow-${runtime}-rollback-cwd-`);
+    const statePath = path.join(home, '.stub', `${runtime}-state.json`);
+    const logPath = path.join(home, '.stub', `${runtime}-mutations.jsonl`);
+    const controlPath = path.join(home, '.stub', `${runtime}-control.json`);
+    await fs.mkdir(path.dirname(logPath), { recursive: true });
+    if (runtime === 'claude-code') await makeClaudeStub(bin);
+    else await makeCodexStub(bin);
+    t.after(async () => {
+      for (const dir of [home, bin, rootA, rootB, cwd]) await fs.rm(dir, { recursive: true, force: true });
+    });
+
+    runJson({ runtime, home, bin, statePath, logPath, root: rootA, cwd });
+    const previous = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    await fs.writeFile(logPath, '', 'utf8');
+    await fs.writeFile(controlPath, JSON.stringify({ addFailures: 1 }), 'utf8');
+
+    const result = runJson({
+      runtime, home, bin, statePath, logPath, root: rootB, cwd, allowFailure: true,
+      extraEnv: { IHOW_OFFICIAL_CLI_CONTROL: controlPath },
+    });
+    assert.equal(result.ok, false, 'setup reports the replacement failure');
+    assert.equal(result.applied, false, 'successful rollback leaves no applied runtime mutation');
+    assert.equal(result.restart.required, false, 'restored registration does not request a false restart');
+    assert.deepEqual(JSON.parse(await fs.readFile(statePath, 'utf8')), previous, 'previous exact spec restored');
+    assert.deepEqual((await mutations(logPath)).map((entry) => entry.op), ['remove', 'add-failed', 'add']);
+  });
+
+  test(`${runtime} bundle refresh remains applied when failed replacement rolls back to the same runtime bundle`, async (t) => {
+    const home = await realTemp(`ihow-${runtime}-bundle-rollback-home-`);
+    const bin = await realTemp(`ihow-${runtime}-bundle-rollback-bin-`);
+    const root = await realTemp(`ihow-${runtime}-bundle-rollback-root-`);
+    const cwd = await realTemp(`ihow-${runtime}-bundle-rollback-cwd-`);
+    const statePath = path.join(home, '.stub', `${runtime}-state.json`);
+    const logPath = path.join(home, '.stub', `${runtime}-mutations.jsonl`);
+    const controlPath = path.join(home, '.stub', `${runtime}-control.json`);
+    await fs.mkdir(path.dirname(logPath), { recursive: true });
+    if (runtime === 'claude-code') await makeClaudeStub(bin);
+    else await makeCodexStub(bin);
+    t.after(async () => {
+      for (const dir of [home, bin, root, cwd]) await fs.rm(dir, { recursive: true, force: true });
+    });
+
+    runJson({ runtime, home, bin, statePath, logPath, root, cwd });
+    const previous = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    const drifted = { ...previous, env: { ...(previous.env || {}), VENDOR_DRIFT: '1' } };
+    await fs.writeFile(statePath, JSON.stringify(drifted), 'utf8');
+    if (runtime === 'claude-code') {
+      const canonicalPath = path.join(home, '.claude.json');
+      const canonical = JSON.parse(await fs.readFile(canonicalPath, 'utf8'));
+      canonical.mcpServers['ihow-memory'].env = drifted.env;
+      await fs.writeFile(canonicalPath, JSON.stringify(canonical), 'utf8');
+    }
+    const core = path.join(root, 'official-cli-idempotency', '.runtime', 'core.js');
+    await fs.writeFile(core, '/* corrupt current bundle */', 'utf8');
+    await fs.writeFile(logPath, '', 'utf8');
+    await fs.writeFile(controlPath, JSON.stringify({ addFailures: 1 }), 'utf8');
+
+    const result = runJson({
+      runtime, home, bin, statePath, logPath, root, cwd, allowFailure: true,
+      extraEnv: { IHOW_OFFICIAL_CLI_CONTROL: controlPath },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.applied, true, 'repaired bundle remains an applied change after registration rollback');
+    assert.equal(result.restart.required, true);
+    assert.deepEqual(result.restart.runtimes, [runtime]);
+    assert.deepEqual(JSON.parse(await fs.readFile(statePath, 'utf8')), drifted, 'drifted registration restored exactly');
+    assert.doesNotMatch(await fs.readFile(core, 'utf8'), /corrupt current bundle/, 'bundle corruption repaired');
+    assert.deepEqual((await mutations(logPath)).map((entry) => entry.op), ['remove', 'add-failed', 'add']);
+  });
+
+  test(`${runtime} official CLI reports an applied mutation when replacement and rollback both fail`, async (t) => {
+    const home = await realTemp(`ihow-${runtime}-rollback-fail-home-`);
+    const bin = await realTemp(`ihow-${runtime}-rollback-fail-bin-`);
+    const rootA = await realTemp(`ihow-${runtime}-rollback-fail-root-a-`);
+    const rootB = await realTemp(`ihow-${runtime}-rollback-fail-root-b-`);
+    const cwd = await realTemp(`ihow-${runtime}-rollback-fail-cwd-`);
+    const statePath = path.join(home, '.stub', `${runtime}-state.json`);
+    const logPath = path.join(home, '.stub', `${runtime}-mutations.jsonl`);
+    const controlPath = path.join(home, '.stub', `${runtime}-control.json`);
+    await fs.mkdir(path.dirname(logPath), { recursive: true });
+    if (runtime === 'claude-code') await makeClaudeStub(bin);
+    else await makeCodexStub(bin);
+    t.after(async () => {
+      for (const dir of [home, bin, rootA, rootB, cwd]) await fs.rm(dir, { recursive: true, force: true });
+    });
+
+    runJson({ runtime, home, bin, statePath, logPath, root: rootA, cwd });
+    await fs.writeFile(logPath, '', 'utf8');
+    await fs.writeFile(controlPath, JSON.stringify({ addFailures: 2 }), 'utf8');
+    const result = runJson({
+      runtime, home, bin, statePath, logPath, root: rootB, cwd, allowFailure: true,
+      extraEnv: { IHOW_OFFICIAL_CLI_CONTROL: controlPath },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.applied, true, 'lost registration is reported as a real applied mutation');
+    assert.equal(result.restart.required, true);
+    assert.deepEqual(result.restart.runtimes, [runtime]);
+    assert.equal(await fs.access(statePath).then(() => true, () => false), false, 'failed rollback leaves registration absent in the stub');
+    assert.deepEqual((await mutations(logPath)).map((entry) => entry.op), ['remove', 'add-failed', 'add-failed']);
+  });
+}
+
+for (const [name, mutation, expected] of [
+  ['unparseable transport', { getRaw: '{not-json' }, /existing_spec_unparseable_refusing_remove/],
+  ['non-restorable cwd', { cwd: '/vendor/custom-cwd' }, /nonrestorable_cwd_or_env_vars_refusing_remove/],
+  ['non-restorable env_vars', { env_vars: ['VENDOR_TOKEN'] }, /nonrestorable_cwd_or_env_vars_refusing_remove/],
+]) {
+  test(`codex fails closed without remove when existing ${name} cannot be exactly restored`, async (t) => {
+    const home = await realTemp(`ihow-codex-nonrestorable-home-`);
+    const bin = await realTemp(`ihow-codex-nonrestorable-bin-`);
+    const rootA = await realTemp(`ihow-codex-nonrestorable-root-a-`);
+    const rootB = await realTemp(`ihow-codex-nonrestorable-root-b-`);
+    const cwd = await realTemp(`ihow-codex-nonrestorable-cwd-`);
+    const statePath = path.join(home, '.stub', 'codex-state.json');
+    const logPath = path.join(home, '.stub', 'codex-mutations.jsonl');
+    await fs.mkdir(path.dirname(logPath), { recursive: true });
+    await makeCodexStub(bin);
+    t.after(async () => {
+      for (const dir of [home, bin, rootA, rootB, cwd]) await fs.rm(dir, { recursive: true, force: true });
+    });
+
+    runJson({ runtime: 'codex', home, bin, statePath, logPath, root: rootA, cwd });
+    const previous = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    await fs.writeFile(statePath, JSON.stringify({ ...previous, ...mutation }), 'utf8');
+    await fs.writeFile(logPath, '', 'utf8');
+    const result = runJson({ runtime: 'codex', home, bin, statePath, logPath, root: rootA, cwd, allowFailure: true });
+    assert.equal(result.ok, false);
+    assert.equal(result.applied, false);
+    assert.match(result.skipped[0].error, expected);
+    assert.deepEqual(await mutations(logPath), [], 'non-restorable registration is never removed');
   });
 }

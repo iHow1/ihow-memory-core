@@ -103,7 +103,7 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 
 ### Updating
 
-`connect` freezes a runtime copy of the server into the workspace, so `npm update` does **not** refresh the running MCP server by itself. After updating the package, run `npx ihow-memory@next upgrade` (then restart the runtime) to refresh the connected server. `doctor` warns when the connected server is older than the installed package (a "runtime-bundle" check).
+`connect` freezes a runtime copy of the server and CLI into the workspace. Claude Code and Codex hooks are pinned to that workspace's `.runtime/cli.js` (with the full workspace binding), rather than the package install or an evictable `npx` cache path. Because `npm update` does **not** refresh this frozen runtime by itself, run `npx ihow-memory@next upgrade` (then restart the runtime) after updating. `doctor` warns when the connected server is older than the installed package (a "runtime-bundle" check).
 
 ## Runtime support
 
@@ -310,8 +310,10 @@ In that mode the write boundary is strict: existing durable Markdown is read-onl
 - **Hook installed but nothing captured (Claude Code).** Restart Claude Code after `install-hook` so it loads the settings. The cooperative Stop hook depends on the agent honoring the prompt; the deterministic SessionStart floor only fires for a *previous* session that ended without a cooperative journal (so a session that already journaled is correctly skipped). Inspect outcomes with `npx ihow-memory@next audit`.
 - **Codex hooks installed but not firing.** Restart Codex after `connect --runtime codex --easy` / `install-hook --runtime codex`. If Codex asks you to review hooks, open `/hooks` and trust the iHow Memory command hooks; writing `hooks.json` is the installation step, while Codex still owns the trust gate.
 - **`connect --auto` across projects only backs up one.** Floor capture is single-cwd (see Limitations).
-- **npx cache cleared / hook command broke.** Installing from an `npx` cache path can be wiped; for a durable hook install globally (`npm i -g ihow-memory`) then re-run `install-hook`.
-- **Windows.** Use WSL; native Windows is experimental.
+- **Old hook points into a cleared `npx` cache.** Re-run `npx ihow-memory@next setup` (or `install-hook` for that workspace). It moves only strictly identified iHow entries into canonical hook groups, removes duplicate iHow entries, and points them at the workspace-frozen `.runtime/cli.js` without replacing third-party hooks. Hook argv are shell-escaped, including workspaces whose paths contain spaces, quotes, `$`, or backticks.
+- **Turn prompt recall back off after it was installed.** Re-run `install-hook --no-recall` (or `setup --no-recall`). It removes only iHow's managed `UserPromptSubmit` recall entry and preserves third-party prompt hooks.
+- **Setup refreshed the frozen runtime bundle.** The bundle is integrity-stamped, staged, and validated before an atomic directory swap; the per-space `semantic.json` opt-in is preserved. Setup reports the affected registered runtime as requiring reload/restart instead of claiming no changes. If an official Claude/Codex CLI replacement add fails, setup restores the exact previous registration when possible and reports any failed rollback as a real mutation.
+- **Windows.** Use WSL; native Windows is experimental. Native installs fail closed on unsafe shell metacharacters rather than emitting an injectable hook command.
 
 ## Proactive memory
 
