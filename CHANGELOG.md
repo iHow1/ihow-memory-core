@@ -8,6 +8,11 @@ with pre-release tags.
 
 ## [Unreleased]
 
+### Added
+
+- Added a local, append-only activation evidence ledger with metadata-only hashed workspace/configuration bindings, bounded fail-open locking, integrity-checked managed-entry installation epochs that ignore unrelated config file/inode churn, and stable activation reason codes. `doctor` now distinguishes `ACTIVE`, `READY — WAITING FOR FIRST ACTIVITY`, `TOOLS ONLY`, and `NEEDS REPAIR`; static capability, MCP reachability, synthetic probes, and started-only events never count as live activation.
+- Added live Claude Code and Codex hook-wiring verification. Missing, duplicated, dead-target, wrong-workspace, wrong-owner, or malformed managed hooks degrade previously configured automation to `NEEDS REPAIR`; unrelated workspace bindings remain non-blocking. Invalid/manual hook payloads create no live evidence, and explicit synthetic dispatch remains non-active.
+
 ### Changed
 
 - Claude Code and Codex hook commands now run the workspace-frozen `.runtime/cli.js` with a canonical workspace binding and explicit ownership marker. Reconciliation uses strict argv ownership, moves iHow entries into canonical matcher groups, removes duplicate managed entries, preserves third-party hooks/config, and makes `--no-recall` remove previously installed managed recall instead of only changing the setup message.

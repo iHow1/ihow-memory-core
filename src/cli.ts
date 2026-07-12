@@ -41,6 +41,28 @@ import {
 import * as telemetry from './telemetry.ts';
 import { runCaptureFloorSweep } from './floor.ts';
 import { automationMatrix, worstAutomationStatus, type AutomationMatrixRow } from './automation-doctor.ts';
+import {
+  activationConfigurationId,
+  appendActivationEvidenceFailOpen,
+  readActivationEvidence,
+  type ActivationEvidenceEvent,
+  type ActivationEvidenceSource,
+} from './activation-ledger.ts';
+import {
+  claudeHookConfigPaths,
+  claudeHookInstallPath,
+  codexHookConfigPath,
+  commandHookIsAbsent,
+  commandHookIsCurrent,
+  ensureCommandHook,
+  hookEventShapesValid,
+  IHOW_HOOK_OWNER,
+  recallHookCommand,
+  removeCommandHooks,
+  sessionStartHookCommand,
+  stopHookCommand,
+  verifyRuntimeHookWiring,
+} from './hook-wiring.ts';
 import { explainPromptRecall, recallExplanationFromSelection } from './recall-explanation.ts';
 import {
   PROMPT_RECALL_INCLUDE_LIMIT,
@@ -84,6 +106,7 @@ type ParsedArgs = {
     update?: boolean;
     autoPromote?: boolean;
     hookOwner?: string;
+    synthetic?: boolean;
     from?: string;
     fromDraft?: string;
     scope?: string;
@@ -111,6 +134,176 @@ type DoctorResult = {
   automationMatrix?: AutomationMatrixRow[];
   automationMetrics?: Record<string, unknown>;
 };
+
+async function recordConfiguredActivation(
+  workspace: ReturnType<typeof resolveWorkspace>,
+  runtime: string,
+  source: Extract<ActivationEvidenceSource, 'setup' | 'connect' | 'install-hook'>,
+  options: ParsedArgs['options'],
+  allowGenerationChange = false,
+): Promise<boolean> {
+  if (runtime !== 'claude-code' && runtime !== 'codex') return false;
+  const wiring = await verifyRuntimeHookWiring(workspace, runtime, options);
+  if (wiring.state !== 'current' || !wiring.generationId) return false;
+  const configurationId = activationConfigurationId(wiring.generationId);
+  let priorConfigured: Awaited<ReturnType<typeof readActivationEvidence>>;
+  try {
+    priorConfigured = (await readActivationEvidence(workspace))
+      .filter((row) => row.runtime === runtime && row.status === 'configured');
+  } catch {
+    return false;
+  }
+  const generationAlreadyTrusted = priorConfigured.some((row) => row.configuration?.id === configurationId);
+  // An idempotent/already-present path must never authenticate an out-of-band generation change.
+  // Only a caller that actually rewrote managed hooks or refreshed the frozen bundle may open a new epoch.
+  if (priorConfigured.length > 0 && !generationAlreadyTrusted && !allowGenerationChange) return false;
+  await appendActivationEvidenceFailOpen(workspace, {
+    runtime,
+    event: 'runtime-configured',
+    source,
+    status: 'configured',
+    // Generation includes exact managed commands, integrity-checked installation epochs, and frozen CLI identity.
+    // Unchanged reruns dedupe; an actual repaired config or runtime bundle produces a fresh installation epoch.
+    dedupeKey: wiring.generationId,
+    configurationKey: wiring.generationId,
+  });
+  return true;
+}
+
+async function hookGenerationNeedsRepair(
+  workspace: ReturnType<typeof resolveWorkspace>,
+  runtime: 'claude-code' | 'codex',
+  options: ParsedArgs['options'],
+): Promise<boolean> {
+  try {
+    const wiring = await verifyRuntimeHookWiring(workspace, runtime, options);
+    if (wiring.state !== 'current' || !wiring.generationId) return false;
+    const configured = (await readActivationEvidence(workspace))
+      .filter((row) => row.runtime === runtime && row.status === 'configured');
+    if (!configured.length) return false;
+    const current = activationConfigurationId(wiring.generationId);
+    return !configured.some((row) => row.configuration?.id === current);
+  } catch {
+    return false;
+  }
+}
+
+async function runHookWithActivation(
+  options: ParsedArgs['options'],
+  event: Extract<ActivationEvidenceEvent, 'hook-stop' | 'hook-session-start' | 'hook-user-prompt-submit'>,
+  handler: (payload: Record<string, unknown> | undefined) => Promise<void>,
+): Promise<void> {
+  let payload: Record<string, unknown> | undefined;
+  try {
+    const raw = await readStdinSafe();
+    if (raw.trim()) {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>;
+    }
+  } catch {
+    await handler(undefined).catch(() => {});
+    return;
+  }
+
+  const expectedEvent = event === 'hook-stop'
+    ? 'Stop'
+    : event === 'hook-session-start'
+      ? 'SessionStart'
+      : 'UserPromptSubmit';
+  const sessionId = typeof payload?.session_id === 'string' ? payload.session_id.trim() : '';
+  const eventName = typeof payload?.hook_event_name === 'string' ? payload.hook_event_name : '';
+  const cwd = typeof payload?.cwd === 'string' && payload.cwd.trim() ? payload.cwd : options.cwd;
+  let workspace: ReturnType<typeof resolveWorkspace> | undefined;
+  if (sessionId && eventName === expectedEvent) {
+    try {
+      workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd }));
+    } catch {
+      workspace = undefined;
+    }
+  }
+
+  // Invalid/empty/manual payloads preserve hook fail-open behavior but create no native-live evidence.
+  if (!workspace) {
+    await handler(payload).catch(() => {});
+    return;
+  }
+
+  const runtime = options.runtime === 'codex' ? 'codex' : 'claude-code';
+  const invocationKey = JSON.stringify({
+    event,
+    sessionId,
+    source: typeof payload?.source === 'string' ? payload.source : '',
+    transcript: typeof payload?.transcript_path === 'string' ? payload.transcript_path : '',
+  });
+  if (options.synthetic) {
+    await handler(payload).catch(() => {});
+    await appendActivationEvidenceFailOpen(workspace, {
+      runtime,
+      event: 'synthetic-check',
+      source: 'synthetic-proof',
+      status: 'synthetic',
+      dedupeKey: invocationKey,
+    });
+    return;
+  }
+
+  const prompt = ['prompt', 'user_prompt', 'userPrompt', 'message', 'input']
+    .map((key) => payload?.[key])
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  const handlerWouldAct = event === 'hook-stop'
+    ? payload?.stop_hook_active !== true
+    : event === 'hook-user-prompt-submit'
+      ? !process.env.IHOW_RECALL_OFF && !!prompt
+      : true;
+  const expectedCli = path.join(workspace.spaceDir, '.runtime', 'cli.js');
+  let invokedFromCurrentBundle = false;
+  try {
+    const [actual, expected] = await Promise.all([fs.realpath(path.resolve(process.argv[1] || '')), fs.realpath(expectedCli)]);
+    invokedFromCurrentBundle = actual === expected;
+  } catch {
+    invokedFromCurrentBundle = false;
+  }
+  const wiring = options.hookOwner === IHOW_HOOK_OWNER && invokedFromCurrentBundle && handlerWouldAct
+    ? await verifyRuntimeHookWiring(workspace, runtime, options).catch(() => undefined)
+    : undefined;
+  // A shell command that merely resembles a host event is not activation evidence. Live rows require
+  // the explicit managed owner, the workspace-frozen CLI, current exact wiring, and a handler path that
+  // is not a recursion guard / recall no-op. Manual/source CLI calls remain fail-open but non-activating.
+  if (!wiring || wiring.state !== 'current' || !wiring.generationId) {
+    await handler(payload).catch(() => {});
+    return;
+  }
+
+  await appendActivationEvidenceFailOpen(workspace, {
+    runtime,
+    event,
+    source: 'native-hook',
+    status: 'observed-live-started',
+    dedupeKey: invocationKey,
+    configurationKey: wiring.generationId,
+  });
+  try {
+    await handler(payload);
+    await appendActivationEvidenceFailOpen(workspace, {
+      runtime,
+      event,
+      source: 'native-hook',
+      status: 'observed-live-completed',
+      dedupeKey: invocationKey,
+      configurationKey: wiring.generationId,
+    });
+  } catch {
+    await appendActivationEvidenceFailOpen(workspace, {
+      runtime,
+      event,
+      source: 'native-hook',
+      status: 'failed',
+      dedupeKey: invocationKey,
+      configurationKey: wiring.generationId,
+    });
+    // Host hook contract is fail-open: activation bookkeeping and handler failures never block it.
+  }
+}
 
 function parseArgs(argv: string[]): ParsedArgs {
   const [command = 'help', ...tail] = argv;
@@ -161,6 +354,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--update') options.update = true;
     else if (arg === '--no-auto-promote') options.autoPromote = false;
     else if (arg === '--hook-owner') options.hookOwner = tail[++index];
+    else if (arg === '--synthetic') options.synthetic = true;
     else if (arg === '--from') options.from = tail[++index];
     else if (arg === '--from-draft') options.fromDraft = tail[++index];
     else if (arg === '--scope') {
@@ -1384,229 +1578,6 @@ async function maybeInstallCodexMemoryLoop(): Promise<'installed' | 'already' | 
 
 type HookInstallOutcome = 'installed' | 'already' | 'skipped' | 'failed';
 
-type CommandHookEntry = {
-  type: 'command';
-  command: string;
-  timeout?: number;
-  statusMessage?: string;
-};
-
-type HookGroup = {
-  matcher?: string;
-  hooks?: CommandHookEntry[];
-};
-
-const IHOW_HOOK_OWNER = 'ihow-memory-v1';
-
-// Conservative tokenizer for the command strings we generate (POSIX single/double quotes + escapes).
-// It is used only for ownership classification, never to execute input. A malformed command is unowned.
-function hookCommandTokens(command: string): string[] | null {
-  const words: string[] = [];
-  let word = '';
-  let started = false;
-  let quote: 'single' | 'double' | null = null;
-  let escaped = false;
-  for (const char of command) {
-    if (escaped) {
-      word += char;
-      started = true;
-      escaped = false;
-      continue;
-    }
-    if (quote === 'single') {
-      if (char === "'") quote = null;
-      else word += char;
-      started = true;
-      continue;
-    }
-    if (quote === 'double') {
-      if (char === '"') quote = null;
-      else if (char === '\\') escaped = true;
-      else word += char;
-      started = true;
-      continue;
-    }
-    if (/\s/.test(char)) {
-      if (started) {
-        words.push(word);
-        word = '';
-        started = false;
-      }
-    } else if (char === "'") {
-      quote = 'single';
-      started = true;
-    } else if (char === '"') {
-      quote = 'double';
-      started = true;
-    } else if (char === '\\') {
-      escaped = true;
-      started = true;
-    } else {
-      word += char;
-      started = true;
-    }
-  }
-  if (quote || escaped) return null;
-  if (started) words.push(word);
-  return words;
-}
-
-function commandHookIsOwned(command: string, marker: string): boolean {
-  const words = hookCommandTokens(command);
-  if (!words || words[2] !== marker) return false;
-  const owner = words.indexOf('--hook-owner');
-  if (owner >= 0 && words[owner + 1] === IHOW_HOOK_OWNER) return true;
-  // Legacy iHow commands had the strict shape: node <.../bin/ihow-memory.mjs> <hook-subcommand> ...
-  // Requiring both executable argv positions avoids claiming python/vendor commands that merely use
-  // an ihow-memory.mjs filename and the same subcommand text.
-  const executable = path.basename(words[0] || '').toLowerCase();
-  return (executable === 'node' || executable === 'node.exe') && path.basename(words[1] || '') === 'ihow-memory.mjs';
-}
-
-function hookEventShapesValid(hooks: Record<string, unknown>, events: string[]): boolean {
-  for (const event of events) {
-    const groups = hooks[event];
-    if (groups === undefined) continue;
-    if (!Array.isArray(groups)) return false;
-    for (const group of groups) {
-      if (!group || typeof group !== 'object' || Array.isArray(group)) return false;
-      const record = group as { matcher?: unknown; hooks?: unknown };
-      if (record.matcher !== undefined && typeof record.matcher !== 'string') return false;
-      if (!Array.isArray(record.hooks)) return false;
-      if (record.hooks.some((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry))) return false;
-    }
-  }
-  return true;
-}
-
-function commandHookIsAbsent(hooks: Record<string, unknown>, event: string, marker: string): boolean {
-  const list = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
-  return !list.some((group) => {
-    const entries = (group as { hooks?: unknown[] })?.hooks;
-    return Array.isArray(entries) && entries.some((entry) => {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
-      const command = (entry as Record<string, unknown>).command;
-      return typeof command === 'string' && commandHookIsOwned(command, marker);
-    });
-  });
-}
-
-function commandHookIsCurrent(
-  hooks: Record<string, unknown>,
-  event: string,
-  marker: string,
-  expected: CommandHookEntry,
-  matcher?: string,
-): boolean {
-  const list = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
-  let owned = 0;
-  let currentCount = 0;
-  for (const group of list) {
-    const record = group as { matcher?: unknown; hooks?: unknown[] };
-    const entries = record?.hooks;
-    if (!Array.isArray(entries)) continue;
-    for (const entry of entries) {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
-      const current = entry as Record<string, unknown>;
-      if (typeof current.command !== 'string' || !commandHookIsOwned(current.command, marker)) continue;
-      owned += 1;
-      if (entries.length === 1 && record.matcher === matcher &&
-        current.type === expected.type &&
-        current.command === expected.command &&
-        current.timeout === expected.timeout &&
-        current.statusMessage === expected.statusMessage) currentCount += 1;
-    }
-  }
-  return owned === 1 && currentCount === 1;
-}
-
-function removeCommandHooks(hooks: Record<string, unknown>, event: string, marker: string): boolean {
-  const list = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
-  const nextGroups: unknown[] = [];
-  let changed = false;
-  for (const group of list) {
-    const record = group as { hooks?: unknown[] };
-    if (!Array.isArray(record.hooks)) {
-      nextGroups.push(group);
-      continue;
-    }
-    const next = record.hooks.filter((entry) => {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return true;
-      const command = (entry as Record<string, unknown>).command;
-      const owned = typeof command === 'string' && commandHookIsOwned(command, marker);
-      if (owned) changed = true;
-      return !owned;
-    });
-    if (next.length > 0 || next.length === record.hooks.length) {
-      if (next.length !== record.hooks.length) record.hooks = next;
-      nextGroups.push(group);
-    }
-  }
-  if (changed) {
-    if (nextGroups.length) hooks[event] = nextGroups;
-    else delete hooks[event];
-  }
-  return changed;
-}
-
-function ensureCommandHook(
-  hooks: Record<string, unknown>,
-  event: string,
-  marker: string,
-  command: string,
-  hook: Omit<CommandHookEntry, 'type' | 'command'> = {},
-  matcher?: string,
-): boolean {
-  const list = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
-  const expected: CommandHookEntry = { type: 'command', command, ...hook };
-  if (commandHookIsCurrent(hooks, event, marker, expected, matcher)) return false;
-
-  let firstOwned: Record<string, unknown> | undefined;
-  let preservedGroupFields: Record<string, unknown> = {};
-  const nextGroups: unknown[] = [];
-  for (const group of list) {
-    const record = group as Record<string, unknown> & { hooks?: unknown[] };
-    if (!Array.isArray(record.hooks)) {
-      nextGroups.push(group);
-      continue;
-    }
-    const ownedEntries = record.hooks.filter((entry) => {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
-      const current = entry as Record<string, unknown>;
-      return typeof current.command === 'string' && commandHookIsOwned(current.command, marker);
-    }) as Record<string, unknown>[];
-    if (!ownedEntries.length) {
-      nextGroups.push(group);
-      continue;
-    }
-    if (!firstOwned) {
-      firstOwned = ownedEntries[0];
-      if (ownedEntries.length === record.hooks.length) {
-        preservedGroupFields = Object.fromEntries(
-          Object.entries(record).filter(([key]) => key !== 'hooks' && key !== 'matcher'),
-        );
-      }
-    }
-    const remaining = record.hooks.filter((entry) => !ownedEntries.includes(entry as Record<string, unknown>));
-    if (remaining.length) {
-      record.hooks = remaining;
-      nextGroups.push(group);
-    }
-  }
-
-  const entry = firstOwned ?? {};
-  for (const key of ['type', 'command', 'timeout', 'statusMessage'] as const) {
-    const value = expected[key];
-    if (value === undefined) delete entry[key];
-    else entry[key] = value;
-  }
-  const canonical: HookGroup & Record<string, unknown> = { ...preservedGroupFields, hooks: [entry as CommandHookEntry] };
-  if (matcher !== undefined) canonical.matcher = matcher;
-  nextGroups.push(canonical);
-  hooks[event] = nextGroups;
-  return true;
-}
-
 // Codex hook installer. Codex supports hooks.json at ~/.codex/hooks.json with SessionStart and
 // UserPromptSubmit events. We install only low-noise hooks here:
 //   - SessionStart: resume-awareness hint + deterministic cross-runtime floor trigger
@@ -1615,7 +1586,8 @@ function ensureCommandHook(
 // process-exit/session-end, so using the Claude session-end nudge there could interrupt normal turns.
 async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<HookInstallOutcome> {
   if (options.installHook === false) return 'skipped';
-  const dest = path.join(codexHomeDir(), 'hooks.json');
+  const workspace = resolveWorkspace(options);
+  const dest = codexHookConfigPath();
   let config: Record<string, unknown> = {};
   let existed = false;
   try {
@@ -1633,20 +1605,24 @@ async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<H
   }
   const hooks = (config.hooks ?? {}) as Record<string, unknown>;
   if (!hookEventShapesValid(hooks, ['SessionStart', 'UserPromptSubmit'])) return 'failed';
+  const forceGeneration = await hookGenerationNeedsRepair(workspace, 'codex', options);
   const addedStart = ensureCommandHook(
     hooks,
     'SessionStart',
     'hook-session-start',
-    sessionStartHookCommand(options),
+    sessionStartHookCommand(workspace, 'codex'),
     { timeout: 30, statusMessage: 'Checking iHow Memory handoff' },
     'startup|resume|clear|compact',
+    forceGeneration,
   );
   const recallChanged = options.recall !== false ? ensureCommandHook(
     hooks,
     'UserPromptSubmit',
     'hook-user-prompt-submit',
-    recallHookCommand(options),
+    recallHookCommand(workspace, 'codex'),
     { timeout: 30, statusMessage: 'Searching iHow Memory' },
+    undefined,
+    forceGeneration,
   ) : removeCommandHooks(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit');
 
   if (!addedStart && !recallChanged) return 'already';
@@ -1685,8 +1661,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   const json = options.json === true;
   const line = (s = ''): void => { if (!json) console.log(s); };
   // Run a printing helper with stdout silenced — so reused install functions don't pollute --json output.
-  const silently = async (fn: () => Promise<void>): Promise<void> => {
-    if (!json) return fn();
+  const silently = async (fn: () => Promise<unknown>): Promise<void> => {
+    if (!json) { await fn(); return; }
     const orig = console.log;
     console.log = () => {};
     try { await fn(); } finally { console.log = orig; }
@@ -1849,7 +1825,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     try { await silently(() => maybeInstallStopHook({ ...options, installHook: options.installHook !== false })); } catch { hookThrew = true; }
     const afterSkill = await fs.readFile(skillPath, 'utf8').catch(() => null);
     const afterHook = await fs.readFile(hookPath, 'utf8').catch(() => null);
-    if (beforeSkill !== afterSkill || beforeHook !== afterHook) changedRuntimes.add('claude-code');
+    const hookConfigChanged = beforeHook !== afterHook;
+    if (beforeSkill !== afterSkill || hookConfigChanged) changedRuntimes.add('claude-code');
     line(`       · recall ${options.recall === false ? 'OFF (--no-recall)' : 'ON — reviewed-first + guarded auto soft facts, relevant-only, bounded seamless fenced reference (off: --no-recall / IHOW_RECALL_OFF=1; reviewed-only: IHOW_RECALL_AUTO_DEFAULT=0)'}`);
     if (options.installSkill === false) skill = 'skipped';
     else {
@@ -1865,13 +1842,13 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
           ? parsed.hooks as Record<string, unknown>
           : {};
         wired = commandHookIsCurrent(hooks, 'Stop', 'hook-stop', {
-          type: 'command', command: stopHookCommand(options), timeout: 30,
+          type: 'command', command: stopHookCommand(workspace), timeout: 30,
         }) && commandHookIsCurrent(hooks, 'SessionStart', 'hook-session-start', {
-          type: 'command', command: sessionStartHookCommand(options), timeout: 30,
+          type: 'command', command: sessionStartHookCommand(workspace, 'claude-code'), timeout: 30,
         });
         if (options.recall !== false) {
           wired = wired && commandHookIsCurrent(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit', {
-            type: 'command', command: recallHookCommand(options), timeout: 30,
+            type: 'command', command: recallHookCommand(workspace, 'claude-code'), timeout: 30,
           });
         } else {
           wired = wired && commandHookIsAbsent(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit');
@@ -1879,6 +1856,9 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
       } catch { wired = false; }
       hook = !hookThrew && wired ? 'installed' : 'failed';
     }
+    if (hook === 'installed') await recordConfiguredActivation(
+      workspace, 'claude-code', 'setup', options, hookConfigChanged || bundleChanged,
+    );
   }
 
   // 3/4 (cont.) WorkBuddy has no lifecycle hook; wire cross-thread resume via its BOOTSTRAP.md instead.
@@ -1919,6 +1899,9 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
         : `       ✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
       else if (codexHooks === 'already') line(`       · Codex hooks already present → ${codexConfigLabel('hooks.json')}`);
       else if (codexHooks === 'failed') line(`       ⚠ Codex hooks failed to install → ${codexConfigLabel('hooks.json')}`);
+      if (codexHooks === 'installed' || codexHooks === 'already') {
+        await recordConfiguredActivation(workspace, 'codex', 'setup', options, codexHooks === 'installed' || bundleChanged);
+      }
     }
   }
 
@@ -2297,7 +2280,7 @@ async function doctor(
   const checks: DoctorCheck[] = [];
   const workspace = resolveWorkspace(options);
   const mcpSpec = mcpServerSpec(workspace);
-  const automation = await automationMatrix(workspace, mcpSpec);
+  const automation = await automationMatrix(workspace, mcpSpec, { hookOptions: options });
   const nodeOk = nodeVersionAtLeast(process.versions.node, '22.12.0');
   const sqliteStatus = sqliteRuntimeStatus();
   const writable = await isWritable(workspace.memoryDir);
@@ -2365,17 +2348,36 @@ async function doctor(
   }
 
   const matrixStatus = worstAutomationStatus(automation.rows.map((row) => row.status));
-  const matrixBroken = matrixStatus === 'BROKEN';
+  const selectedRuntimeLabels: Partial<Record<NonNullable<typeof options.runtime>, string>> = {
+    'claude-code': 'Claude Code',
+    codex: 'Codex',
+    openclaw: 'OpenClaw',
+    hermes: 'Hermes',
+    cursor: 'WorkBuddy/OpenCode/Gemini',
+    workbuddy: 'WorkBuddy/OpenCode/Gemini',
+    'claude-desktop': 'WorkBuddy/OpenCode/Gemini',
+    opencode: 'WorkBuddy/OpenCode/Gemini',
+    vscode: 'WorkBuddy/OpenCode/Gemini',
+    gemini: 'WorkBuddy/OpenCode/Gemini',
+  };
+  // A runtime-specific doctor/setup must not be failed by an unrelated runtime's hook config. The
+  // broken row remains visible in the matrix, while an unscoped doctor still audits every configured
+  // runtime. This keeps targeted onboarding composable without weakening the direct misbinding check.
+  const selectedRuntime = options.runtime;
+  const blockingRows = selectedRuntime
+    ? automation.rows.filter((row) => row.runtime === selectedRuntimeLabels[selectedRuntime])
+    : automation.rows;
+  const matrixBroken = blockingRows.some((row) => row.status === 'BROKEN');
   checks.push({
     name: 'automation-matrix',
     ok: !matrixBroken,
-    detail: automation.rows.map((row) => `${row.runtime}:${row.status}`).join(' · '),
+    detail: automation.rows.map((row) => `${row.runtime}:${row.activationStatus}(${row.activationReasonCode})`).join(' · '),
     hint: matrixBroken
       ? 'Fix the broken MCP/hook command path, then rerun ihow-memory doctor.'
-      : matrixStatus === 'WARN'
-        ? 'Connect a runtime or run ihow-memory upgrade to materialize the runtime bundle; warnings do not block local setup.'
+      : matrixStatus === 'WARN' || automation.rows.some((row) => row.status === 'BROKEN')
+        ? 'Connect a runtime or run ihow-memory upgrade to materialize the runtime bundle; unrelated rows and warnings do not block this runtime check.'
         : undefined,
-    severity: matrixBroken ? 'error' : matrixStatus === 'WARN' ? 'warning' : 'info',
+    severity: matrixBroken ? 'error' : matrixStatus === 'WARN' || automation.rows.some((row) => row.status === 'BROKEN') ? 'warning' : 'info',
     required: matrixBroken,
   });
 
@@ -2522,6 +2524,7 @@ async function doctor(
       cooperativeJournalCount: automation.metrics.cooperativeJournalCount,
       pathStatus: automation.path.status,
       pathNotes: automation.path.notes,
+      activationEvidenceCount: automation.evidence.length,
     },
   };
 }
@@ -2809,65 +2812,17 @@ async function maybeInstallClaudeSkill(options: ParsedArgs['options']): Promise<
   console.log(`✓ installed memory skill → ${dest} (restart Claude Code to load it)`);
 }
 
-// Hooks run the workspace-frozen CLI copied by connect/setup, never this package's install path (which
-// may be an evictable npx cache). Pin both the Node executable and the fully resolved workspace so a
-// later hook invocation cannot drift because HOME, cwd, or environment defaults changed.
-function shellQuoteHookArg(value: string): string {
-  if (process.platform === 'win32') {
-    // Native Windows hook shells are still experimental. Fail closed on cmd.exe expansion/control
-    // characters rather than emitting a command that could execute a path fragment. Ordinary paths use
-    // the Windows-compatible quoted argv form; WSL takes the POSIX branch below.
-    if (/[%!^&|<>()`]/.test(value)) throw new Error('unsupported_special_character_in_native_windows_hook_path');
-    return JSON.stringify(value);
-  }
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
-function hookCommand(options: ParsedArgs['options'], command: string, runtime?: string): string {
-  const workspace = resolveWorkspace(options);
-  const cli = path.join(workspace.spaceDir, '.runtime', 'cli.js');
-  const parts = [
-    shellQuoteHookArg(process.execPath),
-    shellQuoteHookArg(cli),
-    command,
-    '--hook-owner',
-    IHOW_HOOK_OWNER,
-  ];
-  if (runtime) parts.push('--runtime', shellQuoteHookArg(runtime));
-  if (workspace.mode === 'existing-memory-root') {
-    parts.push('--memory-root', shellQuoteHookArg(workspace.memoryDir));
-    parts.push('--state-root', shellQuoteHookArg(workspace.root));
-  } else {
-    parts.push('--root', shellQuoteHookArg(workspace.root));
-  }
-  parts.push('--space', shellQuoteHookArg(workspace.space));
-  return parts.join(' ');
-}
-
-function stopHookCommand(options: ParsedArgs['options']): string {
-  return hookCommand(options, 'hook-stop');
-}
-
-function sessionStartHookCommand(options: ParsedArgs['options']): string {
-  return hookCommand(options, 'hook-session-start', options.runtime);
-}
-
-function recallHookCommand(options: ParsedArgs['options']): string {
-  return hookCommand(options, 'hook-user-prompt-submit');
-}
-
 // Optionally wire the session-end auto-capture Stop hook into ~/.claude/settings.json. Consent-gated
 // like the skill install. Mirrors connect's MCP-write safety: merges into existing settings (never
 // drops other hooks/keys), refuses to clobber unparseable JSON, backs up before writing, atomic
 // temp+rename, idempotent (reconciles our entry in place; skips only when it is already current).
-async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<void> {
+async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<HookInstallOutcome> {
   // Default to this project's gitignored local settings (the hook command carries a machine-specific
   // absolute path, so it must NOT be committed, and a Stop hook should not fire for unrelated repos).
   // --global-hook opts into the user-wide ~/.claude/settings.json (fires for every Claude Code project).
   const scopeLabel = options.globalHook ? 'global · all Claude Code projects' : 'this project only';
-  const dest = options.globalHook
-    ? path.join(os.homedir(), '.claude', 'settings.json')
-    : path.join(path.resolve(options.cwd || process.cwd()), '.claude', 'settings.local.json');
+  const workspace = resolveWorkspace(options);
+  const dest = claudeHookInstallPath(options);
 
   let proceed = options.installHook === true;
   if (options.installHook === undefined) {
@@ -2881,12 +2836,12 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
       proceed = /^y(es)?$/i.test(answer.trim());
     } else {
       console.log('Tip: for automatic session-end capture, re-run with --install-hook (adds a project-local Stop hook to .claude/settings.local.json by default; --global-hook for ~/.claude/settings.json).');
-      return;
+      return 'skipped';
     }
   }
   if (!proceed) {
     console.log('Skipped auto-capture hook. (Add it later with --install-hook.)');
-    return;
+    return 'skipped';
   }
 
   let settings: Record<string, unknown> = {};
@@ -2901,38 +2856,39 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
     if (existed) {
       console.error(`refusing to modify unparseable ${dest} — fix it, or add the Stop hook by hand.`);
       process.exitCode = 1;
-      return;
+      return 'failed';
     }
   }
 
   if (settings.hooks !== undefined && (typeof settings.hooks !== 'object' || settings.hooks === null || Array.isArray(settings.hooks))) {
     console.error(`refusing to modify ${dest} — hooks must be an object; fix the file, then re-run install-hook.`);
     process.exitCode = 1;
-    return;
+    return 'failed';
   }
   const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
   if (!hookEventShapesValid(hooks, ['Stop', 'SessionStart', 'UserPromptSubmit'])) {
     console.error(`refusing to modify ${dest} — hook events must contain object groups with hook arrays; fix the file, then re-run install-hook.`);
     process.exitCode = 1;
-    return;
+    return 'failed';
   }
 
   // Two hooks form the auto-capture (write) feature: the Stop hook nudges the agent to journal a handoff
   // at session end (the cooperative path), and the SessionStart hook floors the PREVIOUS session
   // deterministically if it ended without one (the backstop). Both bind the same workspace.
-  const addedStop = ensureCommandHook(hooks, 'Stop', 'hook-stop', stopHookCommand(options), { timeout: 30 });
-  const addedStart = ensureCommandHook(hooks, 'SessionStart', 'hook-session-start', sessionStartHookCommand(options), { timeout: 30 });
+  const forceGeneration = await hookGenerationNeedsRepair(workspace, 'claude-code', options);
+  const addedStop = ensureCommandHook(hooks, 'Stop', 'hook-stop', stopHookCommand(workspace), { timeout: 30 }, undefined, forceGeneration);
+  const addedStart = ensureCommandHook(hooks, 'SessionStart', 'hook-session-start', sessionStartHookCommand(workspace, 'claude-code'), { timeout: 30 }, undefined, forceGeneration);
   // RECALL (read path) installs by DEFAULT; `--no-recall` opts out. Reviewed memory is preferred, while
   // relevant machine-gated auto SOFT facts may surface by default. The shared selector blocks private,
   // flagged, audit-only, unreadable/stale, ambient status, and every behavior-bypass entry; it also applies
   // relevance, recency collapse, redaction, and a bounded seamless reference fence. Set
   // IHOW_RECALL_AUTO_DEFAULT=0 for reviewed-only; IHOW_RECALL_OFF=1 is the runtime kill-switch.
   const recallChanged = options.recall !== false
-    ? ensureCommandHook(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit', recallHookCommand(options), { timeout: 30 })
+    ? ensureCommandHook(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit', recallHookCommand(workspace, 'claude-code'), { timeout: 30 }, undefined, forceGeneration)
     : removeCommandHooks(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit');
   if (!addedStop && !addedStart && !recallChanged) {
     console.log(`✓ ${options.recall !== false ? 'auto-capture + recall hooks' : 'auto-capture hooks (recall OFF)'} already present in ${dest}`);
-    return;
+    return 'already';
   }
   settings.hooks = hooks;
 
@@ -2955,6 +2911,7 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
   if (recallChanged && options.recall !== false) {
     console.log('  recall is ON: reviewed memory is preferred, and some relevant machine-gated auto soft facts can appear by default. Ambient unverified status and dangerous behavior priors stay blocked. Output is a seamless bounded <recalled-memory> reference fence, not per-item tags. Turn off install with --no-recall, disable runtime injection with IHOW_RECALL_OFF=1, or restore reviewed-only with IHOW_RECALL_AUTO_DEFAULT=0. IHOW_RECALL_INCLUDE_AUTO=1 adds engine-anchored auto eligibility but never bypasses behavior or status-intent guards.');
   }
+  return 'installed';
 }
 
 const STOP_HOOK_REASON =
@@ -3120,14 +3077,8 @@ function hookLog(msg: string): void {
 // memory in-session (via the memory.journal MCP tool) before stopping. Designed to NEVER throw
 // or disrupt the session: any problem -> exit 0 with no output. Captures at most once per
 // session (Stop fires on every turn), and short-circuits when our own block re-fired it.
-async function runStopHook(options: ParsedArgs['options']): Promise<void> {
-  let payload: Record<string, unknown> = {};
-  try {
-    const raw = await readStdinSafe();
-    if (raw.trim()) payload = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return; // unparseable input -> no-op
-  }
+async function runStopHook(options: ParsedArgs['options'], payload?: Record<string, unknown>): Promise<void> {
+  if (!payload) return;
   if (payload.stop_hook_active === true) return; // recursion guard
 
   const sessionId = typeof payload.session_id === 'string' ? payload.session_id : 'unknown';
@@ -3235,14 +3186,8 @@ const FLOOR_MAX_PER_START = 5; // process at most N backlog markers per SessionS
 // rollbackable journal entry (sourceAgent='claude-code-hook'). This is the safety net for sessions that
 // ended without the agent honoring the Stop-hook nudge. It NEVER injects context into the new session
 // (recall stays OFF) and NEVER throws — any problem exits 0 with no output.
-async function runSessionStartHook(options: ParsedArgs['options']): Promise<void> {
-  let payload: Record<string, unknown> = {};
-  try {
-    const raw = await readStdinSafe();
-    if (raw.trim()) payload = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return; // unparseable input -> no-op
-  }
+async function runSessionStartHook(options: ParsedArgs['options'], payload?: Record<string, unknown>): Promise<void> {
+  if (!payload) return;
   const currentSessionId = typeof payload.session_id === 'string' ? payload.session_id : '';
   const cwd = typeof payload.cwd === 'string' ? payload.cwd : options.cwd;
   let workspace;
@@ -3457,15 +3402,8 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
 // Prompt recall eligibility lives in prompt-recall.ts. The hook only performs input/output adaptation and
 // renders the selector's already-final included set; preview and context_probe call the same selector.
 
-async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
-  if (process.env.IHOW_RECALL_OFF) return; // kill-switch: disable injection and diagnostics without uninstalling
-  let payload: Record<string, unknown> = {};
-  try {
-    const raw = await readStdinSafe();
-    if (raw.trim()) payload = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return; // unparseable input -> no-op, never block
-  }
+async function runRecallHook(options: ParsedArgs['options'], payload?: Record<string, unknown>): Promise<void> {
+  if (process.env.IHOW_RECALL_OFF || !payload) return; // kill-switch / malformed input: fail open
   const prompt = ['prompt', 'user_prompt', 'userPrompt', 'message', 'input']
     .map((key) => payload[key])
     .find((value): value is string => typeof value === 'string' && value.trim().length > 0) ?? '';
@@ -3555,17 +3493,17 @@ async function main(): Promise<void> {
   }
 
   if (command === 'hook-stop') {
-    await runStopHook(options);
+    await runHookWithActivation(options, 'hook-stop', (payload) => runStopHook(options, payload));
     return;
   }
 
   if (command === 'hook-session-start') {
-    await runSessionStartHook(options);
+    await runHookWithActivation(options, 'hook-session-start', (payload) => runSessionStartHook(options, payload));
     return;
   }
 
   if (command === 'hook-user-prompt-submit') {
-    await runRecallHook(options);
+    await runHookWithActivation(options, 'hook-user-prompt-submit', (payload) => runRecallHook(options, payload));
     return;
   }
 
@@ -3578,12 +3516,13 @@ async function main(): Promise<void> {
     // Standalone installs need the same durable target as connect/setup. Materialize the workspace and
     // freeze dist only when cli.js is absent; do not tear down and recopy a healthy live bundle just to
     // reconcile hook config (upgrade remains the explicit version-refresh path).
-    if (options.installHook !== false) {
-      const workspace = await ensureWorkspace(resolveWorkspace(options));
-      await installRuntimeBundle(workspace);
-    }
+    const workspace = resolveWorkspace(options);
+    if (options.installHook !== false) await installRuntimeBundle(await ensureWorkspace(workspace));
     if (options.runtime === 'codex') {
       const outcome = await maybeInstallCodexHooks({ ...options, installHook: options.installHook !== false });
+      if (outcome === 'installed' || outcome === 'already') {
+        await recordConfiguredActivation(workspace, 'codex', 'install-hook', options, outcome === 'installed');
+      }
       if (outcome === 'installed') console.log(options.recall === false
         ? `✓ installed Codex SessionStart hook; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
         : `✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
@@ -3594,7 +3533,10 @@ async function main(): Promise<void> {
         process.exitCode = 1;
       }
     } else {
-      await maybeInstallStopHook({ ...options, installHook: options.installHook !== false });
+      const outcome = await maybeInstallStopHook({ ...options, installHook: options.installHook !== false });
+      if ((outcome === 'installed' || outcome === 'already') && process.exitCode !== 1) {
+        await recordConfiguredActivation(workspace, 'claude-code', 'install-hook', options, outcome === 'installed');
+      }
     }
     return;
   }
@@ -3672,18 +3614,21 @@ async function main(): Promise<void> {
     // Non-zero exit when the configured server isn't reachable — the same contract the text path honors,
     // and what CHANGELOG promises to --json callers (who are exactly the scripts that check exit codes).
     if (verification && !verification.reachable) process.exitCode = 1;
-    const silently = async (fn: () => Promise<void>): Promise<void> => {
-      if (!options.json) return fn();
+    const silently = async (fn: () => Promise<unknown>): Promise<void> => {
+      if (!options.json) { await fn(); return; }
       const orig = console.log;
       console.log = () => {};
       try { await fn(); } finally { console.log = orig; }
     };
+    let claudeHooks: HookInstallOutcome | null = null;
     if (!result.dryRun && options.runtime === 'claude-code' && options.json) {
       if (options.installSkill === true) {
         try { await silently(() => maybeInstallClaudeSkill(options)); } catch { process.exitCode = 1; }
       }
       if (options.installHook === true) {
-        try { await silently(() => maybeInstallStopHook(options)); } catch { process.exitCode = 1; }
+        try {
+          await silently(async () => { claudeHooks = await maybeInstallStopHook(options); });
+        } catch { process.exitCode = 1; }
       }
     }
     let codexHooks: HookInstallOutcome | null = null;
@@ -3717,7 +3662,7 @@ async function main(): Promise<void> {
         if (!v.reachable) process.exitCode = 1;
         if (options.runtime === 'claude-code') {
           await maybeInstallClaudeSkill(options);
-          await maybeInstallStopHook(options);
+          claudeHooks = await maybeInstallStopHook(options);
         } else if (options.runtime === 'codex' && options.easy && options.installHook !== false) {
           if (codexHooks === 'installed') console.log(options.recall === false
             ? `✓ installed Codex SessionStart hook; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
@@ -3737,6 +3682,13 @@ async function main(): Promise<void> {
       }
     }
     if (!result.dryRun) {
+      await recordConfiguredActivation(
+        workspace,
+        options.runtime,
+        'connect',
+        options,
+        claudeHooks === 'installed' || codexHooks === 'installed',
+      );
       await telemetry.track('connect', { runtime: options.runtime });
       if (!options.json) await maybeAskTelemetry();
     }
@@ -4197,7 +4149,7 @@ async function main(): Promise<void> {
       if (result.automationMatrix?.length) {
         console.log('automation matrix:');
         for (const row of result.automationMatrix) {
-          console.log(`- ${row.status} ${row.runtime}: start=${row.sessionStartResume}; prompt=${row.promptRecall}; end=${row.sessionEndCapture}; floor=${row.floorFallback}; probes=${row.probeCalls}; notes=${row.notes}`);
+          console.log(`- ${row.activationStatus} ${row.runtime} [${row.activationReasonCode}]: wiring=${row.status}; start=${row.sessionStartResume}; prompt=${row.promptRecall}; end=${row.sessionEndCapture}; floor=${row.floorFallback}; probes=${row.probeCalls}; notes=${row.notes}`);
         }
       }
     }

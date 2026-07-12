@@ -33,6 +33,8 @@ npx ihow-memory@next setup
 
 `setup` 会检测已安装的 runtime、接入本地 MCP server，只在 runtime 有稳定入口时安装主动记忆行为，并运行 `doctor`。它可重复执行、改配置前会备份，最后只给一张结果卡：接上了什么、哪些已验证或待确认、是否需要重启、数据在本机哪里，以及唯一下一步。
 
+激活状态来自真实证据，而不是安装成功文案。只有当前 Claude/Codex Hook 接线经现场核验，且该配置代际之后出现有效的真实 Hook 完成事件，`doctor` 才会显示 **ACTIVE**；**READY — WAITING FOR FIRST ACTIVITY** 表示原生 Hook 已配置但尚未观察到合格的真实活动；**TOOLS ONLY** 表示只有 MCP/协作式工具，没有可核验的生命周期 Hook；**NEEDS REPAIR** 表示此前配置过的托管 Hook 已缺失、重复、损坏、目标失效或绑定到了错误 workspace。synthetic probe 和 started-only 事件绝不会升级成 ACTIVE。Activation Ledger 只保存哈希化 binding 与有界元数据，不保存 prompt、transcript、环境变量或错误正文。
+
 想先零写入预览：
 
 ```bash

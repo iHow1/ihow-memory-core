@@ -31,6 +31,8 @@ npx ihow-memory@next setup
 
 `setup` detects installed runtimes, connects the local MCP server, installs proactive memory behavior only where the runtime exposes a stable surface, and runs `doctor`. It is idempotent, backs up edited config, and ends with one result card: what connected, what is verified or pending, whether a restart is required, where local data lives, and the one next command.
 
+Activation is evidence-based, not inferred from installation text. `doctor` reports **ACTIVE** only after a valid live Claude/Codex hook completes on the currently verified wiring generation; **READY — WAITING FOR FIRST ACTIVITY** means the native hooks are configured but have not yet produced qualifying live evidence; **TOOLS ONLY** means MCP/cooperative tools are available without a verified lifecycle hook; **NEEDS REPAIR** means previously configured managed wiring is missing, duplicated, malformed, dead, or bound to the wrong workspace. Synthetic probes and started-only events never become ACTIVE. The activation ledger stores only hashed bindings and bounded metadata—never prompts, transcripts, environment values, or error text.
+
 Want a zero-write preview first?
 
 ```bash
