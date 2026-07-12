@@ -10,6 +10,7 @@ import {
   type ActivationEvidence,
 } from './activation-ledger.ts';
 import { verifyRuntimeHookWiring, type RuntimeHookWiring } from './hook-wiring.ts';
+import { inspectHermesLifecycleWiring, resolveHermesHome } from './hermes-wiring.ts';
 
 export type AutomationRuntime = 'claude-code' | 'codex' | 'openclaw' | 'hermes' | 'no-hook';
 export type AutomationStatus = 'OK' | 'WARN' | 'BROKEN';
@@ -214,18 +215,12 @@ export function deriveRuntimeActivation(
     const generationId = activationConfigurationId(generationKey);
     configured = latest(rows, (row) => row.status === 'configured' && row.configuration?.id === generationId);
     if (!configured) {
-      return anyConfigured
-        ? {
-            status: 'NEEDS REPAIR',
-            reasonCode: 'ACTIVATION_WIRING_GENERATION_UNCONFIRMED',
-            configuredAt: anyConfigured.observedAt,
-            lastObservedAt,
-          }
-        : {
-            status: 'READY — WAITING FOR FIRST ACTIVITY',
-            reasonCode: 'ACTIVATION_CONFIGURED_AWAITING_LIVE_ACTIVITY',
-            lastObservedAt,
-          };
+      return {
+        status: 'NEEDS REPAIR',
+        reasonCode: 'ACTIVATION_WIRING_GENERATION_UNCONFIRMED',
+        configuredAt: anyConfigured?.observedAt,
+        lastObservedAt,
+      };
     }
   }
   if (options.wiring) {
@@ -310,13 +305,27 @@ export function deriveRuntimeActivation(
 export async function automationMatrix(
   workspace: Workspace,
   spec: { command?: string; args?: string[] },
-  options: { now?: number; hookOptions?: WorkspaceOptions & { globalHook?: boolean; recall?: boolean } } = {},
+  options: {
+    now?: number;
+    hookOptions?: WorkspaceOptions & { globalHook?: boolean; recall?: boolean };
+    hermesHome?: string;
+  } = {},
 ): Promise<{ rows: AutomationMatrixRow[]; metrics: ProbeMetrics; path: PathClassification; evidence: ActivationEvidence[] }> {
-  const [metrics, evidence, claudeWiring, codexWiring] = await Promise.all([
+  const hermesHome = resolveHermesHome(options.hermesHome);
+  const [metrics, evidence, claudeWiring, codexWiring, hermesWiring]: [
+    ProbeMetrics,
+    ActivationEvidence[],
+    RuntimeHookWiring,
+    RuntimeHookWiring,
+    LifecycleWiringEvidence & { reason?: string },
+  ] = await Promise.all([
     probeMetrics(workspace),
     readActivationEvidence(workspace).catch(() => []),
     verifyRuntimeHookWiring(workspace, 'claude-code', options.hookOptions),
     verifyRuntimeHookWiring(workspace, 'codex', options.hookOptions),
+    hermesHome
+      ? inspectHermesLifecycleWiring(hermesHome)
+      : Promise.resolve<LifecycleWiringEvidence & { reason?: string }>({ state: 'missing' }),
   ]);
   const wirings = new Map<string, RuntimeHookWiring>([
     ['claude-code', claudeWiring],
@@ -327,7 +336,11 @@ export async function automationMatrix(
   const rows = ROWS.map((row) => {
     const key = runtimeKey(row.runtime);
     const wiring = wirings.get(key);
-    const activation = deriveRuntimeActivation(key as AutomationRuntime, evidence, { wiring, now: options.now });
+    const activation = deriveRuntimeActivation(key as AutomationRuntime, evidence, {
+      wiring,
+      ...(key === 'hermes' ? { lifecycleWiring: hermesWiring } : {}),
+      now: options.now,
+    });
     const probeCalls = key === 'no-hook' ? noHookCalls(metrics) : (metrics.probeCallsByRuntime[key] ?? 0);
     const notes: string[] = [];
     let status: AutomationStatus = 'OK';
@@ -337,7 +350,8 @@ export async function automationMatrix(
     }
     if (activation.status === 'NEEDS REPAIR') {
       status = 'BROKEN';
-      notes.push(...(wiring?.notes.length ? wiring.notes : ['configured lifecycle wiring needs repair']));
+      if (key === 'hermes' && hermesWiring.reason) notes.push(`Hermes lifecycle wiring: ${hermesWiring.reason}`);
+      else notes.push(...(wiring?.notes.length ? wiring.notes : ['configured lifecycle wiring needs repair']));
     }
     if (key === 'no-hook' && probeCalls === 0) {
       status = status === 'BROKEN' ? status : 'WARN';
