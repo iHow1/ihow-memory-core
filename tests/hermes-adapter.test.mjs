@@ -48,8 +48,8 @@ test('detects the legacy ihowmemory alias and thin Python wrapper inventory', ()
     {
       name: 'ihowmemory',
       command: '/venv/bin/python',
-      args: ['/Users/test/.hermes/mcp-servers/ihowmemory_mcp.py'],
-      env: { IHOW_MEMORY_ROOT: '/Users/test' },
+      args: ['/home/test/.hermes/mcp-servers/ihowmemory_mcp.py'],
+      env: { IHOW_MEMORY_ROOT: '/home/test' },
       tools: THIN_TOOLS,
     },
   ]);
@@ -71,8 +71,8 @@ test('detects conflicting duplicate bindings', () => {
     {
       name: 'ihowmemory',
       command: '/venv/bin/python',
-      args: ['/Users/test/.hermes/mcp-servers/ihowmemory_mcp.py'],
-      env: { IHOW_MEMORY_ROOT: '/Users/test' },
+      args: ['/home/test/.hermes/mcp-servers/ihowmemory_mcp.py'],
+      env: { IHOW_MEMORY_ROOT: '/home/test' },
       tools: THIN_TOOLS,
     },
   ]);

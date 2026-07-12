@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import { openCore } from './core.ts';
 import { contextProbe } from './context-probe.ts';
+import { containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
 import {
   runtimeEventToContextProbe,
   type RuntimeLifecycleEvent,
@@ -36,6 +37,13 @@ async function main(): Promise<void> {
     throw new Error('runtime_event_json_invalid');
   }
   if (!KNOWN_EVENTS.has(event.event)) throw new Error('runtime_event_name_invalid');
+  const incoming = event as RuntimeLifecycleEvent & { prompt?: unknown };
+  if (typeof incoming.prompt === 'string' && incoming.prompt.trim()) {
+    const redacted = redactSecretLikeContent(incoming.prompt.trim()).slice(0, 2_000);
+    if (containsSecretLikeContent(redacted)) throw new Error('runtime_event_prompt_redaction_failed');
+    const { prompt: _discarded, ...metadata } = incoming;
+    event = Object.freeze({ ...metadata, promptDigest: redacted }) as RuntimeLifecycleEvent;
+  }
   const request = runtimeEventToContextProbe(event);
   if (!request) {
     process.stdout.write(`${JSON.stringify({ ok: true })}\n`);

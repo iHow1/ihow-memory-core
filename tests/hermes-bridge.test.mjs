@@ -10,6 +10,7 @@ import { openCore } from '../src/core.ts';
 
 const repo = path.resolve(import.meta.dirname, '..');
 const bridge = path.join(repo, 'src', 'hermes-bridge.ts');
+const fakeGithubPat = ['ghp', 'abcdefghijklmnopqrstuvwxyz1234567890'].join('_');
 
 function invokeBridge(event, env = {}) {
   return spawnSync(process.execPath, ['--experimental-strip-types', bridge], {
@@ -78,6 +79,38 @@ test('bridge records synthetic probe evidence but never claims native-live activ
   assert.doesNotMatch(ledger, /"source":"native-hook"/);
   assert.doesNotMatch(ledger, /"status":"observed-live-/);
   assert.doesNotMatch(ledger, /session-1/);
+});
+
+test('bridge applies canonical governance redaction before recall or audit persistence', async () => {
+  const memoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-memory-'));
+  const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-state-'));
+  await fs.mkdir(path.join(memoryRoot, 'scopes'), { recursive: true });
+  await fs.writeFile(path.join(memoryRoot, 'scopes', 'project.md'), '# Hermes continuity\n', 'utf8');
+  const core = await openCore({ memoryRoot, stateRoot, cwd: '/repo' });
+  await core.rebuild();
+  const secrets = [
+    'password is hunter2',
+    fakeGithubPat,
+    'AKIAIOSFODNN7EXAMPLE',
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123',
+    '密码：中文秘密值',
+  ];
+  const run = invokeBridge({
+    ...base,
+    event: 'runtime.before_prompt',
+    prompt: `Hermes continuity ${secrets.join(' ')}`,
+  }, { MEMORY_ROOT: memoryRoot, IHOW_MEMORY_STATE_ROOT: stateRoot });
+  assert.equal(run.status, 0, run.stderr);
+  const auditDirs = [path.join(memoryRoot, '_events'), path.join(memoryRoot, '_mcp', '_events')];
+  const auditParts = [];
+  for (const eventsDir of auditDirs) {
+    const eventFiles = await fs.readdir(eventsDir).catch(() => []);
+    auditParts.push(...await Promise.all(eventFiles.filter(name => name.endsWith('.ndjson')).map(name => fs.readFile(path.join(eventsDir, name), 'utf8'))));
+  }
+  const audit = auditParts.join('\n');
+  for (const secret of secrets) assert.doesNotMatch(audit, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(audit, /promptDigestHash/);
+  assert.doesNotMatch(run.stdout, /hunter2|ghp_|AKIA|eyJhbG|中文秘密值/);
 });
 
 test('bridge rejects invalid event input with a machine-readable error and no stack trace', () => {

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,21 +19,6 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 _MAX_CONTEXT_CHARS = 8_000
 _MAX_PROMPT_DIGEST_CHARS = 2_000
-_PROMPT_SECRET_PATTERNS = (
-    re.compile(r"\b(api[_-]?key|secret|token|password|passwd|pwd|authorization|bearer)\b\s*[:=]\s*\S+", re.I),
-    re.compile(r"\bBearer\s+\S+", re.I),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b", re.I),
-    re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I),
-)
-
-
-def _prompt_digest(value: Any) -> Optional[str]:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    for pattern in _PROMPT_SECRET_PATTERNS:
-        text = pattern.sub("[redacted]", text)
-    return text[:_MAX_PROMPT_DIGEST_CHARS]
 
 
 def _now() -> str:
@@ -56,9 +41,10 @@ def _metadata_event(name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
         "observedAt": _now(),
     }
     if name == "runtime.before_prompt":
-        digest = _prompt_digest(kwargs.get("user_message"))
-        if digest:
-            event["promptDigest"] = digest
+        prompt = kwargs.get("user_message")
+        if isinstance(prompt, str) and prompt.strip():
+            # Canonical governance redaction happens in the Node bridge before logging or recall.
+            event["prompt"] = prompt.strip()[:_MAX_PROMPT_DIGEST_CHARS]
     return event
 
 
@@ -66,17 +52,35 @@ def _append_metadata_event(event: dict[str, Any]) -> None:
     target = os.environ.get("IHOW_MEMORY_HERMES_EVENT_LOG", "").strip()
     if not target:
         return
+    # Raw prompts are never persisted by the Python adapter. Redacted prompt evidence is audited by
+    # context_probe in the Node core as a hash, using the canonical governance policy.
+    safe_event = {key: value for key, value in event.items() if key != "prompt"}
     path = Path(target).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.write(json.dumps(safe_event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _bridge_path() -> Path:
+def _safe_argv(value: str) -> str:
+    if not value or any(ch in value for ch in ("\x00", "\r", "\n")):
+        raise RuntimeError("ihow_memory_hermes_bridge_path_invalid")
+    return value
+
+
+def _bridge_command() -> list[str]:
     configured = os.environ.get("IHOW_MEMORY_HERMES_BRIDGE", "").strip()
     if configured:
-        return Path(configured).expanduser()
-    return Path(__file__).resolve().parent / "hermes-bridge.js"
+        bridge = Path(configured).expanduser()
+        node = os.environ.get("IHOW_MEMORY_HERMES_NODE", "").strip() or "node"
+        argv = [_safe_argv(node)]
+        if bridge.suffix == ".ts":
+            argv.append("--experimental-strip-types")
+        argv.append(_safe_argv(str(bridge)))
+        return argv
+    packaged = shutil.which("ihow-memory-hermes-bridge")
+    if not packaged:
+        raise RuntimeError("ihow_memory_hermes_bridge_not_found")
+    return [_safe_argv(packaged)]
 
 
 def _dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -88,14 +92,8 @@ def _dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
     if mode == "success" and event["event"] == "runtime.before_prompt":
         return {"context": "Verified iHow Memory recall"}
 
-    bridge = _bridge_path()
-    node = os.environ.get("IHOW_MEMORY_HERMES_NODE", "").strip() or "node"
-    argv = [node]
-    if bridge.suffix == ".ts":
-        argv.append("--experimental-strip-types")
-    argv.append(str(bridge))
     completed = subprocess.run(
-        argv,
+        _bridge_command(),
         input=json.dumps(event, ensure_ascii=False) + "\n",
         capture_output=True,
         text=True,

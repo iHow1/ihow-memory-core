@@ -3,17 +3,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { openCore } from '../src/core.ts';
 
 const repo = path.resolve(import.meta.dirname, '..');
-const hermesRepo = path.join(os.homedir(), '.hermes', 'hermes-agent');
+const hermesRepo = process.env.IHOW_MEMORY_HERMES_CHECKOUT || path.join(os.homedir(), '.hermes', 'hermes-agent');
+const hermesPython = process.env.IHOW_MEMORY_HERMES_PYTHON || path.join(hermesRepo, 'venv', 'bin', 'python');
 const pluginSource = path.join(repo, 'integrations', 'hermes', 'ihow-memory');
 const bridge = path.join(repo, 'src', 'hermes-bridge.ts');
+const hostAvailable = fsSync.existsSync(path.join(hermesRepo, 'hermes_cli', 'plugins.py')) && fsSync.existsSync(hermesPython);
 
-test('real Hermes PluginManager discovers the isolated plugin and invokes bounded recall', async () => {
+test('real Hermes PluginManager discovers the isolated plugin and invokes bounded recall', {
+  skip: hostAvailable ? false : 'Hermes checkout unavailable; set IHOW_MEMORY_HERMES_CHECKOUT/IHOW_MEMORY_HERMES_PYTHON',
+}, async () => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-host-'));
   const memoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-memory-'));
   const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-state-'));
@@ -42,7 +47,7 @@ results = mgr.invoke_hook(
 )
 print(json.dumps({"hooks": sorted(mgr._hooks), "results": results}, sort_keys=True))
 `;
-  const run = spawnSync(path.join(hermesRepo, 'venv', 'bin', 'python'), ['-c', script], {
+  const run = spawnSync(hermesPython, ['-c', script], {
     cwd: hermesRepo,
     encoding: 'utf8',
     env: {
