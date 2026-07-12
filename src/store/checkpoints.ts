@@ -262,6 +262,45 @@ async function verifyPinnedCheckpointFile(
   await assertPinnedCheckpointDirectoryCurrent(pinned);
 }
 
+async function verifyPinnedCheckpointOwnedAliasSet(
+  pinned: PinnedCheckpointDirectory,
+  expected: CheckpointFileIdentity,
+  allowedNames: readonly string[],
+): Promise<void> {
+  if (
+    new Set(allowedNames).size !== allowedNames.length
+    || allowedNames.some((name) => (
+      name === ''
+      || name === '.'
+      || name === '..'
+      || path.basename(name) !== name
+      || name.includes('/')
+      || name.includes('\\')
+    ))
+  ) throw new Error('checkpoint_internal_failure');
+  await assertPinnedCheckpointDirectoryCurrent(pinned);
+  const entries = await fs.readdir(pinned.directoryRealPath, { withFileTypes: true });
+  if (entries.length > 4096) throw new Error('checkpoint_cleanup_incomplete');
+  const aliases: string[] = [];
+  const linkCounts: bigint[] = [];
+  for (const name of new Set(entries.map((entry) => entry.name))) {
+    const stat = await fs.lstat(path.join(pinned.directoryRealPath, name), { bigint: true });
+    if (!stat.isFile() || stat.dev !== expected.dev || stat.ino !== expected.ino) continue;
+    aliases.push(name);
+    linkCounts.push(stat.nlink);
+  }
+  aliases.sort();
+  const allowed = [...allowedNames].sort();
+  // nlink also detects hardlinks outside this enumerable pinned directory. The controller rejects
+  // those states; cleanup remains inode-exact and directory-local rather than attempting a disk scan.
+  if (
+    aliases.length !== allowed.length
+    || aliases.some((name, index) => name !== allowed[index])
+    || linkCounts.some((count) => count !== BigInt(allowed.length))
+  ) throw new Error('checkpoint_path_outside_store');
+  await assertPinnedCheckpointDirectoryCurrent(pinned);
+}
+
 function checkpointFileWorkerInvocation(mode?: 'reaper'): { command: string; args: string[] } {
   const currentFile = fileURLToPath(import.meta.url);
   const sourceRuntime = currentFile.endsWith('.ts');
@@ -485,6 +524,11 @@ async function atomicWriteCheckpointFile(
       basename,
       targetIdentity,
       ready.result === 'exists' ? undefined : content,
+    );
+    await verifyPinnedCheckpointOwnedAliasSet(
+      pinned,
+      ready.result === 'exists' ? ownedIdentity : targetIdentity,
+      ready.result === 'exists' ? [] : [basename],
     );
     writeChildLine(reaper, { command: 'commit' });
     const committedLine = await readReaperLine();
@@ -1014,6 +1058,7 @@ async function runCheckpointClaimWorker(
   let guardCommitted = false;
   let reaperArmed = false;
   let reaperCommitted = false;
+  let discardClaimOnAbort = false;
   try {
     writeChildLine(reaper, baseRequest);
     const reaperReadyLine = await readReaperLine();
@@ -1147,7 +1192,12 @@ async function runCheckpointClaimWorker(
     if (prepared.ok !== true || prepared.event !== 'prepared' || Object.keys(prepared).sort().join(',') !== 'event,ok') {
       throw new Error('checkpoint_internal_failure');
     }
-    writeChildLine(guard, { command: 'commit' });
+    writeChildLine(guard, {
+      command: 'commit',
+      result,
+      targetDev: workerResult.targetDev,
+      targetIno: workerResult.targetIno,
+    });
     const committedLine = await readGuardLine();
     if (committedLine === undefined) throw new Error('checkpoint_internal_failure');
     const committed = parseJsonObjectLine(committedLine);
@@ -1192,6 +1242,25 @@ async function runCheckpointClaimWorker(
         );
       }
     }
+    try {
+      await verifyPinnedCheckpointOwnedAliasSet(
+        {
+          path: pinned.paths.artifacts,
+          handle: pinned.handle,
+          dev: pinned.dev,
+          ino: pinned.ino,
+          directoryRealPath: pinned.artifactsRealPath,
+          rootRealPath: pinned.rootRealPath,
+        },
+        claimIdentity,
+        operation === 'prepare' || result === 'unexpected-existing'
+          ? [claimName]
+          : [claimName, `${artifact.id}.json`],
+      );
+    } catch (error) {
+      discardClaimOnAbort = true;
+      throw error;
+    }
     writeChildLine(reaper, { command: 'commit' });
     const reaperCommittedLine = await readReaperLine();
     if (reaperCommittedLine === undefined) throw new Error('checkpoint_internal_failure');
@@ -1217,7 +1286,7 @@ async function runCheckpointClaimWorker(
     let cleanupConfirmed = false;
     if (!reaperCommitted) {
       if (reaper.stdin.writable && !reaper.stdin.destroyed) {
-        try { writeChildLine(reaper, { command: 'abort' }); } catch { /* handled by confirmation below */ }
+        try { writeChildLine(reaper, { command: discardClaimOnAbort ? 'discard' : 'abort' }); } catch { /* handled by confirmation below */ }
         reaper.stdin.end();
       }
       const abortedLine = await readReaperLine().catch(() => undefined);

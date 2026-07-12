@@ -70,6 +70,7 @@ type ReaperCommand =
   | { command: 'arm'; claimDev: string; claimIno: string; claimCreated: boolean }
   | { command: 'prepare-commit'; result: WorkerResult; targetDev: string; targetIno: string }
   | { command: 'commit' }
+  | { command: 'discard' }
   | { command: 'abort' };
 
 function fail(code: string): never {
@@ -278,6 +279,48 @@ function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+async function verifyOwnedAliasSet(
+  request: BaseRequest,
+  directoryHandle: fs.FileHandle,
+  expected: FileIdentity,
+  allowedNames: readonly string[],
+): Promise<void> {
+  for (const name of allowedNames) assertBasename(name);
+  if (new Set(allowedNames).size !== allowedNames.length) fail('checkpoint_internal_failure');
+  await assertCwd(request, directoryHandle);
+  const entries = await fs.readdir('.', { withFileTypes: true });
+  if (entries.length > CLEANUP_MAX_DIRECTORY_ENTRIES) fail('checkpoint_cleanup_incomplete');
+  const aliases: string[] = [];
+  const linkCounts: bigint[] = [];
+  for (const name of new Set(entries.map((entry) => entry.name))) {
+    const stat = await fs.lstat(name, { bigint: true });
+    if (!stat.isFile() || stat.dev !== expected.dev || stat.ino !== expected.ino) continue;
+    aliases.push(name);
+    linkCounts.push(stat.nlink);
+  }
+  aliases.sort();
+  const allowed = [...allowedNames].sort();
+  // A larger nlink than the exact in-directory basename set proves an external/unnameable alias.
+  // Reject it, while deliberately limiting cleanup to exact-inode entries in this pinned directory.
+  if (
+    aliases.length !== allowed.length
+    || aliases.some((name, index) => name !== allowed[index])
+    || linkCounts.some((count) => count !== BigInt(allowed.length))
+  ) fail('checkpoint_artifact_write_claim_invalid');
+  await assertCwd(request, directoryHandle);
+}
+
+async function allowedClaimAliasesForReaperArm(
+  request: BaseRequest,
+  identity: FileIdentity,
+): Promise<string[]> {
+  const source = claimName(request.artifactId, request.writeClaimId);
+  if (request.operation === 'prepare') return [source];
+  const destination = finalName(request.artifactId);
+  const finalIdentity = await relativeFileIdentity(destination);
+  return finalIdentity && sameIdentity(finalIdentity, identity) ? [source, destination] : [source];
+}
+
 async function verifyOpenRelativeFile(
   request: BaseRequest,
   directoryHandle: fs.FileHandle,
@@ -370,16 +413,6 @@ async function cleanupOwnedInodeExcept(expected: FileIdentity, preservedName: st
   fail('checkpoint_cleanup_incomplete');
 }
 
-async function hasOwnedInode(expected: FileIdentity): Promise<boolean> {
-  const entries = await fs.readdir('.', { withFileTypes: true });
-  if (entries.length > CLEANUP_MAX_DIRECTORY_ENTRIES) fail('checkpoint_cleanup_incomplete');
-  for (const entry of entries) {
-    const identity = await relativeFileIdentity(entry.name);
-    if (identity && sameIdentity(identity, expected)) return true;
-  }
-  return false;
-}
-
 async function openVerifiedClaim(
   request: BaseRequest,
   directoryHandle: fs.FileHandle,
@@ -425,6 +458,15 @@ async function prepareWorker(request: WorkerRequest, directoryHandle: fs.FileHan
   const name = claimName(request.artifactId, request.writeClaimId);
   const guarded = { dev: BigInt(request.guardedClaimDev), ino: BigInt(request.guardedClaimIno) };
   let handle: fs.FileHandle | undefined;
+  let discardClaimOnFailure = false;
+  const verifyAliases = async (): Promise<void> => {
+    try {
+      await verifyOwnedAliasSet(request, directoryHandle, guarded, [name]);
+    } catch (error) {
+      discardClaimOnFailure = true;
+      throw error;
+    }
+  };
   try {
     handle = await fs.open(name, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
     const opened = await verifyOpenRelativeFile(request, directoryHandle, name, handle);
@@ -433,6 +475,7 @@ async function prepareWorker(request: WorkerRequest, directoryHandle: fs.FileHan
       if (opened.size > BigInt(CHECKPOINT_ARTIFACT_MAX_BYTES)) fail('checkpoint_artifact_write_claim_invalid');
       if (await handle.readFile('utf8') !== request.canonicalArtifact) fail('checkpoint_artifact_write_claim_invalid');
       await assertCwd(request, directoryHandle);
+      await verifyAliases();
       return {
         ok: true,
         result: 'prepared',
@@ -452,6 +495,7 @@ async function prepareWorker(request: WorkerRequest, directoryHandle: fs.FileHan
     }
     await syncDirectory(directoryHandle);
     await assertCwd(request, directoryHandle);
+    await verifyAliases();
     return {
       ok: true,
       result: 'prepared',
@@ -464,7 +508,7 @@ async function prepareWorker(request: WorkerRequest, directoryHandle: fs.FileHan
       handle = undefined;
     }
     const movedAway = !(await cwdIsExpected(request, directoryHandle));
-    if (request.guardedClaimCreated) await cleanupOwnedInode(guarded);
+    if (request.guardedClaimCreated || discardClaimOnFailure) await cleanupOwnedInode(guarded);
     if (movedAway) fail('checkpoint_path_outside_store');
     throw error;
   } finally {
@@ -494,6 +538,15 @@ async function linkWorker(request: WorkerRequest, directoryHandle: fs.FileHandle
   let linked = false;
   let finalHandle: fs.FileHandle | undefined;
   let claimClosed = false;
+  let discardClaimOnFailure = false;
+  const verifyAliases = async (allowedNames: readonly string[]): Promise<void> => {
+    try {
+      await verifyOwnedAliasSet(request, directoryHandle, claim.identity, allowedNames);
+    } catch (error) {
+      discardClaimOnFailure = true;
+      throw error;
+    }
+  };
   try {
     if (!sameIdentity(claim.identity, guarded)) fail('checkpoint_artifact_write_claim_invalid');
     await phase(request, 'after-claim-verified-before-link');
@@ -519,6 +572,7 @@ async function linkWorker(request: WorkerRequest, directoryHandle: fs.FileHandle
     const finalIdentity = { dev: finalStat.dev, ino: finalStat.ino };
     if (!sameIdentity(claim.identity, finalIdentity)) {
       if (!linked) {
+        await verifyAliases([source]);
         return {
           ok: true,
           result: 'unexpected-existing',
@@ -530,6 +584,7 @@ async function linkWorker(request: WorkerRequest, directoryHandle: fs.FileHandle
     }
     if (finalStat.size > BigInt(CHECKPOINT_ARTIFACT_MAX_BYTES)) {
       if (!linked) {
+        await verifyAliases([source]);
         return {
           ok: true,
           result: 'unexpected-existing',
@@ -542,6 +597,7 @@ async function linkWorker(request: WorkerRequest, directoryHandle: fs.FileHandle
     const raw = await finalHandle.readFile('utf8');
     if (raw !== request.canonicalArtifact) {
       if (!linked) {
+        await verifyAliases([source]);
         return {
           ok: true,
           result: 'unexpected-existing',
@@ -557,6 +613,7 @@ async function linkWorker(request: WorkerRequest, directoryHandle: fs.FileHandle
       await syncDirectory(directoryHandle);
       await assertCwd(request, directoryHandle);
     }
+    await verifyAliases([source, destination]);
     return {
       ok: true,
       result: linked ? 'created' : 'owned',
@@ -569,11 +626,13 @@ async function linkWorker(request: WorkerRequest, directoryHandle: fs.FileHandle
       finalHandle = undefined;
     }
     const movedAway = !(await cwdIsExpected(request, directoryHandle));
-    if (linked) {
+    if (discardClaimOnFailure) {
+      await cleanupOwnedInode(claim.identity);
+    } else if (linked) {
       if (movedAway) await cleanupOwnedInode(claim.identity);
       else await unlinkExactRelative(destination, claim.identity);
     }
-    if (stableError(error) === 'checkpoint_path_outside_store') {
+    if (!discardClaimOnFailure && stableError(error) === 'checkpoint_path_outside_store') {
       await claim.handle.close().catch(() => {});
       claimClosed = true;
       await cleanupOwnedInode(claim.identity);
@@ -655,6 +714,7 @@ async function guardMain(): Promise<void> {
   let claimCreated = false;
   let finalLinked = false;
   let committed = false;
+  let discardClaimOnFailure = false;
   try {
     if (request.operation === 'prepare') {
       const setup = await guardPrepare(request, directoryHandle);
@@ -682,10 +742,11 @@ async function guardMain(): Promise<void> {
       const line = await readLine();
       if (line === undefined) break;
       const command = parseObjectLine(line);
-      if (Object.keys(command).join(',') !== 'command' || typeof command.command !== 'string') {
+      if (typeof command.command !== 'string') {
         fail('checkpoint_internal_failure');
       }
       if (command.command === 'link') {
+        if (Object.keys(command).join(',') !== 'command') fail('checkpoint_internal_failure');
         if (request.operation !== 'link' || finalLinked || !claimIdentity) fail('checkpoint_internal_failure');
         await assertCwd(request, directoryHandle);
         const actualClaim = await relativeFileIdentity(source);
@@ -704,6 +765,21 @@ async function guardMain(): Promise<void> {
       }
       if (command.command === 'commit') {
         if (!claimIdentity) fail('checkpoint_internal_failure');
+        if (
+          Object.keys(command).sort().join(',') !== 'command,result,targetDev,targetIno'
+          || (command.result !== 'prepared'
+            && command.result !== 'created'
+            && command.result !== 'owned'
+            && command.result !== 'unexpected-existing')
+          || typeof command.targetDev !== 'string'
+          || typeof command.targetIno !== 'string'
+          || !/^[0-9]+$/.test(command.targetDev)
+          || !/^[0-9]+$/.test(command.targetIno)
+          || (request.operation === 'prepare' && command.result !== 'prepared')
+          || (request.operation === 'link' && command.result === 'prepared')
+        ) fail('checkpoint_internal_failure');
+        const result = command.result as WorkerResult;
+        const target = { dev: BigInt(command.targetDev), ino: BigInt(command.targetIno) };
         await assertCwd(request, directoryHandle);
         const verifiedClaim = await openVerifiedClaim(request, directoryHandle, source);
         try {
@@ -711,17 +787,39 @@ async function guardMain(): Promise<void> {
         } finally {
           await verifiedClaim.handle.close().catch(() => {});
         }
-        if (request.operation === 'link' && finalLinked) {
+        if (request.operation === 'prepare') {
+          if (!sameIdentity(target, claimIdentity)) fail('checkpoint_artifact_write_claim_invalid');
+        } else {
+          if (finalLinked !== (result === 'created')) fail('checkpoint_artifact_write_claim_invalid');
           const finalHandle = await fs.open(destination, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
           try {
             const finalStat = await verifyOpenRelativeFile(request, directoryHandle, destination, finalHandle);
-            if (!sameIdentity(claimIdentity, { dev: finalStat.dev, ino: finalStat.ino })) {
+            const finalIdentity = { dev: finalStat.dev, ino: finalStat.ino };
+            if (!sameIdentity(target, finalIdentity)) {
               fail('checkpoint_artifact_write_claim_invalid');
             }
-            if (await finalHandle.readFile('utf8') !== request.canonicalArtifact) fail('checkpoint_integrity_hash_collision');
+            if (result === 'unexpected-existing') {
+              if (sameIdentity(claimIdentity, finalIdentity)) fail('checkpoint_artifact_write_claim_invalid');
+            } else {
+              if (!sameIdentity(claimIdentity, finalIdentity)) fail('checkpoint_artifact_write_claim_invalid');
+              if (await finalHandle.readFile('utf8') !== request.canonicalArtifact) fail('checkpoint_integrity_hash_collision');
+            }
           } finally {
             await finalHandle.close().catch(() => {});
           }
+        }
+        try {
+          await verifyOwnedAliasSet(
+            request,
+            directoryHandle,
+            claimIdentity,
+            result === 'prepared' || result === 'unexpected-existing'
+              ? [source]
+              : [source, destination],
+          );
+        } catch (error) {
+          discardClaimOnFailure = true;
+          throw error;
         }
         await syncDirectory(directoryHandle);
         await assertCwd(request, directoryHandle);
@@ -729,19 +827,26 @@ async function guardMain(): Promise<void> {
         writeGuardResponse({ ok: true, event: 'committed' });
         return;
       }
-      if (command.command === 'abort') return;
+      if (command.command === 'abort') {
+        if (Object.keys(command).join(',') !== 'command') fail('checkpoint_internal_failure');
+        return;
+      }
       fail('checkpoint_internal_failure');
     }
   } finally {
     if (!committed && claimIdentity) {
       const movedAway = !(await cwdIsExpected(request, directoryHandle));
-      if (finalLinked) {
+      if (discardClaimOnFailure) {
+        await cleanupOwnedInode(claimIdentity);
+      } else if (finalLinked) {
         if (movedAway) await cleanupOwnedInode(claimIdentity);
         else await unlinkExactRelative(destination, claimIdentity);
       }
       if (
-        (request.operation === 'prepare' && (claimCreated || movedAway))
+        !discardClaimOnFailure
+        && ((request.operation === 'prepare' && (claimCreated || movedAway))
         || (request.operation === 'link' && movedAway)
+        )
       ) {
         await cleanupOwnedInode(claimIdentity);
       }
@@ -774,7 +879,7 @@ async function readReaperCommand(): Promise<ReaperCommand | undefined> {
     && /^[0-9]+$/.test(item.targetIno)
   ) return item as ReaperCommand;
   if (
-    (item.command === 'commit' || item.command === 'abort')
+    (item.command === 'commit' || item.command === 'discard' || item.command === 'abort')
     && Object.keys(item).join(',') === 'command'
   ) return item as ReaperCommand;
   fail('checkpoint_internal_failure');
@@ -846,6 +951,19 @@ async function verifyReaperClaimState(
   }
 }
 
+async function verifyReaperOwnedAliasSet(
+  request: BaseRequest,
+  directoryHandle: fs.FileHandle,
+  identity: FileIdentity,
+  result: WorkerResult,
+): Promise<void> {
+  const source = claimName(request.artifactId, request.writeClaimId);
+  const allowed = result === 'prepared' || result === 'unexpected-existing'
+    ? [source]
+    : [source, finalName(request.artifactId)];
+  await verifyOwnedAliasSet(request, directoryHandle, identity, allowed);
+}
+
 async function reaperMain(): Promise<void> {
   const request = await readRequest(false) as BaseRequest;
   const directoryHandle = await openDirectory(request);
@@ -856,18 +974,34 @@ async function reaperMain(): Promise<void> {
   let preparedTarget: FileIdentity | undefined;
   let committed = false;
   let stopped = false;
+  let discardClaimOnFailure = false;
   try {
     process.stdout.write(`${JSON.stringify({ ok: true, event: 'reaper-ready' })}\n`);
     const arm = await readReaperCommand();
     if (!arm || arm.command !== 'arm') fail('checkpoint_internal_failure');
     identity = { dev: BigInt(arm.claimDev), ino: BigInt(arm.claimIno) };
     claimCreated = arm.claimCreated;
-    if (!(await hasOwnedInode(identity))) fail('checkpoint_cleanup_incomplete');
+    try {
+      await verifyOwnedAliasSet(
+        request,
+        directoryHandle,
+        identity,
+        await allowedClaimAliasesForReaperArm(request, identity),
+      );
+    } catch (error) {
+      discardClaimOnFailure = true;
+      throw error;
+    }
     process.stdout.write(`${JSON.stringify({ ok: true, event: 'armed' })}\n`);
 
     while (!stopped) {
       const command = await readReaperCommand();
       if (!command || command.command === 'abort') {
+        stopped = true;
+        continue;
+      }
+      if (command.command === 'discard') {
+        discardClaimOnFailure = true;
         stopped = true;
         continue;
       }
@@ -877,18 +1011,33 @@ async function reaperMain(): Promise<void> {
         preparedResult = command.result;
         preparedTarget = { dev: BigInt(command.targetDev), ino: BigInt(command.targetIno) };
         await verifyReaperClaimState(request, directoryHandle, identity, preparedResult, preparedTarget);
+        try {
+          await verifyReaperOwnedAliasSet(request, directoryHandle, identity, preparedResult);
+        } catch (error) {
+          discardClaimOnFailure = true;
+          throw error;
+        }
         prepared = true;
         process.stdout.write(`${JSON.stringify({ ok: true, event: 'prepared' })}\n`);
         continue;
       }
       if (!prepared || !preparedResult || !preparedTarget) fail('checkpoint_internal_failure');
       await verifyReaperClaimState(request, directoryHandle, identity, preparedResult, preparedTarget);
+      try {
+        await verifyReaperOwnedAliasSet(request, directoryHandle, identity, preparedResult);
+      } catch (error) {
+        discardClaimOnFailure = true;
+        throw error;
+      }
       committed = true;
       process.stdout.write(`${JSON.stringify({ ok: true, event: 'committed' })}\n`);
       stopped = true;
     }
   } finally {
-    if (!committed && identity) await cleanupReaperClaim(request, directoryHandle, identity, claimCreated);
+    if (!committed && identity) {
+      if (discardClaimOnFailure) await cleanupOwnedInode(identity);
+      else await cleanupReaperClaim(request, directoryHandle, identity, claimCreated);
+    }
     await directoryHandle.close().catch(() => {});
   }
   if (!committed) process.stdout.write(`${JSON.stringify({ ok: true, event: 'aborted' })}\n`);

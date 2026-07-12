@@ -158,6 +158,38 @@ function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+async function verifyOwnedAliasSet(
+  request: WorkerRequest,
+  directoryHandle: fs.FileHandle,
+  expected: FileIdentity,
+  allowedNames: readonly string[],
+): Promise<void> {
+  for (const name of allowedNames) assertBasename(name);
+  if (new Set(allowedNames).size !== allowedNames.length) fail('checkpoint_internal_failure');
+  await assertCwd(request, directoryHandle);
+  const entries = await fs.readdir('.', { withFileTypes: true });
+  if (entries.length > CLEANUP_MAX_DIRECTORY_ENTRIES) fail('checkpoint_cleanup_incomplete');
+  const aliases: string[] = [];
+  const linkCounts: bigint[] = [];
+  for (const name of new Set(entries.map((entry) => entry.name))) {
+    const stat = await fs.lstat(name, { bigint: true });
+    if (!stat.isFile() || stat.dev !== expected.dev || stat.ino !== expected.ino) continue;
+    aliases.push(name);
+    linkCounts.push(stat.nlink);
+  }
+  aliases.sort();
+  const allowed = [...allowedNames].sort();
+  // nlink closes the enumerable-directory gap: a larger count proves that an alias exists outside
+  // this pinned directory (or otherwise cannot be named by this scan). Fail closed, but never scan
+  // or unlink outside the pinned directory; such an external hardlink is intentionally unlocatable.
+  if (
+    aliases.length !== allowed.length
+    || aliases.some((name, index) => name !== allowed[index])
+    || linkCounts.some((count) => count !== BigInt(allowed.length))
+  ) fail('checkpoint_path_outside_store');
+  await assertCwd(request, directoryHandle);
+}
+
 async function assertCwd(request: WorkerRequest, directoryHandle: fs.FileHandle): Promise<void> {
   if (abortRequested) fail('checkpoint_internal_failure');
   let cwdReal: string;
@@ -261,16 +293,6 @@ async function cleanupOwnedInode(expected: FileIdentity): Promise<void> {
     if (!found) return;
   }
   fail('checkpoint_cleanup_incomplete');
-}
-
-async function hasOwnedInode(expected: FileIdentity): Promise<boolean> {
-  const entries = await fs.readdir('.', { withFileTypes: true });
-  if (entries.length > CLEANUP_MAX_DIRECTORY_ENTRIES) fail('checkpoint_cleanup_incomplete');
-  for (const entry of entries) {
-    const identity = await relativeFileIdentity(entry.name);
-    if (identity && sameIdentity(identity, expected)) return true;
-  }
-  return false;
 }
 
 async function verifyOwnedRelativeFile(
@@ -418,10 +440,12 @@ async function workerMain(): Promise<WorkerResult> {
     if (owned && result !== 'exists') {
       await verifyOwnedRelativeFile(request, directoryHandle, request.basename, owned, request.content);
       target = owned;
+      await verifyOwnedAliasSet(request, directoryHandle, owned, [request.basename]);
     } else {
       target = await relativeFileIdentity(request.basename);
       if (!target || (owned && sameIdentity(target, owned))) fail('checkpoint_path_outside_store');
       await verifyRelativeFileIdentity(request, directoryHandle, request.basename, target);
+      if (owned) await verifyOwnedAliasSet(request, directoryHandle, owned, [tmpName]);
     }
     await syncDirectory(directoryHandle);
     await assertCwd(request, directoryHandle);
@@ -434,11 +458,17 @@ async function workerMain(): Promise<WorkerResult> {
       targetIno: target.ino.toString(),
     })}\n`);
     await waitForCommit();
-    if (result === 'exists') await verifyRelativeFileIdentity(request, directoryHandle, request.basename, target);
-    else if (owned) await verifyOwnedRelativeFile(request, directoryHandle, request.basename, owned, request.content);
+    if (result === 'exists') {
+      await verifyRelativeFileIdentity(request, directoryHandle, request.basename, target);
+      if (owned) await verifyOwnedAliasSet(request, directoryHandle, owned, [tmpName]);
+    } else if (owned) {
+      await verifyOwnedRelativeFile(request, directoryHandle, request.basename, owned, request.content);
+      await verifyOwnedAliasSet(request, directoryHandle, owned, [request.basename]);
+    }
     else fail('checkpoint_internal_failure');
     if (result === 'exists' && owned) {
       await cleanupOwnedInode(owned);
+      await verifyOwnedAliasSet(request, directoryHandle, owned, []);
       owned = undefined;
       await verifyRelativeFileIdentity(request, directoryHandle, request.basename, target);
     }
@@ -479,6 +509,7 @@ async function verifyReaperCommitState(
   result: WorkerResult,
   target: FileIdentity,
   phase: 'prepare' | 'commit',
+  ownedName: string,
 ): Promise<void> {
   if (
     (request.operation === 'create' && result === 'replaced')
@@ -488,14 +519,15 @@ async function verifyReaperCommitState(
     if (sameIdentity(target, owned)) fail('checkpoint_path_outside_store');
     await verifyRelativeFileIdentity(request, directoryHandle, request.basename, target);
     if (phase === 'prepare') {
-      if (!(await hasOwnedInode(owned))) fail('checkpoint_cleanup_incomplete');
-    } else if (await hasOwnedInode(owned)) {
-      fail('checkpoint_cleanup_incomplete');
+      await verifyOwnedAliasSet(request, directoryHandle, owned, [ownedName]);
+    } else {
+      await verifyOwnedAliasSet(request, directoryHandle, owned, []);
     }
     return;
   }
   if (!sameIdentity(target, owned)) fail('checkpoint_path_outside_store');
   await verifyOwnedRelativeFile(request, directoryHandle, request.basename, owned, request.content);
+  await verifyOwnedAliasSet(request, directoryHandle, owned, [request.basename]);
 }
 
 async function reaperMain(): Promise<void> {
@@ -546,13 +578,13 @@ async function reaperMain(): Promise<void> {
         if (prepared) fail('checkpoint_internal_failure');
         preparedResult = command.result;
         preparedTarget = { dev: BigInt(command.targetDev), ino: BigInt(command.targetIno) };
-        await verifyReaperCommitState(request, directoryHandle, owned, preparedResult, preparedTarget, 'prepare');
+        await verifyReaperCommitState(request, directoryHandle, owned, preparedResult, preparedTarget, 'prepare', tmpName);
         prepared = true;
         process.stdout.write(`${JSON.stringify({ ok: true, event: 'prepared' })}\n`);
         continue;
       }
       if (!prepared || !preparedResult || !preparedTarget) fail('checkpoint_internal_failure');
-      await verifyReaperCommitState(request, directoryHandle, owned, preparedResult, preparedTarget, 'commit');
+      await verifyReaperCommitState(request, directoryHandle, owned, preparedResult, preparedTarget, 'commit', tmpName);
       committed = true;
       process.stdout.write(`${JSON.stringify({ ok: true, event: 'committed' })}\n`);
       stopped = true;

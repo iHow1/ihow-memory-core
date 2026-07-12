@@ -236,6 +236,159 @@ try {
 }
 `;
 
+const PARENT_OWNED_ALIAS_PRELOAD = String.raw`
+const cp = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+const { syncBuiltinESMExports } = require('node:module');
+const originalSpawn = cp.spawn;
+let attacked = false;
+cp.spawn = function patchedSpawn(command, args, options) {
+  const child = originalSpawn.apply(this, arguments);
+  const argv = Array.isArray(args) ? args.map(String) : [];
+  const isReaper = argv.includes('--reaper');
+  const isGuard = argv.includes('--guard');
+  const isFileWorker = argv.some((arg) => /checkpoint-file-worker\.(?:ts|js)$/.test(arg));
+  const isClaimWorker = argv.some((arg) => /checkpoint-claim-worker\.(?:ts|js)$/.test(arg));
+  if (!attacked && child.stdout && options && typeof options.cwd === 'string') {
+    child.stdout.prependListener('data', (chunk) => {
+      const output = String(chunk);
+      if (attacked) return;
+      if (
+        (process.env.IHOW_ATTACK_KIND === 'file-alias' || process.env.IHOW_ATTACK_KIND === 'file-external-alias')
+        && isFileWorker
+        && !isReaper
+        && output.includes('"event":"ready"')
+      ) {
+        attacked = true;
+        const names = fs.readdirSync(options.cwd).filter((name) => /^draft_[a-f0-9-]+\.json$/.test(name));
+        if (names.length !== 1) throw new Error('expected one draft target');
+        const target = path.join(options.cwd, names[0]);
+        const alias = process.env.IHOW_ATTACK_KIND === 'file-external-alias'
+          ? path.join(path.dirname(options.cwd), 'round8-external-owned-alias')
+          : path.join(options.cwd, 'round8-injected-owned-alias');
+        fs.linkSync(target, alias);
+        const owned = fs.statSync(target, { bigint: true });
+        fs.writeFileSync(process.env.IHOW_ATTACK_EVIDENCE, JSON.stringify({
+          directory: options.cwd,
+          target,
+          alias,
+          owned: { dev: owned.dev.toString(), ino: owned.ino.toString() },
+        }));
+        return;
+      }
+      if (
+        process.env.IHOW_ATTACK_KIND === 'claim-prepare-final'
+        && isClaimWorker
+        && !isReaper
+        && !isGuard
+        && output.includes('"ok":true,"result":"prepared"')
+      ) {
+        attacked = true;
+        const claims = fs.readdirSync(options.cwd).filter((name) => /^\.cp_[a-f0-9]{64}\.claim-[a-f0-9-]+\.tmp$/.test(name));
+        if (claims.length !== 1) throw new Error('unexpected prepare claim boundary names');
+        const claim = path.join(options.cwd, claims[0]);
+        const artifactId = claims[0].slice(1, claims[0].indexOf('.claim-'));
+        const target = path.join(options.cwd, artifactId + '.json');
+        fs.linkSync(claim, target);
+        const owned = fs.statSync(claim, { bigint: true });
+        fs.writeFileSync(process.env.IHOW_ATTACK_EVIDENCE, JSON.stringify({
+          directory: options.cwd,
+          target,
+          claim,
+          alias: target,
+          owned: { dev: owned.dev.toString(), ino: owned.ino.toString() },
+        }));
+        return;
+      }
+      if (
+        process.env.IHOW_ATTACK_KIND === 'claim-alias'
+        && isClaimWorker
+        && !isReaper
+        && !isGuard
+        && output.includes('"ok":true,"result":"created"')
+      ) {
+        attacked = true;
+        const finals = fs.readdirSync(options.cwd).filter((name) => /^cp_[a-f0-9]{64}\.json$/.test(name));
+        const claims = fs.readdirSync(options.cwd).filter((name) => /^\.cp_[a-f0-9]{64}\.claim-[a-f0-9-]+\.tmp$/.test(name));
+        if (finals.length !== 1 || claims.length !== 1) throw new Error('unexpected claim boundary names');
+        const target = path.join(options.cwd, finals[0]);
+        const claim = path.join(options.cwd, claims[0]);
+        const alias = path.join(options.cwd, 'round8-injected-claim-owned-alias');
+        fs.linkSync(target, alias);
+        const owned = fs.statSync(target, { bigint: true });
+        fs.writeFileSync(process.env.IHOW_ATTACK_EVIDENCE, JSON.stringify({
+          directory: options.cwd,
+          target,
+          claim,
+          alias,
+          owned: { dev: owned.dev.toString(), ino: owned.ino.toString() },
+        }));
+      }
+    });
+  }
+  return child;
+};
+syncBuiltinESMExports();
+`;
+
+const PARENT_OWNED_ALIAS_SCENARIO = String.raw`
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+async function exists(file) {
+  try { await fs.lstat(file); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+
+async function aliasesFor(directory, expected) {
+  const aliases = [];
+  for (const name of await fs.readdir(directory)) {
+    const stat = await fs.lstat(path.join(directory, name), { bigint: true });
+    if (stat.isFile() && stat.dev.toString() === expected.dev && stat.ino.toString() === expected.ino) aliases.push(name);
+  }
+  return aliases.sort();
+}
+
+const { openCore } = await import(pathToFileURL(path.join(process.env.IHOW_REPO_ROOT, 'src/core.ts')).href);
+const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-parent-owned-alias-api-'));
+let result;
+try {
+  const project = path.join(root, 'project');
+  await fs.mkdir(project);
+  const core = await openCore({ root: path.join(root, 'store'), space: 'round8', cwd: project });
+  let apiReturned = false;
+  let rejection;
+  try {
+    const draft = await core.checkpoints.createDraft({ runtime: 'round8', claims: { completed: ['owned alias boundary'] } });
+    if (process.env.IHOW_ATTACK_KIND === 'claim-alias' || process.env.IHOW_ATTACK_KIND === 'claim-prepare-final') {
+      await core.checkpoints.finalizeDraft(
+        draft.draftId,
+        { trigger: { kind: 'explicit', signal: 'native', sourceEvent: 'round8', reasonCode: 'test_checkpoint' } },
+        async () => ({ files: [], commands: [] }),
+      );
+    }
+    apiReturned = true;
+  } catch (error) {
+    rejection = error instanceof Error ? error.message : String(error);
+  }
+  const evidence = JSON.parse(await fs.readFile(process.env.IHOW_ATTACK_EVIDENCE, 'utf8'));
+  result = {
+    apiReturned,
+    rejection,
+    pinnedAliases: await aliasesFor(evidence.directory, evidence.owned),
+    canonicalExists: await exists(evidence.target),
+    claimExists: evidence.claim ? await exists(evidence.claim) : undefined,
+    injectedAliasExists: await exists(evidence.alias),
+    externalAlias: process.env.IHOW_ATTACK_KIND === 'file-external-alias',
+  };
+} finally {
+  console.log(JSON.stringify(result));
+  await fs.rm(root, { recursive: true, force: true });
+}
+`;
+
 async function runParentBoundaryScenario(t, label, preloadSource, scenarioSource, env = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), `ihow-${label}-`));
   const preload = path.join(directory, 'spawn-preload.cjs');
@@ -304,6 +457,122 @@ test('parent finalizeDraft claim boundary rejects replacement and removes every 
   assert.notDeepEqual(result.canonicalIdentity, result.ownedIdentity);
   assert.deepEqual(result.injectedAliases, []);
   assert.deepEqual(result.pinnedAliases, [result.claimBasename], 'only the durable canonical claim receipt remains');
+});
+
+test('parent createDraft rejects a pre-commit owned alias and reaps every pinned-directory link', async (t) => {
+  const result = await runParentBoundaryScenario(
+    t,
+    'checkpoint-parent-file-owned-alias',
+    PARENT_OWNED_ALIAS_PRELOAD,
+    PARENT_OWNED_ALIAS_SCENARIO,
+    { IHOW_ATTACK_KIND: 'file-alias' },
+  );
+  assert.equal(result.apiReturned, false);
+  assert.equal(result.rejection, 'checkpoint_internal_failure');
+  assert.deepEqual(result.pinnedAliases, []);
+  assert.equal(result.canonicalExists, false);
+  assert.equal(result.injectedAliasExists, false);
+});
+
+test('parent finalizeDraft rejects a pre-commit third owned alias and removes the failed durable receipt', async (t) => {
+  const result = await runParentBoundaryScenario(
+    t,
+    'checkpoint-parent-claim-owned-alias',
+    PARENT_OWNED_ALIAS_PRELOAD,
+    PARENT_OWNED_ALIAS_SCENARIO,
+    { IHOW_ATTACK_KIND: 'claim-alias' },
+  );
+  assert.equal(result.apiReturned, false);
+  assert.equal(result.rejection, 'checkpoint_internal_failure');
+  assert.deepEqual(result.pinnedAliases, []);
+  assert.equal(result.canonicalExists, false);
+  assert.equal(result.claimExists, false);
+  assert.equal(result.injectedAliasExists, false);
+});
+
+test('parent finalizeDraft rejects a final hardlink injected before the first prepare commit', async (t) => {
+  const result = await runParentBoundaryScenario(
+    t,
+    'checkpoint-parent-prepare-final-alias',
+    PARENT_OWNED_ALIAS_PRELOAD,
+    PARENT_OWNED_ALIAS_SCENARIO,
+    { IHOW_ATTACK_KIND: 'claim-prepare-final' },
+  );
+  assert.equal(result.apiReturned, false);
+  assert.equal(result.rejection, 'checkpoint_internal_failure');
+  assert.deepEqual(result.pinnedAliases, []);
+  assert.equal(result.canonicalExists, false);
+  assert.equal(result.claimExists, false);
+  assert.equal(result.injectedAliasExists, false);
+});
+
+test('parent createDraft fails closed when nlink exceeds the enumerable allowed basename set', async (t) => {
+  const result = await runParentBoundaryScenario(
+    t,
+    'checkpoint-parent-file-external-owned-alias',
+    PARENT_OWNED_ALIAS_PRELOAD,
+    PARENT_OWNED_ALIAS_SCENARIO,
+    { IHOW_ATTACK_KIND: 'file-external-alias' },
+  );
+  assert.equal(result.apiReturned, false);
+  assert.equal(result.rejection, 'checkpoint_internal_failure');
+  assert.deepEqual(result.pinnedAliases, []);
+  assert.equal(result.canonicalExists, false);
+  assert.equal(result.injectedAliasExists, true, 'the external hardlink is intentionally not located or removed');
+});
+
+test('normal API success retains the exact owned hardlink cardinality', async (t) => {
+  const core = await tempCore(t, 'checkpoint-owned-link-cardinality');
+  const draft = await core.checkpoints.createDraft({ runtime: 'round8', claims: { completed: ['exact file link'] } });
+  const paths = checkpointStorePaths(core.workspace);
+  const draftStat = await fs.stat(path.join(paths.drafts, `${draft.draftId}.json`), { bigint: true });
+  assert.equal(draftStat.nlink, 1n);
+
+  const finalized = await core.checkpoints.finalizeDraft(
+    draft.draftId,
+    explicit,
+    async () => ({ files: [], commands: [] }),
+  );
+  const artifactIdentity = await fs.stat(path.join(paths.artifacts, `${finalized.artifact.id}.json`), { bigint: true });
+  assert.equal(artifactIdentity.nlink, 2n);
+  const aliases = [];
+  for (const name of await fs.readdir(paths.artifacts)) {
+    const stat = await fs.lstat(path.join(paths.artifacts, name), { bigint: true });
+    if (stat.isFile() && stat.dev === artifactIdentity.dev && stat.ino === artifactIdentity.ino) aliases.push(name);
+  }
+  assert.equal(aliases.length, 2);
+  assert.ok(aliases.includes(`${finalized.artifact.id}.json`));
+  assert.ok(aliases.some((name) => name.startsWith(`.${finalized.artifact.id}.claim-`)));
+});
+
+test('prepare refuses an existing receipt that is already linked to the final basename', async (t) => {
+  const core = await tempCore(t, 'checkpoint-round9-reprepare');
+  const draft = await core.checkpoints.createDraft({ runtime: 'round9', claims: { completed: ['strict prepared binding'] } });
+  const artifact = artifactForDraft(draft);
+  const writeClaimId = crypto.randomUUID();
+  const paths = checkpointStorePaths(core.workspace);
+  const claimName = `.${artifact.id}.claim-${writeClaimId}.tmp`;
+  const finalName = `${artifact.id}.json`;
+
+  await prepareCheckpointArtifactWriteClaimUnlocked(core.workspace, artifact, writeClaimId);
+  assert.equal(await linkCheckpointArtifactWriteClaimUnlocked(core.workspace, artifact, writeClaimId), 'created');
+  const owned = await fs.stat(path.join(paths.artifacts, claimName), { bigint: true });
+  assert.equal(owned.nlink, 2n);
+
+  let returned = false;
+  await assert.rejects(
+    prepareCheckpointArtifactWriteClaimUnlocked(core.workspace, artifact, writeClaimId).then(() => { returned = true; }),
+    /checkpoint_internal_failure/,
+  );
+  assert.equal(returned, false);
+  const aliases = [];
+  for (const name of await fs.readdir(paths.artifacts)) {
+    const stat = await fs.lstat(path.join(paths.artifacts, name), { bigint: true });
+    if (stat.isFile() && stat.dev === owned.dev && stat.ino === owned.ino) aliases.push(name);
+  }
+  assert.deepEqual(aliases, []);
+  await assert.rejects(fs.access(path.join(paths.artifacts, claimName)), /ENOENT/);
+  await assert.rejects(fs.access(path.join(paths.artifacts, finalName)), /ENOENT/);
 });
 
 async function runAtClaimWorkerPhase(operation, controlDirectory, phase, action) {
