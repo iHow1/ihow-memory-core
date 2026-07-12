@@ -45,9 +45,10 @@ Status: STOP GATE — requires explicit approval before applying
     - session start
     - before prompt recall
     - finalize/session end checkpoint
-    - native-hook completed evidence
-    - doctor state `ACTIVE`
-12. After all checks pass, disable legacy `ihowmemory`; retain its backup for rollback.
+    - direct host evidence from the real PluginManager E2E
+    - doctor remains `READY — WAITING FOR FIRST ACTIVITY` because current Hermes does not expose an unforgeable lifecycle provenance channel
+12. Do not use bridge-supplied fields, environment tokens, or synthetic probes to claim `ACTIVE`.
+13. After all functional checks pass, disable legacy `ihowmemory`; retain its backup for rollback.
 
 ## Verification gates
 
@@ -56,8 +57,8 @@ Status: STOP GATE — requires explicit approval before applying
 - No conflicting `ihow-memory` / `ihowmemory` active binding remains after cutover.
 - Recall is injected through `pre_llm_call` without model-initiated MCP use.
 - `on_session_finalize` creates a valid immutable Checkpoint.
-- Activation evidence is from `native-hook`, same installation generation, `observed-live-completed`.
-- Doctor reports `ACTIVE` only after the above evidence.
+- Direct real-host E2E proves PluginManager discovery and lifecycle execution without converting caller-controlled bridge input into authenticated `native-hook` evidence.
+- Doctor remains `READY — WAITING FOR FIRST ACTIVITY`; `ACTIVE` is unavailable until Hermes provides an unforgeable host provenance channel.
 - Raw prompt, response, history, tool results, and checkpoint claims do not appear in Python plugin logs.
 - Bridge failure remains fail-open.
 

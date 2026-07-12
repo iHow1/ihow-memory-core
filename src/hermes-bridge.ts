@@ -9,8 +9,7 @@ import { openCore } from './core.ts';
 import { contextProbe } from './context-probe.ts';
 import { containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
 import { CheckpointValidationError, type CheckpointMachineAnchors } from './checkpoint-schema.ts';
-import { appendActivationEvidenceFailOpen } from './activation-ledger.ts';
-import { hermesLifecycleConfigurationKey, resolveHermesHome } from './hermes-wiring.ts';
+
 import {
   runtimeEventToContextProbe,
   type RuntimeLifecycleEvent,
@@ -35,15 +34,6 @@ const FILE_ANCHOR_MAX_BYTES = 1024 * 1024;
 type HermesBridgeEvent = RuntimeLifecycleEvent & {
   prompt?: unknown;
   checkpointClaims?: unknown;
-  nativeHook?: unknown;
-  nativeHookToken?: unknown;
-};
-
-const ACTIVATION_EVENT: Partial<Record<RuntimeLifecycleEventName, 'hook-session-start' | 'hook-user-prompt-submit' | 'hook-stop'>> = {
-  'runtime.session_start': 'hook-session-start',
-  'runtime.before_prompt': 'hook-user-prompt-submit',
-  'runtime.session_finalize': 'hook-stop',
-  'runtime.session_end': 'hook-stop',
 };
 
 function errorCode(error: unknown): string {
@@ -112,38 +102,6 @@ function checkpointSkipCode(error: unknown): string | undefined {
   return undefined;
 }
 
-async function nativeLifecycleEvidence(
-  core: Awaited<ReturnType<typeof openCore>>,
-  event: HermesBridgeEvent,
-  status: 'observed-live-started' | 'observed-live-completed' | 'failed',
-): Promise<void> {
-  const expectedToken = process.env.IHOW_MEMORY_HERMES_NATIVE_TOKEN;
-  if (
-    event.nativeHook !== true
-    || typeof event.nativeHookToken !== 'string'
-    || !expectedToken
-    || event.nativeHookToken !== expectedToken
-  ) return;
-  const evidenceEvent = ACTIVATION_EVENT[event.event];
-  if (!evidenceEvent) return;
-  const home = resolveHermesHome();
-  if (!home) return;
-  let generation: string;
-  try {
-    generation = await hermesLifecycleConfigurationKey(home);
-  } catch {
-    return;
-  }
-  await appendActivationEvidenceFailOpen(core.workspace, {
-    runtime: 'hermes',
-    event: evidenceEvent,
-    source: 'native-hook',
-    status,
-    observedAt: event.observedAt,
-    dedupeKey: `${event.sessionId ?? ''}:${event.event}`,
-    configurationKey: generation,
-  });
-}
 
 async function maybeFinalizeCheckpoint(
   core: Awaited<ReturnType<typeof openCore>>,
@@ -199,30 +157,22 @@ async function main(): Promise<void> {
   }
   const request = runtimeEventToContextProbe(event);
   const core = await openCore({ cwd: event.cwd });
-  await nativeLifecycleEvidence(core, event, 'observed-live-started');
-  try {
-    if (!request) {
-      await nativeLifecycleEvidence(core, event, 'observed-live-completed');
-      process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
-      return;
-    }
-    const output = await contextProbe(core.workspace, request, {
-      search: core.search,
-    });
-    const context = typeof output.injectText === 'string' && output.injectText.trim()
-      ? output.injectText.slice(0, MAX_CONTEXT_CHARS)
-      : undefined;
-    const checkpoint = await maybeFinalizeCheckpoint(core, event);
-    await nativeLifecycleEvidence(core, event, 'observed-live-completed');
-    process.stdout.write(`${JSON.stringify({
-      ok: true,
-      ...(context ? { context } : {}),
-      ...checkpoint,
-    })}\n`);
-  } catch (error) {
-    await nativeLifecycleEvidence(core, event, 'failed');
-    throw error;
+  if (!request) {
+    process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
+    return;
   }
+  const output = await contextProbe(core.workspace, request, {
+    search: core.search,
+  });
+  const context = typeof output.injectText === 'string' && output.injectText.trim()
+    ? output.injectText.slice(0, MAX_CONTEXT_CHARS)
+    : undefined;
+  const checkpoint = await maybeFinalizeCheckpoint(core, event);
+  process.stdout.write(`${JSON.stringify({
+    ok: true,
+    ...(context ? { context } : {}),
+    ...checkpoint,
+  })}\n`);
 }
 
 main().catch((error) => {

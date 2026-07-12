@@ -62,7 +62,7 @@ print(json.dumps({"start": start, "recall": recall, "finalize": finalize}, sort_
   });
 }
 
-test('real Hermes lifecycle advances matching installation from READY to ACTIVE and checkpoints finalize', {
+test('real Hermes lifecycle verifies host execution and checkpoints finalize without claiming authenticated ACTIVE', {
   skip: hostAvailable ? false : 'Hermes checkout unavailable; set IHOW_MEMORY_HERMES_CHECKOUT/IHOW_MEMORY_HERMES_PYTHON',
 }, async (t) => {
   const priorBridge = process.env.IHOW_MEMORY_HERMES_BRIDGE;
@@ -84,12 +84,10 @@ test('real Hermes lifecycle advances matching installation from READY to ACTIVE 
   const run = invokeHost(f);
   assert.equal(run.status, 0, run.stderr);
   const evidence = await readActivationEvidence(f.core.workspace);
-  assert.ok(evidence.some(row => row.runtime === 'hermes' && row.source === 'native-hook' && row.status === 'observed-live-completed' && row.event === 'hook-session-start'));
-  assert.ok(evidence.some(row => row.runtime === 'hermes' && row.source === 'native-hook' && row.status === 'observed-live-completed' && row.event === 'hook-stop'));
-  assert.ok(evidence.filter(row => row.source === 'native-hook').every(row => row.configuration?.id === evidence.find(item => item.status === 'configured')?.configuration?.id));
+  assert.equal(evidence.some(row => row.runtime === 'hermes' && row.source === 'native-hook'), false);
 
-  const active = await automationMatrix(f.core.workspace, { command: process.execPath }, { hermesHome: f.home });
-  assert.equal(active.rows.find(row => row.runtime === 'Hermes')?.activationStatus, 'ACTIVE');
+  const verified = await automationMatrix(f.core.workspace, { command: process.execPath }, { hermesHome: f.home });
+  assert.equal(verified.rows.find(row => row.runtime === 'Hermes')?.activationStatus, 'READY — WAITING FOR FIRST ACTIVITY');
   const artifacts = await fs.readdir(path.join(f.memoryRoot, '_mcp', 'checkpoints', 'artifacts'));
   assert.ok(artifacts.some(name => /^cp_[a-f0-9]{64}\.json$/.test(name)));
 });
@@ -130,15 +128,18 @@ test('direct bridge input cannot forge native lifecycle evidence', async (t) => 
     runtime: 'hermes', event: 'runtime-configured', source: 'install-hook', status: 'configured',
     dedupeKey: wiring.generationId, configurationKey: wiring.generationId,
   });
+  const attackerToken = 'attacker-controls-both-channels';
   const forged = spawnSync(process.execPath, [builtBridge], {
     encoding: 'utf8',
     input: `${JSON.stringify({
       schemaVersion: 1, event: 'runtime.session_start', runtime: 'hermes', cwd: f.project,
-      sessionId: 'forged', platform: 'cli', observedAt: new Date().toISOString(), nativeHook: true,
+      sessionId: 'forged', platform: 'cli', observedAt: new Date().toISOString(),
+      nativeHook: true, nativeHookToken: attackerToken,
     })}\n`,
     env: {
       ...process.env, HERMES_HOME: f.home, MEMORY_ROOT: f.memoryRoot,
       IHOW_MEMORY_STATE_ROOT: f.stateRoot, IHOW_MEMORY_HERMES_BRIDGE: builtBridge,
+      IHOW_MEMORY_HERMES_NATIVE_TOKEN: attackerToken,
     },
   });
   assert.equal(forged.status, 0, forged.stderr);
