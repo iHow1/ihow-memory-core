@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 _MAX_CONTEXT_CHARS = 8_000
 _MAX_PROMPT_DIGEST_CHARS = 2_000
+_NATIVE_HOOK_TOKEN = secrets.token_hex(32)
 
 
 def _now() -> str:
@@ -42,6 +44,7 @@ def _metadata_event(name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
         # Added only by a callback registered with Hermes PluginManager. Direct bridge probes omit
         # this marker and therefore remain synthetic/non-activating.
         "nativeHook": True,
+        "nativeHookToken": _NATIVE_HOOK_TOKEN,
     }
     if name == "runtime.before_prompt":
         prompt = kwargs.get("user_message")
@@ -63,7 +66,7 @@ def _append_metadata_event(event: dict[str, Any]) -> None:
     # context_probe in the Node core as a hash, using the canonical governance policy.
     safe_event = {
         key: value for key, value in event.items()
-        if key not in ("prompt", "checkpointClaims")
+        if key not in ("prompt", "checkpointClaims", "nativeHookToken")
     }
     path = Path(target).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,6 +112,7 @@ def _dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
         text=True,
         timeout=5,
         check=False,
+        env={**os.environ, "IHOW_MEMORY_HERMES_NATIVE_TOKEN": _NATIVE_HOOK_TOKEN},
     )
     if completed.returncode != 0:
         raise RuntimeError("ihow_memory_hermes_bridge_failed")

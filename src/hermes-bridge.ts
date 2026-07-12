@@ -36,6 +36,7 @@ type HermesBridgeEvent = RuntimeLifecycleEvent & {
   prompt?: unknown;
   checkpointClaims?: unknown;
   nativeHook?: unknown;
+  nativeHookToken?: unknown;
 };
 
 const ACTIVATION_EVENT: Partial<Record<RuntimeLifecycleEventName, 'hook-session-start' | 'hook-user-prompt-submit' | 'hook-stop'>> = {
@@ -116,7 +117,13 @@ async function nativeLifecycleEvidence(
   event: HermesBridgeEvent,
   status: 'observed-live-started' | 'observed-live-completed' | 'failed',
 ): Promise<void> {
-  if (event.nativeHook !== true) return;
+  const expectedToken = process.env.IHOW_MEMORY_HERMES_NATIVE_TOKEN;
+  if (
+    event.nativeHook !== true
+    || typeof event.nativeHookToken !== 'string'
+    || !expectedToken
+    || event.nativeHookToken !== expectedToken
+  ) return;
   const evidenceEvent = ACTIVATION_EVENT[event.event];
   if (!evidenceEvent) return;
   const home = resolveHermesHome();

@@ -65,8 +65,11 @@ export async function inspectHermesLifecycleWiring(home: string): Promise<Hermes
     const pathValue = process.env.PATH ?? '';
     const commandExists = await Promise.all(pathValue.split(path.delimiter).filter(Boolean).map(async dir => {
       try {
-        const stat = await fs.stat(path.join(dir, 'ihow-memory-hermes-bridge'));
-        return stat.isFile();
+        const target = path.join(dir, 'ihow-memory-hermes-bridge');
+        const stat = await fs.stat(target);
+        if (!stat.isFile()) return false;
+        await fs.access(target, fs.constants.X_OK);
+        return true;
       } catch {
         return false;
       }

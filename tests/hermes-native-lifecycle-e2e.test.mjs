@@ -116,3 +116,54 @@ test('real Hermes lifecycle remains available and does not forge completion when
   const state = await automationMatrix(f.core.workspace, { command: process.execPath }, { hermesHome: f.home });
   assert.notEqual(state.rows.find(row => row.runtime === 'Hermes')?.activationStatus, 'ACTIVE');
 });
+
+test('direct bridge input cannot forge native lifecycle evidence', async (t) => {
+  const priorBridge = process.env.IHOW_MEMORY_HERMES_BRIDGE;
+  process.env.IHOW_MEMORY_HERMES_BRIDGE = builtBridge;
+  t.after(() => {
+    if (priorBridge === undefined) delete process.env.IHOW_MEMORY_HERMES_BRIDGE;
+    else process.env.IHOW_MEMORY_HERMES_BRIDGE = priorBridge;
+  });
+  const f = await fixture(t);
+  const wiring = await inspectHermesLifecycleWiring(f.home);
+  await appendActivationEvidence(f.core.workspace, {
+    runtime: 'hermes', event: 'runtime-configured', source: 'install-hook', status: 'configured',
+    dedupeKey: wiring.generationId, configurationKey: wiring.generationId,
+  });
+  const forged = spawnSync(process.execPath, [builtBridge], {
+    encoding: 'utf8',
+    input: `${JSON.stringify({
+      schemaVersion: 1, event: 'runtime.session_start', runtime: 'hermes', cwd: f.project,
+      sessionId: 'forged', platform: 'cli', observedAt: new Date().toISOString(), nativeHook: true,
+    })}\n`,
+    env: {
+      ...process.env, HERMES_HOME: f.home, MEMORY_ROOT: f.memoryRoot,
+      IHOW_MEMORY_STATE_ROOT: f.stateRoot, IHOW_MEMORY_HERMES_BRIDGE: builtBridge,
+    },
+  });
+  assert.equal(forged.status, 0, forged.stderr);
+  const evidence = await readActivationEvidence(f.core.workspace);
+  assert.equal(evidence.some(row => row.source === 'native-hook'), false);
+  const state = await automationMatrix(f.core.workspace, { command: process.execPath }, { hermesHome: f.home });
+  assert.notEqual(state.rows.find(row => row.runtime === 'Hermes')?.activationStatus, 'ACTIVE');
+});
+
+test('non-executable PATH bridge makes Hermes wiring broken', async (t) => {
+  const f = await fixture(t);
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-nonexec-bin-'));
+  t.after(() => fs.rm(bin, { recursive: true, force: true }));
+  const command = path.join(bin, 'ihow-memory-hermes-bridge');
+  await fs.writeFile(command, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+  const priorPath = process.env.PATH;
+  const priorBridge = process.env.IHOW_MEMORY_HERMES_BRIDGE;
+  delete process.env.IHOW_MEMORY_HERMES_BRIDGE;
+  process.env.PATH = bin;
+  t.after(() => {
+    process.env.PATH = priorPath;
+    if (priorBridge === undefined) delete process.env.IHOW_MEMORY_HERMES_BRIDGE;
+    else process.env.IHOW_MEMORY_HERMES_BRIDGE = priorBridge;
+  });
+  const wiring = await inspectHermesLifecycleWiring(f.home);
+  assert.equal(wiring.state, 'broken');
+  assert.equal(wiring.reason, 'bridge-command-missing');
+});
