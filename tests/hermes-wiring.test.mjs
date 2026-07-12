@@ -25,6 +25,17 @@ async function fixture() {
   return { home, core };
 }
 
+async function withBridgeOverride(fn) {
+  const prior = process.env.IHOW_MEMORY_HERMES_BRIDGE;
+  process.env.IHOW_MEMORY_HERMES_BRIDGE = bridgeSource;
+  try {
+    return await fn();
+  } finally {
+    if (prior === undefined) delete process.env.IHOW_MEMORY_HERMES_BRIDGE;
+    else process.env.IHOW_MEMORY_HERMES_BRIDGE = prior;
+  }
+}
+
 async function installFixture(home, enabled = true) {
   const plugin = path.join(home, 'plugins', 'ihow-memory');
   await fs.mkdir(path.dirname(plugin), { recursive: true });
@@ -35,16 +46,16 @@ async function installFixture(home, enabled = true) {
     : 'plugins:\n  enabled: []\n', 'utf8');
 }
 
-test('Hermes wiring is missing until the packaged plugin is installed and enabled', async () => {
+test('Hermes wiring is missing until the packaged plugin is installed and enabled', async () => withBridgeOverride(async () => {
   const { home } = await fixture();
   assert.deepEqual(await inspectHermesLifecycleWiring(home), { state: 'missing' });
   await installFixture(home, false);
   const disabled = await inspectHermesLifecycleWiring(home);
   assert.equal(disabled.state, 'broken');
   assert.match(disabled.reason ?? '', /not-enabled/);
-});
+}));
 
-test('Hermes wiring generation is content-bound and detects plugin tampering', async () => {
+test('Hermes wiring generation is content-bound and detects plugin tampering', async () => withBridgeOverride(async () => {
   const { home } = await fixture();
   await installFixture(home);
   const current = await inspectHermesLifecycleWiring(home);
@@ -56,9 +67,9 @@ test('Hermes wiring generation is content-bound and detects plugin tampering', a
   const changed = await inspectHermesLifecycleWiring(home);
   assert.equal(changed.state, 'current');
   assert.notEqual(changed.generationId, current.generationId);
-});
+}));
 
-test('automationMatrix receives real Hermes wiring and refuses READY without matching configured evidence', async () => {
+test('automationMatrix receives real Hermes wiring and refuses READY without matching configured evidence', async () => withBridgeOverride(async () => {
   const { home, core } = await fixture();
   await installFixture(home);
   const wiring = await inspectHermesLifecycleWiring(home);
@@ -80,9 +91,9 @@ test('automationMatrix receives real Hermes wiring and refuses READY without mat
   });
   const second = configured.rows.find(row => row.runtime === 'Hermes');
   assert.equal(second?.activationStatus, 'READY — WAITING FOR FIRST ACTIVITY');
-});
+}));
 
-test('broken and missing Hermes wiring are reported honestly through automationMatrix', async () => {
+test('broken and missing Hermes wiring are reported honestly through automationMatrix', async () => withBridgeOverride(async () => {
   const { home, core } = await fixture();
   const missing = await automationMatrix(core.workspace, { command: process.execPath }, { hermesHome: home });
   assert.equal(missing.rows.find(row => row.runtime === 'Hermes')?.activationStatus, 'TOOLS ONLY');
@@ -90,7 +101,7 @@ test('broken and missing Hermes wiring are reported honestly through automationM
   await installFixture(home, false);
   const broken = await automationMatrix(core.workspace, { command: process.execPath }, { hermesHome: home });
   assert.equal(broken.rows.find(row => row.runtime === 'Hermes')?.activationStatus, 'NEEDS REPAIR');
-});
+}));
 
 test('Hermes current wiring without a generation or matching configured row is never READY', async () => {
   const none = await import('../src/automation-doctor.ts');

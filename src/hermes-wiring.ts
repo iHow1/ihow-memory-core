@@ -10,7 +10,7 @@ export type HermesLifecycleWiring = {
   reason?: string;
 };
 
-const REQUIRED_FILES = ['plugin.yaml', '__init__.py', 'hermes-bridge.js'] as const;
+const REQUIRED_FILES = ['plugin.yaml', '__init__.py'] as const;
 
 function sha(value: string | Buffer): string {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -35,6 +35,11 @@ export async function hermesLifecycleConfigurationKey(home: string): Promise<str
     const content = await fs.readFile(path.join(pluginDir, file));
     parts.push(`${file}\0${sha(content)}`);
   }
+  const configuredBridge = process.env.IHOW_MEMORY_HERMES_BRIDGE?.trim();
+  if (configuredBridge) {
+    const content = await fs.readFile(path.resolve(configuredBridge));
+    parts.push(`bridge-override\0${sha(content)}`);
+  }
   return sha(parts.join('\n'));
 }
 
@@ -53,6 +58,20 @@ export async function inspectHermesLifecycleWiring(home: string): Promise<Hermes
     } catch {
       return { state: 'broken', reason: `missing-${file}` };
     }
+  }
+  if (!process.env.IHOW_MEMORY_HERMES_BRIDGE?.trim()) {
+    // Production installs discover the package-owned executable through PATH. Verification of the
+    // executable itself belongs to the package/fresh-install gate rather than the copied Python plugin.
+    const pathValue = process.env.PATH ?? '';
+    const commandExists = await Promise.all(pathValue.split(path.delimiter).filter(Boolean).map(async dir => {
+      try {
+        const stat = await fs.stat(path.join(dir, 'ihow-memory-hermes-bridge'));
+        return stat.isFile();
+      } catch {
+        return false;
+      }
+    })).then(rows => rows.some(Boolean));
+    if (!commandExists) return { state: 'broken', reason: 'bridge-command-missing' };
   }
   if (!await readEnabled(home)) return { state: 'broken', reason: 'not-enabled' };
   try {

@@ -39,12 +39,19 @@ def _metadata_event(name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
         "sessionId": str(kwargs.get("session_id") or "")[:256],
         "platform": str(kwargs.get("platform") or "")[:64],
         "observedAt": _now(),
+        # Added only by a callback registered with Hermes PluginManager. Direct bridge probes omit
+        # this marker and therefore remain synthetic/non-activating.
+        "nativeHook": True,
     }
     if name == "runtime.before_prompt":
         prompt = kwargs.get("user_message")
         if isinstance(prompt, str) and prompt.strip():
             # Canonical governance redaction happens in the Node bridge before logging or recall.
             event["prompt"] = prompt.strip()[:_MAX_PROMPT_DIGEST_CHARS]
+    if name in ("runtime.session_finalize", "runtime.session_end"):
+        claims = kwargs.get("checkpoint_claims")
+        if isinstance(claims, dict):
+            event["checkpointClaims"] = claims
     return event
 
 
@@ -54,7 +61,10 @@ def _append_metadata_event(event: dict[str, Any]) -> None:
         return
     # Raw prompts are never persisted by the Python adapter. Redacted prompt evidence is audited by
     # context_probe in the Node core as a hash, using the canonical governance policy.
-    safe_event = {key: value for key, value in event.items() if key != "prompt"}
+    safe_event = {
+        key: value for key, value in event.items()
+        if key not in ("prompt", "checkpointClaims")
+    }
     path = Path(target).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
