@@ -10,6 +10,7 @@ with pre-release tags.
 
 ### Added
 
+- Added the alpha.27 Stage 2 checkpoint core: mutable short-lived drafts finalize into immutable hash-addressed `CheckpointArtifactV1` JSON with deterministic canonical hashing, a 32 KiB hard bound, explicit omission counts, atomic no-overwrite storage, dedup/supersedes, workspace locking, minimal rejection audit, and read/list/inspect library APIs. Claims and engine-collected machine anchors use separate inputs; secret/schema/integrity failures are fail-closed. Runtime hooks, PreCompact, continue integration, and checkpoint UX are not connected yet.
 - Added a local, append-only activation evidence ledger with metadata-only hashed workspace/configuration bindings, bounded fail-open locking, integrity-checked managed-entry installation epochs that ignore unrelated config file/inode churn, and stable activation reason codes. `doctor` now distinguishes `ACTIVE`, `READY — WAITING FOR FIRST ACTIVITY`, `TOOLS ONLY`, and `NEEDS REPAIR`; static capability, MCP reachability, synthetic probes, and started-only events never count as live activation.
 - Added live Claude Code and Codex hook-wiring verification. Missing, duplicated, dead-target, wrong-workspace, wrong-owner, or malformed managed hooks degrade previously configured automation to `NEEDS REPAIR`; unrelated workspace bindings remain non-blocking. Invalid/manual hook payloads create no live evidence, and explicit synthetic dispatch remains non-active.
 

@@ -21,6 +21,8 @@ iHow Memory is a local, shared-memory runtime for heterogeneous coding agents �
 3. **Safe writes + governance.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event.
 4. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
 
+**Alpha.27 checkpoint-core status:** the library now has bounded mutable drafts and immutable, hash-addressed checkpoint artifacts with fail-closed governance and read/list/inspect APIs. This is storage/core only: no Claude/Codex hook, PreCompact, `continue`, or user-facing checkpoint flow is connected yet.
+
 ## Quickstart — first success in about 3 minutes
 
 ### 1. Set up locally

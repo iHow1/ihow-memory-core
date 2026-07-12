@@ -11,6 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -24,6 +25,15 @@ test('every relative import in a packed module is itself in the tarball (fresh i
   const packed = new Set((report[0].files || []).map((f) => f.path.replace(/\\/g, '/')));
   const jsFiles = [...packed].filter((p) => p.startsWith('dist/') && p.endsWith('.js'));
   assert.ok(jsFiles.length > 5, `tarball should contain the dist modules (got ${jsFiles.length})`);
+  for (const required of [
+    'dist/checkpoint-claim-worker.js',
+    'dist/checkpoint-file-worker.js',
+    'dist/checkpoint-schema.js',
+    'dist/checkpoints.js',
+    'dist/store/checkpoints.js',
+  ]) {
+    assert.ok(packed.has(required), `tarball must include ${required}`);
+  }
 
   const missing = [];
   for (const rel of jsFiles) {
@@ -36,4 +46,69 @@ test('every relative import in a packed module is itself in the tarball (fresh i
     }
   }
   assert.deepEqual(missing, [], `tarball is missing modules that packed code imports:\n  ${missing.join('\n  ')}`);
+});
+
+test('tracked-only clean tree rebuild packs a spawnable checkpoint worker', () => {
+  const tracked = execFileSync('git', ['ls-files', '-z', '--cached'], { cwd: ROOT })
+    .toString('utf8')
+    .split('\0')
+    .filter(Boolean);
+  assert.ok(tracked.includes('src/checkpoint-claim-worker.ts'), 'checkpoint claim worker source must be tracked in the delivery index');
+  assert.ok(tracked.includes('src/checkpoint-file-worker.ts'), 'checkpoint file worker source must be tracked in the delivery index');
+
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ihow-package-clean-tree-'));
+  const cleanTree = path.join(temporaryRoot, 'repo');
+  const consumer = path.join(temporaryRoot, 'consumer');
+  fs.mkdirSync(cleanTree, { recursive: true });
+  fs.mkdirSync(consumer, { recursive: true });
+  try {
+    for (const relative of tracked) {
+      const source = path.join(ROOT, relative);
+      const destination = path.join(cleanTree, relative);
+      const stat = fs.lstatSync(source);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      if (stat.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(source), destination);
+      else if (stat.isFile()) fs.copyFileSync(source, destination);
+    }
+
+    const packReport = JSON.parse(execFileSync('npm', ['pack', '--json'], {
+      cwd: cleanTree,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }));
+    const tarball = path.join(cleanTree, packReport[0].filename);
+    fs.writeFileSync(path.join(consumer, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
+    execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', tarball], {
+      cwd: consumer,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const smoke = String.raw`
+      import fs from 'node:fs/promises';
+      import os from 'node:os';
+      import path from 'node:path';
+      import { openCore } from 'ihow-memory/dist/core.js';
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-packed-worker-smoke-'));
+      try {
+        const project = path.join(root, 'project');
+        await fs.mkdir(project);
+        const core = await openCore({ root: path.join(root, 'store'), space: 'packed-worker', cwd: project });
+        const draft = await core.checkpoints.createDraft({ runtime: 'package-test', claims: { completed: ['spawn packaged worker'] } });
+        const result = await core.checkpoints.finalizeDraft(
+          draft.draftId,
+          { trigger: { kind: 'explicit', signal: 'native', sourceEvent: 'package-test', reasonCode: 'package_test' } },
+          async () => ({ files: [], commands: [] }),
+        );
+        if (!result.artifact?.id?.startsWith('cp_')) throw new Error('packaged checkpoint worker did not finalize');
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', smoke], {
+      cwd: consumer,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
 });
