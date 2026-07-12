@@ -26,6 +26,7 @@ export type HermesBindingDiagnosis = Readonly<{
   status: HermesBindingStatus;
   canonical?: HermesMcpBinding;
   legacy?: HermesMcpBinding;
+  bindings: readonly HermesMcpBinding[];
   issues: readonly HermesBindingIssue[];
 }>;
 
@@ -49,6 +50,30 @@ const LEGACY_THIN_TOOLS = Object.freeze([
   'append_daily',
 ]);
 
+function freezeBinding(binding: HermesMcpBinding): HermesMcpBinding {
+  return Object.freeze({
+    name: binding.name,
+    command: binding.command,
+    args: Object.freeze([...binding.args]),
+    ...(binding.env ? { env: Object.freeze({ ...binding.env }) } : {}),
+    ...(binding.tools ? { tools: Object.freeze([...binding.tools]) } : {}),
+  });
+}
+
+function freezeDiagnosis(input: {
+  status: HermesBindingStatus;
+  canonical?: HermesMcpBinding;
+  legacy?: HermesMcpBinding;
+  bindings: readonly HermesMcpBinding[];
+  issues: readonly HermesBindingIssue[];
+}): HermesBindingDiagnosis {
+  return Object.freeze({
+    ...input,
+    bindings: Object.freeze([...input.bindings]),
+    issues: Object.freeze([...input.issues]),
+  });
+}
+
 function hasAllTools(binding: HermesMcpBinding, required: readonly string[]): boolean {
   const available = new Set(binding.tools ?? []);
   return required.every((tool) => available.has(tool));
@@ -56,7 +81,8 @@ function hasAllTools(binding: HermesMcpBinding, required: readonly string[]): bo
 
 function hasCanonicalRoots(binding: HermesMcpBinding): boolean {
   const env = binding.env ?? {};
-  return Boolean(env.MEMORY_ROOT && env.IHOW_MEMORY_STATE_ROOT);
+  const memoryRoot = env.MEMORY_ROOT || env.IHOW_MEMORY_ROOT;
+  return Boolean(memoryRoot && env.IHOW_MEMORY_STATE_ROOT);
 }
 
 function isLegacyThinWrapper(binding: HermesMcpBinding): boolean {
@@ -66,37 +92,46 @@ function isLegacyThinWrapper(binding: HermesMcpBinding): boolean {
 }
 
 export function classifyHermesMcpBindings(bindings: readonly HermesMcpBinding[]): HermesBindingDiagnosis {
-  const canonical = bindings.find((binding) => binding.name === 'ihow-memory');
-  const legacy = bindings.find((binding) => binding.name === 'ihowmemory');
-  if (!canonical && !legacy) {
-    return Object.freeze({ status: 'absent', issues: Object.freeze([]) });
+  const relevant = bindings
+    .filter((binding) => binding.name === 'ihow-memory' || binding.name === 'ihowmemory')
+    .map(freezeBinding);
+  const canonicals = relevant.filter((binding) => binding.name === 'ihow-memory');
+  const legacies = relevant.filter((binding) => binding.name === 'ihowmemory');
+  const canonical = canonicals[0];
+  const legacy = legacies[0];
+
+  if (relevant.length === 0) {
+    return freezeDiagnosis({ status: 'absent', bindings: relevant, issues: [] });
   }
 
-  if (canonical && legacy) {
-    return Object.freeze({
+  if (relevant.length > 1) {
+    return freezeDiagnosis({
       status: 'conflicting-bindings',
       canonical,
       legacy,
-      issues: Object.freeze<HermesBindingIssue[]>(['DUPLICATE_BINDINGS']),
+      bindings: relevant,
+      issues: ['DUPLICATE_BINDINGS'],
     });
   }
 
   if (legacy) {
     const issues: HermesBindingIssue[] = ['LEGACY_ALIAS'];
     if (!hasAllTools(legacy, REQUIRED_FULL_TOOLS)) issues.push('INCOMPLETE_TOOL_INVENTORY');
-    return Object.freeze({
+    return freezeDiagnosis({
       status: isLegacyThinWrapper(legacy) ? 'legacy-thin-wrapper' : 'needs-repair',
       legacy,
-      issues: Object.freeze(issues),
+      bindings: relevant,
+      issues,
     });
   }
 
   const issues: HermesBindingIssue[] = [];
   if (!hasAllTools(canonical!, REQUIRED_FULL_TOOLS)) issues.push('INCOMPLETE_TOOL_INVENTORY');
   if (!hasCanonicalRoots(canonical!)) issues.push('MISSING_ROOT_BINDING');
-  return Object.freeze({
+  return freezeDiagnosis({
     status: issues.length === 0 ? 'canonical-full' : 'needs-repair',
     canonical,
-    issues: Object.freeze(issues),
+    bindings: relevant,
+    issues,
   });
 }

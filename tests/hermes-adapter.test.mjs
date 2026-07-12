@@ -106,3 +106,64 @@ test('returns absent when neither canonical nor legacy binding exists', () => {
   assert.equal(result.canonical, undefined);
   assert.deepEqual(result.issues, []);
 });
+
+test('detects duplicate canonical entries instead of accepting the first one', () => {
+  const result = classifyHermesMcpBindings([
+    {
+      name: 'ihow-memory',
+      command: '/opt/homebrew/bin/node',
+      args: ['/workspace/.runtime/mcp/server.js'],
+      env: { MEMORY_ROOT: '/workspace/memory', IHOW_MEMORY_STATE_ROOT: '/workspace/state' },
+      tools: FULL_TOOLS,
+    },
+    {
+      name: 'ihow-memory',
+      command: '/tmp/node',
+      args: ['/tmp/stale-server.js'],
+      env: { MEMORY_ROOT: '/tmp/memory', IHOW_MEMORY_STATE_ROOT: '/tmp/state' },
+      tools: FULL_TOOLS,
+    },
+  ]);
+
+  assert.equal(result.status, 'conflicting-bindings');
+  assert.ok(result.issues.includes('DUPLICATE_BINDINGS'));
+  assert.equal(result.bindings.length, 2);
+});
+
+test('accepts the documented IHOW_MEMORY_ROOT alias as a memory root binding', () => {
+  const result = classifyHermesMcpBindings([
+    {
+      name: 'ihow-memory',
+      command: '/opt/homebrew/bin/node',
+      args: ['/workspace/.runtime/mcp/server.js'],
+      env: {
+        IHOW_MEMORY_ROOT: '/workspace/memory',
+        IHOW_MEMORY_STATE_ROOT: '/workspace/state',
+      },
+      tools: FULL_TOOLS,
+    },
+  ]);
+
+  assert.equal(result.status, 'canonical-full');
+  assert.deepEqual(result.issues, []);
+});
+
+test('returns a detached immutable diagnosis rather than caller-owned mutable bindings', () => {
+  const source = {
+    name: 'ihow-memory',
+    command: '/opt/homebrew/bin/node',
+    args: ['/workspace/.runtime/mcp/server.js'],
+    env: { MEMORY_ROOT: '/workspace/memory', IHOW_MEMORY_STATE_ROOT: '/workspace/state' },
+    tools: [...FULL_TOOLS],
+  };
+  const result = classifyHermesMcpBindings([source]);
+  source.args[0] = '/tmp/changed.js';
+  source.env.MEMORY_ROOT = '/tmp/changed';
+  source.tools.length = 0;
+
+  assert.equal(result.canonical?.args[0], '/workspace/.runtime/mcp/server.js');
+  assert.equal(result.canonical?.env?.MEMORY_ROOT, '/workspace/memory');
+  assert.equal(result.canonical?.tools?.length, FULL_TOOLS.length);
+  assert.throws(() => result.canonical?.args.push('x'), TypeError);
+  assert.throws(() => { result.canonical.env.MEMORY_ROOT = '/tmp'; }, TypeError);
+});
