@@ -10,12 +10,30 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 _MAX_CONTEXT_CHARS = 8_000
+_MAX_PROMPT_DIGEST_CHARS = 2_000
+_PROMPT_SECRET_PATTERNS = (
+    re.compile(r"\b(api[_-]?key|secret|token|password|passwd|pwd|authorization|bearer)\b\s*[:=]\s*\S+", re.I),
+    re.compile(r"\bBearer\s+\S+", re.I),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b", re.I),
+    re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I),
+)
+
+
+def _prompt_digest(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    for pattern in _PROMPT_SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text[:_MAX_PROMPT_DIGEST_CHARS]
 
 
 def _now() -> str:
@@ -28,7 +46,7 @@ def _cwd(kwargs: dict[str, Any]) -> str:
 
 
 def _metadata_event(name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
-    return {
+    event = {
         "schemaVersion": 1,
         "event": name,
         "runtime": "hermes",
@@ -37,6 +55,11 @@ def _metadata_event(name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
         "platform": str(kwargs.get("platform") or "")[:64],
         "observedAt": _now(),
     }
+    if name == "runtime.before_prompt":
+        digest = _prompt_digest(kwargs.get("user_message"))
+        if digest:
+            event["promptDigest"] = digest
+    return event
 
 
 def _append_metadata_event(event: dict[str, Any]) -> None:
@@ -49,19 +72,42 @@ def _append_metadata_event(event: dict[str, Any]) -> None:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Dispatch one event without making Hermes availability depend on iHow Memory.
+def _bridge_path() -> Path:
+    configured = os.environ.get("IHOW_MEMORY_HERMES_BRIDGE", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parent / "hermes-bridge.js"
 
-    Test mode is the first executable contract. A later slice replaces it with the packaged Node
-    bridge/MCP transport while preserving this fail-open boundary and the same event envelope.
-    """
+
+def _dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Dispatch one event without making Hermes availability depend on iHow Memory."""
     _append_metadata_event(event)
     mode = os.environ.get("IHOW_MEMORY_HERMES_TEST_MODE", "").strip().lower()
     if mode == "failure":
         raise RuntimeError("simulated iHow Memory transport failure")
     if mode == "success" and event["event"] == "runtime.before_prompt":
         return {"context": "Verified iHow Memory recall"}
-    return None
+
+    bridge = _bridge_path()
+    node = os.environ.get("IHOW_MEMORY_HERMES_NODE", "").strip() or "node"
+    argv = [node]
+    if bridge.suffix == ".ts":
+        argv.append("--experimental-strip-types")
+    argv.append(str(bridge))
+    completed = subprocess.run(
+        argv,
+        input=json.dumps(event, ensure_ascii=False) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("ihow_memory_hermes_bridge_failed")
+    payload = json.loads(completed.stdout.strip() or "{}")
+    if payload.get("ok") is not True:
+        raise RuntimeError("ihow_memory_hermes_bridge_failed")
+    return payload
 
 
 def _safe_dispatch(event_name: str, kwargs: dict[str, Any]) -> Optional[dict[str, Any]]:

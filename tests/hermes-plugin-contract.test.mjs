@@ -95,7 +95,7 @@ test('pre_llm_call returns bounded recall context while event logs stay metadata
   assert.match(log, /runtime\.before_prompt/);
   assert.match(log, /runtime\.after_turn/);
   assert.match(log, /runtime\.session_finalize/);
-  assert.doesNotMatch(log, /fix activation truth/);
+  assert.match(log, /"promptDigest": "fix activation truth"/);
   assert.doesNotMatch(log, /hunter2/);
   assert.doesNotMatch(log, /secret body/);
 });
