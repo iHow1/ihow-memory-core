@@ -119,4 +119,24 @@ test('invalid or oversized runtime event data is rejected before persistence', (
     observedAt: '2026-07-12T00:00:00.000Z',
     promptDigest: 'x'.repeat(2001),
   }), /runtime_event_prompt_digest_too_large/);
+
+  assert.throws(() => runtimeEventToContextProbe({
+    schemaVersion: 1,
+    event: 'runtime.session_start',
+    runtime: 'h'.repeat(65),
+    cwd: '/repo',
+    sessionId: 'session-1',
+    platform: 'cli',
+    observedAt: '2026-07-12T00:00:00.000Z',
+  }), /runtime_event_runtime_too_large/);
+
+  assert.throws(() => runtimeEventToContextProbe({
+    schemaVersion: 1,
+    event: 'runtime.session_start',
+    runtime: 'hermes',
+    cwd: `/${'x'.repeat(4096)}`,
+    sessionId: 'session-1',
+    platform: 'cli',
+    observedAt: '2026-07-12T00:00:00.000Z',
+  }), /runtime_event_cwd_too_large/);
 });

@@ -64,9 +64,10 @@ def _dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
-def _safe_dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
+def _safe_dispatch(event_name: str, kwargs: dict[str, Any]) -> Optional[dict[str, Any]]:
     try:
-        result = _dispatch(event)
+        # Event construction belongs inside the same fail-open boundary as transport dispatch.
+        result = _dispatch(_metadata_event(event_name, kwargs))
         if not isinstance(result, dict):
             return None
         context = result.get("context")
@@ -79,30 +80,30 @@ def _safe_dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
 
 
 def _on_session_start(**kwargs: Any) -> None:
-    _safe_dispatch(_metadata_event("runtime.session_start", kwargs))
+    _safe_dispatch("runtime.session_start", kwargs)
 
 
 def _on_session_reset(**kwargs: Any) -> None:
-    _safe_dispatch(_metadata_event("runtime.session_reset", kwargs))
+    _safe_dispatch("runtime.session_reset", kwargs)
 
 
 def _on_pre_llm_call(**kwargs: Any) -> Optional[dict[str, str]]:
     # user_message and conversation_history are deliberately ignored here. The transport slice will
     # pass only a bounded prompt digest after applying iHow Memory's redaction policy.
-    return _safe_dispatch(_metadata_event("runtime.before_prompt", kwargs))
+    return _safe_dispatch("runtime.before_prompt", kwargs)
 
 
 def _on_post_llm_call(**kwargs: Any) -> None:
     # assistant_response and conversation_history are deliberately ignored in this metadata-only slice.
-    _safe_dispatch(_metadata_event("runtime.after_turn", kwargs))
+    _safe_dispatch("runtime.after_turn", kwargs)
 
 
 def _on_session_finalize(**kwargs: Any) -> None:
-    _safe_dispatch(_metadata_event("runtime.session_finalize", kwargs))
+    _safe_dispatch("runtime.session_finalize", kwargs)
 
 
 def _on_session_end(**kwargs: Any) -> None:
-    _safe_dispatch(_metadata_event("runtime.session_end", kwargs))
+    _safe_dispatch("runtime.session_end", kwargs)
 
 
 def register(ctx: Any) -> None:

@@ -52,8 +52,10 @@ function validateRuntimeEvent(input: RuntimeLifecycleEvent): RuntimeLifecycleEve
   if (!input || typeof input !== 'object' || input.schemaVersion !== 1) {
     throw new Error('runtime_event_schema_invalid');
   }
-  if (!normalizedString(input.runtime, 64)) throw new Error('runtime_event_runtime_required');
-  if (!normalizedString(input.cwd, 4096)) throw new Error('runtime_event_cwd_required');
+  if (typeof input.runtime !== 'string' || !input.runtime.trim()) throw new Error('runtime_event_runtime_required');
+  if (input.runtime.trim().length > 64) throw new Error('runtime_event_runtime_too_large');
+  if (typeof input.cwd !== 'string' || !input.cwd.trim()) throw new Error('runtime_event_cwd_required');
+  if (input.cwd.trim().length > 4096) throw new Error('runtime_event_cwd_too_large');
   if (!Number.isFinite(Date.parse(input.observedAt))) throw new Error('runtime_event_observed_at_invalid');
   if (typeof input.promptDigest === 'string' && input.promptDigest.length > 2000) {
     throw new Error('runtime_event_prompt_digest_too_large');

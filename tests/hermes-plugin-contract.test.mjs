@@ -17,7 +17,7 @@ async function copyPlugin(home) {
   return target;
 }
 
-function runPython({ plugin, home, mode = 'success' }) {
+function runPython({ plugin, home, mode = 'success', badCwd = false }) {
   const script = String.raw`
 import importlib.util, json, os, pathlib, sys
 plugin = pathlib.Path(sys.argv[1])
@@ -38,7 +38,11 @@ assert set(ctx.hooks) == {
 os.environ["HERMES_HOME"] = str(home)
 os.environ["IHOW_MEMORY_HERMES_EVENT_LOG"] = str(home / "events.ndjson")
 os.environ["IHOW_MEMORY_HERMES_TEST_MODE"] = mode
-start = ctx.hooks["on_session_start"](session_id="s1", model="m", platform="cli", cwd="/repo")
+if sys.argv[4] == "bad-cwd":
+    module.os.getcwd = lambda: (_ for _ in ()).throw(OSError("cwd unavailable"))
+    start = ctx.hooks["on_session_start"](session_id="s1", model="m", platform="cli")
+else:
+    start = ctx.hooks["on_session_start"](session_id="s1", model="m", platform="cli", cwd="/repo")
 pre = ctx.hooks["pre_llm_call"](
     session_id="s1", user_message="fix activation truth", conversation_history=[{"role":"user","content":"secret body"}],
     is_first_turn=True, model="m", platform="cli", cwd="/repo",
@@ -50,7 +54,7 @@ post = ctx.hooks["post_llm_call"](
 finalize = ctx.hooks["on_session_finalize"](session_id="s1", platform="cli", cwd="/repo")
 print(json.dumps({"start": start, "pre": pre, "post": post, "finalize": finalize}, sort_keys=True))
 `;
-  return spawnSync('python3', ['-c', script, plugin, home, mode], {
+  return spawnSync('python3', ['-c', script, plugin, home, mode, badCwd ? 'bad-cwd' : 'normal'], {
     cwd: repo,
     encoding: 'utf8',
     env: { ...process.env },
@@ -67,6 +71,15 @@ test('Hermes plugin registers six lifecycle hooks and remains fail-open', async 
   assert.equal(result.pre, null);
   assert.equal(result.post, null);
   assert.equal(result.finalize, null);
+});
+
+test('Hermes plugin fails open when metadata event construction raises', async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-plugin-'));
+  const plugin = await copyPlugin(home);
+  const run = runPython({ plugin, home, mode: 'success', badCwd: true });
+  assert.equal(run.status, 0, run.stderr);
+  const result = JSON.parse(run.stdout.trim());
+  assert.equal(result.start, null);
 });
 
 test('pre_llm_call returns bounded recall context while event logs stay metadata-only', async () => {
