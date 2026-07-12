@@ -28,6 +28,7 @@ const CHECKPOINT_EVENTS = new Set<RuntimeLifecycleEventName>([
   'runtime.session_finalize',
   'runtime.session_end',
 ]);
+const FILE_ANCHOR_MAX_BYTES = 1024 * 1024;
 
 type HermesBridgeEvent = RuntimeLifecycleEvent & {
   prompt?: unknown;
@@ -40,26 +41,54 @@ function errorCode(error: unknown): string {
     : 'hermes_bridge_failed';
 }
 
-function commandOutputHash(output: string): string {
+function commandOutputHash(output: string | Buffer): string {
   return crypto.createHash('sha256').update(output).digest('hex');
+}
+
+async function boundedRegularFileAnchor(
+  cwd: string,
+  relative: string,
+): Promise<CheckpointMachineAnchors['files'][number] | undefined> {
+  const target = path.join(cwd, relative);
+  let handle: fsPromises.FileHandle | undefined;
+  try {
+    // O_NOFOLLOW rejects a symlink at the final component. One descriptor binds metadata and bytes
+    // to the same inode, avoiding a stat/read TOCTOU anchor.
+    handle = await fsPromises.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const before = await handle.stat();
+    if (!before.isFile() || before.size > FILE_ANCHOR_MAX_BYTES) return undefined;
+    const content = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < content.length) {
+      const { bytesRead } = await handle.read(content, offset, content.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const after = await handle.stat();
+    if (
+      offset !== before.size
+      || after.size !== before.size
+      || after.mtimeMs !== before.mtimeMs
+      || after.ino !== before.ino
+      || after.dev !== before.dev
+    ) return undefined;
+    return {
+      path: relative,
+      sha256: commandOutputHash(content),
+      mtime: after.mtime.toISOString(),
+    };
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
 }
 
 async function collectCheckpointAnchors(cwd: string): Promise<CheckpointMachineAnchors> {
   const files: CheckpointMachineAnchors['files'] = [];
   for (const relative of ['package.json', 'README.md']) {
-    const target = path.join(cwd, relative);
-    try {
-      const stat = await fsPromises.stat(target);
-      if (!stat.isFile()) continue;
-      const content = await fsPromises.readFile(target);
-      files.push({
-        path: relative,
-        sha256: commandOutputHash(content.toString('binary')),
-        mtime: stat.mtime.toISOString(),
-      });
-    } catch {
-      // Missing optional project anchors are represented by omission, never a fabricated value.
-    }
+    const anchor = await boundedRegularFileAnchor(cwd, relative);
+    if (anchor) files.push(anchor);
   }
   return { files, commands: [] };
 }

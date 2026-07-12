@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 
 const repo = path.resolve(import.meta.dirname, '..');
@@ -19,10 +20,13 @@ function invokeBridge(event, env) {
   });
 }
 
-async function roots() {
+async function roots(t) {
   const memoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-memory-'));
   const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-state-'));
   const project = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-project-'));
+  t.after(async () => {
+    await Promise.all([memoryRoot, stateRoot, project].map(dir => fs.rm(dir, { recursive: true, force: true })));
+  });
   return { memoryRoot, stateRoot, project };
 }
 
@@ -38,8 +42,8 @@ function event(overrides = {}) {
   };
 }
 
-test('Hermes finalize creates a bounded session-end checkpoint and returns only its id', async () => {
-  const { memoryRoot, stateRoot, project } = await roots();
+test('Hermes finalize creates a bounded session-end checkpoint and returns only its id', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
   const run = invokeBridge(event({
     cwd: project,
     event: 'runtime.session_finalize',
@@ -72,8 +76,8 @@ test('Hermes finalize creates a bounded session-end checkpoint and returns only 
   assert.equal(artifact.state.objective, 'Finish Hermes runtime adapter');
 });
 
-test('Hermes session_end does not create a checkpoint without bounded claims', async () => {
-  const { memoryRoot, stateRoot, project } = await roots();
+test('Hermes session_end does not create a checkpoint without bounded claims', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
   const run = invokeBridge(event({ cwd: project, event: 'runtime.session_end' }), {
     MEMORY_ROOT: memoryRoot,
     IHOW_MEMORY_STATE_ROOT: stateRoot,
@@ -84,8 +88,8 @@ test('Hermes session_end does not create a checkpoint without bounded claims', a
   assert.deepEqual(await fs.readdir(artifactDir).catch(() => []), []);
 });
 
-test('Hermes checkpoint secret rejection fails open without persisting raw claims', async () => {
-  const { memoryRoot, stateRoot, project } = await roots();
+test('Hermes checkpoint secret rejection fails open without persisting raw claims', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
   const secret = 'password is hunter2';
   const run = invokeBridge(event({
     cwd: project,
@@ -107,8 +111,8 @@ test('Hermes checkpoint secret rejection fails open without persisting raw claim
 });
 
 
-test('observational after-turn events cannot create checkpoints', async () => {
-  const { memoryRoot, stateRoot, project } = await roots();
+test('observational after-turn events cannot create checkpoints', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
   const run = invokeBridge(event({
     cwd: project,
     event: 'runtime.after_turn',
@@ -117,4 +121,39 @@ test('observational after-turn events cannot create checkpoints', async () => {
   assert.equal(run.status, 0, run.stderr);
   assert.deepEqual(JSON.parse(run.stdout.trim()), { ok: true });
   assert.deepEqual(await fs.readdir(path.join(memoryRoot, '_mcp', 'checkpoints', 'artifacts')).catch(() => []), []);
+});
+
+async function finalizedArtifact(memoryRoot) {
+  const dir = path.join(memoryRoot, '_mcp', 'checkpoints', 'artifacts');
+  const file = (await fs.readdir(dir)).find(name => /^cp_[a-f0-9]{64}\.json$/.test(name));
+  assert.ok(file);
+  return JSON.parse(await fs.readFile(path.join(dir, file), 'utf8'));
+}
+
+test('file anchors hash the exact raw bytes for non-ASCII project files', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
+  const raw = Buffer.from([0x23, 0x20, 0xe4, 0xb8, 0xad, 0xe6, 0x96, 0x87, 0x0a, 0xff]);
+  await fs.writeFile(path.join(project, 'README.md'), raw);
+  const run = invokeBridge(event({
+    cwd: project, event: 'runtime.session_finalize', checkpointClaims: { completed: ['raw byte anchor'] },
+  }), { MEMORY_ROOT: memoryRoot, IHOW_MEMORY_STATE_ROOT: stateRoot });
+  assert.equal(run.status, 0, run.stderr);
+  const artifact = await finalizedArtifact(memoryRoot);
+  const anchor = artifact.anchors.files.find(item => item.path === 'README.md');
+  assert.equal(anchor.sha256, crypto.createHash('sha256').update(raw).digest('hex'));
+});
+
+test('file anchors skip symlinks and files beyond the bounded read ceiling', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
+  const outside = path.join(os.tmpdir(), `ihow-outside-${crypto.randomUUID()}.md`);
+  t.after(() => fs.rm(outside, { force: true }));
+  await fs.writeFile(outside, 'outside target', 'utf8');
+  await fs.symlink(outside, path.join(project, 'README.md'));
+  await fs.writeFile(path.join(project, 'package.json'), Buffer.alloc(1024 * 1024 + 1, 0x61));
+  const run = invokeBridge(event({
+    cwd: project, event: 'runtime.session_finalize', checkpointClaims: { completed: ['bounded anchor'] },
+  }), { MEMORY_ROOT: memoryRoot, IHOW_MEMORY_STATE_ROOT: stateRoot });
+  assert.equal(run.status, 0, run.stderr);
+  const artifact = await finalizedArtifact(memoryRoot);
+  assert.deepEqual(artifact.anchors.files, []);
 });
