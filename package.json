@@ -26,9 +26,7 @@
   "files": [
     "bin/",
     "dist/",
-    "LICENSE",
-    "NOTICE",
-    "TRADEMARK.md",
+    "integrations/hermes/ihow-memory/",
     "README.md",
     "README.zh-CN.md",
     "skills/",
