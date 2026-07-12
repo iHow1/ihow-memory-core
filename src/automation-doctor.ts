@@ -36,6 +36,11 @@ export type RuntimeActivation = {
   lastObservedAt?: string;
 };
 
+export type LifecycleWiringEvidence = {
+  state: 'current' | 'missing' | 'broken';
+  generationId?: string;
+};
+
 export type AutomationMatrixRow = {
   runtime: string;
   sessionStartResume: string;
@@ -175,7 +180,7 @@ function latest(rows: ActivationEvidence[], predicate: (row: ActivationEvidence)
 export function deriveRuntimeActivation(
   runtime: AutomationRuntime,
   allEvidence: ActivationEvidence[],
-  options: { wiring?: RuntimeHookWiring; now?: number } = {},
+  options: { wiring?: RuntimeHookWiring; lifecycleWiring?: LifecycleWiringEvidence; now?: number } = {},
 ): RuntimeActivation {
   const rows = evidenceForRuntime(allEvidence, runtime);
   const lastObservedAt = latest(rows, () => true)?.observedAt;
@@ -184,12 +189,45 @@ export function deriveRuntimeActivation(
   if (runtime === 'no-hook') {
     return { status: 'TOOLS ONLY', reasonCode: 'ACTIVATION_NO_HOOK_TOOLS_ONLY', lastObservedAt };
   }
-  if (runtime === 'openclaw' || runtime === 'hermes') {
+  if (runtime === 'openclaw') {
+    return { status: 'TOOLS ONLY', reasonCode: 'ACTIVATION_NO_VERIFIED_LIFECYCLE_TOOLS_ONLY', lastObservedAt };
+  }
+  if (runtime === 'hermes' && options.lifecycleWiring?.state !== 'current') {
+    if (options.lifecycleWiring?.state === 'broken') {
+      return { status: 'NEEDS REPAIR', reasonCode: 'ACTIVATION_WIRING_BROKEN', lastObservedAt };
+    }
     return { status: 'TOOLS ONLY', reasonCode: 'ACTIVATION_NO_VERIFIED_LIFECYCLE_TOOLS_ONLY', lastObservedAt };
   }
 
   const anyConfigured = latest(rows, (row) => row.status === 'configured');
   let configured = anyConfigured;
+  if (runtime === 'hermes' && options.lifecycleWiring?.state === 'current') {
+    const generationKey = options.lifecycleWiring.generationId;
+    if (!generationKey) {
+      return {
+        status: 'NEEDS REPAIR',
+        reasonCode: 'ACTIVATION_WIRING_GENERATION_UNCONFIRMED',
+        configuredAt: anyConfigured?.observedAt,
+        lastObservedAt,
+      };
+    }
+    const generationId = activationConfigurationId(generationKey);
+    configured = latest(rows, (row) => row.status === 'configured' && row.configuration?.id === generationId);
+    if (!configured) {
+      return anyConfigured
+        ? {
+            status: 'NEEDS REPAIR',
+            reasonCode: 'ACTIVATION_WIRING_GENERATION_UNCONFIRMED',
+            configuredAt: anyConfigured.observedAt,
+            lastObservedAt,
+          }
+        : {
+            status: 'READY — WAITING FOR FIRST ACTIVITY',
+            reasonCode: 'ACTIVATION_CONFIGURED_AWAITING_LIVE_ACTIVITY',
+            lastObservedAt,
+          };
+    }
+  }
   if (options.wiring) {
     const wasEnabled = !!anyConfigured || options.wiring.managedPresent;
     if (options.wiring.state !== 'current') {
@@ -225,9 +263,14 @@ export function deriveRuntimeActivation(
   const synthetic = latest(rows, (row) => row.status === 'synthetic');
   const sameConfiguredGeneration = (row: ActivationEvidence): boolean =>
     !configured?.configuration || row.configuration?.id === configured.configuration.id;
-  const started = latest(rows, (row) => row.status === 'observed-live-started' && sameConfiguredGeneration(row));
-  const completed = latest(rows, (row) => row.status === 'observed-live-completed' && sameConfiguredGeneration(row));
-  const failed = latest(rows, (row) => row.status === 'failed' && sameConfiguredGeneration(row));
+  const trustedLifecycleEvidence = (row: ActivationEvidence): boolean =>
+    runtime !== 'hermes' || row.source === 'native-hook';
+  const started = latest(rows, (row) => row.status === 'observed-live-started' &&
+    sameConfiguredGeneration(row) && trustedLifecycleEvidence(row));
+  const completed = latest(rows, (row) => row.status === 'observed-live-completed' &&
+    sameConfiguredGeneration(row) && trustedLifecycleEvidence(row));
+  const failed = latest(rows, (row) => row.status === 'failed' &&
+    sameConfiguredGeneration(row) && trustedLifecycleEvidence(row));
 
   if (!configured) {
     if (synthetic) return { status: 'READY — WAITING FOR FIRST ACTIVITY', reasonCode: 'ACTIVATION_SYNTHETIC_ONLY', lastObservedAt };
