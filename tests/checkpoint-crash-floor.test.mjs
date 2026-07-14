@@ -6,12 +6,15 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { canonicalCheckpointJson } from '../src/checkpoint-schema.ts';
+import { boundCheckpointDraft, canonicalCheckpointJson } from '../src/checkpoint-schema.ts';
 import { openCore } from '../src/core.ts';
 import { runCaptureFloorSweep } from '../src/floor.ts';
+import { withWorkspaceLock } from '../src/store/lock.ts';
 import {
   checkpointPrivateIndexPaths,
   checkpointStorePaths,
+  stageCheckpointDraftLocatorUpdateUnlocked,
+  writeCheckpointDraftUnlocked,
 } from '../src/store/checkpoints.ts';
 
 const STALE_MS = 30 * 60 * 1000;
@@ -125,6 +128,15 @@ async function artifacts(core) {
   return await Promise.all(listed.filter((item) => item.integrity === 'valid').map((item) => core.checkpoints.read(item.id)));
 }
 
+async function ageDraft(core, draft, updatedAt) {
+  const aged = boundCheckpointDraft({ ...draft, updatedAt: new Date(updatedAt).toISOString() });
+  await withWorkspaceLock(core.workspace, async () => {
+    await stageCheckpointDraftLocatorUpdateUnlocked(core.workspace, draft, aged);
+    await writeCheckpointDraftUnlocked(core.workspace, aged);
+  });
+  return aged;
+}
+
 test('stale valid draft becomes one bounded partial shadow checkpoint with live anchors', async (t) => {
   const f = await staleDraftFixture(t, 'stale-valid');
   const result = await runCaptureFloorSweep(f.core.workspace, { now: f.sweepNow });
@@ -158,6 +170,65 @@ test('fresh draft is not finalized by the checkpoint crash floor', async (t) => 
   assert.equal(result.checkpointed, 0);
   assert.ok(result.checkpointOutcomes.some((row) => row.outcome === 'skipped-checkpoint-fresh'));
   assert.equal((await artifacts(f.core)).length, 0);
+});
+
+test('stale observation cannot finalize a draft refreshed before the locked commit', async (t) => {
+  const f = await fixture(t, 'stale-cas-refresh');
+  const sessionId = 'codex-stale-cas-refresh';
+  const created = await f.core.checkpoints.createDraft({
+    runtime: 'codex',
+    sessionId,
+    claims: {
+      completed: ['STALE-OBSERVED-CLAIM'],
+      pending: ['await floor'],
+      coverage: { complete: false, eventCount: 1 },
+    },
+  });
+  const now = Date.now();
+  const aged = await ageDraft(f.core, created, now - STALE_MS - 60_000);
+  await plantCodexSession(f.home, {
+    id: sessionId,
+    cwd: f.project,
+    mtimeMs: now - STALE_MS - 1,
+  });
+
+  let refreshed;
+  const result = await runCaptureFloorSweep(f.core.workspace, {
+    now,
+    checkpointAnchorProvider: async () => {
+      refreshed = await f.core.checkpoints.updateDraft(aged.draftId, {
+        claims: {
+          completed: ['REFRESHED-BEFORE-FINALIZE'],
+          pending: ['keep working'],
+          coverage: { complete: false, eventCount: 2 },
+        },
+      });
+      return { files: [], commands: [] };
+    },
+  });
+
+  assert.equal(result.checkpointed, 0, 'the invalidated stale observation cannot publish an artifact');
+  assert.deepEqual(result.checkpointOutcomes, [{
+    tool: 'codex',
+    outcome: 'skipped-checkpoint-fresh',
+    reasonCode: 'checkpoint_draft_precondition_failed',
+  }]);
+  assert.ok(refreshed, 'controlled anchor provider refreshed the draft between finalize locks');
+  assert.ok(Date.parse(refreshed.updatedAt) > Date.parse(aged.updatedAt), 'updatedAt became fresh');
+  assert.equal((await artifacts(f.core)).length, 0, 'CAS mismatch creates no artifact');
+  const paths = checkpointStorePaths(f.core.workspace);
+  const stored = JSON.parse(await fs.readFile(
+    path.join(paths.drafts, `${aged.draftId}.json`),
+    'utf8',
+  ));
+  assert.equal(stored.finalization, undefined, 'refreshed draft remains open');
+  assert.deepEqual(stored.claims.completed, ['REFRESHED-BEFORE-FINALIZE']);
+  assert.deepEqual(await fs.readdir(paths.finalizations), [], 'CAS mismatch creates no finalization receipt');
+  assert.deepEqual(
+    (await f.core.checkpoints.audit()).filter((event) => event.operation === 'artifact.finalize'),
+    [],
+    'CAS mismatch does not mark the fresh draft as a checkpoint error',
+  );
 });
 
 test('Hermes stale draft resolves its tool-call project without constructing handoff anchors', async (t) => {

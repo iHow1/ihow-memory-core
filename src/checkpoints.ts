@@ -57,6 +57,11 @@ import { readEventsAllLanes } from './store/events.ts';
 
 export type CheckpointMachineAnchorProvider = () => CheckpointMachineAnchors | Promise<CheckpointMachineAnchors>;
 
+export type CheckpointDraftFinalizationPrecondition = {
+  expectedUpdatedAt: string;
+  expectedContentSha256: string;
+};
+
 export type CheckpointListItem = {
   id: string;
   createdAt?: string;
@@ -92,7 +97,12 @@ type CheckpointDraftSnapshot = {
 export type CheckpointService = {
   createDraft(input: unknown): Promise<CheckpointDraftV1>;
   updateDraft(draftId: string, input: unknown): Promise<CheckpointDraftV1>;
-  finalizeDraft(draftId: string, request: unknown, collectMachineAnchors: CheckpointMachineAnchorProvider): Promise<{ artifact: CheckpointArtifactV1; deduplicated: boolean }>;
+  finalizeDraft(
+    draftId: string,
+    request: unknown,
+    collectMachineAnchors: CheckpointMachineAnchorProvider,
+    precondition?: CheckpointDraftFinalizationPrecondition,
+  ): Promise<{ artifact: CheckpointArtifactV1; deduplicated: boolean }>;
   list(opts?: { limit?: number }): Promise<CheckpointListItem[]>;
   read(artifactId: string): Promise<CheckpointArtifactV1>;
   inspect(artifactId: string): Promise<CheckpointInspection>;
@@ -101,6 +111,26 @@ export type CheckpointService = {
 
 function digest(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+export function checkpointDraftFinalizationPrecondition(
+  draft: CheckpointDraftV1,
+): CheckpointDraftFinalizationPrecondition {
+  return {
+    expectedUpdatedAt: draft.updatedAt,
+    expectedContentSha256: digest(canonicalCheckpointJson(draft)),
+  };
+}
+
+function assertCheckpointDraftFinalizationPrecondition(
+  draft: CheckpointDraftV1,
+  precondition: CheckpointDraftFinalizationPrecondition | undefined,
+): void {
+  if (!precondition) return;
+  if (
+    draft.updatedAt !== precondition.expectedUpdatedAt
+    || digest(canonicalCheckpointJson(draft)) !== precondition.expectedContentSha256
+  ) throw new Error('checkpoint_draft_precondition_failed');
 }
 
 async function canonicalRealPath(input: string): Promise<string> {
@@ -446,6 +476,7 @@ async function rejected<T>(workspace: Workspace, operation: CheckpointAuditEvent
       'checkpoint_audit_publication_invalid',
       'checkpoint_audit_segment_invalid',
       'checkpoint_audit_state_invalid',
+      'checkpoint_draft_precondition_failed',
     ].includes(code)) {
       await auditRejection(workspace, operation, code);
     }
@@ -755,7 +786,7 @@ export async function createCheckpointService(
       });
     },
 
-    async finalizeDraft(draftId, request, collectMachineAnchors) {
+    async finalizeDraft(draftId, request, collectMachineAnchors, precondition) {
       return await rejected(workspace, 'artifact.finalize', async () => {
         const finalized = validateFinalizeRequest(request);
         if (typeof collectMachineAnchors !== 'function') throw new CheckpointValidationError('checkpoint_machine_anchor_provider_required');
@@ -765,6 +796,7 @@ export async function createCheckpointService(
         const recovered = await withWorkspaceLock(workspace, async () => {
           const draft = await readCheckpointDraftUnlocked(workspace, draftId);
           assertProjectMatchesService(draft, project);
+          assertCheckpointDraftFinalizationPrecondition(draft, precondition);
           const marked = await recoverDraftMarkerUnlocked(workspace, draft, project, finalized);
           if (marked) return marked;
           const artifact = await recoverDraftFinalizationUnlocked(workspace, draft, project, finalized);
@@ -794,6 +826,9 @@ export async function createCheckpointService(
         return await withWorkspaceLock(workspace, async () => {
           const draft = await readCheckpointDraftUnlocked(workspace, draftId);
           assertProjectMatchesService(draft, project);
+          // This is the authoritative CAS: after it passes, the workspace lock excludes updateDraft
+          // until the artifact, audit, draft marker, and locator commit have completed.
+          assertCheckpointDraftFinalizationPrecondition(draft, precondition);
           const marked = await recoverDraftMarkerUnlocked(workspace, draft, project, finalized);
           if (marked) return { artifact: marked, deduplicated: true };
           const crashedArtifact = await recoverDraftFinalizationUnlocked(workspace, draft, project, finalized);

@@ -37,9 +37,11 @@
 import type { Workspace } from './types.ts';
 import { gitAnchors } from './anchors.ts';
 import {
+  checkpointDraftFinalizationPrecondition,
   createCheckpointService,
   locateCheckpointDrafts,
   resolveCheckpointProjectIdentity,
+  type CheckpointMachineAnchorProvider,
 } from './checkpoints.ts';
 import { listResumableSessions } from './handoff.ts';
 import { appendFloorJournalOnce } from './governance.ts';
@@ -90,6 +92,7 @@ export type FloorSweepOptions = {
   lookbackMs?: number;
   maxPerSweep?: number;
   checkpointStaleMs?: number;
+  checkpointAnchorProvider?: (projectDir: string) => ReturnType<CheckpointMachineAnchorProvider>; // controlled override; defaults to live git anchors
   runtimes?: Set<string>;
   excludeSessionId?: string; // optional; the idle gate is the primary self-exclude
 };
@@ -131,6 +134,7 @@ async function finalizeStaleCheckpointDraft(
   session: Awaited<ReturnType<typeof listResumableSessions>>[number],
   now: number,
   staleMs: number,
+  checkpointAnchorProvider: FloorSweepOptions['checkpointAnchorProvider'],
 ): Promise<CheckpointFloorSweepOutcome | undefined> {
   if (!session.projectDir) return undefined;
   try {
@@ -156,6 +160,7 @@ async function finalizeStaleCheckpointDraft(
 
     const checkpoints = await createCheckpointService(workspace, options);
     const supersedes = located.recentFinalized?.finalization?.artifactId;
+    const precondition = checkpointDraftFinalizationPrecondition(located.open);
     const finalized = await checkpoints.finalizeDraft(located.open.draftId, {
       trigger: {
         kind: 'crash_floor',
@@ -164,17 +169,27 @@ async function finalizeStaleCheckpointDraft(
         reasonCode: 'stale_checkpoint_draft',
       },
       ...(supersedes ? { supersedes } : {}),
-    }, async () => checkpointFloorAnchors(session.projectDir as string));
+    }, async () => checkpointAnchorProvider
+      ? await checkpointAnchorProvider(session.projectDir as string)
+      : checkpointFloorAnchors(session.projectDir as string), precondition);
     return {
       tool: session.tool,
       outcome: 'checkpointed-partial',
       artifactId: finalized.artifact.id,
     };
   } catch (error) {
+    const reasonCode = checkpointFloorFailureCode(error);
+    if (reasonCode === 'checkpoint_draft_precondition_failed') {
+      return {
+        tool: session.tool,
+        outcome: 'skipped-checkpoint-fresh',
+        reasonCode,
+      };
+    }
     return {
       tool: session.tool,
       outcome: 'checkpoint-error',
-      reasonCode: checkpointFloorFailureCode(error),
+      reasonCode,
     };
   }
 }
@@ -257,6 +272,7 @@ export async function runCaptureFloorSweep(
       session,
       now,
       checkpointStaleMs,
+      options.checkpointAnchorProvider,
     );
     if (!outcome) continue;
     result.checkpointOutcomes.push(outcome);
