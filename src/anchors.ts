@@ -28,8 +28,10 @@ export type GitAnchors = {
   headSubject?: string;
   ahead?: number;
   behind?: number;
+  dirty?: boolean;
   dirtyCount?: number;
   dirtyFiles?: string[];
+  statusHash?: string;
   lastCommitRel?: string;
   files?: FileAnchor[]; // non-git fallback anchors (only set when isRepo is false)
 };
@@ -43,9 +45,9 @@ export type GitAnchors = {
 // disable terminal prompts so a hostile/odd repo can't make git hang or block.
 const GIT_HARDENING_ARGS = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'];
 
-// Run one git subcommand, bounded, hardened, and non-throwing. Returns trimmed stdout, or null on any
-// failure (not a repo, git missing, timeout, non-zero exit).
-function git(cwd: string, args: string[]): string | null {
+// Run one git subcommand, bounded, hardened, and non-throwing. Returns raw stdout, or null on any
+// failure (not a repo, git missing, timeout, non-zero exit); callers trim only when appropriate.
+function gitRaw(cwd: string, args: string[]): string | null {
   try {
     const r = spawnSync('git', [...GIT_HARDENING_ARGS, ...args], {
       cwd,
@@ -55,10 +57,39 @@ function git(cwd: string, args: string[]): string | null {
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' },
     });
     if (r.status !== 0 || typeof r.stdout !== 'string') return null;
-    return r.stdout.trim();
+    return r.stdout;
   } catch {
     return null;
   }
+}
+
+function git(cwd: string, args: string[]): string | null {
+  return gitRaw(cwd, args)?.trim() ?? null;
+}
+
+const STATUS_HASH_MAX_UNTRACKED_FILES = 256;
+
+export function gitWorktreeStatusHash(cwd: string): string | undefined {
+  const top = git(cwd, ['rev-parse', '--show-toplevel']);
+  if (!top) return undefined;
+  const porcelain = gitRaw(top, ['status', '--porcelain=v1', '--untracked-files=all']);
+  const cachedDiff = gitRaw(top, ['diff', '--no-ext-diff', '--binary', '--cached', 'HEAD', '--']);
+  const unstagedDiff = gitRaw(top, ['diff', '--no-ext-diff', '--binary', '--']);
+  const untrackedRaw = gitRaw(top, ['ls-files', '--others', '--exclude-standard', '-z']);
+  if (porcelain === null) return undefined;
+  if (cachedDiff === null || unstagedDiff === null || untrackedRaw === null) return undefined;
+  const untracked = untrackedRaw.split('\0').filter(Boolean).sort();
+  if (untracked.length > STATUS_HASH_MAX_UNTRACKED_FILES) return undefined;
+  const hash = crypto.createHash('sha256')
+    .update(porcelain).update('\0')
+    .update(cachedDiff).update('\0')
+    .update(unstagedDiff).update('\0');
+  for (const file of untracked) {
+    const blob = git(top, ['hash-object', '--no-filters', '--', file]);
+    if (!blob || !/^[a-f0-9]{40,64}$/.test(blob)) return undefined;
+    hash.update(file).update('\0').update(blob).update('\0');
+  }
+  return hash.digest('hex');
 }
 
 // Collect git anchors for a working directory. Deterministic, bounded, never throws.
@@ -66,8 +97,9 @@ export function gitAnchors(cwd: string): GitAnchors {
   const top = git(cwd, ['rev-parse', '--show-toplevel']);
   if (!top) return { isRepo: false };
 
-  const porcelain = git(cwd, ['status', '--porcelain']);
+  const porcelain = gitRaw(top, ['status', '--porcelain=v1', '--untracked-files=all']);
   const dirtyFiles = porcelain ? porcelain.split('\n').filter((l) => l.trim()) : [];
+  const dirtyCount = porcelain === null ? undefined : dirtyFiles.length;
 
   let ahead: number | undefined;
   let behind: number | undefined;
@@ -90,7 +122,8 @@ export function gitAnchors(cwd: string): GitAnchors {
     headSubject: git(cwd, ['log', '-1', '--pretty=%s']) ?? undefined,
     ahead,
     behind,
-    dirtyCount: dirtyFiles.length,
+    dirty: dirtyCount === undefined ? undefined : dirtyCount > 0,
+    dirtyCount,
     dirtyFiles: dirtyFiles.slice(0, 10),
     lastCommitRel: git(cwd, ['log', '-1', '--pretty=%cr']) ?? undefined,
   };

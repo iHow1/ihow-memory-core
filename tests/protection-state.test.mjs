@@ -10,6 +10,7 @@ import { appendActivationEvidence } from '../src/activation-ledger.ts';
 import { gitAnchors } from '../src/anchors.ts';
 import { openCore } from '../src/core.ts';
 import { appendFloorJournalOnce } from '../src/governance.ts';
+import { checkpointStorePaths } from '../src/store/checkpoints.ts';
 
 const ZERO_HASH = '0'.repeat(64);
 
@@ -131,6 +132,21 @@ test('worst-loss is unknown when event lineage cannot prove a bounded count', as
   assert.equal(protection.latestComplete.artifactId, complete.id);
   assert.equal(protection.stale, true);
   assert.equal(protection.worstLossEvents, 'unknown');
+});
+
+test('degraded artifact snapshot cannot claim an exact safe protection state from remaining valid artifacts', async (t) => {
+  const f = await fixture(t, 'artifact-degraded');
+  const { complete, partial } = await completeThenPartial(f);
+  const artifactPath = path.join(checkpointStorePaths(f.core.workspace).artifacts, `${partial.id}.json`);
+  await fs.writeFile(artifactPath, '{corrupt-checkpoint', 'utf8');
+
+  const protection = (await f.core.status()).protectionState;
+  assert.equal(protection.lookup.status, 'degraded');
+  assert.match(protection.lookup.reasonCode, /^checkpoint_[a-z0-9_]+$/);
+  assert.equal(protection.latestComplete.artifactId, complete.id, 'validated evidence remains visible under degraded lookup');
+  assert.equal(protection.latestPartial, null, 'the corrupt canonical artifact is never reported as valid evidence');
+  assert.equal(protection.stale, 'unknown', 'incomplete artifact lookup cannot prove freshness');
+  assert.equal(protection.worstLossEvents, 'unknown', 'incomplete artifact lookup cannot prove exact zero loss');
 });
 
 test('floor journal is exposed as a bounded metadata-only fallback when no crash checkpoint exists', async (t) => {

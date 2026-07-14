@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { appendActivationEvidence } from '../src/activation-ledger.ts';
@@ -15,8 +16,6 @@ import { buildHandoffPacket } from '../src/handoff.ts';
 import { checkpointStorePaths } from '../src/store/checkpoints.ts';
 
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'mcp', 'server.ts');
-const ZERO_HASH = '0'.repeat(64);
-
 async function makeRepo(project, marker = 'seed') {
   await fs.mkdir(project, { recursive: true });
   const git = (args) => execFileSync('git', args, { cwd: project, encoding: 'utf8' }).trim();
@@ -56,14 +55,27 @@ async function plantCodexSession(home, { id, cwd, marker, mtimeMs = Date.now() }
 }
 
 function checkpointAnchors(project) {
+  const raw = (args) => execFileSync('git', args, { cwd: project, encoding: 'utf8' });
+  const porcelain = raw(['status', '--porcelain=v1', '--untracked-files=all']);
+  const cachedDiff = raw(['diff', '--no-ext-diff', '--binary', '--cached', 'HEAD', '--']);
+  const unstagedDiff = raw(['diff', '--no-ext-diff', '--binary', '--']);
+  const untracked = raw(['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean).sort();
+  const hash = crypto.createHash('sha256')
+    .update(porcelain).update('\0')
+    .update(cachedDiff).update('\0')
+    .update(unstagedDiff).update('\0');
+  for (const file of untracked) {
+    const blob = raw(['hash-object', '--no-filters', '--', file]).trim();
+    hash.update(file).update('\0').update(blob).update('\0');
+  }
   const live = gitAnchors(project);
   return async () => ({
     git: {
       repo: live.repo,
       branch: live.branch,
       head: live.head,
-      dirty: false,
-      statusHash: ZERO_HASH,
+      dirty: (live.dirtyCount ?? 0) > 0,
+      statusHash: hash.digest('hex'),
     },
     files: [],
     commands: [],
@@ -204,6 +216,18 @@ test('checkpoint verdict recomputes live anchors: HEAD drift, wrong checkout, an
   const blankCheckpoint = blank.candidates.find((candidate) => candidate.checkpoint);
   assert.ok(blankCheckpoint);
   assert.notEqual(blankCheckpoint.verdict.state, 'GREEN');
+});
+
+test('checkpoint verdict rejects same-HEAD worktree drift captured by statusHash', async (t) => {
+  const f = await fixture(t, 'worktree-drift');
+  await seedCheckpointStack(f);
+  await fs.writeFile(path.join(f.project, 'seed.txt'), 'same HEAD, changed worktree\n', 'utf8');
+
+  const packet = await buildHandoffPacket({ cwd: f.project, workspace: f.core.workspace, limit: 5 });
+  const checkpoint = packet.candidates.find((candidate) => candidate.checkpoint);
+  assert.ok(checkpoint);
+  assert.equal(checkpoint.verdict.state, 'RED', checkpoint.verdict.reason);
+  assert.match(checkpoint.verdict.reason, /worktree drift/i);
 });
 
 test('missing or corrupt checkpoint falls back honestly to transcript without fabricated checkpoint summary', async (t) => {

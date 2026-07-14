@@ -360,7 +360,7 @@ export async function checkpointProtectionState(
   const newestMaterial = openDrafts[0];
 
   let stale: CheckpointProtectionState['stale'];
-  if (draftSnapshot.status === 'degraded') stale = 'unknown';
+  if (artifactSnapshot.status === 'degraded' || draftSnapshot.status === 'degraded') stale = 'unknown';
   else stale = !!newestMaterial && (!latestSafeArtifact || newestMaterial.updatedAt > latestSafeArtifact.createdAt);
 
   let worstLossEvents: CheckpointProtectionState['worstLossEvents'] = 'unknown';

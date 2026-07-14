@@ -18,7 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import type { Workspace } from './types.ts';
 import { parseTranscript, summarizeTranscript, type TranscriptRecord } from './transcript.ts';
-import { gitAnchors, fileAnchors, inferProjectDir, repoRoot, type GitAnchors } from './anchors.ts';
+import { gitAnchors, gitWorktreeStatusHash, fileAnchors, inferProjectDir, repoRoot, type GitAnchors } from './anchors.ts';
 import { redactSecretLikeContent } from './governance.ts';
 import { anchorConflicts } from './handoff-metrics.ts';
 import { RECEIVER_INSTRUCTION } from './envelope.ts';
@@ -954,7 +954,9 @@ function checkpointRecordedAnchors(artifact: CheckpointArtifactV1): GitAnchors {
     repo: git.repo,
     branch: git.branch,
     head: git.head,
+    dirty: git.dirty,
     dirtyCount: git.dirty === undefined ? undefined : git.dirty ? 1 : 0,
+    statusHash: git.statusHash,
   };
 }
 
@@ -1143,6 +1145,20 @@ export function computeContinueVerdict(
   }
   if (recorded.branch && live.branch && recorded.branch !== live.branch) {
     return { state: 'YELLOW', reason: `same HEAD but on a different branch (recorded ${recorded.branch}, now ${live.branch}) — confirm you're where you meant to be`, recordedHead: rHead, liveHead: lHead };
+  }
+  const recordedDirty = recorded.dirty ?? (recorded.dirtyCount === undefined ? undefined : recorded.dirtyCount > 0);
+  const liveDirty = live.dirty ?? (live.dirtyCount === undefined ? undefined : live.dirtyCount > 0);
+  if (recordedDirty !== undefined && liveDirty !== undefined && recordedDirty !== liveDirty) {
+    return cap({ state: 'RED', reason: `worktree drifted: recorded ${recordedDirty ? 'dirty' : 'clean'}, now ${liveDirty ? 'dirty' : 'clean'} at the same HEAD — inspect uncommitted changes before continuing`, recordedHead: rHead, liveHead: lHead });
+  }
+  if (recorded.statusHash) {
+    const liveStatusHash = gitWorktreeStatusHash(projectDir);
+    if (!liveStatusHash) {
+      return cap({ state: 'YELLOW', reason: 'could not verify the live worktree statusHash — inspect uncommitted changes before continuing', recordedHead: rHead, liveHead: lHead });
+    }
+    if (recorded.statusHash !== liveStatusHash) {
+      return cap({ state: 'RED', reason: 'worktree drifted: statusHash changed at the same HEAD and branch — inspect uncommitted changes before continuing', recordedHead: rHead, liveHead: lHead });
+    }
   }
   if (DESTRUCTIVE_NARRATIVE.test(narrative)) {
     return { state: 'YELLOW', reason: `anchors match (HEAD ${lHead}), but the prior narrative mentions a push/force/delete — verify intent before any destructive action`, recordedHead: rHead, liveHead: lHead };
