@@ -16,6 +16,67 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const RELEASE_VERSION = '0.1.0-alpha.27';
+
+function readRoot(relative) {
+  return fs.readFileSync(path.join(ROOT, relative), 'utf8');
+}
+
+function unreleasedSection(changelog) {
+  const match = changelog.match(/## \[Unreleased\]\n([\s\S]*?)(?=\n## \[)/);
+  assert.ok(match, 'CHANGELOG has an Unreleased section');
+  return match[1];
+}
+
+test('alpha.27 release candidate metadata and docs stay truthful and aligned', () => {
+  const manifest = JSON.parse(readRoot('package.json'));
+  const lock = JSON.parse(readRoot('package-lock.json'));
+  assert.equal(manifest.version, RELEASE_VERSION);
+  assert.equal(lock.version, RELEASE_VERSION);
+  assert.equal(lock.packages?.['']?.version, RELEASE_VERSION);
+
+  const unreleased = unreleasedSection(readRoot('CHANGELOG.md'));
+  for (const heading of ['### Added', '### Changed', '### Notes']) {
+    assert.match(unreleased, new RegExp(`^${heading.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}$`, 'm'));
+  }
+  for (const surface of [
+    /Checkpoint Core/i,
+    /native `?PreCompact`?/i,
+    /crash-floor/i,
+    /checkpoint-first/i,
+    /protection state/i,
+    /same-HEAD[^\n]*`?statusHash`? drift/i,
+    /missing `?statusHash`?[^\n]*fail(?:s|ed)? closed/i,
+    /textconv/i,
+    /fsmonitor/i,
+  ]) {
+    assert.match(unreleased, surface, `Unreleased documents ${surface}`);
+  }
+  assert.match(unreleased, /local release-ready only/i);
+  assert.match(unreleased, /no (?:push, tag, publish, release, or deploy|push\/tag\/publish\/release\/deploy)/i);
+  assert.match(unreleased, /does not claim production certification/i);
+  assert.doesNotMatch(unreleased, /remain deferred/i);
+  assert.doesNotMatch(unreleased, /Checkpoint-to-`continue` integration[^\n]*deferred/i);
+  assert.doesNotMatch(unreleased, /checkpoint crash floor[^\n]*deferred/i);
+
+  const readmes = [
+    ['README.md', readRoot('README.md')],
+    ['README.zh-CN.md', readRoot('README.zh-CN.md')],
+  ];
+  for (const [name, readme] of readmes) {
+    assert.match(readme, /0\.1\.0-alpha\.27/, `${name} states the local candidate version`);
+    assert.match(readme, /Alpha\.27/i, `${name} identifies the alpha.27 surface`);
+    assert.match(readme, /PreCompact/i, `${name} documents native PreCompact`);
+    assert.match(readme, /checkpoint-first/i, `${name} documents checkpoint-first continue`);
+    assert.match(readme, /crash-floor/i, `${name} documents the crash floor`);
+    assert.match(readme, /statusHash/, `${name} documents statusHash safety`);
+    assert.match(readme, /local release-ready only/i, `${name} states the local-only boundary`);
+    assert.doesNotMatch(readme, /not yet consumed by `memory\.continue`/i, `${name} removes stale continue deferral`);
+    assert.doesNotMatch(readme, /does not yet feed `memory\.continue`/i, `${name} removes stale continue deferral`);
+    assert.doesNotMatch(readme, /尚未接入 `memory\.continue`/, `${name} removes stale continue deferral`);
+    assert.doesNotMatch(readme, /尚无 checkpoint crash-floor/, `${name} removes stale crash-floor deferral`);
+  }
+});
 
 test('every relative import in a packed module is itself in the tarball (fresh install resolves)', () => {
   // --ignore-scripts: do NOT run prepack (which rebuilds dist) — that would race the other test files
@@ -26,10 +87,15 @@ test('every relative import in a packed module is itself in the tarball (fresh i
   const jsFiles = [...packed].filter((p) => p.startsWith('dist/') && p.endsWith('.js'));
   assert.ok(jsFiles.length > 5, `tarball should contain the dist modules (got ${jsFiles.length})`);
   for (const required of [
+    'dist/anchors.js',
     'dist/checkpoint-claim-worker.js',
     'dist/checkpoint-file-worker.js',
     'dist/checkpoint-schema.js',
     'dist/checkpoints.js',
+    'dist/floor.js',
+    'dist/handoff.js',
+    'dist/mcp/server.js',
+    'dist/native-precompact.js',
     'dist/store/checkpoints.js',
   ]) {
     assert.ok(packed.has(required), `tarball must include ${required}`);

@@ -10,18 +10,22 @@ with pre-release tags.
 
 ### Added
 
-- Added the alpha.27 Stage 2 checkpoint core: mutable short-lived drafts finalize into immutable hash-addressed `CheckpointArtifactV1` JSON with deterministic canonical hashing, a 32 KiB hard bound, explicit omission counts, atomic no-overwrite storage, dedup/supersedes, workspace locking, minimal rejection audit, and read/list/inspect library APIs. Claims and engine-collected machine anchors use separate inputs; secret/schema/integrity failures are fail-closed. Checkpoint-to-`continue` integration, a checkpoint crash floor, and user-facing checkpoint UX remain deferred.
-- Added the unreleased Stage 3 candidate Claude Code and Codex native `PreCompact` adapter. `setup` / `install-hook` preserve third-party configuration while wiring a bounded, transcript-free finalizer with a 2.5 s host-fail-open watchdog. Private canonical content-bound locators select the latest project/session draft without a global scan, and exact semantic-fingerprint indexes deduplicate artifacts without enumerating the artifact directory; missing, stale, or tampered private indexes fail closed to bounded recovery or a safe extra artifact.
-- Added a local, append-only activation evidence ledger with metadata-only hashed workspace/configuration bindings, bounded fail-open locking, integrity-checked managed-entry installation epochs that ignore unrelated config file/inode churn, and stable activation reason codes. `doctor` now distinguishes `ACTIVE`, `READY — WAITING FOR FIRST ACTIVITY`, `TOOLS ONLY`, and `NEEDS REPAIR`; static capability, MCP reachability, synthetic probes, and started-only events never count as live activation.
-- Added live Claude Code and Codex hook-wiring verification. Missing, duplicated, dead-target, wrong-workspace, wrong-owner, or malformed managed hooks degrade previously configured automation to `NEEDS REPAIR`; unrelated workspace bindings remain non-blocking. Invalid/manual hook payloads create no live evidence, and explicit synthetic dispatch remains non-active.
+- **Checkpoint Core.** Mutable, short-lived drafts now finalize into immutable hash-addressed `CheckpointArtifactV1` JSON with deterministic canonical hashing, a 32 KiB hard bound, explicit omission counts, atomic no-overwrite storage, dedup/supersedes, workspace locking, rejection audit, and read/list/inspect APIs. Claims and engine-collected anchors remain separate inputs, and secret/schema/integrity failures fail closed.
+- **Native PreCompact and crash-floor resume.** Claude Code and Codex native `PreCompact` hooks finalize bounded transcript-free checkpoints under a 2.5 s host-fail-open watchdog, while stale valid drafts can be recovered as bounded partial shadow checkpoints by the crash-floor path. Private content-bound indexes avoid unbounded scans and keep artifact persistence fail-closed.
+- **Checkpoint-first continue.** `memory.continue` and the CLI now prefer complete checkpoints, then partial/shadow checkpoints, before transcript and floor-journal candidates; checkpoint claims remain explicitly UNVERIFIED until live machine anchors are recomputed.
+- **Protection state.** `status` reports the latest complete, partial, and floor evidence, stale/newer material, bounded or unknown worst-loss estimates, degraded lookup state, and activation degradation without erasing validated checkpoint evidence.
+- **Activation truth.** A local append-only evidence ledger and live Claude Code/Codex hook-wiring checks distinguish `ACTIVE`, `READY — WAITING FOR FIRST ACTIVITY`, `TOOLS ONLY`, and `NEEDS REPAIR`; static capability, synthetic probes, started-only events, and malformed/manual payloads do not count as live activation.
 
 ### Changed
 
-- Claude Code and Codex hook commands now run the workspace-frozen `.runtime/cli.js` with a canonical workspace binding and explicit ownership marker. Reconciliation uses strict argv ownership, moves iHow entries into canonical matcher groups, removes duplicate managed entries, preserves third-party hooks/config, and makes `--no-recall` remove previously installed managed recall instead of only changing the setup message.
-- Hook argv now use POSIX-safe quoting for spaces, quotes, `$`, and backticks; native Windows fails closed on unsafe shell metacharacters. Malformed Claude hook shapes are preserved for user repair instead of being overwritten.
-- Frozen runtime bundles are integrity-stamped, health-checked, staged, validated, and atomically swapped only when stale or explicitly upgraded. Refresh preserves the per-space `semantic.json` opt-in, repairs same-version corruption, and setup counts a real bundle refresh as an applied change for runtimes whose registration survived setup.
-- Claude/Codex official-CLI replacement now restores the exact previous registration when add fails; if both replacement and rollback fail, setup reports the real mutation and required restart instead of claiming an unchanged system.
-- WorkBuddy is only shown as memory-loop enabled when its resume guidance was actually installed or already present.
+- **Verify-first checkpoint hardening.** Same-HEAD `statusHash` drift is RED, and a checkpoint candidate with a missing `statusHash` fails closed instead of earning a trusted verdict. Git anchor collection disables repository-controlled `textconv` and `core.fsmonitor` execution while preserving canonical status hashing.
+- **Hook and runtime integrity.** Claude Code and Codex hooks use the workspace-frozen `.runtime/cli.js`, canonical workspace bindings, strict ownership reconciliation, safe argv quoting, third-party config preservation, integrity-stamped atomic runtime refresh, and exact official-CLI rollback on failed replacement.
+- **alpha.27 package prep.** Local package metadata is bumped to `0.1.0-alpha.27` for release-candidate validation.
+
+### Notes
+
+- This checkout is local release-ready only: no push, tag, publish, release, or deploy is part of this change.
+- This alpha candidate does not claim production certification; runtime support remains limited to the documented alpha and single-machine smoke boundaries.
 
 ## [0.1.0-alpha.26] — 2026-07-11
 
