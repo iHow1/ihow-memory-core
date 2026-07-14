@@ -11,7 +11,6 @@ import {
   boundCheckpointDraft,
   buildCheckpointArtifact,
   canonicalCheckpointJson,
-  canonicalCheckpointSemanticJson,
   type CheckpointArtifactV1,
   type CheckpointArtifactBuildV1,
   type CheckpointDraftV1,
@@ -29,17 +28,27 @@ import {
 } from './checkpoint-schema.ts';
 import {
   appendCheckpointAuditUnlocked,
+  commitCheckpointDraftLocatorFinalizedUnlocked,
+  findCheckpointDraftsByLocatorUnlocked,
   listCheckpointArtifactFiles,
   readCheckpointArtifactUnlocked,
   readCheckpointAudit,
+  readCheckpointFinalizationAuditUnlocked,
   readCheckpointDraftUnlocked,
   readCheckpointFinalizationIntentUnlocked,
+  readCheckpointSemanticArtifactIndexUnlocked,
   linkCheckpointArtifactWriteClaimUnlocked,
   prepareCheckpointArtifactWriteClaimUnlocked,
   removeCheckpointFinalizationIntentUnlocked,
+  stageCheckpointDraftLocatorCreateUnlocked,
+  stageCheckpointDraftLocatorFinalizedUnlocked,
+  stageCheckpointDraftLocatorUpdateUnlocked,
   writeCheckpointDraftUnlocked,
   writeCheckpointFinalizationIntentUnlocked,
+  writeCheckpointSemanticArtifactIndexUnlocked,
+  checkpointAuditV2MarkerFaultPoint,
   type CheckpointAuditEvent,
+  type CheckpointDraftLocatorMatch,
   type CheckpointFinalizationIntentV1,
 } from './store/checkpoints.ts';
 
@@ -94,6 +103,18 @@ export async function resolveCheckpointProjectIdentity(options: WorkspaceOptions
   };
 }
 
+export async function locateCheckpointDrafts(
+  workspace: Workspace,
+  project: CheckpointProjectIdentity,
+  runtime: string,
+  sessionId: string,
+): Promise<CheckpointDraftLocatorMatch> {
+  const session = normalizeCheckpointSession(runtime, sessionId);
+  return await withWorkspaceLock(workspace, async () => (
+    await findCheckpointDraftsByLocatorUnlocked(workspace, project, session)
+  ));
+}
+
 function stableFailureCode(error: unknown): string {
   if (error instanceof CheckpointValidationError) return error.code;
   if (error instanceof Error && /^checkpoint_[a-z0-9_]+$/.test(error.message)) return error.message;
@@ -115,7 +136,15 @@ async function rejected<T>(workspace: Workspace, operation: CheckpointAuditEvent
     const code = stableFailureCode(error);
     // Persisted audit contradictions must be observed without mutating the very audit log under
     // investigation. In particular, an audit-only finalization is a fail-closed state, not a healing path.
-    if (code !== 'checkpoint_finalization_audit_outcome_mismatch') {
+    if (![
+      'checkpoint_finalization_audit_outcome_mismatch',
+      'checkpoint_finalization_audit_missing',
+      'checkpoint_audit_conflict_invalid',
+      'checkpoint_audit_pending_invalid',
+      'checkpoint_audit_publication_invalid',
+      'checkpoint_audit_segment_invalid',
+      'checkpoint_audit_state_invalid',
+    ].includes(code)) {
       await auditRejection(workspace, operation, code);
     }
     if (error instanceof CheckpointValidationError) throw error;
@@ -141,12 +170,17 @@ function assertProjectMatchesService(draft: CheckpointDraftV1, project: Checkpoi
 }
 
 async function findSemanticDuplicateUnlocked(workspace: Workspace, candidate: CheckpointArtifactV1): Promise<CheckpointArtifactV1 | undefined> {
-  const candidateSemantic = canonicalCheckpointSemanticJson(candidate);
-  for (const artifactId of await listCheckpointArtifactFiles(workspace)) {
-    const artifact = (await readCheckpointArtifactUnlocked(workspace, artifactId)).artifact;
-    if (canonicalCheckpointSemanticJson(artifact) === candidateSemantic) return artifact;
-  }
-  return undefined;
+  return await readCheckpointSemanticArtifactIndexUnlocked(workspace, candidate);
+}
+
+async function repairSemanticIndexAfterDurableFinalization(
+  workspace: Workspace,
+  artifact: CheckpointArtifactV1,
+): Promise<void> {
+  // The index is a private optimization, not completion authority. Writing it only after the artifact,
+  // audit, and draft marker are durable makes every crash window conservative: a lost write causes one
+  // safe extra artifact, while a stale/early pointer is revalidated and ignored on the next lookup.
+  await writeCheckpointSemanticArtifactIndexUnlocked(workspace, artifact).catch(() => {});
 }
 
 async function ensureFinalizationAuditUnlocked(
@@ -155,17 +189,6 @@ async function ensureFinalizationAuditUnlocked(
   artifact: CheckpointArtifactV1,
   type: 'checkpoint.artifact.created' | 'checkpoint.artifact.deduplicated',
 ): Promise<void> {
-  const existing = await readCheckpointAudit(workspace);
-  const matching = existing.filter((event) => event.operation === 'artifact.finalize' && event.draftId === draftId);
-  if (matching.length > 0) {
-    if (
-      matching.length !== 1
-      || matching[0].artifactId !== artifact.id
-      || matching[0].type !== type
-      || matching[0].supersedes !== artifact.supersedes
-    ) throw new Error('checkpoint_finalization_audit_outcome_mismatch');
-    return;
-  }
   await appendCheckpointAuditUnlocked(workspace, {
     type,
     operation: 'artifact.finalize',
@@ -173,6 +196,13 @@ async function ensureFinalizationAuditUnlocked(
     artifactId: artifact.id,
     ...(artifact.supersedes ? { supersedes: artifact.supersedes } : {}),
   });
+  const published = await readCheckpointFinalizationAuditUnlocked(workspace, draftId, true);
+  if (
+    !published
+    || published.artifactId !== artifact.id
+    || published.type !== type
+    || published.supersedes !== artifact.supersedes
+  ) throw new Error('checkpoint_finalization_audit_outcome_mismatch');
 }
 
 async function requireFinalizationAuditUnlocked(
@@ -180,25 +210,19 @@ async function requireFinalizationAuditUnlocked(
   draftId: string,
   artifact: CheckpointArtifactV1,
 ): Promise<void> {
-  const existing = await readCheckpointAudit(workspace);
-  const matching = existing.filter((event) => (
-    event.operation === 'artifact.finalize'
-    && event.draftId === draftId
-  ));
-  if (matching.length === 0) throw new Error('checkpoint_finalization_audit_missing');
+  const existing = await readCheckpointFinalizationAuditUnlocked(workspace, draftId, true);
+  if (!existing) throw new Error('checkpoint_finalization_audit_missing');
   if (
-    matching.length !== 1
-    || matching[0].artifactId !== artifact.id
-    || matching[0].supersedes !== artifact.supersedes
-    || (matching[0].type !== 'checkpoint.artifact.created' && matching[0].type !== 'checkpoint.artifact.deduplicated')
+    existing.artifactId !== artifact.id
+    || existing.supersedes !== artifact.supersedes
+    || (existing.type !== 'checkpoint.artifact.created' && existing.type !== 'checkpoint.artifact.deduplicated')
   ) throw new Error('checkpoint_finalization_audit_outcome_mismatch');
 }
 
 async function assertNoAuditOnlyFinalizationUnlocked(workspace: Workspace, draftId: string): Promise<void> {
-  const matching = (await readCheckpointAudit(workspace)).filter((event) => (
-    event.operation === 'artifact.finalize' && event.draftId === draftId
-  ));
-  if (matching.length > 0) throw new Error('checkpoint_finalization_audit_outcome_mismatch');
+  if (await readCheckpointFinalizationAuditUnlocked(workspace, draftId)) {
+    throw new Error('checkpoint_finalization_audit_outcome_mismatch');
+  }
 }
 
 function assertFinalizeRequestMatchesBuild(request: CheckpointFinalizeRequest, build: CheckpointArtifactBuildV1): void {
@@ -303,8 +327,12 @@ async function recoverDraftFinalizationUnlocked(
     artifact,
     intent.creationProvenance === 'created' ? 'checkpoint.artifact.created' : 'checkpoint.artifact.deduplicated',
   );
+  checkpointAuditV2MarkerFaultPoint();
   const recovered = boundCheckpointDraft({ ...draft, finalization: { artifactId: artifact.id } });
+  await stageCheckpointDraftLocatorFinalizedUnlocked(workspace, draft, recovered);
   await writeCheckpointDraftUnlocked(workspace, recovered);
+  await commitCheckpointDraftLocatorFinalizedUnlocked(workspace, recovered);
+  await repairSemanticIndexAfterDurableFinalization(workspace, artifact);
   await removeCheckpointFinalizationIntentUnlocked(workspace, draft.draftId);
   return artifact;
 }
@@ -347,6 +375,8 @@ async function recoverDraftMarkerUnlocked(
     assertRecoveredArtifactMatchesDraft(draft, artifact);
     await requireFinalizationAuditUnlocked(workspace, draft.draftId, artifact);
   }
+  await commitCheckpointDraftLocatorFinalizedUnlocked(workspace, draft);
+  await repairSemanticIndexAfterDurableFinalization(workspace, artifact);
   await removeCheckpointFinalizationIntentUnlocked(workspace, draft.draftId);
   return artifact;
 }
@@ -388,6 +418,10 @@ export async function createCheckpointService(
           redaction: normalized.redaction,
         });
         await withWorkspaceLock(workspace, async () => {
+          // Publish the content-bound locator first. Until the canonical draft write lands, lookup
+          // rejects the early pointer; after it lands, a new cooperative draft can no longer be hidden
+          // behind an older finalized receipt even if this process dies before the audit append.
+          await stageCheckpointDraftLocatorCreateUnlocked(workspace, draft);
           await writeCheckpointDraftUnlocked(workspace, draft);
           await appendCheckpointAuditUnlocked(workspace, { type: 'checkpoint.draft.created', operation: 'draft.create', draftId: draft.draftId });
         });
@@ -405,6 +439,7 @@ export async function createCheckpointService(
           if (draft.finalization) throw new Error('checkpoint_draft_finalization_started');
           if (await recoverDraftFinalizationUnlocked(workspace, draft, project)) throw new Error('checkpoint_draft_finalization_started');
           const updated = mergeDraftUpdate(draft, normalized, new Date().toISOString());
+          await stageCheckpointDraftLocatorUpdateUnlocked(workspace, draft, updated);
           await writeCheckpointDraftUnlocked(workspace, updated);
           await appendCheckpointAuditUnlocked(workspace, { type: 'checkpoint.draft.updated', operation: 'draft.update', draftId });
           return updated;
@@ -487,8 +522,12 @@ export async function createCheckpointService(
               build: { ...build, createdAt: semanticDuplicate.createdAt },
             });
             await ensureFinalizationAuditUnlocked(workspace, draftId, semanticDuplicate, 'checkpoint.artifact.deduplicated');
+            checkpointAuditV2MarkerFaultPoint();
             const completedDraft = boundCheckpointDraft({ ...draft, finalization: { artifactId: semanticDuplicate.id } });
+            await stageCheckpointDraftLocatorFinalizedUnlocked(workspace, draft, completedDraft);
             await writeCheckpointDraftUnlocked(workspace, completedDraft);
+            await commitCheckpointDraftLocatorFinalizedUnlocked(workspace, completedDraft);
+            await repairSemanticIndexAfterDurableFinalization(workspace, semanticDuplicate);
             await removeCheckpointFinalizationIntentUnlocked(workspace, draft.draftId);
             return { artifact: semanticDuplicate, deduplicated: true };
           }
@@ -515,8 +554,12 @@ export async function createCheckpointService(
             artifact,
             'checkpoint.artifact.created',
           );
+          checkpointAuditV2MarkerFaultPoint();
           const completedDraft = boundCheckpointDraft({ ...draft, finalization: { artifactId: artifact.id } });
+          await stageCheckpointDraftLocatorFinalizedUnlocked(workspace, draft, completedDraft);
           await writeCheckpointDraftUnlocked(workspace, completedDraft);
+          await commitCheckpointDraftLocatorFinalizedUnlocked(workspace, completedDraft);
+          await repairSemanticIndexAfterDurableFinalization(workspace, artifact);
           await removeCheckpointFinalizationIntentUnlocked(workspace, draft.draftId);
           return { artifact, deduplicated: false };
         });
@@ -566,7 +609,7 @@ export async function createCheckpointService(
     },
 
     async audit() {
-      return await readCheckpointAudit(workspace);
+      return await withWorkspaceLock(workspace, async () => await readCheckpointAudit(workspace));
     },
   };
 }

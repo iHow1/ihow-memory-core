@@ -83,11 +83,20 @@ true. Wording must avoid "verified handoff" / "confirmed facts".
 - Tests: module (`continue-handoff`), CLI integration (`continue-command`), redaction
   (`continue-redaction`), anchor-safety (`continue-anchor-safety`), protocol lanes (`receiver-protocol`).
 
+## Stage 3 checkpoint candidate (implemented after this MVP note)
+
+- Claude Code and Codex native `PreCompact` are now wired by `setup` / `install-hook` to the bounded
+  checkpoint core. The adapter is transcript-free, uses exact private project/session and semantic
+  fingerprint indexes, preserves third-party Hook entries, and returns fail-open to the host under a
+  2.5 s watchdog.
+- This does **not** change `continue` yet: `memory.continue` still reads the existing handoff/capture
+  sources and does not consume checkpoint artifacts. The candidate also has no checkpoint crash-floor
+  path and is not published.
+
 ## Deferred / gated (NOT in this MVP)
 
-- **PreCompact hook** (auto-capture exactly at context overflow) — designed, **not wired**; `continue`
-  already works from Stop markers, so this is an optimization. Activating it changes live session
-  behavior → Commander's call.
+- **Checkpoint → `continue` integration and checkpoint crash floor** — still deferred; PreCompact
+  persistence exists, but resume selection and crash-boundary capture have not moved to it.
 - **`handoff` explicit checkpoint** (persisted envelope for cross-tool) — `handoff` currently aliases
   `continue`; the persisted-checkpoint form is second-phase (cross-tool).
 - **Publish / push / recall-default-on / multi-cwd / team sync** — all gated.

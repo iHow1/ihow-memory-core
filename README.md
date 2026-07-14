@@ -21,7 +21,7 @@ iHow Memory is a local, shared-memory runtime for heterogeneous coding agents �
 3. **Safe writes + governance.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event.
 4. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
 
-**Alpha.27 checkpoint-core status:** the library now has bounded mutable drafts and immutable, hash-addressed checkpoint artifacts with fail-closed governance and read/list/inspect APIs. This is storage/core only: no Claude/Codex hook, PreCompact, `continue`, or user-facing checkpoint flow is connected yet.
+**Alpha.27 Stage 3 candidate status (unreleased):** the bounded draft / immutable hash-addressed checkpoint core is now wired to native Claude Code and Codex `PreCompact` hooks through `setup` / `install-hook`. The adapter is transcript-free, uses bounded private draft/artifact indexes, preserves third-party hook config, and fails open to the host under a 2.5 s watchdog while durable checkpoint completion remains fail-closed. Checkpoint artifacts are **not yet consumed by `memory.continue`**, there is no checkpoint crash-floor path yet, and this candidate has not been published.
 
 ## Quickstart — first success in about 3 minutes
 
@@ -115,8 +115,8 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 
 | Runtime | connect | resume reader | Notes |
 | --- | --- | --- | --- |
-| Claude Code | ✓ (`claude mcp add-json`) | ✓ | real-app + ongoing dogfood; skill + auto-capture hooks |
-| Codex | ✓ (`codex mcp add`) | ✓ | native SessionStart/UserPromptSubmit hooks + proactive `~/.codex/AGENTS.md` memory loop; single-machine real-app smoke |
+| Claude Code | ✓ (`claude mcp add-json`) | ✓ | real-app + ongoing dogfood; skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks |
+| Codex | ✓ (`codex mcp add`) | ✓ | native SessionStart / PreCompact / UserPromptSubmit hooks + proactive `~/.codex/AGENTS.md` memory loop; single-machine real-app smoke |
 | OpenClaw | ✓ (`~/.openclaw/openclaw.json`) | ✓ | single-machine real-app smoke (memory.continue + git preflight) |
 | Hermes | ✓ (`hermes mcp add`) | ✓ (JSON + `state.db`) | single-machine real-app smoke |
 | OpenCode | ✓ (`~/.config/opencode`) | ✓ (`opencode.db`) | single-machine real-app smoke |
@@ -127,7 +127,7 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 | Gemini CLI | ✓ (`~/.gemini/settings.json`) | ✓ (`~/.gemini/tmp/*/logs.json`) | passive reader of Gemini's on-disk **user-prompt log** (Gemini records no assistant turns) → session topic + git anchors; manual `GEMINI.md` nudge. Verified against real local data |
 | Cline (VS Code) | — (add via Cline's own MCP settings) | ✓ (`globalStorage` / `~/.cline/data`) | passive reader of `tasks/<id>/api_conversation_history.json`; cwd from `environment_details`. Fixture-tested, not yet real-app smoke |
 
-The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / UserPromptSubmit hooks. Codex uses native SessionStart / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the Codex capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
+The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / PreCompact / UserPromptSubmit hooks. Codex uses native SessionStart / PreCompact / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the existing capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. The Stage 3 PreCompact checkpoint adapter is bounded, transcript-free, and host-fail-open; it does not yet feed `memory.continue` or provide a checkpoint crash floor. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
 
 ### Runtimes wired without an auto-injected resume nudge (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
 

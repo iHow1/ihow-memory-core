@@ -339,6 +339,10 @@ export function recallHookCommand(workspace: Workspace, runtime: 'claude-code' |
   return hookCommand(workspace, 'hook-user-prompt-submit', runtime);
 }
 
+export function preCompactHookCommand(workspace: Workspace, runtime: 'claude-code' | 'codex'): string {
+  return hookCommand(workspace, 'hook-pre-compact', runtime);
+}
+
 export function claudeHookInstallPath(options: HookCommandOptions): string {
   return options.globalHook
     ? path.join(os.homedir(), '.claude', 'settings.json')
@@ -534,6 +538,7 @@ export async function verifyRuntimeHookWiring(
     const expected = [
       { event: 'Stop', marker: 'hook-stop', entry: { type: 'command' as const, command: stopHookCommand(workspace), timeout: 30 } },
       { event: 'SessionStart', marker: 'hook-session-start', entry: { type: 'command' as const, command: sessionStartHookCommand(workspace, runtime), timeout: 30 } },
+      { event: 'PreCompact', marker: 'hook-pre-compact', entry: { type: 'command' as const, command: preCompactHookCommand(workspace, runtime), timeout: 3 } },
       { event: 'UserPromptSubmit', marker: 'hook-user-prompt-submit', entry: { type: 'command' as const, command: recallHookCommand(workspace, runtime), timeout: 30 } },
     ];
     const results = [];
@@ -563,6 +568,10 @@ export async function verifyRuntimeHookWiring(
       event: 'SessionStart', marker: 'hook-session-start',
       entry: { type: 'command' as const, command: sessionStartHookCommand(workspace, runtime), timeout: 30, statusMessage: 'Checking iHow Memory handoff' },
       matcher: 'startup|resume|clear|compact',
+    },
+    {
+      event: 'PreCompact', marker: 'hook-pre-compact',
+      entry: { type: 'command' as const, command: preCompactHookCommand(workspace, runtime), timeout: 3, statusMessage: 'Saving iHow Memory checkpoint' },
     },
     {
       event: 'UserPromptSubmit', marker: 'hook-user-prompt-submit',

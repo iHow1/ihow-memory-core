@@ -57,12 +57,19 @@ import {
   ensureCommandHook,
   hookEventShapesValid,
   IHOW_HOOK_OWNER,
+  preCompactHookCommand,
   recallHookCommand,
   removeCommandHooks,
   sessionStartHookCommand,
   stopHookCommand,
   verifyRuntimeHookWiring,
 } from './hook-wiring.ts';
+import {
+  NATIVE_PRECOMPACT_INPUT_MAX_BYTES,
+  normalizeNativePreCompactTrigger,
+  runNativePreCompact,
+  type NativePreCompactTrigger,
+} from './native-precompact.ts';
 import { explainPromptRecall, recallExplanationFromSelection } from './recall-explanation.ts';
 import {
   PROMPT_RECALL_INCLUDE_LIMIT,
@@ -302,6 +309,108 @@ async function runHookWithActivation(
       configurationKey: wiring.generationId,
     });
     // Host hook contract is fail-open: activation bookkeeping and handler failures never block it.
+  }
+}
+
+function preCompactBudgetMs(): number {
+  const requested = Number(process.env.IHOW_PRECOMPACT_BUDGET_MS);
+  if (Number.isSafeInteger(requested) && requested >= 100 && requested <= 2_500) return requested;
+  return 2_500;
+}
+
+async function verifiedPreCompactGeneration(
+  options: ParsedArgs['options'],
+  workspace: ReturnType<typeof resolveWorkspace>,
+  contract: NativePreCompactTrigger,
+): Promise<string | undefined> {
+  if (options.synthetic || options.hookOwner !== IHOW_HOOK_OWNER) return undefined;
+  const expectedCli = path.join(workspace.spaceDir, '.runtime', 'cli.js');
+  try {
+    const [actual, expected] = await Promise.all([
+      fs.realpath(path.resolve(process.argv[1] || '')),
+      fs.realpath(expectedCli),
+    ]);
+    if (actual !== expected) return undefined;
+  } catch {
+    return undefined;
+  }
+  const wiring = await verifyRuntimeHookWiring(workspace, contract.runtime, { ...options, cwd: contract.project.cwd }).catch(() => undefined);
+  return wiring?.state === 'current' ? wiring.generationId : undefined;
+}
+
+// Compact hooks have a hard availability contract: iHow may lose this checkpoint attempt, but it may
+// never hold up host compaction. The process-level watchdog is intentional; Stage 2 persistence is
+// crash-safe/fail-closed, while an uncancellable filesystem operation must not outlive the host budget.
+async function runPreCompactHookCommand(options: ParsedArgs['options']): Promise<void> {
+  const budgetMs = preCompactBudgetMs();
+  const hardDeadline = setTimeout(() => process.exit(0), budgetMs);
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const raw = await readStdinBounded(NATIVE_PRECOMPACT_INPUT_MAX_BYTES);
+    if (!raw.trim()) return;
+    let payload: unknown;
+    try { payload = JSON.parse(raw); } catch { return; }
+    const runtime = options.runtime === 'codex' ? 'codex' : 'claude-code';
+    let contract: NativePreCompactTrigger;
+    try { contract = normalizeNativePreCompactTrigger(runtime, payload); } catch { return; }
+
+    let workspace: Awaited<ReturnType<typeof ensureWorkspace>>;
+    try {
+      workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd: contract.project.cwd }));
+    } catch {
+      return;
+    }
+    const generation = await verifiedPreCompactGeneration(options, workspace, contract);
+    if (generation) {
+      await appendActivationEvidenceFailOpen(workspace, {
+        runtime: contract.runtime,
+        event: 'hook-pre-compact',
+        source: 'native-hook',
+        status: 'observed-live-started',
+        observedAt: contract.observedAt,
+        dedupeKey: contract.delivery.dedupeKey,
+        configurationKey: generation,
+      });
+    }
+
+    let timedOut = false;
+    const workBudget = Math.max(1, budgetMs - 150);
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        reject(new Error('native_precompact_timeout'));
+      }, workBudget);
+    });
+    try {
+      await Promise.race([runNativePreCompact(contract, options), deadline]);
+      if (generation) {
+        await appendActivationEvidenceFailOpen(workspace, {
+          runtime: contract.runtime,
+          event: 'hook-pre-compact',
+          source: 'native-hook',
+          status: 'observed-live-completed',
+          dedupeKey: contract.delivery.dedupeKey,
+          configurationKey: generation,
+        });
+      }
+    } catch {
+      if (generation) {
+        await appendActivationEvidenceFailOpen(workspace, {
+          runtime: contract.runtime,
+          event: 'hook-pre-compact',
+          source: 'native-hook',
+          status: 'failed',
+          dedupeKey: contract.delivery.dedupeKey,
+          configurationKey: generation,
+        });
+      }
+      if (timedOut) process.exit(0);
+    }
+  } catch {
+    // Invalid/oversized input and every internal error are fail-open to host compaction.
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    clearTimeout(hardDeadline);
   }
 }
 
@@ -1578,9 +1687,12 @@ async function maybeInstallCodexMemoryLoop(): Promise<'installed' | 'already' | 
 
 type HookInstallOutcome = 'installed' | 'already' | 'skipped' | 'failed';
 
-// Codex hook installer. Codex supports hooks.json at ~/.codex/hooks.json with SessionStart and
-// UserPromptSubmit events. We install only low-noise hooks here:
+// Stage 3 candidate: current official Codex hooks support PreCompact in hooks.json (verified against
+// the shipped 0.144.1 schema as well as upstream generated schemas), so setup wires the bounded,
+// transcript-free, host-fail-open checkpoint adapter here. It does not yet feed continue or a crash
+// floor, and Codex still has no SessionEnd. We install only low-noise hooks here:
 //   - SessionStart: resume-awareness hint + deterministic cross-runtime floor trigger
+//   - PreCompact: bounded transcript-free checkpoint finalizer
 //   - UserPromptSubmit: relevant curated-memory recall
 // Stop is intentionally not installed yet: Codex documents Stop as turn-scope, not necessarily
 // process-exit/session-end, so using the Claude session-end nudge there could interrupt normal turns.
@@ -1604,7 +1716,7 @@ async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<H
     return 'failed';
   }
   const hooks = (config.hooks ?? {}) as Record<string, unknown>;
-  if (!hookEventShapesValid(hooks, ['SessionStart', 'UserPromptSubmit'])) return 'failed';
+  if (!hookEventShapesValid(hooks, ['SessionStart', 'PreCompact', 'UserPromptSubmit'])) return 'failed';
   const forceGeneration = await hookGenerationNeedsRepair(workspace, 'codex', options);
   const addedStart = ensureCommandHook(
     hooks,
@@ -1613,6 +1725,15 @@ async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<H
     sessionStartHookCommand(workspace, 'codex'),
     { timeout: 30, statusMessage: 'Checking iHow Memory handoff' },
     'startup|resume|clear|compact',
+    forceGeneration,
+  );
+  const addedPreCompact = ensureCommandHook(
+    hooks,
+    'PreCompact',
+    'hook-pre-compact',
+    preCompactHookCommand(workspace, 'codex'),
+    { timeout: 3, statusMessage: 'Saving iHow Memory checkpoint' },
+    undefined,
     forceGeneration,
   );
   const recallChanged = options.recall !== false ? ensureCommandHook(
@@ -1625,7 +1746,7 @@ async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<H
     forceGeneration,
   ) : removeCommandHooks(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit');
 
-  if (!addedStart && !recallChanged) return 'already';
+  if (!addedStart && !addedPreCompact && !recallChanged) return 'already';
   config.hooks = hooks;
   try {
     await fs.mkdir(path.dirname(dest), { recursive: true });
@@ -1807,7 +1928,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     line('       · (no Claude Code detected — skill + auto-capture hook are Claude Code only)');
   } else if (dryRun) {
     line('       · would install memory skill → ~/.claude/skills/ihow-memory/');
-    line(`       · would install Stop + SessionStart auto-capture hook${options.recall === false ? '' : ' + UserPromptSubmit recall (reviewed-first + guarded auto soft facts)'} ${options.globalHook ? '[all Claude Code projects]' : '[this project only]'}`);
+    line(`       · would install Stop + SessionStart + PreCompact checkpoint hooks${options.recall === false ? '' : ' + UserPromptSubmit recall (reviewed-first + guarded auto soft facts)'} ${options.globalHook ? '[all Claude Code projects]' : '[this project only]'}`);
     skill = 'dry-run'; hook = 'dry-run';
   } else {
     // The install helpers can no-op (unparseable settings, unreadable bundle) or throw on an fs error;
@@ -1845,6 +1966,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
           type: 'command', command: stopHookCommand(workspace), timeout: 30,
         }) && commandHookIsCurrent(hooks, 'SessionStart', 'hook-session-start', {
           type: 'command', command: sessionStartHookCommand(workspace, 'claude-code'), timeout: 30,
+        }) && commandHookIsCurrent(hooks, 'PreCompact', 'hook-pre-compact', {
+          type: 'command', command: preCompactHookCommand(workspace, 'claude-code'), timeout: 3,
         });
         if (options.recall !== false) {
           wired = wired && commandHookIsCurrent(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit', {
@@ -1878,16 +2001,16 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     }
   }
 
-  // 3/4 (cont.) Codex has native hooks. Install the low-noise pair: SessionStart (resume hint + Codex
-  // floor trigger) and UserPromptSubmit (curated recall). Keep the AGENTS.md loop below as the model's
+  // 3/4 (cont.) Codex has native hooks. Install SessionStart (resume hint + Codex floor trigger),
+  // PreCompact (bounded checkpoint), and UserPromptSubmit (curated recall). Keep AGENTS.md as the model's
   // explicit memory-use discipline.
   const hasCodex = present.some((d) => d.runtime === 'codex');
   let codexHooks = 'not-applicable';
   if (hasCodex) {
     if (dryRun) {
       line(options.recall === false
-        ? `       · would install Codex SessionStart hook with recall OFF → ${codexConfigLabel('hooks.json')}`
-        : `       · would install Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+        ? `       · would install Codex SessionStart + PreCompact hooks with recall OFF → ${codexConfigLabel('hooks.json')}`
+        : `       · would install Codex SessionStart + UserPromptSubmit hooks + PreCompact checkpoint → ${codexConfigLabel('hooks.json')}`);
       codexHooks = 'dry-run';
     } else if (options.installHook === false) {
       codexHooks = 'skipped';
@@ -1895,8 +2018,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
       try { codexHooks = await maybeInstallCodexHooks({ ...options, runtime: 'codex' }); } catch { codexHooks = 'failed'; }
       if (codexHooks === 'installed') changedRuntimes.add('codex');
       if (codexHooks === 'installed') line(options.recall === false
-        ? `       ✓ installed Codex SessionStart hook; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
-        : `       ✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+        ? `       ✓ installed Codex SessionStart hook + PreCompact checkpoint; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
+        : `       ✓ installed Codex SessionStart + UserPromptSubmit hooks + PreCompact checkpoint → ${codexConfigLabel('hooks.json')}`);
       else if (codexHooks === 'already') line(`       · Codex hooks already present → ${codexConfigLabel('hooks.json')}`);
       else if (codexHooks === 'failed') line(`       ⚠ Codex hooks failed to install → ${codexConfigLabel('hooks.json')}`);
       if (codexHooks === 'installed' || codexHooks === 'already') {
@@ -2144,9 +2267,10 @@ Usage:
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Stop-hook handler (Claude Code session-end nudge; reads hook JSON on stdin)
   ihow-memory hook-session-start          # SessionStart-hook handler (Claude Code marker floor; Codex resume hint + Codex capture floor trigger)
+  ihow-memory hook-pre-compact            # Claude/Codex native PreCompact checkpoint adapter; bounded, transcript-free, fail-open
   ihow-memory hook-user-prompt-submit     # UserPromptSubmit recall — reviewed-first + guarded auto soft facts; relevant-only, bounded, seamless fenced reference. Off: IHOW_RECALL_OFF=1; reviewed-only: IHOW_RECALL_AUTO_DEFAULT=0
   ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
-  ihow-memory install-hook [--runtime claude-code|codex] [--global-hook] [--no-recall] [--no-install-hook]   # Claude Code: Stop + SessionStart + UserPromptSubmit hooks (project-local by default; --global-hook for ~/.claude/settings.json). Codex: SessionStart + UserPromptSubmit hooks in ~/.codex/hooks.json. Recall is ON by default; --no-recall skips it.
+  ihow-memory install-hook [--runtime claude-code|codex] [--global-hook] [--no-recall] [--no-install-hook]   # Claude Code: Stop + SessionStart + PreCompact + UserPromptSubmit hooks (project-local by default; --global-hook for ~/.claude/settings.json). Codex: SessionStart + PreCompact + UserPromptSubmit hooks in ~/.codex/hooks.json. Recall is ON by default; --no-recall skips it.
 
 Defaults:
   root: ${defaultRoot()}
@@ -2866,7 +2990,7 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<Hoo
     return 'failed';
   }
   const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
-  if (!hookEventShapesValid(hooks, ['Stop', 'SessionStart', 'UserPromptSubmit'])) {
+  if (!hookEventShapesValid(hooks, ['Stop', 'SessionStart', 'PreCompact', 'UserPromptSubmit'])) {
     console.error(`refusing to modify ${dest} — hook events must contain object groups with hook arrays; fix the file, then re-run install-hook.`);
     process.exitCode = 1;
     return 'failed';
@@ -2878,6 +3002,7 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<Hoo
   const forceGeneration = await hookGenerationNeedsRepair(workspace, 'claude-code', options);
   const addedStop = ensureCommandHook(hooks, 'Stop', 'hook-stop', stopHookCommand(workspace), { timeout: 30 }, undefined, forceGeneration);
   const addedStart = ensureCommandHook(hooks, 'SessionStart', 'hook-session-start', sessionStartHookCommand(workspace, 'claude-code'), { timeout: 30 }, undefined, forceGeneration);
+  const addedPreCompact = ensureCommandHook(hooks, 'PreCompact', 'hook-pre-compact', preCompactHookCommand(workspace, 'claude-code'), { timeout: 3 }, undefined, forceGeneration);
   // RECALL (read path) installs by DEFAULT; `--no-recall` opts out. Reviewed memory is preferred, while
   // relevant machine-gated auto SOFT facts may surface by default. The shared selector blocks private,
   // flagged, audit-only, unreadable/stale, ambient status, and every behavior-bypass entry; it also applies
@@ -2886,7 +3011,7 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<Hoo
   const recallChanged = options.recall !== false
     ? ensureCommandHook(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit', recallHookCommand(workspace, 'claude-code'), { timeout: 30 }, undefined, forceGeneration)
     : removeCommandHooks(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit');
-  if (!addedStop && !addedStart && !recallChanged) {
+  if (!addedStop && !addedStart && !addedPreCompact && !recallChanged) {
     console.log(`✓ ${options.recall !== false ? 'auto-capture + recall hooks' : 'auto-capture hooks (recall OFF)'} already present in ${dest}`);
     return 'already';
   }
@@ -2904,6 +3029,7 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<Hoo
   const added = [
     addedStop ? 'Stop (session-end nudge)' : null,
     addedStart ? 'SessionStart (next-session floor)' : null,
+    addedPreCompact ? 'PreCompact (bounded checkpoint)' : null,
     recallChanged && options.recall !== false ? 'UserPromptSubmit (recall — reviewed-first + guarded auto soft facts)' : null,
     recallChanged && options.recall === false ? 'removed managed UserPromptSubmit (recall OFF)' : null,
   ].filter(Boolean).join(' + ');
@@ -2922,6 +3048,22 @@ async function readStdinSafe(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function readStdinBounded(maxBytes: number): Promise<string> {
+  if (process.stdin.isTTY) return '';
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of process.stdin) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+    total += buffer.length;
+    if (total > maxBytes) {
+      process.stdin.destroy();
+      throw new Error('native_hook_input_too_large');
+    }
+    chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString('utf8');
 }
@@ -3507,6 +3649,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'hook-pre-compact') {
+    await runPreCompactHookCommand(options);
+    return;
+  }
+
   if (command === 'install-skill') {
     await maybeInstallClaudeSkill({ ...options, installSkill: options.installSkill !== false });
     return;
@@ -3524,8 +3671,8 @@ async function main(): Promise<void> {
         await recordConfiguredActivation(workspace, 'codex', 'install-hook', options, outcome === 'installed');
       }
       if (outcome === 'installed') console.log(options.recall === false
-        ? `✓ installed Codex SessionStart hook; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
-        : `✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+        ? `✓ installed Codex SessionStart hook + PreCompact checkpoint; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
+        : `✓ installed Codex SessionStart + UserPromptSubmit hooks + PreCompact checkpoint → ${codexConfigLabel('hooks.json')}`);
       else if (outcome === 'already') console.log(`✓ Codex hooks already present in ${codexConfigLabel('hooks.json')}`);
       else if (outcome === 'skipped') console.log('Skipped Codex hooks. (Add them later with install-hook --runtime codex.)');
       else {
@@ -3665,8 +3812,8 @@ async function main(): Promise<void> {
           claudeHooks = await maybeInstallStopHook(options);
         } else if (options.runtime === 'codex' && options.easy && options.installHook !== false) {
           if (codexHooks === 'installed') console.log(options.recall === false
-            ? `✓ installed Codex SessionStart hook; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
-            : `✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+            ? `✓ installed Codex SessionStart hook + PreCompact checkpoint; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
+            : `✓ installed Codex SessionStart + UserPromptSubmit hooks + PreCompact checkpoint → ${codexConfigLabel('hooks.json')}`);
           else if (codexHooks === 'already') console.log(`· Codex hooks already present → ${codexConfigLabel('hooks.json')}`);
           else if (codexHooks === 'failed') {
             console.log(`⚠ Codex hooks failed to install → ${codexConfigLabel('hooks.json')}`);
@@ -4687,7 +4834,7 @@ main().catch((error) => {
   // Match the COMMAND word only (argv[2] = the subcommand for `ihow-memory <cmd> …`), never any argv
   // token — otherwise `ihow-memory search hook-stop` or a candidate body mentioning a hook name would
   // wrongly swallow a real failure.
-  const HOOK_COMMANDS = new Set(['hook-stop', 'hook-session-start', 'hook-user-prompt-submit']);
+  const HOOK_COMMANDS = new Set(['hook-stop', 'hook-session-start', 'hook-pre-compact', 'hook-user-prompt-submit']);
   if (HOOK_COMMANDS.has(process.argv[2])) {
     process.exitCode = 0;
     return;

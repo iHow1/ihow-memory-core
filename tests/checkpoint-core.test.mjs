@@ -23,6 +23,9 @@ import {
 import { openCore } from '../src/core.ts';
 import {
   appendCheckpointAuditUnlocked,
+  CHECKPOINT_OPEN_DRAFT_MAX,
+  checkpointAuditV2Paths,
+  checkpointPrivateIndexPaths,
   checkpointStorePaths,
   linkCheckpointArtifactWriteClaimUnlocked,
   prepareCheckpointArtifactWriteClaimUnlocked,
@@ -121,7 +124,13 @@ cp.spawn = function patchedSpawn(command, args, options) {
     child.stdout.prependListener('data', (chunk) => {
       const output = String(chunk);
       if (attacked) return;
-      if (process.env.IHOW_ATTACK_KIND === 'file' && isFileWorker && !isReaper && output.includes('"event":"ready"')) {
+      if (
+        process.env.IHOW_ATTACK_KIND === 'file'
+        && isFileWorker
+        && !isReaper
+        && path.basename(options.cwd) === 'drafts'
+        && output.includes('"event":"ready"')
+      ) {
         attacked = true;
         const pinnedDirectory = options.cwd;
         const names = fs.readdirSync(pinnedDirectory).filter((name) => /^draft_[a-f0-9-]+\.json$/.test(name));
@@ -258,6 +267,7 @@ cp.spawn = function patchedSpawn(command, args, options) {
         (process.env.IHOW_ATTACK_KIND === 'file-alias' || process.env.IHOW_ATTACK_KIND === 'file-external-alias')
         && isFileWorker
         && !isReaper
+        && path.basename(options.cwd) === 'drafts'
         && output.includes('"event":"ready"')
       ) {
         attacked = true;
@@ -545,6 +555,28 @@ test('normal API success retains the exact owned hardlink cardinality', async (t
   assert.ok(aliases.some((name) => name.startsWith(`.${finalized.artifact.id}.claim-`)));
 });
 
+test('owned-alias verification stops at the 4097th directory entry instead of loading an unbounded directory', async (t) => {
+  const core = await tempCore(t, 'checkpoint-owned-alias-cardinality');
+  const draft = await core.checkpoints.createDraft({
+    runtime: 'cardinality',
+    sessionId: 'bounded-directory',
+    claims: { completed: ['bounded alias scan'] },
+  });
+  const paths = checkpointStorePaths(core.workspace);
+  const total = 4097;
+  for (let start = 0; start < total; start += 256) {
+    await Promise.all(Array.from(
+      { length: Math.min(256, total - start) },
+      (_, offset) => fs.writeFile(path.join(paths.drafts, `noise-${start + offset}`), '', 'utf8'),
+    ));
+  }
+
+  await assert.rejects(
+    writeCheckpointDraftUnlocked(core.workspace, draft),
+    /checkpoint_internal_failure|checkpoint_cleanup_incomplete/,
+  );
+});
+
 test('prepare refuses an existing receipt that is already linked to the final basename', async (t) => {
   const core = await tempCore(t, 'checkpoint-round9-reprepare');
   const draft = await core.checkpoints.createDraft({ runtime: 'round9', claims: { completed: ['strict prepared binding'] } });
@@ -675,6 +707,65 @@ test('property-style bounds are deterministic, canonical, hash-addressed, and <=
   }
 });
 
+test('open-draft bound is persisted exactly and the max+1 create fails before writing a draft', async (t) => {
+  const core = await tempCore(t, 'checkpoint-open-bound');
+  const sessionId = 'bounded-open-session';
+  const created = [];
+  for (let index = 0; index < CHECKPOINT_OPEN_DRAFT_MAX; index += 1) {
+    created.push(await core.checkpoints.createDraft({
+      runtime: 'unit',
+      sessionId,
+      claims: { pending: [`open-${index}`] },
+    }));
+  }
+  await assert.rejects(
+    core.checkpoints.createDraft({ runtime: 'unit', sessionId, claims: { pending: ['must-not-land'] } }),
+    /checkpoint_open_draft_limit_exceeded/,
+  );
+
+  const paths = checkpointStorePaths(core.workspace);
+  const storedDrafts = (await fs.readdir(paths.drafts)).filter((name) => /^draft_.*\.json$/.test(name));
+  assert.equal(storedDrafts.length, CHECKPOINT_OPEN_DRAFT_MAX);
+  assert.deepEqual(new Set(storedDrafts.map((name) => name.slice(0, -5))), new Set(created.map((draft) => draft.draftId)));
+
+  const indexes = checkpointPrivateIndexPaths(core.workspace);
+  const locatorNames = await fs.readdir(indexes.draftLocators);
+  assert.equal(locatorNames.length, 1);
+  const locatorRaw = await fs.readFile(path.join(indexes.draftLocators, locatorNames[0]), 'utf8');
+  const locator = JSON.parse(locatorRaw);
+  assert.equal(locator.openSetComplete, true);
+  assert.equal(locator.open.length, CHECKPOINT_OPEN_DRAFT_MAX);
+  assert.equal(locatorRaw, canonicalCheckpointJson(locator));
+});
+
+test('concurrent creates serialize at the open-draft bound', async (t) => {
+  const core = await tempCore(t, 'checkpoint-open-bound-concurrent');
+  const sessionId = 'bounded-concurrent-session';
+  for (let index = 0; index < CHECKPOINT_OPEN_DRAFT_MAX - 1; index += 1) {
+    await core.checkpoints.createDraft({
+      runtime: 'unit',
+      sessionId,
+      claims: { pending: [`seed-${index}`] },
+    });
+  }
+
+  const outcomes = await Promise.allSettled([
+    core.checkpoints.createDraft({ runtime: 'unit', sessionId, claims: { pending: ['contender-a'] } }),
+    core.checkpoints.createDraft({ runtime: 'unit', sessionId, claims: { pending: ['contender-b'] } }),
+  ]);
+  assert.equal(outcomes.filter((outcome) => outcome.status === 'fulfilled').length, 1);
+  const rejection = outcomes.find((outcome) => outcome.status === 'rejected');
+  assert.match(String(rejection?.reason?.message), /checkpoint_open_draft_limit_exceeded/);
+
+  const paths = checkpointStorePaths(core.workspace);
+  const storedDrafts = (await fs.readdir(paths.drafts)).filter((name) => /^draft_.*\.json$/.test(name));
+  assert.equal(storedDrafts.length, CHECKPOINT_OPEN_DRAFT_MAX);
+  const [locatorName] = await fs.readdir(checkpointPrivateIndexPaths(core.workspace).draftLocators);
+  const locator = JSON.parse(await fs.readFile(path.join(checkpointPrivateIndexPaths(core.workspace).draftLocators, locatorName), 'utf8'));
+  assert.equal(locator.openSetComplete, true);
+  assert.equal(locator.open.length, CHECKPOINT_OPEN_DRAFT_MAX);
+});
+
 test('semantic fingerprint excludes createdAt and deduplicates equivalent drafts', async (t) => {
   const core = await tempCore(t, 'checkpoint-semantic-dedup');
   const claims = {
@@ -698,6 +789,89 @@ test('semantic fingerprint excludes createdAt and deduplicates equivalent drafts
   const paths = checkpointStorePaths(core.workspace);
   const storedSecondDraft = JSON.parse(await fs.readFile(path.join(paths.drafts, `${secondDraft.draftId}.json`), 'utf8'));
   assert.equal(storedSecondDraft.finalization.artifactId, first.artifact.id);
+});
+
+test('semantic dedupe uses the exact private fingerprint index and never scans a large artifact directory', async (t) => {
+  const core = await tempCore(t, 'checkpoint-semantic-index-bounded');
+  const claims = { completed: ['bounded semantic lookup'], coverage: { complete: true, eventCount: 1 } };
+  const firstDraft = await core.checkpoints.createDraft({ runtime: 'unit', sessionId: 'bounded-index', claims });
+  const first = await core.checkpoints.finalizeDraft(firstDraft.draftId, explicit, anchorProvider());
+  const paths = checkpointStorePaths(core.workspace);
+  await Promise.all(Array.from({ length: 320 }, async (_, index) => {
+    const id = index.toString(16).padStart(64, '0');
+    await fs.writeFile(path.join(paths.artifacts, `cp_${id}.json`), '{"invalid":"must-not-be-read"}', 'utf8');
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const secondDraft = await core.checkpoints.createDraft({ runtime: 'unit', sessionId: 'bounded-index', claims });
+
+  const originalReaddir = fs.readdir;
+  let artifactDirectoryScans = 0;
+  fs.readdir = async function guardedReaddir(target, ...args) {
+    if (path.resolve(String(target)) === path.resolve(paths.artifacts)) {
+      artifactDirectoryScans += 1;
+      throw new Error('artifact_directory_scan_forbidden');
+    }
+    return await originalReaddir.call(this, target, ...args);
+  };
+  let second;
+  try {
+    second = await core.checkpoints.finalizeDraft(secondDraft.draftId, explicit, anchorProvider());
+  } finally {
+    fs.readdir = originalReaddir;
+  }
+  assert.equal(artifactDirectoryScans, 0, 'semantic lookup never enumerates artifacts');
+  assert.equal(second.deduplicated, true);
+  assert.equal(second.artifact.id, first.artifact.id);
+});
+
+test('missing, stale, and tampered semantic indexes fail closed, permit a safe extra artifact, and self-repair', async (t) => {
+  for (const mode of ['missing', 'stale', 'tampered']) {
+    await t.test(mode, async (t) => {
+      const core = await tempCore(t, `checkpoint-semantic-index-${mode}`);
+      const claims = { completed: [`semantic-${mode}`], coverage: { complete: true, eventCount: 1 } };
+      const firstDraft = await core.checkpoints.createDraft({ runtime: 'unit', sessionId: `index-${mode}`, claims });
+      const first = await core.checkpoints.finalizeDraft(firstDraft.draftId, explicit, anchorProvider());
+      const semanticSha256 = computeCheckpointSemanticSha256(first.artifact);
+      const indexPath = path.join(checkpointPrivateIndexPaths(core.workspace).artifactSemantic, `${semanticSha256}.json`);
+
+      let wrongArtifactId;
+      if (mode === 'missing') {
+        await fs.rm(indexPath);
+      } else if (mode === 'stale') {
+        const stale = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+        stale.artifactId = `cp_${'f'.repeat(64)}`;
+        stale.artifactContentSha256 = 'f'.repeat(64);
+        await fs.writeFile(indexPath, canonicalCheckpointJson(stale), 'utf8');
+      } else {
+        const otherDraft = await core.checkpoints.createDraft({
+          runtime: 'unit',
+          sessionId: `index-${mode}`,
+          claims: { completed: ['different semantic artifact'], coverage: { complete: true, eventCount: 2 } },
+        });
+        const other = await core.checkpoints.finalizeDraft(otherDraft.draftId, explicit, anchorProvider());
+        wrongArtifactId = other.artifact.id;
+        const tampered = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+        tampered.artifactId = other.artifact.id;
+        tampered.artifactContentSha256 = other.artifact.integrity.contentSha256;
+        await fs.writeFile(indexPath, canonicalCheckpointJson(tampered), 'utf8');
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const secondDraft = await core.checkpoints.createDraft({ runtime: 'unit', sessionId: `index-${mode}`, claims });
+      const second = await core.checkpoints.finalizeDraft(secondDraft.draftId, explicit, anchorProvider());
+      assert.equal(second.deduplicated, false, `${mode} pointer was ignored rather than trusted`);
+      assert.notEqual(second.artifact.id, first.artifact.id);
+      if (wrongArtifactId) assert.notEqual(second.artifact.id, wrongArtifactId);
+      const repaired = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+      assert.equal(repaired.artifactId, second.artifact.id, `${mode} pointer was repaired after durable completion`);
+
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const thirdDraft = await core.checkpoints.createDraft({ runtime: 'unit', sessionId: `index-${mode}`, claims });
+      const third = await core.checkpoints.finalizeDraft(thirdDraft.draftId, explicit, anchorProvider());
+      assert.equal(third.deduplicated, true);
+      assert.equal(third.artifact.id, second.artifact.id);
+    });
+  }
 });
 
 test('dedup finalization intent prevents replacement anchors after audit-before-marker crash', async (t) => {
@@ -997,7 +1171,7 @@ test('secret and schema failures are fail-closed and persist only minimal raw-fr
   const artifacts = await fs.readdir(paths.artifacts);
   assert.deepEqual(drafts, []);
   assert.deepEqual(artifacts, []);
-  const auditRaw = await fs.readFile(paths.audit, 'utf8');
+  const auditRaw = canonicalCheckpointJson(await core.checkpoints.audit());
   assert.doesNotMatch(auditRaw, /ABCDEF0123456789|api_key|do not persist|invented|operator@example\.com/);
   const safeDraft = await core.checkpoints.createDraft({ runtime: 'unit', claims: { pending: ['safe before anchor rejection'] } });
   await assert.rejects(
@@ -1005,8 +1179,9 @@ test('secret and schema failures are fail-closed and persist only minimal raw-fr
     /checkpoint_secret_rejected/,
   );
   assert.deepEqual(await fs.readdir(paths.artifacts), []);
-  const auditRawAfterAnchorRejection = await fs.readFile(paths.audit, 'utf8');
+  const auditRawAfterAnchorRejection = canonicalCheckpointJson(await core.checkpoints.audit());
   assert.doesNotMatch(auditRawAfterAnchorRejection, /ZZZZZZ|token=/);
+  assert.doesNotMatch(await collectRegularFileText(checkpointAuditV2Paths(core.workspace).root), /ABCDEF0123456789|api_key|do not persist|invented|operator@example\.com|ZZZZZZ|token=/);
   const audit = await core.checkpoints.audit();
   assert.equal(audit.filter((event) => event.type === 'checkpoint.rejected').length, 4);
   assert.deepEqual(Object.keys(audit.find((event) => event.type === 'checkpoint.rejected')).sort(), ['at', 'id', 'operation', 'reasonCode', 'schemaVersion', 'type']);
@@ -1075,6 +1250,9 @@ test('checkpoint-only natural-language secret assignments reject drafts, anchors
   assert.equal(inspection.integrity.valid, false);
   assert.equal(inspection.integrity.reasonCode, 'checkpoint_secret_rejected');
 
+  // Establish the independent locator before planting an unreadable canonical draft. Once such a file
+  // exists, bounded fallback must conservatively treat identities without a locator as unknown.
+  const intentDraft = await core.checkpoints.createDraft({ runtime: 'unit', sessionId: 'intent-secret', claims: { pending: ['safe intent'] } });
   const poisonedDraft = structuredClone(prose);
   poisonedDraft.claims.pending = ['api key is z'];
   await fs.writeFile(path.join(paths.drafts, `${prose.draftId}.json`), canonicalCheckpointJson(poisonedDraft), 'utf8');
@@ -1083,7 +1261,6 @@ test('checkpoint-only natural-language secret assignments reject drafts, anchors
     /checkpoint_secret_rejected/,
   );
 
-  const intentDraft = await core.checkpoints.createDraft({ runtime: 'unit', sessionId: 'intent-secret', claims: { pending: ['safe intent'] } });
   const intentAnchors = normalizeMachineAnchors({ files: [], commands: [] });
   const poisonedBuild = finalizationBuild(intentAnchors, '2026-07-12T08:00:00.000Z');
   poisonedBuild.anchors.files = [{ path: 'password is q' }];
@@ -2104,16 +2281,15 @@ test('audit reconciliation rejects every competing finalization artifact or outc
     'same audit healing write is idempotent',
   );
   const other = await createAndFinalize(core, { completed: ['other artifact'] });
-  const paths = checkpointStorePaths(core.workspace);
-  await fs.appendFile(paths.audit, `${canonicalCheckpointJson({
-    schemaVersion: 1,
-    id: '00000000-0000-4000-8000-000000000099',
-    at: '2026-07-12T08:00:00.000Z',
-    type: 'checkpoint.artifact.deduplicated',
-    operation: 'artifact.finalize',
-    draftId: first.draft.draftId,
-    artifactId: other.artifact.id,
-  })}\n`, 'utf8');
+  await assert.rejects(
+    appendCheckpointAuditUnlocked(core.workspace, {
+      type: 'checkpoint.artifact.deduplicated',
+      operation: 'artifact.finalize',
+      draftId: first.draft.draftId,
+      artifactId: other.artifact.id,
+    }),
+    /checkpoint_finalization_audit_outcome_mismatch/,
+  );
 
   let providerCalls = 0;
   await assert.rejects(
@@ -2124,8 +2300,11 @@ test('audit reconciliation rejects every competing finalization artifact or outc
     /checkpoint_finalization_audit_outcome_mismatch/,
   );
   assert.equal(providerCalls, 0);
-  const events = (await core.checkpoints.audit()).filter((event) => event.operation === 'artifact.finalize' && event.draftId === first.draft.draftId);
-  assert.equal(events.length, 2, 'reconciliation fails closed instead of appending a third healing event');
+  await assert.rejects(
+    core.checkpoints.audit(),
+    /checkpoint_finalization_audit_outcome_mismatch/,
+    'the durable conflict marker keeps all later inspection and healing fail-closed',
+  );
 });
 
 test('audit event supersedes must exactly match the immutable artifact and healing stays idempotent', async (t) => {
@@ -2133,11 +2312,16 @@ test('audit event supersedes must exactly match the immutable artifact and heali
   const prior = await createAndFinalize(core, { completed: ['parent'] });
   const childRequest = { ...explicit, supersedes: prior.artifact.id };
   const child = await createAndFinalize(core, { completed: ['child'] }, childRequest);
-  const paths = checkpointStorePaths(core.workspace);
-  const lines = (await fs.readFile(paths.audit, 'utf8')).trimEnd().split('\n').map((line) => JSON.parse(line));
-  const event = lines.find((entry) => entry.operation === 'artifact.finalize' && entry.draftId === child.draft.draftId);
-  delete event.supersedes;
-  await fs.writeFile(paths.audit, `${lines.map((entry) => canonicalCheckpointJson(entry)).join('\n')}\n`, 'utf8');
+  await assert.rejects(
+    appendCheckpointAuditUnlocked(core.workspace, {
+      type: 'checkpoint.artifact.created',
+      operation: 'artifact.finalize',
+      draftId: child.draft.draftId,
+      artifactId: child.artifact.id,
+    }),
+    /checkpoint_finalization_audit_outcome_mismatch/,
+    'omitting the immutable artifact supersedes binding is a competing outcome',
+  );
 
   let providerCalls = 0;
   await assert.rejects(
@@ -2148,10 +2332,7 @@ test('audit event supersedes must exactly match the immutable artifact and heali
     /checkpoint_finalization_audit_outcome_mismatch/,
   );
   assert.equal(providerCalls, 0);
-  assert.equal(
-    (await core.checkpoints.audit()).filter((entry) => entry.operation === 'artifact.finalize' && entry.draftId === child.draft.draftId).length,
-    1,
-  );
+  await assert.rejects(core.checkpoints.audit(), /checkpoint_finalization_audit_outcome_mismatch/);
 });
 
 test('torn temp files are ignored; finalized artifacts are complete canonical JSON', async (t) => {
@@ -2393,7 +2574,7 @@ test('checkpoint audit replacement fails closed when the checkpoint root is swap
   assert.ok((await fs.readdir(raced.moved)).includes('third-party.txt'));
   const movedFiles = await fs.readdir(raced.moved);
   assert.equal(movedFiles.some((name) => name.endsWith('.tmp')), false);
-  assert.doesNotMatch(await fs.readFile(path.join(raced.moved, 'audit.ndjson'), 'utf8'), /checkpoint_directory_swap_probe/);
+  assert.doesNotMatch(await collectRegularFileText(raced.moved), /checkpoint_directory_swap_probe/);
   assert.equal(await fs.readFile(paths.audit, 'utf8'), 'replacement-audit-must-survive\n');
 });
 

@@ -30,6 +30,7 @@ export type ActivationEvidenceEvent =
   | 'runtime-configured'
   | 'hook-stop'
   | 'hook-session-start'
+  | 'hook-pre-compact'
   | 'hook-user-prompt-submit'
   | 'context-probe-session-start'
   | 'context-probe-prompt'
@@ -78,7 +79,7 @@ const KNOWN_RUNTIMES = new Set([
   'vscode', 'gemini', 'no-hook', 'unknown',
 ]);
 const KNOWN_EVENTS = new Set<ActivationEvidenceEvent>([
-  'runtime-configured', 'hook-stop', 'hook-session-start', 'hook-user-prompt-submit',
+  'runtime-configured', 'hook-stop', 'hook-session-start', 'hook-pre-compact', 'hook-user-prompt-submit',
   'context-probe-session-start', 'context-probe-prompt', 'context-probe-session-end',
   'context-probe-tick', 'synthetic-check',
 ]);
