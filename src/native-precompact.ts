@@ -12,7 +12,11 @@ import {
   canonicalCheckpointJson,
   type CheckpointDraftV1,
 } from './checkpoint-schema.ts';
-import { locateCheckpointDrafts, resolveCheckpointProjectIdentity } from './checkpoints.ts';
+import {
+  collectLiveCheckpointMachineAnchors,
+  locateCheckpointDrafts,
+  resolveCheckpointProjectIdentity,
+} from './checkpoints.ts';
 import {
   readNativePreCompactReceipt,
   writeNativePreCompactReceipt,
@@ -282,7 +286,7 @@ export async function runNativePreCompact(
         ? 'native_precompact_existing_draft'
         : 'native_precompact_minimal_partial',
     },
-  }, async () => ({ files: [], commands: [] }));
+  }, async () => collectLiveCheckpointMachineAnchors(path.resolve(contract.project.cwd)));
   await writeNativePreCompactReceipt(core.workspace, {
     schemaVersion: 1,
     dedupeKey: contract.delivery.dedupeKey,

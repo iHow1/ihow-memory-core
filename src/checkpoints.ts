@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { CheckpointProtectionState, CheckpointProtectionSummary, Workspace, WorkspaceOptions } from './types.ts';
-import { repoRoot } from './anchors.ts';
+import { gitAnchors, gitWorktreeStatusHash, repoRoot } from './anchors.ts';
 import { withWorkspaceLock } from './store/lock.ts';
 import {
   CHECKPOINT_DEFAULT_LIST_LIMIT,
@@ -56,6 +56,27 @@ import { readActivationEvidence } from './activation-ledger.ts';
 import { readEventsAllLanes } from './store/events.ts';
 
 export type CheckpointMachineAnchorProvider = () => CheckpointMachineAnchors | Promise<CheckpointMachineAnchors>;
+
+// Canonical live provider for runtime-generated checkpoints. Git facts and the worktree content hash
+// are collected by the same hardened anchor implementation used by continue verification. A failed
+// statusHash collection is omitted rather than invented; checkpoint provenance then keeps the artifact
+// fail-closed at YELLOW until a receiver can verify it live.
+export function collectLiveCheckpointMachineAnchors(projectDir: string): CheckpointMachineAnchors {
+  const live = gitAnchors(projectDir);
+  if (!live.isRepo || !live.repo) return { files: [], commands: [] };
+  const statusHash = gitWorktreeStatusHash(projectDir);
+  return {
+    git: {
+      repo: live.repo,
+      ...(live.branch ? { branch: live.branch } : {}),
+      ...(live.head ? { head: live.head } : {}),
+      ...(live.dirty !== undefined ? { dirty: live.dirty } : {}),
+      ...(statusHash ? { statusHash } : {}),
+    },
+    files: [],
+    commands: [],
+  };
+}
 
 export type CheckpointDraftFinalizationPrecondition = {
   expectedUpdatedAt: string;

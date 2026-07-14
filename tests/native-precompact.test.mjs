@@ -156,6 +156,13 @@ test('normalization tolerates missing/null transcript refs but rejects wrong hos
 
 test('no-draft Claude PreCompact writes one minimal partial shadow without reading transcript or retaining secrets', async (t) => {
   const f = await fixture(t, 'minimal');
+  const git = (...args) => execFileSync('git', args, { cwd: f.project, encoding: 'utf8' });
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'user.name', 'test');
+  await fs.writeFile(path.join(f.project, 'seed.txt'), 'native checkpoint seed\n', 'utf8');
+  git('add', '.');
+  git('commit', '-q', '-m', 'seed');
   const secret = 'AKIAIOSFODNN7EXAMPLE';
   const result = runHook({ ...f, payload: claudePayload(f.project, {
     transcript_path: path.join(f.project, `missing-${secret}.jsonl`),
@@ -175,7 +182,13 @@ test('no-draft Claude PreCompact writes one minimal partial shadow without readi
   assert.equal(artifact.trigger.sourceEvent, 'ClaudeCode.PreCompact');
   assert.equal(artifact.coverage.complete, false);
   assert.deepEqual(artifact.state, { completed: [], pending: [], decisions: [], blockers: [], nextActions: [] });
-  assert.deepEqual(artifact.anchors, { files: [], commands: [] });
+  assert.equal(artifact.anchors.git?.repo, path.basename(f.project));
+  assert.equal(artifact.anchors.git?.branch, 'main');
+  assert.match(artifact.anchors.git?.head ?? '', /^[a-f0-9]{7,40}$/);
+  assert.equal(artifact.anchors.git?.dirty, false);
+  assert.match(artifact.anchors.git?.statusHash ?? '', /^[a-f0-9]{64}$/);
+  assert.deepEqual(artifact.anchors.files, []);
+  assert.deepEqual(artifact.anchors.commands, []);
 
   for (const file of await allFiles(path.join(f.root, f.space))) {
     const bytes = await fs.readFile(file);

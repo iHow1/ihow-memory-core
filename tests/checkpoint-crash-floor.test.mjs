@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { boundCheckpointDraft, canonicalCheckpointJson } from '../src/checkpoint-schema.ts';
 import { openCore } from '../src/core.ts';
 import { runCaptureFloorSweep } from '../src/floor.ts';
+import { buildHandoffPacket } from '../src/handoff.ts';
 import { withWorkspaceLock } from '../src/store/lock.ts';
 import {
   checkpointPrivateIndexPaths,
@@ -153,6 +154,30 @@ test('stale valid draft becomes one bounded partial shadow checkpoint with live 
   assert.deepEqual(artifact.evidence, [{ kind: 'test', ref: 'tests/checkpoint-crash-floor.test.mjs' }]);
   assert.equal(artifact.anchors.git?.head, f.head, 'git HEAD is recomputed live at floor time');
   assert.equal(artifact.anchors.git?.branch, 'main');
+});
+
+test('default crash-floor checkpoint statusHash prevents same-HEAD dirty A to dirty B false GREEN', async (t) => {
+  const f = await staleDraftFixture(t, 'status-hash-drift');
+  await fs.writeFile(path.join(f.project, 'seed.txt'), 'dirty checkpoint state A\n', 'utf8');
+  const result = await runCaptureFloorSweep(f.core.workspace, { now: f.sweepNow });
+  assert.equal(result.checkpointed, 1);
+  const [artifact] = await artifacts(f.core);
+  assert.ok(artifact, 'default crash-floor created a real checkpoint artifact');
+
+  await fs.writeFile(path.join(f.project, 'seed.txt'), 'dirty live state B\n', 'utf8');
+  const packet = await buildHandoffPacket({
+    cwd: f.project,
+    workspace: f.core.workspace,
+    limit: 5,
+  });
+  const checkpoint = packet.candidates.find((candidate) => candidate.checkpoint?.artifactId === artifact.id);
+  assert.ok(checkpoint, 'real handoff/continue path selected the crash-floor checkpoint');
+  assert.notEqual(
+    checkpoint.verdict.state,
+    'GREEN',
+    `same dirty bit with changed bytes must not bypass checkpoint verification: ${checkpoint.verdict.reason}`,
+  );
+  assert.match(artifact.anchors.git?.statusHash ?? '', /^[a-f0-9]{64}$/, 'default provider records a canonical live statusHash');
 });
 
 test('fresh draft is not finalized by the checkpoint crash floor', async (t) => {

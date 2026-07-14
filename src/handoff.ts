@@ -1087,7 +1087,7 @@ export function computeContinueVerdict(
   recorded: GitAnchors,
   projectDir: string | undefined,
   narrative: string,
-  opts: { inferred?: boolean; cwd?: string } = {},
+  opts: { inferred?: boolean; cwd?: string; anchorProvenance?: 'checkpoint' | 'transcript' } = {},
 ): ContinueVerdict {
   // `inferred` = the baseline was guessed from a STATE doc (C1), not captured from a real session.
   // A doc-grepped hash is NOT a recorded snapshot, so it can never earn a confident GREEN or a hard
@@ -1150,6 +1150,9 @@ export function computeContinueVerdict(
   const liveDirty = live.dirty ?? (live.dirtyCount === undefined ? undefined : live.dirtyCount > 0);
   if (recordedDirty !== undefined && liveDirty !== undefined && recordedDirty !== liveDirty) {
     return cap({ state: 'RED', reason: `worktree drifted: recorded ${recordedDirty ? 'dirty' : 'clean'}, now ${liveDirty ? 'dirty' : 'clean'} at the same HEAD — inspect uncommitted changes before continuing`, recordedHead: rHead, liveHead: lHead });
+  }
+  if (opts.anchorProvenance === 'checkpoint' && !recorded.statusHash) {
+    return cap({ state: 'YELLOW', reason: 'checkpoint git anchors have no recorded statusHash — inspect the live worktree before continuing', recordedHead: rHead, liveHead: lHead });
   }
   if (recorded.statusHash) {
     const liveStatusHash = gitWorktreeStatusHash(projectDir);
@@ -1275,7 +1278,7 @@ export async function buildHandoffPacket(opts: {
               checkpointRecordedAnchors(artifact),
               projectDir,
               narrative,
-              { cwd: opts.cwd },
+              { cwd: opts.cwd, anchorProvenance: 'checkpoint' },
             ),
             checkpoint: {
               artifactId: artifact.id,

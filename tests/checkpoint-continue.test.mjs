@@ -16,6 +16,7 @@ import { buildHandoffPacket } from '../src/handoff.ts';
 import { checkpointStorePaths } from '../src/store/checkpoints.ts';
 
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'mcp', 'server.ts');
+const ZERO_HASH = '0'.repeat(64);
 async function makeRepo(project, marker = 'seed') {
   await fs.mkdir(project, { recursive: true });
   const git = (args) => execFileSync('git', args, { cwd: project, encoding: 'utf8' }).trim();
@@ -230,6 +231,42 @@ test('checkpoint verdict rejects same-HEAD worktree drift captured by statusHash
   assert.match(checkpoint.verdict.reason, /worktree drift/i);
 });
 
+test('checkpoint git anchors without statusHash fail closed while legacy transcript compatibility stays separate', async (t) => {
+  const f = await fixture(t, 'missing-status-hash');
+  const draft = await f.core.checkpoints.createDraft({
+    runtime: 'codex',
+    sessionId: 'checkpoint-without-status-hash',
+    claims: {
+      objective: 'MISSING-STATUS-HASH-CHECKPOINT',
+      coverage: { complete: false, eventCount: 1 },
+    },
+  });
+  const live = gitAnchors(f.project);
+  await f.core.checkpoints.finalizeDraft(draft.draftId, {
+    trigger: { kind: 'crash_floor', signal: 'shadow', sourceEvent: 'unit-test', reasonCode: 'missing_status_hash' },
+  }, async () => ({
+    git: {
+      repo: live.repo,
+      branch: live.branch,
+      head: live.head,
+      dirty: (live.dirtyCount ?? 0) > 0,
+    },
+    files: [],
+    commands: [],
+  }));
+  await plantCodexSession(f.home, {
+    id: 'missing-status-hash-project-map',
+    cwd: f.project,
+    marker: 'MISSING-STATUS-HASH-PROJECT-MAP',
+  });
+
+  const packet = await buildHandoffPacket({ cwd: f.project, workspace: f.core.workspace, limit: 5 });
+  const checkpoint = packet.candidates.find((candidate) => candidate.checkpoint);
+  assert.ok(checkpoint);
+  assert.equal(checkpoint.verdict.state, 'YELLOW', checkpoint.verdict.reason);
+  assert.match(checkpoint.verdict.reason, /checkpoint.*statusHash|statusHash.*checkpoint/i);
+});
+
 test('missing or corrupt checkpoint falls back honestly to transcript without fabricated checkpoint summary', async (t) => {
   await t.test('missing', async (t) => {
     const f = await fixture(t, 'missing');
@@ -292,4 +329,61 @@ test('memory.continue MCP consumes checkpoints and preserves the blank-cwd non-G
 
   const blankPacket = messages.find((message) => message.id === 3).result.structuredContent;
   assert.notEqual(blankPacket.candidates[0].verdict.state, 'GREEN');
+});
+
+test('memory.continue never executes a repo-local textconv driver while recomputing checkpoint statusHash', async (t) => {
+  const f = await fixture(t, 'textconv');
+  await fs.writeFile(path.join(f.project, '.gitattributes'), '*.txt diff=ihow-sentinel\n', 'utf8');
+  f.git(['add', '.gitattributes']);
+  f.git(['commit', '-q', '-m', 'add attributes']);
+
+  const marker = path.join(f.base, 'TEXTCONV_EXECUTED');
+  const driver = path.join(f.base, 'textconv-sentinel.sh');
+  await fs.writeFile(driver, `#!/bin/sh\n: > ${JSON.stringify(marker)}\ncat "$1"\n`, 'utf8');
+  await fs.chmod(driver, 0o700);
+  f.git(['config', 'diff.ihow-sentinel.textconv', driver]);
+  await fs.writeFile(path.join(f.project, 'seed.txt'), 'attacker-controlled dirty bytes A\n', 'utf8');
+
+  const live = gitAnchors(f.project);
+  const draft = await f.core.checkpoints.createDraft({
+    runtime: 'codex',
+    sessionId: 'textconv-checkpoint',
+    claims: { objective: 'TEXTCONV-CHECKPOINT', coverage: { complete: false, eventCount: 1 } },
+  });
+  await f.core.checkpoints.finalizeDraft(draft.draftId, {
+    trigger: { kind: 'explicit', signal: 'native', sourceEvent: 'unit-test', reasonCode: 'textconv_regression' },
+  }, async () => ({
+    git: {
+      repo: live.repo,
+      branch: live.branch,
+      head: live.head,
+      dirty: true,
+      statusHash: ZERO_HASH,
+    },
+    files: [],
+    commands: [],
+  }));
+  await plantCodexSession(f.home, {
+    id: 'textconv-project-map',
+    cwd: f.project,
+    marker: 'TEXTCONV-PROJECT-MAP',
+  });
+  await fs.writeFile(path.join(f.project, 'seed.txt'), 'attacker-controlled dirty bytes B\n', 'utf8');
+  await fs.rm(marker, { force: true });
+
+  const lines = [
+    JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+    JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory.continue', arguments: { cwd: f.project, limit: 5 } } }),
+  ].join('\n') + '\n';
+  const stdout = execFileSync(process.execPath, [SERVER, '--root', f.root, '--space', 't'], {
+    cwd: f.project,
+    encoding: 'utf8',
+    input: lines,
+    env: { ...process.env, HOME: f.home, IHOW_CAPTURE_FLOOR: '0' },
+    timeout: 30_000,
+  });
+  const messages = stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const packet = messages.find((message) => message.id === 2).result.structuredContent;
+  assert.ok(packet.candidates.some((candidate) => candidate.checkpoint), 'memory.continue consumed the checkpoint');
+  await assert.rejects(fs.access(marker), 'statusHash verification must not execute the repo-local textconv command');
 });

@@ -35,9 +35,9 @@
 //   - BOUNDED + best-effort + NEVER THROWS: capped per sweep, swallows every error, returns a summary.
 
 import type { Workspace } from './types.ts';
-import { gitAnchors } from './anchors.ts';
 import {
   checkpointDraftFinalizationPrecondition,
+  collectLiveCheckpointMachineAnchors,
   createCheckpointService,
   locateCheckpointDrafts,
   resolveCheckpointProjectIdentity,
@@ -107,28 +107,6 @@ function checkpointFloorFailureCode(error: unknown): string {
   return 'checkpoint_internal_failure';
 }
 
-function checkpointFloorAnchors(projectDir: string): {
-  git?: { repo: string; branch?: string; head?: string; dirty?: boolean };
-  files: [];
-  commands: [];
-} {
-  const live = gitAnchors(projectDir);
-  return {
-    ...(live.isRepo && live.repo
-      ? {
-          git: {
-            repo: live.repo,
-            ...(live.branch ? { branch: live.branch } : {}),
-            ...(live.head ? { head: live.head } : {}),
-            dirty: (live.dirtyCount ?? 0) > 0,
-          },
-        }
-      : {}),
-    files: [],
-    commands: [],
-  };
-}
-
 async function finalizeStaleCheckpointDraft(
   workspace: Workspace,
   session: Awaited<ReturnType<typeof listResumableSessions>>[number],
@@ -171,7 +149,7 @@ async function finalizeStaleCheckpointDraft(
       ...(supersedes ? { supersedes } : {}),
     }, async () => checkpointAnchorProvider
       ? await checkpointAnchorProvider(session.projectDir as string)
-      : checkpointFloorAnchors(session.projectDir as string), precondition);
+      : collectLiveCheckpointMachineAnchors(session.projectDir as string), precondition);
     return {
       tool: session.tool,
       outcome: 'checkpointed-partial',

@@ -73,8 +73,8 @@ export function gitWorktreeStatusHash(cwd: string): string | undefined {
   const top = git(cwd, ['rev-parse', '--show-toplevel']);
   if (!top) return undefined;
   const porcelain = gitRaw(top, ['status', '--porcelain=v1', '--untracked-files=all']);
-  const cachedDiff = gitRaw(top, ['diff', '--no-ext-diff', '--binary', '--cached', 'HEAD', '--']);
-  const unstagedDiff = gitRaw(top, ['diff', '--no-ext-diff', '--binary', '--']);
+  const cachedDiff = gitRaw(top, ['diff', '--no-ext-diff', '--no-textconv', '--binary', '--cached', 'HEAD', '--']);
+  const unstagedDiff = gitRaw(top, ['diff', '--no-ext-diff', '--no-textconv', '--binary', '--']);
   const untrackedRaw = gitRaw(top, ['ls-files', '--others', '--exclude-standard', '-z']);
   if (porcelain === null) return undefined;
   if (cachedDiff === null || unstagedDiff === null || untrackedRaw === null) return undefined;
