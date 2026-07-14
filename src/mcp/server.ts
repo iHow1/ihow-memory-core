@@ -337,12 +337,13 @@ async function main(): Promise<void> {
           payload = await core.status();
         } else if (name === 'memory.continue') {
           payload = await buildHandoffPacket({
-            // Normalize a blank/whitespace cwd to the launch dir — never pass "" through, or the
-            // receiver-context gate (which proves you're in the recorded checkout) is bypassed to GREEN.
-            cwd: typeof args.cwd === 'string' && args.cwd.trim() ? args.cwd : process.cwd(),
+            // An explicitly blank cwd means the receiver location is unknown and must stay non-GREEN.
+            // Only an omitted cwd falls back to the server launch directory.
+            cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
             projectHint: typeof args.projectHint === 'string' ? args.projectHint : undefined,
             limit: Number.isFinite(args.limit as number) ? Number(args.limit) : undefined,
             excludeSessionId: typeof args.excludeSessionId === 'string' ? args.excludeSessionId : undefined,
+            workspace: core.workspace,
           });
         } else if (name === 'memory.context_probe') {
           payload = await contextProbe(

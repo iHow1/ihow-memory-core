@@ -3,7 +3,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import type { Workspace, WorkspaceOptions } from './types.ts';
+import type { CheckpointProtectionState, CheckpointProtectionSummary, Workspace, WorkspaceOptions } from './types.ts';
 import { repoRoot } from './anchors.ts';
 import { withWorkspaceLock } from './store/lock.ts';
 import {
@@ -47,10 +47,13 @@ import {
   writeCheckpointFinalizationIntentUnlocked,
   writeCheckpointSemanticArtifactIndexUnlocked,
   checkpointAuditV2MarkerFaultPoint,
+  checkpointStorePaths,
   type CheckpointAuditEvent,
   type CheckpointDraftLocatorMatch,
   type CheckpointFinalizationIntentV1,
 } from './store/checkpoints.ts';
+import { readActivationEvidence } from './activation-ledger.ts';
+import { readEventsAllLanes } from './store/events.ts';
 
 export type CheckpointMachineAnchorProvider = () => CheckpointMachineAnchors | Promise<CheckpointMachineAnchors>;
 
@@ -72,6 +75,18 @@ export type CheckpointInspection = {
   canonical?: boolean;
   integrity: { valid: boolean; contentSha256?: string; reasonCode?: string };
   supersedes?: string;
+};
+
+export type CheckpointArtifactSnapshot = {
+  status: 'ok' | 'missing' | 'degraded';
+  artifacts: CheckpointArtifactV1[];
+  reasonCode?: string;
+};
+
+type CheckpointDraftSnapshot = {
+  status: 'ok' | 'missing' | 'degraded';
+  drafts: CheckpointDraftV1[];
+  reasonCode?: string;
 };
 
 export type CheckpointService = {
@@ -100,6 +115,293 @@ export async function resolveCheckpointProjectIdentity(options: WorkspaceOptions
     cwdHash: digest(`cwd\0${cwd}`),
     workspaceId: digest(`workspace\0${workspace.space}`),
     projectId: digest(`project\0${root}`),
+  };
+}
+
+const CHECKPOINT_ARTIFACT_SNAPSHOT_MAX_VISITS = 256;
+const CHECKPOINT_ARTIFACT_BASENAME_RE = /^cp_[a-f0-9]{64}\.json$/;
+const CHECKPOINT_DRAFT_SNAPSHOT_MAX_VISITS = 256;
+const CHECKPOINT_DRAFT_SNAPSHOT_BASENAME_RE = /^draft_[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\.json$/;
+
+async function checkpointSnapshotDirectoryState(
+  workspace: Workspace,
+  directory: string,
+): Promise<'contained' | 'missing' | 'invalid'> {
+  try {
+    const stat = await fs.lstat(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return 'invalid';
+    const containment = workspace.mode === 'existing-memory-root' ? workspace.mcpDir : workspace.spaceDir;
+    const [containmentReal, directoryReal] = await Promise.all([fs.realpath(containment), fs.realpath(directory)]);
+    return directoryReal !== containmentReal && directoryReal.startsWith(`${containmentReal}${path.sep}`)
+      ? 'contained'
+      : 'invalid';
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'invalid';
+  }
+}
+
+// Resume/status discovery is deliberately separate from the public list API: it proves a bounded view
+// of the canonical namespace, marks canonical non-files/corrupt bytes as degraded, and never lets an
+// unbounded artifact directory turn memory.continue into a startup scan.
+export async function readCheckpointArtifactSnapshot(
+  workspace: Workspace,
+  limit = CHECKPOINT_ARTIFACT_SNAPSHOT_MAX_VISITS,
+): Promise<CheckpointArtifactSnapshot> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > CHECKPOINT_ARTIFACT_SNAPSHOT_MAX_VISITS) {
+    return { status: 'degraded', artifacts: [], reasonCode: 'checkpoint_artifact_scan_limit_invalid' };
+  }
+  const directoryPath = checkpointStorePaths(workspace).artifacts;
+  const directoryState = await checkpointSnapshotDirectoryState(workspace, directoryPath);
+  if (directoryState === 'missing') return { status: 'missing', artifacts: [] };
+  if (directoryState === 'invalid') {
+    return { status: 'degraded', artifacts: [], reasonCode: 'checkpoint_path_outside_store' };
+  }
+  let directory: Awaited<ReturnType<typeof fs.opendir>>;
+  try {
+    directory = await fs.opendir(directoryPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { status: 'missing', artifacts: [] };
+    return { status: 'degraded', artifacts: [], reasonCode: checkpointSnapshotFailureCode(error) };
+  }
+  const ids: string[] = [];
+  let degradedReason: string | undefined;
+  let visited = 0;
+  try {
+    for await (const entry of directory) {
+      visited += 1;
+      if (visited > limit) {
+        degradedReason = 'checkpoint_artifact_scan_limit_exceeded';
+        break;
+      }
+      if (!CHECKPOINT_ARTIFACT_BASENAME_RE.test(entry.name)) continue;
+      if (!entry.isFile()) {
+        degradedReason ??= 'checkpoint_path_outside_store';
+        continue;
+      }
+      ids.push(entry.name.slice(0, -'.json'.length));
+    }
+  } catch (error) {
+    degradedReason ??= checkpointSnapshotFailureCode(error);
+  } finally {
+    await directory.close().catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code !== 'ERR_DIR_CLOSED') degradedReason ??= checkpointSnapshotFailureCode(error);
+    });
+  }
+  if (degradedReason === 'checkpoint_artifact_scan_limit_exceeded') {
+    return { status: 'degraded', artifacts: [], reasonCode: degradedReason };
+  }
+  const artifacts: CheckpointArtifactV1[] = [];
+  for (const id of ids.sort()) {
+    try {
+      artifacts.push((await readCheckpointArtifactUnlocked(workspace, id)).artifact);
+    } catch (error) {
+      degradedReason ??= checkpointSnapshotFailureCode(error);
+    }
+  }
+  if (degradedReason) return { status: 'degraded', artifacts, reasonCode: degradedReason };
+  return artifacts.length ? { status: 'ok', artifacts } : { status: 'missing', artifacts: [] };
+}
+
+function checkpointSnapshotFailureCode(error: unknown): string {
+  if (error instanceof CheckpointValidationError) return error.code;
+  if (error instanceof Error && /^checkpoint_[a-z0-9_]+$/.test(error.message)) return error.message;
+  return 'checkpoint_internal_failure';
+}
+
+async function readCheckpointDraftSnapshot(
+  workspace: Workspace,
+  limit = CHECKPOINT_DRAFT_SNAPSHOT_MAX_VISITS,
+): Promise<CheckpointDraftSnapshot> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > CHECKPOINT_DRAFT_SNAPSHOT_MAX_VISITS) {
+    return { status: 'degraded', drafts: [], reasonCode: 'checkpoint_draft_scan_limit_invalid' };
+  }
+  const directoryPath = checkpointStorePaths(workspace).drafts;
+  const directoryState = await checkpointSnapshotDirectoryState(workspace, directoryPath);
+  if (directoryState === 'missing') return { status: 'missing', drafts: [] };
+  if (directoryState === 'invalid') {
+    return { status: 'degraded', drafts: [], reasonCode: 'checkpoint_path_outside_store' };
+  }
+  let directory: Awaited<ReturnType<typeof fs.opendir>>;
+  try {
+    directory = await fs.opendir(directoryPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { status: 'missing', drafts: [] };
+    return { status: 'degraded', drafts: [], reasonCode: checkpointSnapshotFailureCode(error) };
+  }
+  const ids: string[] = [];
+  let degradedReason: string | undefined;
+  let visited = 0;
+  try {
+    for await (const entry of directory) {
+      visited += 1;
+      if (visited > limit) {
+        degradedReason = 'checkpoint_draft_scan_limit_exceeded';
+        break;
+      }
+      if (!CHECKPOINT_DRAFT_SNAPSHOT_BASENAME_RE.test(entry.name)) continue;
+      if (!entry.isFile()) {
+        degradedReason ??= 'checkpoint_path_outside_store';
+        continue;
+      }
+      ids.push(entry.name.slice(0, -'.json'.length));
+    }
+  } catch (error) {
+    degradedReason ??= checkpointSnapshotFailureCode(error);
+  } finally {
+    await directory.close().catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code !== 'ERR_DIR_CLOSED') degradedReason ??= checkpointSnapshotFailureCode(error);
+    });
+  }
+  if (degradedReason === 'checkpoint_draft_scan_limit_exceeded') {
+    return { status: 'degraded', drafts: [], reasonCode: degradedReason };
+  }
+  const drafts: CheckpointDraftV1[] = [];
+  for (const id of ids.sort()) {
+    try { drafts.push(await readCheckpointDraftUnlocked(workspace, id)); }
+    catch (error) { degradedReason ??= checkpointSnapshotFailureCode(error); }
+  }
+  if (degradedReason) return { status: 'degraded', drafts, reasonCode: degradedReason };
+  return drafts.length ? { status: 'ok', drafts } : { status: 'missing', drafts: [] };
+}
+
+function sameCheckpointProject(
+  value: { project: CheckpointProjectIdentity },
+  project: CheckpointProjectIdentity,
+): boolean {
+  return value.project.projectId && project.projectId
+    ? value.project.projectId === project.projectId
+    : value.project.cwdHash === project.cwdHash;
+}
+
+function newestCheckpointFirst(left: CheckpointArtifactV1, right: CheckpointArtifactV1): number {
+  const byTime = right.createdAt.localeCompare(left.createdAt);
+  if (byTime) return byTime;
+  if (left.supersedes === right.id) return -1;
+  if (right.supersedes === left.id) return 1;
+  return left.id.localeCompare(right.id);
+}
+
+function protectionSummary(artifact: CheckpointArtifactV1 | undefined): CheckpointProtectionSummary | null {
+  if (!artifact) return null;
+  return {
+    artifactId: artifact.id,
+    createdAt: artifact.createdAt,
+    triggerKind: artifact.trigger.kind,
+    triggerSignal: artifact.trigger.signal,
+    coverageComplete: artifact.coverage.complete,
+    ...(artifact.coverage.eventCount === undefined ? {} : { eventCount: artifact.coverage.eventCount }),
+  };
+}
+
+export async function checkpointProtectionState(
+  workspace: Workspace,
+  options: WorkspaceOptions = {},
+): Promise<CheckpointProtectionState> {
+  let project: CheckpointProjectIdentity;
+  try {
+    project = await resolveCheckpointProjectIdentity({ ...options, cwd: options.cwd || process.cwd() }, workspace);
+  } catch {
+    return {
+      lookup: { status: 'degraded', reasonCode: 'checkpoint_project_identity_unavailable' },
+      latestComplete: null,
+      latestPartial: null,
+      latestFloor: null,
+      stale: 'unknown',
+      newerMaterial: null,
+      worstLossEvents: 'unknown',
+      activationDegradation: [],
+    };
+  }
+  const [artifactSnapshot, draftSnapshot, events, activation] = await Promise.all([
+    readCheckpointArtifactSnapshot(workspace),
+    readCheckpointDraftSnapshot(workspace),
+    readEventsAllLanes(workspace).catch(() => []),
+    readActivationEvidence(workspace).catch(() => []),
+  ]);
+  const projectArtifacts = artifactSnapshot.artifacts
+    .filter((artifact) => sameCheckpointProject(artifact, project))
+    .sort(newestCheckpointFirst);
+  const latestCompleteArtifact = projectArtifacts.find((artifact) => artifact.coverage.complete);
+  const latestPartialArtifact = projectArtifacts.find((artifact) => !artifact.coverage.complete);
+  const latestSafeArtifact = projectArtifacts[0];
+  const openDrafts = draftSnapshot.drafts
+    .filter((draft) => !draft.finalization && sameCheckpointProject(draft, project))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.draftId.localeCompare(b.draftId));
+  const newestMaterial = openDrafts[0];
+
+  let stale: CheckpointProtectionState['stale'];
+  if (draftSnapshot.status === 'degraded') stale = 'unknown';
+  else stale = !!newestMaterial && (!latestSafeArtifact || newestMaterial.updatedAt > latestSafeArtifact.createdAt);
+
+  let worstLossEvents: CheckpointProtectionState['worstLossEvents'] = 'unknown';
+  if (stale === false && latestSafeArtifact) {
+    worstLossEvents = 0;
+  } else if (stale === true && newestMaterial) {
+    const baseline = newestMaterial.coverage.fromCheckpointId
+      ? projectArtifacts.find((artifact) => artifact.id === newestMaterial.coverage.fromCheckpointId)
+      : undefined;
+    if (
+      baseline
+      && typeof baseline.coverage.eventCount === 'number'
+      && typeof newestMaterial.coverage.eventCount === 'number'
+      && newestMaterial.coverage.eventCount >= baseline.coverage.eventCount
+    ) {
+      worstLossEvents = newestMaterial.coverage.eventCount - baseline.coverage.eventCount;
+    }
+  }
+
+  const latestCrashFloor = projectArtifacts
+    .filter((artifact) => artifact.trigger.kind === 'crash_floor')
+    .sort(newestCheckpointFirst)[0];
+  const latestFloorJournal = [...events]
+    .filter((event) => event.type === 'memory.journal.appended' && event.metadata?.floor === true)
+    .sort((a, b) => String(b.at).localeCompare(String(a.at)))[0];
+  const latestFloor: CheckpointProtectionState['latestFloor'] = latestCrashFloor
+    ? {
+        kind: 'checkpoint',
+        artifactId: latestCrashFloor.id,
+        at: latestCrashFloor.createdAt,
+        triggerSignal: latestCrashFloor.trigger.signal,
+      }
+    : latestFloorJournal
+      ? {
+          kind: 'journal',
+          at: latestFloorJournal.at,
+          runtime: typeof latestFloorJournal.metadata?.floorRuntime === 'string'
+            ? latestFloorJournal.metadata.floorRuntime
+            : 'unknown',
+        }
+      : null;
+
+  const latestActivation = new Map<string, (typeof activation)[number]>();
+  for (const row of activation) latestActivation.set(row.runtime, row);
+  const activationDegradation: CheckpointProtectionState['activationDegradation'] = [...latestActivation.values()]
+    .filter((row) => row.status === 'failed')
+    .map((row) => ({
+      runtime: row.runtime,
+      observedAt: row.observedAt,
+      reasonCode: 'activation_latest_event_failed' as const,
+    }))
+    .sort((a, b) => a.runtime.localeCompare(b.runtime));
+
+  return {
+    lookup: {
+      status: artifactSnapshot.status,
+      ...(artifactSnapshot.reasonCode ? { reasonCode: artifactSnapshot.reasonCode } : {}),
+    },
+    latestComplete: protectionSummary(latestCompleteArtifact),
+    latestPartial: protectionSummary(latestPartialArtifact),
+    latestFloor,
+    stale,
+    newerMaterial: stale === true && newestMaterial
+      ? {
+          draftId: newestMaterial.draftId,
+          updatedAt: newestMaterial.updatedAt,
+          ...(newestMaterial.coverage.eventCount === undefined ? {} : { eventCount: newestMaterial.coverage.eventCount }),
+        }
+      : null,
+    worstLossEvents,
+    activationDegradation,
   };
 }
 
@@ -248,7 +550,13 @@ function buildArtifactFromDraft(draft: CheckpointDraftV1, build: CheckpointArtif
     state: draft.claims,
     anchors: build.anchors,
     evidence: draft.evidence,
-    coverage: draft.coverage,
+    // A crash-floor observation proves only that this bounded draft was the latest safely persisted
+    // state we could recover. It can never upgrade the cooperative draft's coverage claim to complete,
+    // even when the draft author marked it complete before the host disappeared. Keeping this rule in
+    // the deterministic artifact builder also keeps intent/marker recovery byte-for-byte reproducible.
+    coverage: build.trigger.kind === 'crash_floor'
+      ? { ...draft.coverage, complete: false }
+      : draft.coverage,
     redaction: draft.redaction,
     supersedes: build.supersedes,
     anchorOmittedCounts: build.anchorOmittedCounts,

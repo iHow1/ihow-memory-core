@@ -30,7 +30,7 @@ import { filterForgotten, forgetPath, listForgotten, rememberPath } from './forg
 import type { ForgetOutcome, RememberOutcome } from './forget.ts';
 import { organizeDraft, exportVaultFromDraft } from './gardener.ts';
 import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraftOptions } from './gardener.ts';
-import { createCheckpointService, type CheckpointService } from './checkpoints.ts';
+import { checkpointProtectionState, createCheckpointService, type CheckpointService } from './checkpoints.ts';
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -148,6 +148,7 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
       const exists = fs.existsSync(workspace.indexPath);
       const documents = await countIndexedDocuments(workspace);
       const providerStatus = await engineStatus(workspace, engineConfig);
+      const protectionState = await checkpointProtectionState(workspace, options);
       // Honest capability gate: semantic is ON only when a semantic provider is BOTH the active engine
       // AND ready (not a fallback to FTS). The default binary, or an unreachable sidecar, reports false.
       const p = providerStatus.provider;
@@ -175,6 +176,7 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
           semantic: semanticActive,
         },
         recallReadiness: recallReadiness(options, providerStatus.provider),
+        protectionState,
         sync: {
           enabled: false,
         },
