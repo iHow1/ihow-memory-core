@@ -35,6 +35,14 @@
 //   - BOUNDED + best-effort + NEVER THROWS: capped per sweep, swallows every error, returns a summary.
 
 import type { Workspace } from './types.ts';
+import {
+  checkpointDraftFinalizationPrecondition,
+  collectLiveCheckpointMachineAnchors,
+  createCheckpointService,
+  locateCheckpointDrafts,
+  resolveCheckpointProjectIdentity,
+  type CheckpointMachineAnchorProvider,
+} from './checkpoints.ts';
 import { listResumableSessions } from './handoff.ts';
 import { appendFloorJournalOnce } from './governance.ts';
 import { readEventsAllLanes } from './store/events.ts';
@@ -66,6 +74,15 @@ export type FloorSweepResult = {
   scanned: number;
   journaled: number;
   outcomes: Array<{ tool: string; sessionId: string; outcome: FloorSweepOutcome; eventId?: string }>;
+  checkpointed: number;
+  checkpointOutcomes: CheckpointFloorSweepOutcome[];
+};
+
+export type CheckpointFloorSweepOutcome = {
+  tool: string;
+  outcome: 'checkpointed-partial' | 'skipped-checkpoint-fresh' | 'checkpoint-error';
+  artifactId?: string;
+  reasonCode?: string;
 };
 
 export type FloorSweepOptions = {
@@ -74,6 +91,8 @@ export type FloorSweepOptions = {
   idleMs?: number;
   lookbackMs?: number;
   maxPerSweep?: number;
+  checkpointStaleMs?: number;
+  checkpointAnchorProvider?: (projectDir: string) => ReturnType<CheckpointMachineAnchorProvider>; // controlled override; defaults to live git anchors
   runtimes?: Set<string>;
   excludeSessionId?: string; // optional; the idle gate is the primary self-exclude
 };
@@ -81,6 +100,76 @@ export type FloorSweepOptions = {
 // Composite idempotency key — sessionId alone is NOT globally unique across runtimes.
 function floorKey(runtime: string, sessionId: string): string {
   return `${runtime}::${sessionId}`;
+}
+
+function checkpointFloorFailureCode(error: unknown): string {
+  if (error instanceof Error && /^checkpoint_[a-z0-9_]+$/.test(error.message)) return error.message;
+  return 'checkpoint_internal_failure';
+}
+
+async function finalizeStaleCheckpointDraft(
+  workspace: Workspace,
+  session: Awaited<ReturnType<typeof listResumableSessions>>[number],
+  now: number,
+  staleMs: number,
+  checkpointAnchorProvider: FloorSweepOptions['checkpointAnchorProvider'],
+): Promise<CheckpointFloorSweepOutcome | undefined> {
+  if (!session.projectDir) return undefined;
+  try {
+    const options = { cwd: session.projectDir };
+    const project = await resolveCheckpointProjectIdentity(options, workspace);
+    const located = await locateCheckpointDrafts(
+      workspace,
+      project,
+      session.tool,
+      session.sessionId,
+    );
+    if (located.completeness === 'unknown') {
+      return { tool: session.tool, outcome: 'checkpoint-error', reasonCode: located.reasonCode };
+    }
+    if (!located.open) return undefined;
+    const updatedAt = Date.parse(located.open.updatedAt);
+    if (!Number.isFinite(updatedAt)) {
+      return { tool: session.tool, outcome: 'checkpoint-error', reasonCode: 'checkpoint_draft_schema_invalid' };
+    }
+    if (now - updatedAt < staleMs) {
+      return { tool: session.tool, outcome: 'skipped-checkpoint-fresh' };
+    }
+
+    const checkpoints = await createCheckpointService(workspace, options);
+    const supersedes = located.recentFinalized?.finalization?.artifactId;
+    const precondition = checkpointDraftFinalizationPrecondition(located.open);
+    const finalized = await checkpoints.finalizeDraft(located.open.draftId, {
+      trigger: {
+        kind: 'crash_floor',
+        signal: 'shadow',
+        sourceEvent: 'capture-floor-sweep',
+        reasonCode: 'stale_checkpoint_draft',
+      },
+      ...(supersedes ? { supersedes } : {}),
+    }, async () => checkpointAnchorProvider
+      ? await checkpointAnchorProvider(session.projectDir as string)
+      : collectLiveCheckpointMachineAnchors(session.projectDir as string), precondition);
+    return {
+      tool: session.tool,
+      outcome: 'checkpointed-partial',
+      artifactId: finalized.artifact.id,
+    };
+  } catch (error) {
+    const reasonCode = checkpointFloorFailureCode(error);
+    if (reasonCode === 'checkpoint_draft_precondition_failed') {
+      return {
+        tool: session.tool,
+        outcome: 'skipped-checkpoint-fresh',
+        reasonCode,
+      };
+    }
+    return {
+      tool: session.tool,
+      outcome: 'checkpoint-error',
+      reasonCode,
+    };
+  }
 }
 
 // Read the audit log once and derive the set of (runtime, sessionId) keys we have ALREADY floored. This
@@ -115,21 +204,57 @@ export async function runCaptureFloorSweep(
   const idleMs = options.idleMs ?? FLOOR_IDLE_MS;
   const lookbackMs = options.lookbackMs ?? FLOOR_LOOKBACK_MS;
   const maxPerSweep = options.maxPerSweep ?? FLOOR_MAX_PER_SWEEP;
+  const checkpointStaleMs = options.checkpointStaleMs ?? idleMs;
   const runtimes = options.runtimes ?? SWEEP_RUNTIMES;
-  const result: FloorSweepResult = { scanned: 0, journaled: 0, outcomes: [] };
+  const result: FloorSweepResult = {
+    scanned: 0,
+    journaled: 0,
+    outcomes: [],
+    checkpointed: 0,
+    checkpointOutcomes: [],
+  };
 
   const flooredKeys = await readFlooredKeys(workspace);
 
   // Over-fetch so the per-runtime / idle / dedup filters below still leave up to maxPerSweep to write.
-  // skipAnchors: true keeps this discovery entirely OFF the synchronous-git path (gitAnchors /
-  // inferProjectDir / chooseHermesProject) — the floor never reads anchors/projectDir, and this sweep
-  // runs on the MCP server's single event-loop thread at startup, where a blocking git probe would
-  // delay the initialize handshake and tool calls.
+  // skipAnchors prevents construction of handoff anchors. Stage 4 still resolves project identity for
+  // the explicitly selected floor runtimes (Hermes needs a bounded git-root probe for tool workdirs),
+  // because an exact project binding is required before any checkpoint draft can be finalized.
   let sessions: Awaited<ReturnType<typeof listResumableSessions>>;
   try {
-    sessions = await listResumableSessions(maxPerSweep * 6 + 12, options.excludeSessionId, { skipAnchors: true });
+    sessions = await listResumableSessions(maxPerSweep * 6 + 12, options.excludeSessionId, {
+      skipAnchors: true,
+      resolveProject: true,
+      runtimes,
+    });
   } catch {
     return result; // discovery failed — nothing to do, never crash
+  }
+
+  // Checkpoint crash floor runs before journal dedupe. A session may already have a low-weight floor
+  // journal while a newer cooperative checkpoint draft is still open; the journal key must not freeze
+  // that checkpoint lane forever. Discovery resolves only the project binding; full live checkpoint
+  // anchors are read only after an exact, stale, valid draft has been found.
+  for (const session of sessions) {
+    if (result.checkpointed >= maxPerSweep) break;
+    if (!runtimes.has(session.tool)) continue;
+    const sessionId = typeof session.sessionId === 'string' ? session.sessionId.trim() : '';
+    if (!sessionId) continue;
+    if (options.excludeSessionId && sessionId === options.excludeSessionId) continue;
+    const lastMs = Date.parse(session.modifiedAt);
+    if (!Number.isFinite(lastMs)) continue;
+    const ageMs = now - lastMs;
+    if (ageMs < idleMs || ageMs > lookbackMs) continue;
+    const outcome = await finalizeStaleCheckpointDraft(
+      workspace,
+      session,
+      now,
+      checkpointStaleMs,
+      options.checkpointAnchorProvider,
+    );
+    if (!outcome) continue;
+    result.checkpointOutcomes.push(outcome);
+    if (outcome.outcome === 'checkpointed-partial') result.checkpointed += 1;
   }
 
   for (const session of sessions) {

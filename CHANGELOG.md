@@ -8,6 +8,26 @@ with pre-release tags.
 
 ## [Unreleased]
 
+### Added
+
+- **Checkpoint Core.** Mutable, short-lived drafts now finalize into immutable hash-addressed `CheckpointArtifactV1` JSON with deterministic canonical hashing, a 32 KiB hard bound, explicit omission counts, atomic no-overwrite storage, dedup/supersedes, workspace locking, rejection audit, and read/list/inspect APIs. Claims and engine-collected anchors remain separate inputs, and secret/schema/integrity failures fail closed.
+- **Native PreCompact and crash-floor resume.** Claude Code and Codex native `PreCompact` hooks finalize bounded transcript-free checkpoints under an 8 s host-fail-open watchdog, while stale valid drafts can be recovered as bounded partial shadow checkpoints by the crash-floor path. Private content-bound indexes avoid unbounded scans and keep artifact persistence fail-closed.
+- **Checkpoint-first continue.** `memory.continue` and the CLI now prefer complete checkpoints, then partial/shadow checkpoints, before transcript and floor-journal candidates; checkpoint claims remain explicitly UNVERIFIED until live machine anchors are recomputed.
+- **Protection state.** `status` reports the latest complete, partial, and floor evidence, stale/newer material, bounded or unknown worst-loss estimates, degraded lookup state, and activation degradation without erasing validated checkpoint evidence.
+- **Activation truth.** A local append-only evidence ledger and live Claude Code/Codex hook-wiring checks distinguish `ACTIVE`, `READY — WAITING FOR FIRST ACTIVITY`, `TOOLS ONLY`, and `NEEDS REPAIR`; static capability, synthetic probes, started-only events, and malformed/manual payloads do not count as live activation.
+- **Hermes native lifecycle package.** The npm surface now includes the Hermes Plugin (`plugin.yaml` and `__init__.py`) plus the `ihow-memory-hermes-bridge` executable for bounded lifecycle recall/checkpoint dispatch. Prior adapter-lane real-host evidence is represented only as `HOST VERIFIED/READY`; the merged package is not independently certifiable as `ACTIVE`, remains local release-ready only, and has not been published.
+
+### Changed
+
+- **Verify-first checkpoint hardening.** Same-HEAD `statusHash` drift is RED, and a checkpoint candidate with a missing `statusHash` fails closed instead of earning a trusted verdict. Git anchor collection disables repository-controlled `textconv` and `core.fsmonitor` execution while preserving canonical status hashing.
+- **Hook and runtime integrity.** Claude Code and Codex hooks use the workspace-frozen `.runtime/cli.js`, canonical workspace bindings, strict ownership reconciliation, safe argv quoting, third-party config preservation, integrity-stamped atomic runtime refresh, and exact official-CLI rollback on failed replacement.
+- **alpha.27 package prep.** Local package metadata is bumped to `0.1.0-alpha.27` for release-candidate validation.
+
+### Notes
+
+- This checkout is local release-ready only: no push, tag, publish, release, or deploy is part of this change.
+- This alpha candidate does not claim production certification; runtime support remains limited to the documented alpha and single-machine smoke boundaries.
+
 ## [0.1.0-alpha.26] — 2026-07-11
 
 ### Added

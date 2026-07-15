@@ -1,6 +1,6 @@
 {
   "name": "ihow-memory",
-  "version": "0.1.0-alpha.26",
+  "version": "0.1.0-alpha.27",
   "type": "module",
   "description": "Local-first shared memory for AI agents with zero-dependency FTS, citations, governance, and MCP.",
   "keywords": [
@@ -26,6 +26,7 @@
   "files": [
     "bin/",
     "dist/",
+    "integrations/hermes/ihow-memory/",
     "LICENSE",
     "NOTICE",
     "TRADEMARK.md",
@@ -38,7 +39,8 @@
   ],
   "bin": {
     "ihow-memory": "bin/ihow-memory.mjs",
-    "ihow-memory-mcp": "dist/mcp/server.js"
+    "ihow-memory-mcp": "dist/mcp/server.js",
+    "ihow-memory-hermes-bridge": "dist/hermes-bridge.js"
   },
   "engines": {
     "node": ">=22.12"
@@ -51,7 +53,7 @@
     "preactivation-proof": "npm run build",
     "activation-proof": "node scripts/activation-proof.mjs",
     "proof": "node scripts/proof.mjs",
-    "test": "node --test \"tests/**/*.test.mjs\"",
+    "test": "node scripts/run-tests.mjs",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run build",
     "secret-scan": "node scripts/secret-scan.mjs"

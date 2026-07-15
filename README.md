@@ -21,6 +21,8 @@ iHow Memory is a local, shared-memory runtime for heterogeneous coding agents �
 3. **Safe writes + governance.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event.
 4. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
 
+**Alpha.27 local candidate (`0.1.0-alpha.27`; local release-ready only):** the bounded immutable Checkpoint Core is wired to native Claude Code and Codex `PreCompact`, stale valid drafts have a bounded partial checkpoint crash-floor, and `memory.continue` uses checkpoint-first ordering before transcript and floor-journal candidates. `status` exposes protection state without treating degraded evidence as exact; live verification rejects same-HEAD `statusHash` drift and fails closed when a checkpoint `statusHash` is missing. Repository-controlled `textconv` and `core.fsmonitor` commands are disabled during git anchor collection. Hook execution remains host-fail-open under its watchdog while checkpoint persistence and trust decisions remain fail-closed. The package also carries the Hermes Plugin and its `ihow-memory-hermes-bridge` executable for the Hermes native lifecycle; prior adapter-lane real-host evidence supports only the bounded label `HOST VERIFIED/READY`, and the merged package is not independently certifiable as `ACTIVE`. This checkout has not been published or otherwise pushed, tagged, released, or deployed, and it is not a production certification.
+
 ## Quickstart — first success in about 3 minutes
 
 ### 1. Set up locally
@@ -30,6 +32,8 @@ npx ihow-memory@next setup
 ```
 
 `setup` detects installed runtimes, connects the local MCP server, installs proactive memory behavior only where the runtime exposes a stable surface, and runs `doctor`. It is idempotent, backs up edited config, and ends with one result card: what connected, what is verified or pending, whether a restart is required, where local data lives, and the one next command.
+
+Activation is evidence-based, not inferred from installation text. `doctor` reports **ACTIVE** only after a valid live Claude/Codex hook completes on the currently verified wiring generation; **READY — WAITING FOR FIRST ACTIVITY** means the native hooks are configured but have not yet produced qualifying live evidence; **TOOLS ONLY** means MCP/cooperative tools are available without a verified lifecycle hook; **NEEDS REPAIR** means previously configured managed wiring is missing, duplicated, malformed, dead, or bound to the wrong workspace. Synthetic probes and started-only events never become ACTIVE. The activation ledger stores only hashed bindings and bounded metadata—never prompts, transcripts, environment values, or error text.
 
 Want a zero-write preview first?
 
@@ -103,7 +107,7 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 
 ### Updating
 
-`connect` freezes a runtime copy of the server into the workspace, so `npm update` does **not** refresh the running MCP server by itself. After updating the package, run `npx ihow-memory@next upgrade` (then restart the runtime) to refresh the connected server. `doctor` warns when the connected server is older than the installed package (a "runtime-bundle" check).
+`connect` freezes a runtime copy of the server and CLI into the workspace. Claude Code and Codex hooks are pinned to that workspace's `.runtime/cli.js` (with the full workspace binding), rather than the package install or an evictable `npx` cache path. Because `npm update` does **not** refresh this frozen runtime by itself, run `npx ihow-memory@next upgrade` (then restart the runtime) after updating. `doctor` warns when the connected server is older than the installed package (a "runtime-bundle" check).
 
 ## Runtime support
 
@@ -111,8 +115,8 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 
 | Runtime | connect | resume reader | Notes |
 | --- | --- | --- | --- |
-| Claude Code | ✓ (`claude mcp add-json`) | ✓ | real-app + ongoing dogfood; skill + auto-capture hooks |
-| Codex | ✓ (`codex mcp add`) | ✓ | native SessionStart/UserPromptSubmit hooks + proactive `~/.codex/AGENTS.md` memory loop; single-machine real-app smoke |
+| Claude Code | ✓ (`claude mcp add-json`) | ✓ | real-app + ongoing dogfood; skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks |
+| Codex | ✓ (`codex mcp add`) | ✓ | native SessionStart / PreCompact / UserPromptSubmit hooks + proactive `~/.codex/AGENTS.md` memory loop; single-machine real-app smoke |
 | OpenClaw | ✓ (`~/.openclaw/openclaw.json`) | ✓ | single-machine real-app smoke (memory.continue + git preflight) |
 | Hermes | ✓ (`hermes mcp add`) | ✓ (JSON + `state.db`) | single-machine real-app smoke |
 | OpenCode | ✓ (`~/.config/opencode`) | ✓ (`opencode.db`) | single-machine real-app smoke |
@@ -123,7 +127,7 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 | Gemini CLI | ✓ (`~/.gemini/settings.json`) | ✓ (`~/.gemini/tmp/*/logs.json`) | passive reader of Gemini's on-disk **user-prompt log** (Gemini records no assistant turns) → session topic + git anchors; manual `GEMINI.md` nudge. Verified against real local data |
 | Cline (VS Code) | — (add via Cline's own MCP settings) | ✓ (`globalStorage` / `~/.cline/data`) | passive reader of `tasks/<id>/api_conversation_history.json`; cwd from `environment_details`. Fixture-tested, not yet real-app smoke |
 
-The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / UserPromptSubmit hooks. Codex uses native SessionStart / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the Codex capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
+The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / PreCompact / UserPromptSubmit hooks. Codex uses native SessionStart / PreCompact / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the existing capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. The Alpha.27 PreCompact checkpoint path is bounded, transcript-free, and host-fail-open; its crash-floor and checkpoint-first continue path remain fail-closed on artifact or anchor uncertainty. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
 
 ### Runtimes wired without an auto-injected resume nudge (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
 
@@ -310,8 +314,10 @@ In that mode the write boundary is strict: existing durable Markdown is read-onl
 - **Hook installed but nothing captured (Claude Code).** Restart Claude Code after `install-hook` so it loads the settings. The cooperative Stop hook depends on the agent honoring the prompt; the deterministic SessionStart floor only fires for a *previous* session that ended without a cooperative journal (so a session that already journaled is correctly skipped). Inspect outcomes with `npx ihow-memory@next audit`.
 - **Codex hooks installed but not firing.** Restart Codex after `connect --runtime codex --easy` / `install-hook --runtime codex`. If Codex asks you to review hooks, open `/hooks` and trust the iHow Memory command hooks; writing `hooks.json` is the installation step, while Codex still owns the trust gate.
 - **`connect --auto` across projects only backs up one.** Floor capture is single-cwd (see Limitations).
-- **npx cache cleared / hook command broke.** Installing from an `npx` cache path can be wiped; for a durable hook install globally (`npm i -g ihow-memory`) then re-run `install-hook`.
-- **Windows.** Use WSL; native Windows is experimental.
+- **Old hook points into a cleared `npx` cache.** Re-run `npx ihow-memory@next setup` (or `install-hook` for that workspace). It moves only strictly identified iHow entries into canonical hook groups, removes duplicate iHow entries, and points them at the workspace-frozen `.runtime/cli.js` without replacing third-party hooks. Hook argv are shell-escaped, including workspaces whose paths contain spaces, quotes, `$`, or backticks.
+- **Turn prompt recall back off after it was installed.** Re-run `install-hook --no-recall` (or `setup --no-recall`). It removes only iHow's managed `UserPromptSubmit` recall entry and preserves third-party prompt hooks.
+- **Setup refreshed the frozen runtime bundle.** The bundle is integrity-stamped, staged, and validated before an atomic directory swap; the per-space `semantic.json` opt-in is preserved. Setup reports the affected registered runtime as requiring reload/restart instead of claiming no changes. If an official Claude/Codex CLI replacement add fails, setup restores the exact previous registration when possible and reports any failed rollback as a real mutation.
+- **Windows.** Use WSL; native Windows is experimental. Native installs fail closed on unsafe shell metacharacters rather than emitting an injectable hook command.
 
 ## Proactive memory
 
@@ -378,7 +384,7 @@ A hosted runtime is not included in this npm package or this repository.
 
 ## Status
 
-Alpha prerelease (`0.1.0-alpha` line — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex now has native SessionStart/UserPromptSubmit hooks plus a proactive AGENTS memory loop; the other runtimes are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they can call the tools but cannot resume). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated daily on macOS and Linux; native Windows is **experimental** — the `packageDir` path bug is fixed and a `windows-latest` CI lane covers build + a connect/doctor reachability smoke + the full test suite, with WSL as the supported path. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
+Alpha prerelease candidate `0.1.0-alpha.27` (local release-ready only — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex now has native SessionStart/UserPromptSubmit hooks plus a proactive AGENTS memory loop; the other runtimes are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they can call the tools but cannot resume). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated daily on macOS and Linux; native Windows is **experimental** — the `packageDir` path bug is fixed and a `windows-latest` CI lane covers build + a connect/doctor reachability smoke + the full test suite, with WSL as the supported path. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
 
 **Which version has what (dist-tags).** Prereleases publish under the `next` dist-tag; `npm install ihow-memory` resolves `latest`.
 

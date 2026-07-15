@@ -1,0 +1,10 @@
+name: ihow-memory
+version: "0.1.0"
+description: Fail-open Hermes lifecycle adapter for iHow Memory recall and checkpoint signals.
+hooks:
+  - on_session_start
+  - on_session_reset
+  - pre_llm_call
+  - post_llm_call
+  - on_session_finalize
+  - on_session_end

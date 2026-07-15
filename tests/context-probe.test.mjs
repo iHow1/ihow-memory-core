@@ -241,7 +241,7 @@ test('fresh-root doctor keeps unmaterialized runtime bundle as a warning, not a 
     await fs.rm(root, { recursive: true, force: true });
     await fs.rm(home, { recursive: true, force: true });
   });
-  const out = execFileSync(process.execPath, [CLI, 'doctor', '--root', root, '--space', 'fresh', '--json'], {
+  const out = execFileSync(process.execPath, [CLI, 'doctor', '--root', root, '--space', 'fresh', '--cwd', root, '--json'], {
     encoding: 'utf8',
     env: { ...process.env, HOME: home, IHOW_CAPTURE_FLOOR: '0' },
   });

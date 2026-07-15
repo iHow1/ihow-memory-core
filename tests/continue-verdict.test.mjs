@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { computeContinueVerdict, referencedHead } from '../src/handoff.ts';
 import { gitAnchors } from '../src/anchors.ts';
@@ -22,6 +23,28 @@ async function tmpRepo(t) {
   await fs.writeFile(path.join(dir, 'a.txt'), 'one');
   g('add', '.'); g('commit', '-qm', 'first');
   return { dir, g };
+}
+
+function capturedGitAnchors(dir) {
+  const raw = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+  const porcelain = raw(['status', '--porcelain=v1', '--untracked-files=all']);
+  const cachedDiff = raw(['diff', '--no-ext-diff', '--binary', '--cached', 'HEAD', '--']);
+  const unstagedDiff = raw(['diff', '--no-ext-diff', '--binary', '--']);
+  const untracked = raw(['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean).sort();
+  const hash = crypto.createHash('sha256')
+    .update(porcelain).update('\0')
+    .update(cachedDiff).update('\0')
+    .update(unstagedDiff).update('\0');
+  for (const file of untracked) {
+    const blob = raw(['hash-object', '--no-filters', '--', file]).trim();
+    hash.update(file).update('\0').update(blob).update('\0');
+  }
+  const live = gitAnchors(dir);
+  return {
+    ...live,
+    dirty: (live.dirtyCount ?? 0) > 0,
+    statusHash: hash.digest('hex'),
+  };
 }
 
 test('GREEN when the live repo matches the recorded anchors', async (t) => {
@@ -40,6 +63,49 @@ test('RED when HEAD drifted (someone committed since)', async (t) => {
   const v = computeContinueVerdict(recorded, dir, 'clean narrative');
   assert.equal(v.state, 'RED', v.reason);
   assert.match(v.reason, /drift/i);
+});
+
+test('worktree statusHash drift never earns GREEN at the same HEAD and branch', async (t) => {
+  await t.test('captured clean to live dirty', async (t) => {
+    const { dir } = await tmpRepo(t);
+    const recorded = capturedGitAnchors(dir);
+    await fs.writeFile(path.join(dir, 'a.txt'), 'live dirty');
+
+    const v = computeContinueVerdict(recorded, dir, 'clean narrative');
+    assert.equal(v.state, 'RED', v.reason);
+    assert.match(v.reason, /worktree drift/i);
+  });
+
+  await t.test('captured dirty to live clean', async (t) => {
+    const { dir } = await tmpRepo(t);
+    await fs.writeFile(path.join(dir, 'a.txt'), 'captured dirty');
+    const recorded = capturedGitAnchors(dir);
+    await fs.writeFile(path.join(dir, 'a.txt'), 'one');
+
+    const v = computeContinueVerdict(recorded, dir, 'clean narrative');
+    assert.equal(v.state, 'RED', v.reason);
+    assert.match(v.reason, /worktree drift/i);
+  });
+
+  await t.test('captured dirty statusHash A to live dirty statusHash B', async (t) => {
+    const { dir } = await tmpRepo(t);
+    await fs.writeFile(path.join(dir, 'a.txt'), 'dirty version A');
+    const recorded = capturedGitAnchors(dir);
+    await fs.writeFile(path.join(dir, 'a.txt'), 'dirty version B');
+
+    const v = computeContinueVerdict(recorded, dir, 'clean narrative');
+    assert.equal(v.state, 'RED', v.reason);
+    assert.match(v.reason, /worktree drift/i);
+  });
+
+  await t.test('exact dirty statusHash match remains GREEN', async (t) => {
+    const { dir } = await tmpRepo(t);
+    await fs.writeFile(path.join(dir, 'a.txt'), 'same dirty state');
+    const recorded = capturedGitAnchors(dir);
+
+    const v = computeContinueVerdict(recorded, dir, 'clean narrative');
+    assert.equal(v.state, 'GREEN', v.reason);
+  });
 });
 
 test('YELLOW when the project is undetermined', () => {

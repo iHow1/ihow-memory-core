@@ -41,6 +41,35 @@ import {
 import * as telemetry from './telemetry.ts';
 import { runCaptureFloorSweep } from './floor.ts';
 import { automationMatrix, worstAutomationStatus, type AutomationMatrixRow } from './automation-doctor.ts';
+import {
+  activationConfigurationId,
+  appendActivationEvidenceFailOpen,
+  readActivationEvidence,
+  type ActivationEvidenceEvent,
+  type ActivationEvidenceSource,
+} from './activation-ledger.ts';
+import {
+  claudeHookConfigPaths,
+  claudeHookInstallPath,
+  codexHookConfigPath,
+  commandHookIsAbsent,
+  commandHookIsCurrent,
+  ensureCommandHook,
+  hookEventShapesValid,
+  IHOW_HOOK_OWNER,
+  preCompactHookCommand,
+  recallHookCommand,
+  removeCommandHooks,
+  sessionStartHookCommand,
+  stopHookCommand,
+  verifyRuntimeHookWiring,
+} from './hook-wiring.ts';
+import {
+  NATIVE_PRECOMPACT_INPUT_MAX_BYTES,
+  normalizeNativePreCompactTrigger,
+  runNativePreCompact,
+  type NativePreCompactTrigger,
+} from './native-precompact.ts';
 import { explainPromptRecall, recallExplanationFromSelection } from './recall-explanation.ts';
 import {
   PROMPT_RECALL_INCLUDE_LIMIT,
@@ -83,6 +112,8 @@ type ParsedArgs = {
     apply?: boolean;
     update?: boolean;
     autoPromote?: boolean;
+    hookOwner?: string;
+    synthetic?: boolean;
     from?: string;
     fromDraft?: string;
     scope?: string;
@@ -110,6 +141,278 @@ type DoctorResult = {
   automationMatrix?: AutomationMatrixRow[];
   automationMetrics?: Record<string, unknown>;
 };
+
+async function recordConfiguredActivation(
+  workspace: ReturnType<typeof resolveWorkspace>,
+  runtime: string,
+  source: Extract<ActivationEvidenceSource, 'setup' | 'connect' | 'install-hook'>,
+  options: ParsedArgs['options'],
+  allowGenerationChange = false,
+): Promise<boolean> {
+  if (runtime !== 'claude-code' && runtime !== 'codex') return false;
+  const wiring = await verifyRuntimeHookWiring(workspace, runtime, options);
+  if (wiring.state !== 'current' || !wiring.generationId) return false;
+  const configurationId = activationConfigurationId(wiring.generationId);
+  let priorConfigured: Awaited<ReturnType<typeof readActivationEvidence>>;
+  try {
+    priorConfigured = (await readActivationEvidence(workspace))
+      .filter((row) => row.runtime === runtime && row.status === 'configured');
+  } catch {
+    return false;
+  }
+  const generationAlreadyTrusted = priorConfigured.some((row) => row.configuration?.id === configurationId);
+  // An idempotent/already-present path must never authenticate an out-of-band generation change.
+  // Only a caller that actually rewrote managed hooks or refreshed the frozen bundle may open a new epoch.
+  if (priorConfigured.length > 0 && !generationAlreadyTrusted && !allowGenerationChange) return false;
+  await appendActivationEvidenceFailOpen(workspace, {
+    runtime,
+    event: 'runtime-configured',
+    source,
+    status: 'configured',
+    // Generation includes exact managed commands, integrity-checked installation epochs, and frozen CLI identity.
+    // Unchanged reruns dedupe; an actual repaired config or runtime bundle produces a fresh installation epoch.
+    dedupeKey: wiring.generationId,
+    configurationKey: wiring.generationId,
+  });
+  return true;
+}
+
+async function hookGenerationNeedsRepair(
+  workspace: ReturnType<typeof resolveWorkspace>,
+  runtime: 'claude-code' | 'codex',
+  options: ParsedArgs['options'],
+): Promise<boolean> {
+  try {
+    const wiring = await verifyRuntimeHookWiring(workspace, runtime, options);
+    if (wiring.state !== 'current' || !wiring.generationId) return false;
+    const configured = (await readActivationEvidence(workspace))
+      .filter((row) => row.runtime === runtime && row.status === 'configured');
+    if (!configured.length) return false;
+    const current = activationConfigurationId(wiring.generationId);
+    return !configured.some((row) => row.configuration?.id === current);
+  } catch {
+    return false;
+  }
+}
+
+async function runHookWithActivation(
+  options: ParsedArgs['options'],
+  event: Extract<ActivationEvidenceEvent, 'hook-stop' | 'hook-session-start' | 'hook-user-prompt-submit'>,
+  handler: (payload: Record<string, unknown> | undefined) => Promise<void>,
+): Promise<void> {
+  let payload: Record<string, unknown> | undefined;
+  try {
+    const raw = await readStdinSafe();
+    if (raw.trim()) {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>;
+    }
+  } catch {
+    await handler(undefined).catch(() => {});
+    return;
+  }
+
+  const expectedEvent = event === 'hook-stop'
+    ? 'Stop'
+    : event === 'hook-session-start'
+      ? 'SessionStart'
+      : 'UserPromptSubmit';
+  const sessionId = typeof payload?.session_id === 'string' ? payload.session_id.trim() : '';
+  const eventName = typeof payload?.hook_event_name === 'string' ? payload.hook_event_name : '';
+  const cwd = typeof payload?.cwd === 'string' && payload.cwd.trim() ? payload.cwd : options.cwd;
+  let workspace: ReturnType<typeof resolveWorkspace> | undefined;
+  if (sessionId && eventName === expectedEvent) {
+    try {
+      workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd }));
+    } catch {
+      workspace = undefined;
+    }
+  }
+
+  // Invalid/empty/manual payloads preserve hook fail-open behavior but create no native-live evidence.
+  if (!workspace) {
+    await handler(payload).catch(() => {});
+    return;
+  }
+
+  const runtime = options.runtime === 'codex' ? 'codex' : 'claude-code';
+  const invocationKey = JSON.stringify({
+    event,
+    sessionId,
+    source: typeof payload?.source === 'string' ? payload.source : '',
+    transcript: typeof payload?.transcript_path === 'string' ? payload.transcript_path : '',
+  });
+  if (options.synthetic) {
+    await handler(payload).catch(() => {});
+    await appendActivationEvidenceFailOpen(workspace, {
+      runtime,
+      event: 'synthetic-check',
+      source: 'synthetic-proof',
+      status: 'synthetic',
+      dedupeKey: invocationKey,
+    });
+    return;
+  }
+
+  const prompt = ['prompt', 'user_prompt', 'userPrompt', 'message', 'input']
+    .map((key) => payload?.[key])
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  const handlerWouldAct = event === 'hook-stop'
+    ? payload?.stop_hook_active !== true
+    : event === 'hook-user-prompt-submit'
+      ? !process.env.IHOW_RECALL_OFF && !!prompt
+      : true;
+  const expectedCli = path.join(workspace.spaceDir, '.runtime', 'cli.js');
+  let invokedFromCurrentBundle = false;
+  try {
+    const [actual, expected] = await Promise.all([fs.realpath(path.resolve(process.argv[1] || '')), fs.realpath(expectedCli)]);
+    invokedFromCurrentBundle = actual === expected;
+  } catch {
+    invokedFromCurrentBundle = false;
+  }
+  const wiring = options.hookOwner === IHOW_HOOK_OWNER && invokedFromCurrentBundle && handlerWouldAct
+    ? await verifyRuntimeHookWiring(workspace, runtime, options).catch(() => undefined)
+    : undefined;
+  // A shell command that merely resembles a host event is not activation evidence. Live rows require
+  // the explicit managed owner, the workspace-frozen CLI, current exact wiring, and a handler path that
+  // is not a recursion guard / recall no-op. Manual/source CLI calls remain fail-open but non-activating.
+  if (!wiring || wiring.state !== 'current' || !wiring.generationId) {
+    await handler(payload).catch(() => {});
+    return;
+  }
+
+  await appendActivationEvidenceFailOpen(workspace, {
+    runtime,
+    event,
+    source: 'native-hook',
+    status: 'observed-live-started',
+    dedupeKey: invocationKey,
+    configurationKey: wiring.generationId,
+  });
+  try {
+    await handler(payload);
+    await appendActivationEvidenceFailOpen(workspace, {
+      runtime,
+      event,
+      source: 'native-hook',
+      status: 'observed-live-completed',
+      dedupeKey: invocationKey,
+      configurationKey: wiring.generationId,
+    });
+  } catch {
+    await appendActivationEvidenceFailOpen(workspace, {
+      runtime,
+      event,
+      source: 'native-hook',
+      status: 'failed',
+      dedupeKey: invocationKey,
+      configurationKey: wiring.generationId,
+    });
+    // Host hook contract is fail-open: activation bookkeeping and handler failures never block it.
+  }
+}
+
+function preCompactBudgetMs(): number {
+  const requested = Number(process.env.IHOW_PRECOMPACT_BUDGET_MS);
+  if (Number.isSafeInteger(requested) && requested >= 100 && requested <= 8_000) return requested;
+  return 8_000;
+}
+
+async function verifiedPreCompactGeneration(
+  options: ParsedArgs['options'],
+  workspace: ReturnType<typeof resolveWorkspace>,
+  contract: NativePreCompactTrigger,
+): Promise<string | undefined> {
+  if (options.synthetic || options.hookOwner !== IHOW_HOOK_OWNER) return undefined;
+  const expectedCli = path.join(workspace.spaceDir, '.runtime', 'cli.js');
+  try {
+    const [actual, expected] = await Promise.all([
+      fs.realpath(path.resolve(process.argv[1] || '')),
+      fs.realpath(expectedCli),
+    ]);
+    if (actual !== expected) return undefined;
+  } catch {
+    return undefined;
+  }
+  const wiring = await verifyRuntimeHookWiring(workspace, contract.runtime, { ...options, cwd: contract.project.cwd }).catch(() => undefined);
+  return wiring?.state === 'current' ? wiring.generationId : undefined;
+}
+
+// Compact hooks have a hard availability contract: iHow may lose this checkpoint attempt, but it may
+// never hold up host compaction. The process-level watchdog is intentional; Stage 2 persistence is
+// crash-safe/fail-closed, while an uncancellable filesystem operation must not outlive the host budget.
+async function runPreCompactHookCommand(options: ParsedArgs['options']): Promise<void> {
+  const budgetMs = preCompactBudgetMs();
+  const hardDeadline = setTimeout(() => process.exit(0), budgetMs);
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const raw = await readStdinBounded(NATIVE_PRECOMPACT_INPUT_MAX_BYTES);
+    if (!raw.trim()) return;
+    let payload: unknown;
+    try { payload = JSON.parse(raw); } catch { return; }
+    const runtime = options.runtime === 'codex' ? 'codex' : 'claude-code';
+    let contract: NativePreCompactTrigger;
+    try { contract = normalizeNativePreCompactTrigger(runtime, payload); } catch { return; }
+
+    let workspace: Awaited<ReturnType<typeof ensureWorkspace>>;
+    try {
+      workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd: contract.project.cwd }));
+    } catch {
+      return;
+    }
+    const generation = await verifiedPreCompactGeneration(options, workspace, contract);
+    if (generation) {
+      await appendActivationEvidenceFailOpen(workspace, {
+        runtime: contract.runtime,
+        event: 'hook-pre-compact',
+        source: 'native-hook',
+        status: 'observed-live-started',
+        observedAt: contract.observedAt,
+        dedupeKey: contract.delivery.dedupeKey,
+        configurationKey: generation,
+      });
+    }
+
+    let timedOut = false;
+    const workBudget = Math.max(1, budgetMs - 150);
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        reject(new Error('native_precompact_timeout'));
+      }, workBudget);
+    });
+    try {
+      await Promise.race([runNativePreCompact(contract, options), deadline]);
+      if (generation) {
+        await appendActivationEvidenceFailOpen(workspace, {
+          runtime: contract.runtime,
+          event: 'hook-pre-compact',
+          source: 'native-hook',
+          status: 'observed-live-completed',
+          dedupeKey: contract.delivery.dedupeKey,
+          configurationKey: generation,
+        });
+      }
+    } catch {
+      if (generation) {
+        await appendActivationEvidenceFailOpen(workspace, {
+          runtime: contract.runtime,
+          event: 'hook-pre-compact',
+          source: 'native-hook',
+          status: 'failed',
+          dedupeKey: contract.delivery.dedupeKey,
+          configurationKey: generation,
+        });
+      }
+      if (timedOut) process.exit(0);
+    }
+  } catch {
+    // Invalid/oversized input and every internal error are fail-open to host compaction.
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    clearTimeout(hardDeadline);
+  }
+}
 
 function parseArgs(argv: string[]): ParsedArgs {
   const [command = 'help', ...tail] = argv;
@@ -159,6 +462,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--apply') options.apply = true;
     else if (arg === '--update') options.update = true;
     else if (arg === '--no-auto-promote') options.autoPromote = false;
+    else if (arg === '--hook-owner') options.hookOwner = tail[++index];
+    else if (arg === '--synthetic') options.synthetic = true;
     else if (arg === '--from') options.from = tail[++index];
     else if (arg === '--from-draft') options.fromDraft = tail[++index];
     else if (arg === '--scope') {
@@ -288,19 +593,136 @@ function initBackupGuidance(runtime?: string): string {
   return 'Before writing this snippet into any runtime config, back up the existing config file.';
 }
 
-async function installRuntimeBundle(workspace: Awaited<ReturnType<typeof ensureWorkspace>>): Promise<string> {
+type RuntimeBundleManifest = {
+  type?: string;
+  version?: string;
+  integrity?: { files?: Record<string, string> };
+};
+
+async function fileSha256(file: string): Promise<string> {
+  return crypto.createHash('sha256').update(await fs.readFile(file)).digest('hex');
+}
+
+async function runtimeFileIntegrity(root: string): Promise<Record<string, string>> {
+  const files: Record<string, string> = {};
+  async function walk(relative: string): Promise<void> {
+    const directory = path.join(root, relative);
+    const entries = (await fs.readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const next = relative ? path.join(relative, entry.name) : entry.name;
+      const absolute = path.join(root, next);
+      if (entry.isSymbolicLink()) throw new Error(`runtime_bundle_symlink_not_allowed:${next}`);
+      if (entry.isDirectory()) await walk(next);
+      else if (entry.isFile()) files[next.split(path.sep).join('/')] = await fileSha256(absolute);
+      else throw new Error(`runtime_bundle_special_file_not_allowed:${next}`);
+    }
+  }
+  await walk('');
+  return files;
+}
+
+async function targetMatchesIntegrity(target: string, expected: Record<string, string>): Promise<boolean> {
+  try {
+    for (const [relative, sha256] of Object.entries(expected)) {
+      const file = path.join(target, ...relative.split('/'));
+      const stat = await fs.lstat(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size === 0 || await fileSha256(file) !== sha256) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runtimeBundleHealthy(workspace: Awaited<ReturnType<typeof ensureWorkspace>>): Promise<boolean> {
   const source = path.join(packageDir(), 'dist');
   const target = path.join(workspace.spaceDir, '.runtime');
   try {
-    await fs.access(path.join(source, 'mcp', 'server.js'));
+    const [manifest, expected] = await Promise.all([
+      fs.readFile(path.join(target, 'package.json'), 'utf8'),
+      runtimeFileIntegrity(source),
+    ]);
+    const parsed = JSON.parse(manifest) as RuntimeBundleManifest;
+    if (parsed.type !== 'module' || parsed.version !== packageVersion() ||
+      !parsed.integrity?.files || !isDeepStrictEqual(parsed.integrity.files, expected)) return false;
+    return targetMatchesIntegrity(target, expected);
+  } catch {
+    return false;
+  }
+}
+
+async function installRuntimeBundle(
+  workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
+  options: { force?: boolean } = {},
+): Promise<string> {
+  const source = path.join(packageDir(), 'dist');
+  const target = path.join(workspace.spaceDir, '.runtime');
+  if (!options.force && await runtimeBundleHealthy(workspace)) return target;
+  const sourceCli = path.join(source, 'cli.js');
+  const sourceServer = path.join(source, 'mcp', 'server.js');
+  try {
+    const [cli, server] = await Promise.all([fs.lstat(sourceCli), fs.lstat(sourceServer)]);
+    if (!cli.isFile() || cli.isSymbolicLink() || cli.size === 0 ||
+      !server.isFile() || server.isSymbolicLink() || server.size === 0) throw new Error('invalid_source');
   } catch {
     throw new Error('runtime_bundle_missing_run_npm_build');
   }
-  await fs.rm(target, { recursive: true, force: true });
-  await fs.cp(source, target, { recursive: true });
-  // Stamp the real package version into the runtime bundle so the MCP server (run from .runtime/) reports the right version.
-  await fs.writeFile(path.join(target, 'package.json'), `${JSON.stringify({ type: 'module', version: packageVersion() }, null, 2)}\n`, 'utf8');
-  return target;
+
+  // semantic.json is explicit per-space user state even though it lives beside the frozen runtime.
+  // Preserve it across bundle refreshes; never follow a symlink into arbitrary external content.
+  let semanticConfig: Buffer | null = null;
+  const semanticPath = path.join(target, 'semantic.json');
+  try {
+    const stat = await fs.lstat(semanticPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('runtime_semantic_config_must_be_regular_file');
+    semanticConfig = await fs.readFile(semanticPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  // Build and validate beside the live directory, then swap. A failed copy never removes the old bundle.
+  const nonce = `${process.pid}-${crypto.randomUUID()}`;
+  const staged = path.join(workspace.spaceDir, `.runtime.ihow-tmp-${nonce}`);
+  const backup = path.join(workspace.spaceDir, `.runtime.ihow-bak-${nonce}`);
+  let movedOld = false;
+  try {
+    await fs.cp(source, staged, { recursive: true });
+    const [expected, stagedIntegrity] = await Promise.all([
+      runtimeFileIntegrity(source),
+      runtimeFileIntegrity(staged),
+    ]);
+    if (!isDeepStrictEqual(stagedIntegrity, expected)) throw new Error('runtime_bundle_stage_invalid');
+    if (semanticConfig) await fs.writeFile(path.join(staged, 'semantic.json'), semanticConfig);
+    const manifest: RuntimeBundleManifest = {
+      type: 'module',
+      version: packageVersion(),
+      integrity: { files: expected },
+    };
+    await fs.writeFile(path.join(staged, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    try {
+      await fs.rename(target, backup);
+      movedOld = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    await fs.rename(staged, target);
+    if (movedOld) await fs.rm(backup, { recursive: true, force: true }).catch(() => {});
+    return target;
+  } catch (error) {
+    await fs.rm(staged, { recursive: true, force: true }).catch(() => {});
+    if (movedOld) {
+      try {
+        await fs.access(target);
+      } catch {
+        await fs.rename(backup, target).catch(() => {});
+      }
+    }
+    throw error;
+  } finally {
+    await fs.rm(staged, { recursive: true, force: true }).catch(() => {});
+    // If rollback itself failed, leave the backup in place for manual recovery rather than deleting
+    // the last known-good bundle. Successful swaps/remediations remove it above.
+  }
 }
 
 // Version stamped into a connected workspace's frozen .runtime bundle (the code the MCP server actually
@@ -345,11 +767,12 @@ type NormalizedMcpSpec = {
   args: string[];
   env: Record<string, string>;
   envVars: string[];
+  cwd: string | null;
 };
 
 function normalizeMcpSpec(value: unknown): NormalizedMcpSpec | null {
   if (!value || typeof value !== 'object') return null;
-  const candidate = value as { command?: unknown; args?: unknown; env?: unknown; env_vars?: unknown; envVars?: unknown };
+  const candidate = value as { command?: unknown; args?: unknown; env?: unknown; env_vars?: unknown; envVars?: unknown; cwd?: unknown };
   if (typeof candidate.command !== 'string') return null;
   if (candidate.args !== undefined && !Array.isArray(candidate.args)) return null;
   const args = (candidate.args || []).map((arg) => typeof arg === 'string' ? arg : String(arg));
@@ -364,11 +787,13 @@ function normalizeMcpSpec(value: unknown): NormalizedMcpSpec | null {
   const rawEnvVars = candidate.env_vars ?? candidate.envVars ?? [];
   if (!Array.isArray(rawEnvVars)) return null;
   const envVars = rawEnvVars.map((key) => typeof key === 'string' ? key : String(key)).sort();
+  if (candidate.cwd !== undefined && candidate.cwd !== null && typeof candidate.cwd !== 'string') return null;
   return {
     command: candidate.command,
     args,
     env: Object.fromEntries(Object.entries(env).sort(([a], [b]) => a.localeCompare(b))),
     envVars,
+    cwd: typeof candidate.cwd === 'string' ? candidate.cwd : null,
   };
 }
 
@@ -384,15 +809,39 @@ function claudeConfigPath(): string {
   return path.join(configuredDir || os.homedir(), '.claude.json');
 }
 
-function readClaudeUserMcpSpec(): NormalizedMcpSpec | null {
+type ClaudeCanonicalMcpEntry = {
+  present: boolean;
+  raw?: unknown;
+  normalized: NormalizedMcpSpec | null;
+  exactlyRestorable: boolean;
+};
+
+function readClaudeUserMcpEntry(): ClaudeCanonicalMcpEntry {
   try {
     const config = JSON.parse(readFileSync(claudeConfigPath(), 'utf8')) as {
       mcpServers?: Record<string, unknown>;
     };
-    return normalizeMcpSpec(config.mcpServers?.['ihow-memory']);
-  } catch {
-    return null;
+    if (!config.mcpServers || !Object.prototype.hasOwnProperty.call(config.mcpServers, 'ihow-memory')) {
+      return { present: false, normalized: null, exactlyRestorable: false };
+    }
+    const raw = config.mcpServers['ihow-memory'];
+    const normalized = normalizeMcpSpec(raw);
+    const record = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+    const allowed = new Set(['type', 'command', 'args', 'env', 'env_vars', 'envVars', 'cwd']);
+    const exactlyRestorable = !!normalized && !!record &&
+      [...Object.keys(record)].every((key) => allowed.has(key)) &&
+      (record.type === undefined || record.type === 'stdio') &&
+      normalized.cwd === null && normalized.envVars.length === 0;
+    return { present: true, raw, normalized, exactlyRestorable };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+      ? { present: false, normalized: null, exactlyRestorable: false }
+      : { present: true, normalized: null, exactlyRestorable: false };
   }
+}
+
+function specUsesDesiredBundle(existing: NormalizedMcpSpec, desired: NormalizedMcpSpec): boolean {
+  return existing.command === desired.command && existing.args[0] === desired.args[0];
 }
 
 type ClaudeVisibleScope = 'user' | 'project' | 'local' | 'unknown';
@@ -662,6 +1111,31 @@ async function writeJsonMcpConfig(
   };
 }
 
+class RuntimeConnectFailure extends Error {
+  runtime: string;
+  configChanged: boolean;
+  registrationUsesCurrentBundle: boolean;
+
+  constructor(message: string, runtime: string, configChanged: boolean, registrationUsesCurrentBundle = false) {
+    super(message);
+    this.name = 'RuntimeConnectFailure';
+    this.runtime = runtime;
+    this.configChanged = configChanged;
+    this.registrationUsesCurrentBundle = registrationUsesCurrentBundle;
+  }
+}
+
+function claudeAddJsonArgs(spec: { command: string; args: string[]; env?: Record<string, string> }): string[] {
+  return ['mcp', 'add-json', '--scope', 'user', 'ihow-memory', JSON.stringify({
+    type: 'stdio', command: spec.command, args: spec.args, env: spec.env ?? {},
+  })];
+}
+
+function codexAddArgs(spec: { command: string; args: string[]; env?: Record<string, string> }): string[] {
+  const env = Object.entries(spec.env ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
+  return ['mcp', 'add', 'ihow-memory', ...env, '--', spec.command, ...spec.args];
+}
+
 // claude-code prefers the official CLI (claude mcp add-json --scope user): atomic, officially
 // supported, and avoids racing Claude Code's own writes to ~/.claude.json.
 // Returns null when the claude CLI is absent -> caller falls back to writeJsonMcpConfig.
@@ -671,8 +1145,9 @@ function connectViaClaudeCli(
 ): Record<string, unknown> | null {
   if (!commandExists('claude')) return null;
   const desired = desiredMcpSpec(spec);
-  const existing = readClaudeUserMcpSpec();
-  const canonicalUserEntry = existing !== null;
+  const canonical = readClaudeUserMcpEntry();
+  const existing = canonical.normalized;
+  const canonicalUserEntry = canonical.present;
   // `claude mcp get` is human-readable only: argv is space-joined without boundary quoting, the
   // environment listing is not a completeness contract, and the selected scope cannot be proven
   // reliably. It may establish that a name exists, but canonical user-scope JSON is the sole source
@@ -699,21 +1174,29 @@ function connectViaClaudeCli(
     }
     visibleScope = exists ? parseClaudeVisibleScope(get.stdout || '') : 'unknown';
   }
+  // Destructive replacement is allowed only with a complete, reversible canonical user snapshot.
+  // Project/local-only visibility is safe to leave untouched while adding user scope. A visible
+  // user/unknown entry without readable canonical JSON must be repaired manually rather than removed.
+  if (canonicalUserEntry && (!existing || !canonical.exactlyRestorable)) {
+    throw new RuntimeConnectFailure(
+      'claude_mcp_existing_user_spec_not_exactly_restorable_refusing_remove',
+      'claude-code', false, existing ? specUsesDesiredBundle(existing, desired) : true,
+    );
+  }
+  if (!canonicalUserEntry && exists && (visibleScope === 'user' || visibleScope === 'unknown')) {
+    throw new RuntimeConnectFailure(
+      'claude_mcp_visible_user_spec_unavailable_refusing_remove',
+      'claude-code', false, true,
+    );
+  }
   if (options.dryRun) {
     return {
       ok: true, runtime: 'claude-code', method: 'official-cli:claude',
       alreadyExists: exists, unchanged, changed: !unchanged, dryRun: true,
     };
   }
-  // A visible project/local entry does not imply that a removable user entry exists. The real
-  // Claude CLI permits adding the same name at user scope alongside a narrower-scope entry, while
-  // `remove --scope user` fails when only project/local exists. Remove only when canonical config
-  // proves a user entry, the CLI reports user scope, or scope is unknown. Under unknown scope, the
-  // real "No user-scoped MCP server found" result is safe evidence to continue with the user add.
   let removedUserEntry = false;
-  const shouldTryUserRemove = canonicalUserEntry
-    || (exists && (visibleScope === 'user' || visibleScope === 'unknown'));
-  if (shouldTryUserRemove) {
+  if (canonicalUserEntry) {
     const remove = spawnSync('claude', ['mcp', 'remove', 'ihow-memory', '--scope', 'user'], { encoding: 'utf8' });
     if (remove.status === 0) {
       removedUserEntry = true;
@@ -721,10 +1204,24 @@ function connectViaClaudeCli(
       throw new Error(`claude_mcp_remove_failed: ${(remove.stderr || remove.stdout || '').slice(0, 300)}`);
     }
   }
-  const json = JSON.stringify({ type: 'stdio', command: spec.command, args: spec.args });
-  const add = spawnSync('claude', ['mcp', 'add-json', '--scope', 'user', 'ihow-memory', json], { encoding: 'utf8' });
+  const add = spawnSync('claude', claudeAddJsonArgs(desired), { encoding: 'utf8' });
   if (add.status !== 0) {
-    throw new Error(`claude_mcp_add_failed: ${(add.stderr || add.stdout || '').slice(0, 300)}`);
+    const detail = (add.stderr || add.stdout || '').slice(0, 300);
+    if (removedUserEntry && existing) {
+      const rollback = spawnSync('claude', claudeAddJsonArgs(existing), { encoding: 'utf8' });
+      if (rollback.status === 0) {
+        throw new RuntimeConnectFailure(
+          `claude_mcp_add_failed_rolled_back: ${detail}`,
+          'claude-code', false, specUsesDesiredBundle(existing, desired),
+        );
+      }
+      throw new RuntimeConnectFailure(
+        `claude_mcp_add_failed_and_rollback_failed: ${detail}; rollback=${(rollback.stderr || rollback.stdout || '').slice(0, 200)}`,
+        'claude-code', true,
+      );
+    }
+    if (removedUserEntry) throw new RuntimeConnectFailure(`claude_mcp_add_failed_after_remove: ${detail}`, 'claude-code', true);
+    throw new Error(`claude_mcp_add_failed: ${detail}`);
   }
   return {
     ok: true, runtime: 'claude-code', method: 'official-cli:claude',
@@ -747,6 +1244,15 @@ function connectViaCodexCli(
   const desired = desiredMcpSpec(spec);
   const existing = exists ? parseCodexMcpGet(get.stdout || '') : null;
   const unchanged = existing !== null && isDeepStrictEqual(existing, desired);
+  if (exists && !existing) {
+    throw new RuntimeConnectFailure('codex_mcp_existing_spec_unparseable_refusing_remove', 'codex', false, true);
+  }
+  if (existing && (existing.cwd !== null || existing.envVars.length > 0)) {
+    throw new RuntimeConnectFailure(
+      'codex_mcp_existing_spec_has_nonrestorable_cwd_or_env_vars_refusing_remove',
+      'codex', false, specUsesDesiredBundle(existing, desired),
+    );
+  }
   if (options.dryRun) {
     return {
       ok: true, runtime: 'codex', method: 'official-cli:codex',
@@ -766,9 +1272,24 @@ function connectViaCodexCli(
       throw new Error(`codex_mcp_remove_failed: ${(remove.stderr || remove.stdout || '').slice(0, 300)}`);
     }
   }
-  const add = spawnSync('codex', ['mcp', 'add', 'ihow-memory', '--', spec.command, ...spec.args], { encoding: 'utf8' });
+  const add = spawnSync('codex', codexAddArgs(desired), { encoding: 'utf8' });
   if (add.status !== 0) {
-    throw new Error(`codex_mcp_add_failed: ${(add.stderr || add.stdout || '').slice(0, 300)}`);
+    const detail = (add.stderr || add.stdout || '').slice(0, 300);
+    if (exists && existing) {
+      const rollback = spawnSync('codex', codexAddArgs(existing), { encoding: 'utf8' });
+      if (rollback.status === 0) {
+        throw new RuntimeConnectFailure(
+          `codex_mcp_add_failed_rolled_back: ${detail}`,
+          'codex', false, specUsesDesiredBundle(existing, desired),
+        );
+      }
+      throw new RuntimeConnectFailure(
+        `codex_mcp_add_failed_and_rollback_failed: ${detail}; rollback=${(rollback.stderr || rollback.stdout || '').slice(0, 200)}`,
+        'codex', true,
+      );
+    }
+    if (exists) throw new RuntimeConnectFailure(`codex_mcp_add_failed_after_remove: ${detail}`, 'codex', true);
+    throw new Error(`codex_mcp_add_failed: ${detail}`);
   }
   return {
     ok: true, runtime: 'codex', method: 'official-cli:codex',
@@ -1166,51 +1687,19 @@ async function maybeInstallCodexMemoryLoop(): Promise<'installed' | 'already' | 
 
 type HookInstallOutcome = 'installed' | 'already' | 'skipped' | 'failed';
 
-type CommandHookEntry = {
-  type: 'command';
-  command: string;
-  timeout?: number;
-  statusMessage?: string;
-};
-
-type HookGroup = {
-  matcher?: string;
-  hooks?: CommandHookEntry[];
-};
-
-function ensureCommandHook(
-  hooks: Record<string, unknown>,
-  event: string,
-  marker: string,
-  command: string,
-  hook: Omit<CommandHookEntry, 'type' | 'command'> = {},
-  matcher?: string,
-): boolean {
-  const list = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
-  const present = list.some((group) => {
-    const entries = (group as { hooks?: unknown[] })?.hooks;
-    return Array.isArray(entries) && entries.some((entry) => {
-      const cmd = (entry as { command?: string })?.command;
-      return typeof cmd === 'string' && cmd.includes(marker) && cmd.includes('ihow-memory');
-    });
-  });
-  if (present) return false;
-  const group: HookGroup = { hooks: [{ type: 'command', command, ...hook }] };
-  if (matcher) group.matcher = matcher;
-  list.push(group);
-  hooks[event] = list;
-  return true;
-}
-
-// Codex hook installer. Codex supports hooks.json at ~/.codex/hooks.json with SessionStart and
-// UserPromptSubmit events. We install only low-noise hooks here:
+// Stage 3 candidate: current official Codex hooks support PreCompact in hooks.json (verified against
+// the shipped 0.144.1 schema as well as upstream generated schemas), so setup wires the bounded,
+// transcript-free, host-fail-open checkpoint adapter here. It does not yet feed continue or a crash
+// floor, and Codex still has no SessionEnd. We install only low-noise hooks here:
 //   - SessionStart: resume-awareness hint + deterministic cross-runtime floor trigger
+//   - PreCompact: bounded transcript-free checkpoint finalizer
 //   - UserPromptSubmit: relevant curated-memory recall
 // Stop is intentionally not installed yet: Codex documents Stop as turn-scope, not necessarily
 // process-exit/session-end, so using the Claude session-end nudge there could interrupt normal turns.
 async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<HookInstallOutcome> {
   if (options.installHook === false) return 'skipped';
-  const dest = path.join(codexHomeDir(), 'hooks.json');
+  const workspace = resolveWorkspace(options);
+  const dest = codexHookConfigPath();
   let config: Record<string, unknown> = {};
   let existed = false;
   try {
@@ -1227,27 +1716,37 @@ async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<H
     return 'failed';
   }
   const hooks = (config.hooks ?? {}) as Record<string, unknown>;
-  if ((hooks.SessionStart !== undefined && !Array.isArray(hooks.SessionStart)) ||
-    (hooks.UserPromptSubmit !== undefined && !Array.isArray(hooks.UserPromptSubmit))) {
-    return 'failed';
-  }
+  if (!hookEventShapesValid(hooks, ['SessionStart', 'PreCompact', 'UserPromptSubmit'])) return 'failed';
+  const forceGeneration = await hookGenerationNeedsRepair(workspace, 'codex', options);
   const addedStart = ensureCommandHook(
     hooks,
     'SessionStart',
     'hook-session-start',
-    sessionStartHookCommand(options),
+    sessionStartHookCommand(workspace, 'codex'),
     { timeout: 30, statusMessage: 'Checking iHow Memory handoff' },
     'startup|resume|clear|compact',
+    forceGeneration,
   );
-  const addedRecall = options.recall !== false ? ensureCommandHook(
+  const addedPreCompact = ensureCommandHook(
+    hooks,
+    'PreCompact',
+    'hook-pre-compact',
+    preCompactHookCommand(workspace, 'codex'),
+    { timeout: 10, statusMessage: 'Saving iHow Memory checkpoint' },
+    undefined,
+    forceGeneration,
+  );
+  const recallChanged = options.recall !== false ? ensureCommandHook(
     hooks,
     'UserPromptSubmit',
     'hook-user-prompt-submit',
-    recallHookCommand(options),
+    recallHookCommand(workspace, 'codex'),
     { timeout: 30, statusMessage: 'Searching iHow Memory' },
-  ) : false;
+    undefined,
+    forceGeneration,
+  ) : removeCommandHooks(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit');
 
-  if (!addedStart && !addedRecall) return 'already';
+  if (!addedStart && !addedPreCompact && !recallChanged) return 'already';
   config.hooks = hooks;
   try {
     await fs.mkdir(path.dirname(dest), { recursive: true });
@@ -1283,8 +1782,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   const json = options.json === true;
   const line = (s = ''): void => { if (!json) console.log(s); };
   // Run a printing helper with stdout silenced — so reused install functions don't pollute --json output.
-  const silently = async (fn: () => Promise<void>): Promise<void> => {
-    if (!json) return fn();
+  const silently = async (fn: () => Promise<unknown>): Promise<void> => {
+    if (!json) { await fn(); return; }
     const orig = console.log;
     console.log = () => {};
     try { await fn(); } finally { console.log = orig; }
@@ -1344,11 +1843,15 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
 
   // workspace + bundle (once); a write failure here is the one hard stop
   let workspace;
+  let bundleChanged = false;
   try {
     // dry-run must touch NOTHING: resolveWorkspace is pure (computes paths, no fs writes); ensureWorkspace
     // materializes the dir tree + index-manifest. Only materialize for a real run.
     workspace = dryRun ? resolveWorkspace(options) : await ensureWorkspace(resolveWorkspace(options));
-    if (!dryRun) await installRuntimeBundle(workspace);
+    if (!dryRun) {
+      bundleChanged = !(await runtimeBundleHealthy(workspace));
+      await installRuntimeBundle(workspace);
+    }
   } catch (caught) {
     const err = caught instanceof Error ? caught.message : String(caught);
     if (json) printJson({
@@ -1400,10 +1903,19 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
         line(`       ⚠ ${d.runtime}  config written but NOT reachable — ${v.detail} (check the runtime config, then re-run: ihow-memory setup)`);
       }
     } catch (caught) {
+      if (caught instanceof RuntimeConnectFailure &&
+        (caught.configChanged || (bundleChanged && caught.registrationUsesCurrentBundle))) {
+        changedRuntimes.add(d.runtime);
+      }
       const error = caught instanceof Error ? caught.message : String(caught);
       skipped.push({ runtime: d.runtime, error });
       line(`       · skipped ${d.runtime}: ${error}`);
     }
+  }
+  // A refreshed bundle matters only to runtimes whose registration/config path survived this setup.
+  // Do not claim an applied change or request a restart for a runtime that failed before registration.
+  if (bundleChanged) {
+    for (const result of [...connected, ...unverified]) changedRuntimes.add(result.runtime);
   }
 
   // 3/4 Claude Code only: install the memory skill + auto-capture hook (forced non-interactive)
@@ -1416,7 +1928,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     line('       · (no Claude Code detected — skill + auto-capture hook are Claude Code only)');
   } else if (dryRun) {
     line('       · would install memory skill → ~/.claude/skills/ihow-memory/');
-    line(`       · would install Stop + SessionStart auto-capture hook${options.recall === false ? '' : ' + UserPromptSubmit recall (reviewed-first + guarded auto soft facts)'} ${options.globalHook ? '[all Claude Code projects]' : '[this project only]'}`);
+    line(`       · would install Stop + SessionStart + PreCompact checkpoint hooks${options.recall === false ? '' : ' + UserPromptSubmit recall (reviewed-first + guarded auto soft facts)'} ${options.globalHook ? '[all Claude Code projects]' : '[this project only]'}`);
     skill = 'dry-run'; hook = 'dry-run';
   } else {
     // The install helpers can no-op (unparseable settings, unreadable bundle) or throw on an fs error;
@@ -1434,7 +1946,8 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     try { await silently(() => maybeInstallStopHook({ ...options, installHook: options.installHook !== false })); } catch { hookThrew = true; }
     const afterSkill = await fs.readFile(skillPath, 'utf8').catch(() => null);
     const afterHook = await fs.readFile(hookPath, 'utf8').catch(() => null);
-    if (beforeSkill !== afterSkill || beforeHook !== afterHook) changedRuntimes.add('claude-code');
+    const hookConfigChanged = beforeHook !== afterHook;
+    if (beforeSkill !== afterSkill || hookConfigChanged) changedRuntimes.add('claude-code');
     line(`       · recall ${options.recall === false ? 'OFF (--no-recall)' : 'ON — reviewed-first + guarded auto soft facts, relevant-only, bounded seamless fenced reference (off: --no-recall / IHOW_RECALL_OFF=1; reviewed-only: IHOW_RECALL_AUTO_DEFAULT=0)'}`);
     if (options.installSkill === false) skill = 'skipped';
     else {
@@ -1445,11 +1958,30 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     else {
       let wired = false;
       try {
-        const raw = await fs.readFile(hookPath, 'utf8');
-        wired = raw.includes('hook-stop') && raw.includes('hook-session-start') && raw.includes('ihow-memory');
+        const parsed = JSON.parse(await fs.readFile(hookPath, 'utf8')) as { hooks?: unknown };
+        const hooks = parsed.hooks && typeof parsed.hooks === 'object' && !Array.isArray(parsed.hooks)
+          ? parsed.hooks as Record<string, unknown>
+          : {};
+        wired = commandHookIsCurrent(hooks, 'Stop', 'hook-stop', {
+          type: 'command', command: stopHookCommand(workspace), timeout: 30,
+        }) && commandHookIsCurrent(hooks, 'SessionStart', 'hook-session-start', {
+          type: 'command', command: sessionStartHookCommand(workspace, 'claude-code'), timeout: 30,
+        }) && commandHookIsCurrent(hooks, 'PreCompact', 'hook-pre-compact', {
+          type: 'command', command: preCompactHookCommand(workspace, 'claude-code'), timeout: 10,
+        });
+        if (options.recall !== false) {
+          wired = wired && commandHookIsCurrent(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit', {
+            type: 'command', command: recallHookCommand(workspace, 'claude-code'), timeout: 30,
+          });
+        } else {
+          wired = wired && commandHookIsAbsent(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit');
+        }
       } catch { wired = false; }
       hook = !hookThrew && wired ? 'installed' : 'failed';
     }
+    if (hook === 'installed') await recordConfiguredActivation(
+      workspace, 'claude-code', 'setup', options, hookConfigChanged || bundleChanged,
+    );
   }
 
   // 3/4 (cont.) WorkBuddy has no lifecycle hook; wire cross-thread resume via its BOOTSTRAP.md instead.
@@ -1469,23 +2001,30 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     }
   }
 
-  // 3/4 (cont.) Codex has native hooks. Install the low-noise pair: SessionStart (resume hint + Codex
-  // floor trigger) and UserPromptSubmit (curated recall). Keep the AGENTS.md loop below as the model's
+  // 3/4 (cont.) Codex has native hooks. Install SessionStart (resume hint + Codex floor trigger),
+  // PreCompact (bounded checkpoint), and UserPromptSubmit (curated recall). Keep AGENTS.md as the model's
   // explicit memory-use discipline.
   const hasCodex = present.some((d) => d.runtime === 'codex');
   let codexHooks = 'not-applicable';
   if (hasCodex) {
     if (dryRun) {
-      line(`       · would install Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+      line(options.recall === false
+        ? `       · would install Codex SessionStart + PreCompact hooks with recall OFF → ${codexConfigLabel('hooks.json')}`
+        : `       · would install Codex SessionStart + UserPromptSubmit hooks + PreCompact checkpoint → ${codexConfigLabel('hooks.json')}`);
       codexHooks = 'dry-run';
     } else if (options.installHook === false) {
       codexHooks = 'skipped';
     } else {
       try { codexHooks = await maybeInstallCodexHooks({ ...options, runtime: 'codex' }); } catch { codexHooks = 'failed'; }
       if (codexHooks === 'installed') changedRuntimes.add('codex');
-      if (codexHooks === 'installed') line(`       ✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+      if (codexHooks === 'installed') line(options.recall === false
+        ? `       ✓ installed Codex SessionStart hook + PreCompact checkpoint; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
+        : `       ✓ installed Codex SessionStart + UserPromptSubmit hooks + PreCompact checkpoint → ${codexConfigLabel('hooks.json')}`);
       else if (codexHooks === 'already') line(`       · Codex hooks already present → ${codexConfigLabel('hooks.json')}`);
       else if (codexHooks === 'failed') line(`       ⚠ Codex hooks failed to install → ${codexConfigLabel('hooks.json')}`);
+      if (codexHooks === 'installed' || codexHooks === 'already') {
+        await recordConfiguredActivation(workspace, 'codex', 'setup', options, codexHooks === 'installed' || bundleChanged);
+      }
     }
   }
 
@@ -1627,7 +2166,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
   }
   const memOnTools = [
     hasClaude ? 'Claude Code' : null,
-    hasWorkbuddy && workbuddyResume !== 'failed' ? 'WorkBuddy' : null,
+    hasWorkbuddy && ['installed', 'already'].includes(workbuddyResume) ? 'WorkBuddy' : null,
     hasCodex && codexHooks !== 'failed' && resumeGuidance.codex && !['failed', 'skipped'].includes(resumeGuidance.codex) ? 'Codex' : null,
   ].filter(Boolean);
   const verifiedRt = connected.filter((c) => c.verified).map((c) => c.runtime);
@@ -1728,9 +2267,10 @@ Usage:
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Stop-hook handler (Claude Code session-end nudge; reads hook JSON on stdin)
   ihow-memory hook-session-start          # SessionStart-hook handler (Claude Code marker floor; Codex resume hint + Codex capture floor trigger)
+  ihow-memory hook-pre-compact            # Claude/Codex native PreCompact checkpoint adapter; bounded, transcript-free, fail-open
   ihow-memory hook-user-prompt-submit     # UserPromptSubmit recall — reviewed-first + guarded auto soft facts; relevant-only, bounded, seamless fenced reference. Off: IHOW_RECALL_OFF=1; reviewed-only: IHOW_RECALL_AUTO_DEFAULT=0
   ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
-  ihow-memory install-hook [--runtime claude-code|codex] [--global-hook] [--no-recall] [--no-install-hook]   # Claude Code: Stop + SessionStart + UserPromptSubmit hooks (project-local by default; --global-hook for ~/.claude/settings.json). Codex: SessionStart + UserPromptSubmit hooks in ~/.codex/hooks.json. Recall is ON by default; --no-recall skips it.
+  ihow-memory install-hook [--runtime claude-code|codex] [--global-hook] [--no-recall] [--no-install-hook]   # Claude Code: Stop + SessionStart + PreCompact + UserPromptSubmit hooks (project-local by default; --global-hook for ~/.claude/settings.json). Codex: SessionStart + PreCompact + UserPromptSubmit hooks in ~/.codex/hooks.json. Recall is ON by default; --no-recall skips it.
 
 Defaults:
   root: ${defaultRoot()}
@@ -1864,7 +2404,7 @@ async function doctor(
   const checks: DoctorCheck[] = [];
   const workspace = resolveWorkspace(options);
   const mcpSpec = mcpServerSpec(workspace);
-  const automation = await automationMatrix(workspace, mcpSpec);
+  const automation = await automationMatrix(workspace, mcpSpec, { hookOptions: options });
   const nodeOk = nodeVersionAtLeast(process.versions.node, '22.12.0');
   const sqliteStatus = sqliteRuntimeStatus();
   const writable = await isWritable(workspace.memoryDir);
@@ -1932,17 +2472,36 @@ async function doctor(
   }
 
   const matrixStatus = worstAutomationStatus(automation.rows.map((row) => row.status));
-  const matrixBroken = matrixStatus === 'BROKEN';
+  const selectedRuntimeLabels: Partial<Record<NonNullable<typeof options.runtime>, string>> = {
+    'claude-code': 'Claude Code',
+    codex: 'Codex',
+    openclaw: 'OpenClaw',
+    hermes: 'Hermes',
+    cursor: 'WorkBuddy/OpenCode/Gemini',
+    workbuddy: 'WorkBuddy/OpenCode/Gemini',
+    'claude-desktop': 'WorkBuddy/OpenCode/Gemini',
+    opencode: 'WorkBuddy/OpenCode/Gemini',
+    vscode: 'WorkBuddy/OpenCode/Gemini',
+    gemini: 'WorkBuddy/OpenCode/Gemini',
+  };
+  // A runtime-specific doctor/setup must not be failed by an unrelated runtime's hook config. The
+  // broken row remains visible in the matrix, while an unscoped doctor still audits every configured
+  // runtime. This keeps targeted onboarding composable without weakening the direct misbinding check.
+  const selectedRuntime = options.runtime;
+  const blockingRows = selectedRuntime
+    ? automation.rows.filter((row) => row.runtime === selectedRuntimeLabels[selectedRuntime])
+    : automation.rows;
+  const matrixBroken = blockingRows.some((row) => row.status === 'BROKEN');
   checks.push({
     name: 'automation-matrix',
     ok: !matrixBroken,
-    detail: automation.rows.map((row) => `${row.runtime}:${row.status}`).join(' · '),
+    detail: automation.rows.map((row) => `${row.runtime}:${row.activationStatus}(${row.activationReasonCode})`).join(' · '),
     hint: matrixBroken
       ? 'Fix the broken MCP/hook command path, then rerun ihow-memory doctor.'
-      : matrixStatus === 'WARN'
-        ? 'Connect a runtime or run ihow-memory upgrade to materialize the runtime bundle; warnings do not block local setup.'
+      : matrixStatus === 'WARN' || automation.rows.some((row) => row.status === 'BROKEN')
+        ? 'Connect a runtime or run ihow-memory upgrade to materialize the runtime bundle; unrelated rows and warnings do not block this runtime check.'
         : undefined,
-    severity: matrixBroken ? 'error' : matrixStatus === 'WARN' ? 'warning' : 'info',
+    severity: matrixBroken ? 'error' : matrixStatus === 'WARN' || automation.rows.some((row) => row.status === 'BROKEN') ? 'warning' : 'info',
     required: matrixBroken,
   });
 
@@ -2089,6 +2648,7 @@ async function doctor(
       cooperativeJournalCount: automation.metrics.cooperativeJournalCount,
       pathStatus: automation.path.status,
       pathNotes: automation.path.notes,
+      activationEvidenceCount: automation.evidence.length,
     },
   };
 }
@@ -2376,59 +2936,17 @@ async function maybeInstallClaudeSkill(options: ParsedArgs['options']): Promise<
   console.log(`✓ installed memory skill → ${dest} (restart Claude Code to load it)`);
 }
 
-// The Stop-hook command Claude Code runs: an absolute `node <bin> hook-stop` so it is fast (no npx
-// resolution) and works regardless of PATH. Paths are JSON-quoted for shell safety.
-function stopHookCommand(options: ParsedArgs['options']): string {
-  const bin = path.join(packageDir(), 'bin', 'ihow-memory.mjs');
-  const parts = [JSON.stringify(process.execPath), JSON.stringify(bin), 'hook-stop'];
-  // Bind the connect-time workspace into the hook so hook-stop resolves the SAME memory the MCP
-  // server writes to — otherwise, under a custom root/memory-root, the marker and the journal can
-  // diverge ("hook fired but nothing in memory").
-  if (options.root) parts.push('--root', JSON.stringify(options.root));
-  if (options.space) parts.push('--space', JSON.stringify(options.space));
-  if (options.memoryRoot) parts.push('--memory-root', JSON.stringify(options.memoryRoot));
-  if (options.stateRoot) parts.push('--state-root', JSON.stringify(options.stateRoot));
-  return parts.join(' ');
-}
-
-// The SessionStart-hook command — the capture FLOOR. Same absolute-node + workspace-binding shape as
-// the Stop hook (so it resolves the SAME memory), but runs `hook-session-start` to floor the PREVIOUS
-// session's transcript when that session ended without a cooperative journal.
-function sessionStartHookCommand(options: ParsedArgs['options']): string {
-  const bin = path.join(packageDir(), 'bin', 'ihow-memory.mjs');
-  const parts = [JSON.stringify(process.execPath), JSON.stringify(bin), 'hook-session-start'];
-  if (options.runtime) parts.push('--runtime', JSON.stringify(options.runtime));
-  if (options.root) parts.push('--root', JSON.stringify(options.root));
-  if (options.space) parts.push('--space', JSON.stringify(options.space));
-  if (options.memoryRoot) parts.push('--memory-root', JSON.stringify(options.memoryRoot));
-  if (options.stateRoot) parts.push('--state-root', JSON.stringify(options.stateRoot));
-  return parts.join(' ');
-}
-
-// The UserPromptSubmit-hook command — RECALL (OpenClaw-gated; opt-in only). Same workspace binding so it
-// reads the SAME memory the capture hooks write. Default-off: wired only when the operator passes --recall.
-function recallHookCommand(options: ParsedArgs['options']): string {
-  const bin = path.join(packageDir(), 'bin', 'ihow-memory.mjs');
-  const parts = [JSON.stringify(process.execPath), JSON.stringify(bin), 'hook-user-prompt-submit'];
-  if (options.root) parts.push('--root', JSON.stringify(options.root));
-  if (options.space) parts.push('--space', JSON.stringify(options.space));
-  if (options.memoryRoot) parts.push('--memory-root', JSON.stringify(options.memoryRoot));
-  if (options.stateRoot) parts.push('--state-root', JSON.stringify(options.stateRoot));
-  return parts.join(' ');
-}
-
 // Optionally wire the session-end auto-capture Stop hook into ~/.claude/settings.json. Consent-gated
 // like the skill install. Mirrors connect's MCP-write safety: merges into existing settings (never
 // drops other hooks/keys), refuses to clobber unparseable JSON, backs up before writing, atomic
-// temp+rename, idempotent (skips if our hook is already present).
-async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<void> {
+// temp+rename, idempotent (reconciles our entry in place; skips only when it is already current).
+async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<HookInstallOutcome> {
   // Default to this project's gitignored local settings (the hook command carries a machine-specific
   // absolute path, so it must NOT be committed, and a Stop hook should not fire for unrelated repos).
   // --global-hook opts into the user-wide ~/.claude/settings.json (fires for every Claude Code project).
   const scopeLabel = options.globalHook ? 'global · all Claude Code projects' : 'this project only';
-  const dest = options.globalHook
-    ? path.join(os.homedir(), '.claude', 'settings.json')
-    : path.join(path.resolve(options.cwd || process.cwd()), '.claude', 'settings.local.json');
+  const workspace = resolveWorkspace(options);
+  const dest = claudeHookInstallPath(options);
 
   let proceed = options.installHook === true;
   if (options.installHook === undefined) {
@@ -2442,19 +2960,12 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
       proceed = /^y(es)?$/i.test(answer.trim());
     } else {
       console.log('Tip: for automatic session-end capture, re-run with --install-hook (adds a project-local Stop hook to .claude/settings.local.json by default; --global-hook for ~/.claude/settings.json).');
-      return;
+      return 'skipped';
     }
   }
   if (!proceed) {
     console.log('Skipped auto-capture hook. (Add it later with --install-hook.)');
-    return;
-  }
-
-  // The hook command points at this package's bin (absolute path). That is stable for a global
-  // (`npm i -g`) or local node_modules install, but an `npx` one-off lives in a cache that can be
-  // cleared — which would silently break the hook. Warn so the user installs durably.
-  if (/[\\/]_npx[\\/]/.test(packageDir())) {
-    console.log('Note: installing from an npx cache path, which can be cleared and break the hook. For a durable hook, install globally first (npm i -g ihow-memory), then re-run install-hook.');
+    return 'skipped';
   }
 
   let settings: Record<string, unknown> = {};
@@ -2469,46 +2980,40 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
     if (existed) {
       console.error(`refusing to modify unparseable ${dest} — fix it, or add the Stop hook by hand.`);
       process.exitCode = 1;
-      return;
+      return 'failed';
     }
   }
 
-  const hooks = (settings.hooks && typeof settings.hooks === 'object' && !Array.isArray(settings.hooks)
-    ? settings.hooks
-    : {}) as Record<string, unknown>;
-
-  // Idempotently ensure one command-hook is present under a hook event (Stop / SessionStart), matched
-  // by a command substring so it survives reinstalls. Merges into the existing list — never drops other
-  // hooks or keys. Returns true if it added the hook, false if ours was already present.
-  const ensureHook = (event: string, marker: string, command: string): boolean => {
-    const list = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
-    const present = list.some((group) => {
-      const entries = (group as { hooks?: unknown[] })?.hooks;
-      return Array.isArray(entries) && entries.some((entry) => {
-        const cmd = (entry as { command?: string })?.command;
-        return typeof cmd === 'string' && cmd.includes(marker) && cmd.includes('ihow-memory');
-      });
-    });
-    if (present) return false;
-    list.push({ hooks: [{ type: 'command', command, timeout: 30 }] });
-    hooks[event] = list;
-    return true;
-  };
+  if (settings.hooks !== undefined && (typeof settings.hooks !== 'object' || settings.hooks === null || Array.isArray(settings.hooks))) {
+    console.error(`refusing to modify ${dest} — hooks must be an object; fix the file, then re-run install-hook.`);
+    process.exitCode = 1;
+    return 'failed';
+  }
+  const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
+  if (!hookEventShapesValid(hooks, ['Stop', 'SessionStart', 'PreCompact', 'UserPromptSubmit'])) {
+    console.error(`refusing to modify ${dest} — hook events must contain object groups with hook arrays; fix the file, then re-run install-hook.`);
+    process.exitCode = 1;
+    return 'failed';
+  }
 
   // Two hooks form the auto-capture (write) feature: the Stop hook nudges the agent to journal a handoff
   // at session end (the cooperative path), and the SessionStart hook floors the PREVIOUS session
   // deterministically if it ended without one (the backstop). Both bind the same workspace.
-  const addedStop = ensureHook('Stop', 'hook-stop', stopHookCommand(options));
-  const addedStart = ensureHook('SessionStart', 'hook-session-start', sessionStartHookCommand(options));
+  const forceGeneration = await hookGenerationNeedsRepair(workspace, 'claude-code', options);
+  const addedStop = ensureCommandHook(hooks, 'Stop', 'hook-stop', stopHookCommand(workspace), { timeout: 30 }, undefined, forceGeneration);
+  const addedStart = ensureCommandHook(hooks, 'SessionStart', 'hook-session-start', sessionStartHookCommand(workspace, 'claude-code'), { timeout: 30 }, undefined, forceGeneration);
+  const addedPreCompact = ensureCommandHook(hooks, 'PreCompact', 'hook-pre-compact', preCompactHookCommand(workspace, 'claude-code'), { timeout: 10 }, undefined, forceGeneration);
   // RECALL (read path) installs by DEFAULT; `--no-recall` opts out. Reviewed memory is preferred, while
   // relevant machine-gated auto SOFT facts may surface by default. The shared selector blocks private,
   // flagged, audit-only, unreadable/stale, ambient status, and every behavior-bypass entry; it also applies
   // relevance, recency collapse, redaction, and a bounded seamless reference fence. Set
   // IHOW_RECALL_AUTO_DEFAULT=0 for reviewed-only; IHOW_RECALL_OFF=1 is the runtime kill-switch.
-  const addedRecall = options.recall !== false ? ensureHook('UserPromptSubmit', 'hook-user-prompt-submit', recallHookCommand(options)) : false;
-  if (!addedStop && !addedStart && !addedRecall) {
-    console.log(`✓ ${options.recall !== false ? 'auto-capture + recall hooks' : 'auto-capture hooks'} already present in ${dest}`);
-    return;
+  const recallChanged = options.recall !== false
+    ? ensureCommandHook(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit', recallHookCommand(workspace, 'claude-code'), { timeout: 30 }, undefined, forceGeneration)
+    : removeCommandHooks(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit');
+  if (!addedStop && !addedStart && !addedPreCompact && !recallChanged) {
+    console.log(`✓ ${options.recall !== false ? 'auto-capture + recall hooks' : 'auto-capture hooks (recall OFF)'} already present in ${dest}`);
+    return 'already';
   }
   settings.hooks = hooks;
 
@@ -2524,12 +3029,15 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<voi
   const added = [
     addedStop ? 'Stop (session-end nudge)' : null,
     addedStart ? 'SessionStart (next-session floor)' : null,
-    addedRecall ? 'UserPromptSubmit (recall — reviewed-first + guarded auto soft facts)' : null,
+    addedPreCompact ? 'PreCompact (bounded checkpoint)' : null,
+    recallChanged && options.recall !== false ? 'UserPromptSubmit (recall — reviewed-first + guarded auto soft facts)' : null,
+    recallChanged && options.recall === false ? 'removed managed UserPromptSubmit (recall OFF)' : null,
   ].filter(Boolean).join(' + ');
   console.log(`✓ installed ${added} [${scopeLabel}] → ${dest} (restart Claude Code to load them)`);
-  if (addedRecall) {
+  if (recallChanged && options.recall !== false) {
     console.log('  recall is ON: reviewed memory is preferred, and some relevant machine-gated auto soft facts can appear by default. Ambient unverified status and dangerous behavior priors stay blocked. Output is a seamless bounded <recalled-memory> reference fence, not per-item tags. Turn off install with --no-recall, disable runtime injection with IHOW_RECALL_OFF=1, or restore reviewed-only with IHOW_RECALL_AUTO_DEFAULT=0. IHOW_RECALL_INCLUDE_AUTO=1 adds engine-anchored auto eligibility but never bypasses behavior or status-intent guards.');
   }
+  return 'installed';
 }
 
 const STOP_HOOK_REASON =
@@ -2540,6 +3048,22 @@ async function readStdinSafe(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function readStdinBounded(maxBytes: number): Promise<string> {
+  if (process.stdin.isTTY) return '';
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of process.stdin) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+    total += buffer.length;
+    if (total > maxBytes) {
+      process.stdin.destroy();
+      throw new Error('native_hook_input_too_large');
+    }
+    chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString('utf8');
 }
@@ -2695,14 +3219,8 @@ function hookLog(msg: string): void {
 // memory in-session (via the memory.journal MCP tool) before stopping. Designed to NEVER throw
 // or disrupt the session: any problem -> exit 0 with no output. Captures at most once per
 // session (Stop fires on every turn), and short-circuits when our own block re-fired it.
-async function runStopHook(options: ParsedArgs['options']): Promise<void> {
-  let payload: Record<string, unknown> = {};
-  try {
-    const raw = await readStdinSafe();
-    if (raw.trim()) payload = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return; // unparseable input -> no-op
-  }
+async function runStopHook(options: ParsedArgs['options'], payload?: Record<string, unknown>): Promise<void> {
+  if (!payload) return;
   if (payload.stop_hook_active === true) return; // recursion guard
 
   const sessionId = typeof payload.session_id === 'string' ? payload.session_id : 'unknown';
@@ -2810,14 +3328,8 @@ const FLOOR_MAX_PER_START = 5; // process at most N backlog markers per SessionS
 // rollbackable journal entry (sourceAgent='claude-code-hook'). This is the safety net for sessions that
 // ended without the agent honoring the Stop-hook nudge. It NEVER injects context into the new session
 // (recall stays OFF) and NEVER throws — any problem exits 0 with no output.
-async function runSessionStartHook(options: ParsedArgs['options']): Promise<void> {
-  let payload: Record<string, unknown> = {};
-  try {
-    const raw = await readStdinSafe();
-    if (raw.trim()) payload = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return; // unparseable input -> no-op
-  }
+async function runSessionStartHook(options: ParsedArgs['options'], payload?: Record<string, unknown>): Promise<void> {
+  if (!payload) return;
   const currentSessionId = typeof payload.session_id === 'string' ? payload.session_id : '';
   const cwd = typeof payload.cwd === 'string' ? payload.cwd : options.cwd;
   let workspace;
@@ -3032,15 +3544,8 @@ async function runSessionStartHook(options: ParsedArgs['options']): Promise<void
 // Prompt recall eligibility lives in prompt-recall.ts. The hook only performs input/output adaptation and
 // renders the selector's already-final included set; preview and context_probe call the same selector.
 
-async function runRecallHook(options: ParsedArgs['options']): Promise<void> {
-  if (process.env.IHOW_RECALL_OFF) return; // kill-switch: disable injection and diagnostics without uninstalling
-  let payload: Record<string, unknown> = {};
-  try {
-    const raw = await readStdinSafe();
-    if (raw.trim()) payload = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return; // unparseable input -> no-op, never block
-  }
+async function runRecallHook(options: ParsedArgs['options'], payload?: Record<string, unknown>): Promise<void> {
+  if (process.env.IHOW_RECALL_OFF || !payload) return; // kill-switch / malformed input: fail open
   const prompt = ['prompt', 'user_prompt', 'userPrompt', 'message', 'input']
     .map((key) => payload[key])
     .find((value): value is string => typeof value === 'string' && value.trim().length > 0) ?? '';
@@ -3130,17 +3635,22 @@ async function main(): Promise<void> {
   }
 
   if (command === 'hook-stop') {
-    await runStopHook(options);
+    await runHookWithActivation(options, 'hook-stop', (payload) => runStopHook(options, payload));
     return;
   }
 
   if (command === 'hook-session-start') {
-    await runSessionStartHook(options);
+    await runHookWithActivation(options, 'hook-session-start', (payload) => runSessionStartHook(options, payload));
     return;
   }
 
   if (command === 'hook-user-prompt-submit') {
-    await runRecallHook(options);
+    await runHookWithActivation(options, 'hook-user-prompt-submit', (payload) => runRecallHook(options, payload));
+    return;
+  }
+
+  if (command === 'hook-pre-compact') {
+    await runPreCompactHookCommand(options);
     return;
   }
 
@@ -3150,9 +3660,19 @@ async function main(): Promise<void> {
   }
 
   if (command === 'install-hook') {
+    // Standalone installs need the same durable target as connect/setup. Materialize the workspace and
+    // freeze dist only when cli.js is absent; do not tear down and recopy a healthy live bundle just to
+    // reconcile hook config (upgrade remains the explicit version-refresh path).
+    const workspace = resolveWorkspace(options);
+    if (options.installHook !== false) await installRuntimeBundle(await ensureWorkspace(workspace));
     if (options.runtime === 'codex') {
       const outcome = await maybeInstallCodexHooks({ ...options, installHook: options.installHook !== false });
-      if (outcome === 'installed') console.log(`✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+      if (outcome === 'installed' || outcome === 'already') {
+        await recordConfiguredActivation(workspace, 'codex', 'install-hook', options, outcome === 'installed');
+      }
+      if (outcome === 'installed') console.log(options.recall === false
+        ? `✓ installed Codex SessionStart hook + PreCompact checkpoint; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
+        : `✓ installed Codex SessionStart + UserPromptSubmit hooks + PreCompact checkpoint → ${codexConfigLabel('hooks.json')}`);
       else if (outcome === 'already') console.log(`✓ Codex hooks already present in ${codexConfigLabel('hooks.json')}`);
       else if (outcome === 'skipped') console.log('Skipped Codex hooks. (Add them later with install-hook --runtime codex.)');
       else {
@@ -3160,7 +3680,10 @@ async function main(): Promise<void> {
         process.exitCode = 1;
       }
     } else {
-      await maybeInstallStopHook({ ...options, installHook: options.installHook !== false });
+      const outcome = await maybeInstallStopHook({ ...options, installHook: options.installHook !== false });
+      if ((outcome === 'installed' || outcome === 'already') && process.exitCode !== 1) {
+        await recordConfiguredActivation(workspace, 'claude-code', 'install-hook', options, outcome === 'installed');
+      }
     }
     return;
   }
@@ -3238,18 +3761,21 @@ async function main(): Promise<void> {
     // Non-zero exit when the configured server isn't reachable — the same contract the text path honors,
     // and what CHANGELOG promises to --json callers (who are exactly the scripts that check exit codes).
     if (verification && !verification.reachable) process.exitCode = 1;
-    const silently = async (fn: () => Promise<void>): Promise<void> => {
-      if (!options.json) return fn();
+    const silently = async (fn: () => Promise<unknown>): Promise<void> => {
+      if (!options.json) { await fn(); return; }
       const orig = console.log;
       console.log = () => {};
       try { await fn(); } finally { console.log = orig; }
     };
+    let claudeHooks: HookInstallOutcome | null = null;
     if (!result.dryRun && options.runtime === 'claude-code' && options.json) {
       if (options.installSkill === true) {
         try { await silently(() => maybeInstallClaudeSkill(options)); } catch { process.exitCode = 1; }
       }
       if (options.installHook === true) {
-        try { await silently(() => maybeInstallStopHook(options)); } catch { process.exitCode = 1; }
+        try {
+          await silently(async () => { claudeHooks = await maybeInstallStopHook(options); });
+        } catch { process.exitCode = 1; }
       }
     }
     let codexHooks: HookInstallOutcome | null = null;
@@ -3283,9 +3809,11 @@ async function main(): Promise<void> {
         if (!v.reachable) process.exitCode = 1;
         if (options.runtime === 'claude-code') {
           await maybeInstallClaudeSkill(options);
-          await maybeInstallStopHook(options);
+          claudeHooks = await maybeInstallStopHook(options);
         } else if (options.runtime === 'codex' && options.easy && options.installHook !== false) {
-          if (codexHooks === 'installed') console.log(`✓ installed Codex SessionStart + UserPromptSubmit hooks → ${codexConfigLabel('hooks.json')}`);
+          if (codexHooks === 'installed') console.log(options.recall === false
+            ? `✓ installed Codex SessionStart hook + PreCompact checkpoint; managed UserPromptSubmit recall is OFF → ${codexConfigLabel('hooks.json')}`
+            : `✓ installed Codex SessionStart + UserPromptSubmit hooks + PreCompact checkpoint → ${codexConfigLabel('hooks.json')}`);
           else if (codexHooks === 'already') console.log(`· Codex hooks already present → ${codexConfigLabel('hooks.json')}`);
           else if (codexHooks === 'failed') {
             console.log(`⚠ Codex hooks failed to install → ${codexConfigLabel('hooks.json')}`);
@@ -3301,6 +3829,13 @@ async function main(): Promise<void> {
       }
     }
     if (!result.dryRun) {
+      await recordConfiguredActivation(
+        workspace,
+        options.runtime,
+        'connect',
+        options,
+        claudeHooks === 'installed' || codexHooks === 'installed',
+      );
       await telemetry.track('connect', { runtime: options.runtime });
       if (!options.json) await maybeAskTelemetry();
     }
@@ -3761,7 +4296,7 @@ async function main(): Promise<void> {
       if (result.automationMatrix?.length) {
         console.log('automation matrix:');
         for (const row of result.automationMatrix) {
-          console.log(`- ${row.status} ${row.runtime}: start=${row.sessionStartResume}; prompt=${row.promptRecall}; end=${row.sessionEndCapture}; floor=${row.floorFallback}; probes=${row.probeCalls}; notes=${row.notes}`);
+          console.log(`- ${row.activationStatus} ${row.runtime} [${row.activationReasonCode}]: wiring=${row.status}; start=${row.sessionStartResume}; prompt=${row.promptRecall}; end=${row.sessionEndCapture}; floor=${row.floorFallback}; probes=${row.probeCalls}; notes=${row.notes}`);
         }
       }
     }
@@ -3910,7 +4445,7 @@ async function main(): Promise<void> {
     // running the old MCP server. (npm update alone does not refresh .runtime — see runtimeBundleVersion.)
     const workspace = await ensureWorkspace(resolveWorkspace(options));
     const before = await runtimeBundleVersion(workspace);
-    await installRuntimeBundle(workspace);
+    await installRuntimeBundle(workspace, { force: true });
     const after = packageVersion();
     // B6 (go/no-go #5): re-handshake after re-stamping. An upgrade that froze a BROKEN bundle would
     // otherwise report success while a connected runtime fails to load it. Probe a fresh server process
@@ -4299,7 +4834,7 @@ main().catch((error) => {
   // Match the COMMAND word only (argv[2] = the subcommand for `ihow-memory <cmd> …`), never any argv
   // token — otherwise `ihow-memory search hook-stop` or a candidate body mentioning a hook name would
   // wrongly swallow a real failure.
-  const HOOK_COMMANDS = new Set(['hook-stop', 'hook-session-start', 'hook-user-prompt-submit']);
+  const HOOK_COMMANDS = new Set(['hook-stop', 'hook-session-start', 'hook-pre-compact', 'hook-user-prompt-submit']);
   if (HOOK_COMMANDS.has(process.argv[2])) {
     process.exitCode = 0;
     return;

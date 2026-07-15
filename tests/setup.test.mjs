@@ -37,6 +37,14 @@ async function dirs(t) {
 async function exists(p) {
   try { await fs.access(p); return true; } catch { return false; }
 }
+async function makeCodexShim(t) {
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-bin-'));
+  const shim = path.join(bin, 'codex');
+  await fs.writeFile(shim, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory"; exit 0; fi\nexit 0\n', 'utf8');
+  await fs.chmod(shim, 0o755);
+  t.after(async () => { await fs.rm(bin, { recursive: true, force: true }); });
+  return bin;
+}
 async function countBackups(...roots) {
   let n = 0;
   async function walk(dir) {
@@ -50,6 +58,10 @@ async function countBackups(...roots) {
   }
   for (const r of roots) await walk(r);
   return n;
+}
+
+function hookEntries(settings, event) {
+  return (settings.hooks?.[event] ?? []).flatMap((group) => group.hooks ?? []);
 }
 
 test('setup --runtime claude-code: writes MCP + skill + hook and reports success', async (t) => {
@@ -83,6 +95,158 @@ test('setup is idempotent — re-running changes nothing and adds no new backups
   assert.equal(json2.applied, false, 'idempotent re-run truthfully reports that nothing was applied');
   assert.equal(json2.restart.required, false, 'idempotent re-run truthfully reports no restart');
   assert.deepEqual(json2.restart.runtimes, [], 'no runtime is listed for restart on an idempotent re-run');
+});
+
+test('setup refreshes a stale runtime bundle atomically and reports restart required', async (t) => {
+  const { home, root, proj } = await dirs(t);
+  const args = ['setup', '--runtime', 'claude-code', '--root', root, '--space', 't', '--cwd', proj];
+  run(args, home);
+  const runtimeDir = path.join(root, 't', '.runtime');
+  const semantic = '{"enabled":true,"provider":"local-test"}\n';
+  await fs.writeFile(path.join(runtimeDir, 'semantic.json'), semantic, 'utf8');
+  await fs.writeFile(path.join(runtimeDir, 'package.json'), `${JSON.stringify({ type: 'module', version: '0.0.0-stale' }, null, 2)}\n`, 'utf8');
+
+  const result = JSON.parse(run([...args, '--json'], home));
+  assert.equal(result.applied, true, 'bundle refresh counts as an applied setup change');
+  assert.equal(result.restart.required, true, 'a running runtime must reload the refreshed bundle');
+  assert.ok(result.restart.runtimes.includes('claude-code'));
+  const manifest = JSON.parse(await fs.readFile(path.join(runtimeDir, 'package.json'), 'utf8'));
+  assert.notEqual(manifest.version, '0.0.0-stale');
+  assert.ok(await exists(path.join(runtimeDir, 'cli.js')));
+  assert.ok(await exists(path.join(runtimeDir, 'mcp', 'server.js')));
+  assert.equal(await fs.readFile(path.join(runtimeDir, 'semantic.json'), 'utf8'), semantic, 'semantic opt-in survives bundle refresh');
+  const manifestIntegrity = JSON.parse(await fs.readFile(path.join(runtimeDir, 'package.json'), 'utf8')).integrity;
+  assert.equal(typeof manifestIntegrity.files['cli.js'], 'string');
+  assert.equal(typeof manifestIntegrity.files['mcp/server.js'], 'string');
+  assert.equal(typeof manifestIntegrity.files['core.js'], 'string');
+  const siblings = await fs.readdir(path.dirname(runtimeDir));
+  assert.equal(siblings.some((name) => /^\.runtime\.ihow-(tmp|bak)-/.test(name)), false, 'successful atomic swap leaves no staging/backup dirs');
+});
+
+test('setup repairs dead npx Claude hooks in place, preserves third-party config, and is idempotent', async (t) => {
+  const { home, root, proj } = await dirs(t);
+  const settingsPath = path.join(proj, '.claude', 'settings.local.json');
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+  const deadCli = '/tmp/_npx/dead/node_modules/ihow-memory/bin/ihow-memory.mjs';
+  const staleEntry = (command) => ({
+    type: 'command', command: `${JSON.stringify(process.execPath)} ${JSON.stringify(deadCli)} ${command} --root /dead`,
+    timeout: 1, statusMessage: 'stale', keepEntryKey: 'KEEP-ENTRY',
+  });
+  await fs.writeFile(settingsPath, `${JSON.stringify({
+    model: 'opus',
+    hooks: {
+      Stop: [{ matcher: 'keep-stop-matcher', keepGroupKey: 'KEEP-GROUP', hooks: [
+        staleEntry('hook-stop'),
+        { type: 'command', command: 'node /opt/acme.mjs --fixture /tmp/ihow-memory.mjs --event hook-stop', timeout: 9 },
+        { type: 'command', command: 'python /vendor/ihow-memory.mjs hook-stop', timeout: 9 },
+        staleEntry('hook-stop'),
+      ] }],
+      SessionStart: [{ matcher: 'keep-start-matcher', hooks: [staleEntry('hook-session-start')] }],
+      UserPromptSubmit: [{ hooks: [staleEntry('hook-user-prompt-submit'), { type: 'command', command: 'echo third-party-prompt' }] }],
+    },
+    keepTopLevel: { yes: true },
+  }, null, 2)}\n`, 'utf8');
+
+  const args = ['setup', '--runtime', 'claude-code', '--root', root, '--space', 't', '--cwd', proj];
+  run(args, home);
+  const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8'));
+  const expectedCli = path.join(root, 't', '.runtime', 'cli.js');
+  for (const [event, marker] of [['Stop', 'hook-stop'], ['SessionStart', 'hook-session-start'], ['UserPromptSubmit', 'hook-user-prompt-submit']]) {
+    const entries = hookEntries(settings, event).filter((entry) =>
+      entry.command?.includes(marker) && entry.command.includes('--hook-owner ihow-memory-v1'));
+    assert.equal(entries.length, 1, `${event} iHow hook reconciled without duplication`);
+    assert.ok(entries[0].command.includes(process.execPath), 'pins the setup Node executable');
+    assert.ok(entries[0].command.includes(expectedCli), 'uses workspace-frozen CLI');
+    assert.ok(entries[0].command.includes(root), 'has canonical root binding');
+    assert.match(entries[0].command, /--space ['"]t['"]/, 'has canonical space binding');
+    assert.match(entries[0].command, /--hook-owner ihow-memory-v1/, 'has explicit iHow ownership marker');
+    assert.doesNotMatch(entries[0].command, /_npx|bin[\\/]ihow-memory\.mjs/, 'dead package/cache path removed');
+    assert.equal(entries[0].timeout, 30, 'managed timeout reconciled');
+    assert.equal(entries[0].statusMessage, undefined, 'stale managed status removed');
+    assert.equal(entries[0].keepEntryKey, 'KEEP-ENTRY', 'unmanaged entry keys preserved');
+  }
+  assert.equal(settings.model, 'opus');
+  assert.deepEqual(settings.keepTopLevel, { yes: true });
+  assert.equal(settings.hooks.Stop[0].matcher, 'keep-stop-matcher', 'third-party group matcher preserved');
+  assert.equal(settings.hooks.Stop[0].keepGroupKey, 'KEEP-GROUP', 'other third-party group keys preserved');
+  const managedStopGroup = settings.hooks.Stop.find((group) => (group.hooks ?? []).some((entry) => entry.command?.includes('--hook-owner ihow-memory-v1')));
+  assert.equal(managedStopGroup.matcher, undefined, 'managed Stop hook moved to a matcher-free canonical group');
+  assert.ok(hookEntries(settings, 'Stop').some((entry) => entry.command === 'node /opt/acme.mjs --fixture /tmp/ihow-memory.mjs --event hook-stop'), 'third-party hook mentioning our filename and marker is preserved');
+  assert.ok(hookEntries(settings, 'Stop').some((entry) => entry.command === 'python /vendor/ihow-memory.mjs hook-stop'), 'legacy ownership requires a Node executable, not only our basename');
+  for (const event of ['Stop', 'SessionStart', 'UserPromptSubmit']) {
+    assert.equal(settings.hooks[event].some((group) => Array.isArray(group.hooks) && group.hooks.length === 0), false, `${event} has no empty groups after reconcile`);
+  }
+  assert.ok(hookEntries(settings, 'UserPromptSubmit').some((entry) => entry.command === 'echo third-party-prompt'), 'third-party prompt hook preserved');
+  assert.ok(await exists(expectedCli), 'setup froze cli.js in the workspace runtime');
+
+  const bodyAfterRepair = await fs.readFile(settingsPath, 'utf8');
+  const backupsAfterRepair = await countBackups(proj);
+  const out2 = run(args, home);
+  assert.match(out2, /hooks already present/);
+  assert.equal(await fs.readFile(settingsPath, 'utf8'), bodyAfterRepair, 'idempotent rerun does not rewrite settings');
+  assert.equal(await countBackups(proj), backupsAfterRepair, 'idempotent rerun adds no backup');
+});
+
+test('setup repairs dead npx Codex hooks in place, preserves third-party config, and is idempotent', async (t) => {
+  const { home, root } = await dirs(t);
+  const bin = await makeCodexShim(t);
+  const env = { PATH: `${bin}:${HERMETIC_PATH}` };
+  const hooksPath = path.join(home, '.codex', 'hooks.json');
+  await fs.mkdir(path.dirname(hooksPath), { recursive: true });
+  const deadCli = '/tmp/_npx/dead/node_modules/ihow-memory/bin/ihow-memory.mjs';
+  await fs.writeFile(hooksPath, `${JSON.stringify({
+    other: 'KEEP',
+    hooks: {
+      SessionStart: [{ matcher: 'keep-existing-matcher', keepGroupKey: 7, hooks: [
+        { type: 'command', command: `${JSON.stringify(process.execPath)} ${JSON.stringify(deadCli)} hook-session-start --runtime codex --root /dead`, timeout: 1, statusMessage: 'stale', keepEntryKey: true },
+        { type: 'command', command: 'echo third-party-start' },
+      ] }],
+      UserPromptSubmit: [{ hooks: [
+        { type: 'command', command: `${JSON.stringify(process.execPath)} ${JSON.stringify(deadCli)} hook-user-prompt-submit --root /dead`, timeout: 1, statusMessage: 'stale', keepEntryKey: true },
+        { type: 'command', command: 'echo third-party-prompt' },
+      ] }],
+    },
+  }, null, 2)}\n`, 'utf8');
+
+  const args = ['setup', '--runtime', 'codex', '--root', root, '--space', 't'];
+  run(args, home, env);
+  const settings = JSON.parse(await fs.readFile(hooksPath, 'utf8'));
+  const expectedCli = path.join(root, 't', '.runtime', 'cli.js');
+  const expected = [
+    ['SessionStart', 'hook-session-start', 'Checking iHow Memory handoff'],
+    ['UserPromptSubmit', 'hook-user-prompt-submit', 'Searching iHow Memory'],
+  ];
+  for (const [event, marker, statusMessage] of expected) {
+    const entries = hookEntries(settings, event).filter((entry) =>
+      entry.command?.includes(marker) && entry.command.includes('--hook-owner ihow-memory-v1'));
+    assert.equal(entries.length, 1, `${event} iHow hook reconciled without duplication`);
+    assert.ok(entries[0].command.includes(process.execPath), 'pins the setup Node executable');
+    assert.ok(entries[0].command.includes(expectedCli), 'uses workspace-frozen CLI');
+    assert.ok(entries[0].command.includes(root), 'has canonical root binding');
+    assert.match(entries[0].command, /--space ['"]t['"]/, 'has canonical space binding');
+    assert.match(entries[0].command, /--hook-owner ihow-memory-v1/, 'has explicit iHow ownership marker');
+    assert.doesNotMatch(entries[0].command, /_npx|bin[\\/]ihow-memory\.mjs/, 'dead package/cache path removed');
+    assert.equal(entries[0].timeout, 30);
+    assert.equal(entries[0].statusMessage, statusMessage);
+    assert.equal(entries[0].keepEntryKey, true, 'unmanaged entry keys preserved');
+  }
+  assert.equal(settings.other, 'KEEP');
+  assert.equal(settings.hooks.SessionStart[0].matcher, 'keep-existing-matcher', 'third-party group matcher preserved');
+  assert.equal(settings.hooks.SessionStart[0].keepGroupKey, 7, 'other third-party group keys preserved');
+  const managedStartGroup = settings.hooks.SessionStart.find((group) => (group.hooks ?? []).some((entry) => entry.command?.includes('--hook-owner ihow-memory-v1')));
+  assert.equal(managedStartGroup.matcher, 'startup|resume|clear|compact', 'managed Codex SessionStart hook uses the canonical matcher');
+  assert.ok(hookEntries(settings, 'SessionStart').some((entry) => entry.command === 'echo third-party-start'), 'third-party start hook preserved');
+  assert.ok(hookEntries(settings, 'UserPromptSubmit').some((entry) => entry.command === 'echo third-party-prompt'), 'third-party prompt hook preserved');
+  for (const event of ['SessionStart', 'UserPromptSubmit']) {
+    assert.equal(settings.hooks[event].some((group) => Array.isArray(group.hooks) && group.hooks.length === 0), false, `${event} has no empty groups after reconcile`);
+  }
+
+  const bodyAfterRepair = await fs.readFile(hooksPath, 'utf8');
+  const backupsAfterRepair = await countBackups(home);
+  const out2 = run(args, home, env);
+  assert.match(out2, /Codex hooks already present/);
+  assert.equal(await fs.readFile(hooksPath, 'utf8'), bodyAfterRepair, 'idempotent rerun does not rewrite hooks.json');
+  assert.equal(await countBackups(home), backupsAfterRepair, 'idempotent rerun adds no backup');
 });
 
 test('setup --dry-run writes NOTHING', async (t) => {
@@ -157,6 +321,17 @@ test('setup --runtime workbuddy wires cross-thread resume into BOOTSTRAP.md (ide
   const after = await fs.readFile(path.join(wbDir, 'BOOTSTRAP.md'), 'utf8');
   assert.equal((after.match(/resume across threads/g) || []).length, 1, 'idempotent — not duplicated on re-run');
   assert.equal(await wbBaks(), 1, 're-run does not re-back-up or re-augment BOOTSTRAP');
+});
+
+test('setup does not claim WorkBuddy memory loop enabled when BOOTSTRAP guidance is skipped', async (t) => {
+  const { home, root } = await dirs(t);
+  const args = ['setup', '--runtime', 'workbuddy', '--root', root, '--space', 't'];
+  const out = run(args, home);
+  assert.doesNotMatch(out, /memory loop: enabled for WorkBuddy/, 'skipped guidance is not presented as enabled');
+  assert.match(out, /memory loop: runtime tools connected; no native capture loop for this runtime/);
+
+  const json = JSON.parse(run([...args, '--json'], home));
+  assert.equal(json.workbuddyResume, 'skipped', 'JSON keeps the skipped guidance outcome honest');
 });
 
 test('setup with no runtime detected is an honest exit-0 no-op', async (t) => {

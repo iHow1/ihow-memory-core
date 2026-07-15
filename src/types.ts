@@ -237,7 +237,35 @@ export type CoreStatus = {
     reason: string;
     warnings: string[];
   };
+  protectionState: CheckpointProtectionState;
   sync: {
     enabled: false;
   };
+};
+
+export type CheckpointProtectionSummary = {
+  artifactId: string;
+  createdAt: string;
+  triggerKind: string;
+  triggerSignal: string;
+  coverageComplete: boolean;
+  eventCount?: number;
+};
+
+export type CheckpointProtectionState = {
+  lookup: { status: 'ok' | 'missing' | 'degraded'; reasonCode?: string };
+  latestComplete: CheckpointProtectionSummary | null;
+  latestPartial: CheckpointProtectionSummary | null;
+  latestFloor:
+    | ({ kind: 'checkpoint'; artifactId: string; at: string; triggerSignal: string })
+    | ({ kind: 'journal'; at: string; runtime: string })
+    | null;
+  stale: boolean | 'unknown';
+  newerMaterial: { draftId: string; updatedAt: string; eventCount?: number } | null;
+  worstLossEvents: number | 'unknown';
+  activationDegradation: Array<{
+    runtime: string;
+    observedAt: string;
+    reasonCode: 'activation_latest_event_failed';
+  }>;
 };

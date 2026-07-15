@@ -18,6 +18,10 @@ import {
   renderPromptRecall,
   selectPromptRecall,
 } from './prompt-recall.ts';
+import {
+  appendActivationEvidenceFailOpen,
+  type ActivationEvidenceEvent,
+} from './activation-ledger.ts';
 
 export type ContextProbeInput = {
   cwd: string;
@@ -171,7 +175,7 @@ async function recordProbeEvent(
   });
 }
 
-export async function contextProbe(
+async function contextProbeInner(
   workspace: Workspace,
   input: ContextProbeInput,
   recallRuntime: ContextProbeRecallRuntime = {},
@@ -264,6 +268,49 @@ export async function contextProbe(
     eventHint: input.eventHint,
   });
   return output;
+}
+
+function probeActivationEvent(eventHint: ContextProbeInput['eventHint'] | undefined): ActivationEvidenceEvent {
+  if (eventHint === 'session_start') return 'context-probe-session-start';
+  if (eventHint === 'prompt') return 'context-probe-prompt';
+  if (eventHint === 'session_end') return 'context-probe-session-end';
+  return 'context-probe-tick';
+}
+
+export async function contextProbe(
+  workspace: Workspace,
+  input: ContextProbeInput,
+  recallRuntime: ContextProbeRecallRuntime = {},
+): Promise<ContextProbeOutput> {
+  const runtime = normalizedRuntime(input?.runtime);
+  const event = probeActivationEvent(input?.eventHint);
+  const validHostProbe = !!input && typeof input === 'object' &&
+    typeof input.cwd === 'string' && input.cwd.trim().length > 0 &&
+    ['session_start', 'prompt', 'session_end', 'tick'].includes(input.eventHint);
+  try {
+    const output = await contextProbeInner(workspace, input, recallRuntime);
+    await appendActivationEvidenceFailOpen(workspace, {
+      runtime,
+      event,
+      source: 'context-probe',
+      status: 'synthetic',
+      dedupeKey: output.auditEventId ?? crypto.randomUUID(),
+    });
+    return output;
+  } catch (error) {
+    // Caller/schema errors are not runtime health evidence. Only a well-formed host probe that failed
+    // during execution may influence recent-health diagnostics.
+    if (validHostProbe) {
+      await appendActivationEvidenceFailOpen(workspace, {
+        runtime,
+        event,
+        source: 'context-probe',
+        status: 'failed',
+        dedupeKey: crypto.randomUUID(),
+      });
+    }
+    throw error;
+  }
 }
 
 export function deriveProbeMetrics(events: MemoryEvent[]): ProbeMetrics {

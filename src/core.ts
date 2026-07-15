@@ -30,6 +30,7 @@ import { filterForgotten, forgetPath, listForgotten, rememberPath } from './forg
 import type { ForgetOutcome, RememberOutcome } from './forget.ts';
 import { organizeDraft, exportVaultFromDraft } from './gardener.ts';
 import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraftOptions } from './gardener.ts';
+import { checkpointProtectionState, createCheckpointService, type CheckpointService } from './checkpoints.ts';
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -49,6 +50,8 @@ export type MemoryCore = {
   forgotten(): Promise<Array<{ path: string; snippet: string }>>;
   organize(opts?: OrganizeDraftOptions): Promise<GardenerDraft>;
   export_vault(fromDraft: string, opts?: ExportVaultOptions): Promise<ExportVaultResult>;
+  // alpha.27 Stage 2: bounded checkpoint core only. No hooks, continue integration, UX, or implicit promotion.
+  checkpoints: CheckpointService;
 };
 
 function excerpt(content: string, max = 300): string {
@@ -59,9 +62,11 @@ function excerpt(content: string, max = 300): string {
 export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCore> {
   const workspace = await ensureWorkspace(resolveWorkspace(options));
   const engineConfig = resolveEngineConfig(options);
+  const checkpoints = await createCheckpointService(workspace, options);
 
   return {
     workspace,
+    checkpoints,
     async search(query, opts = {}) {
       if (typeof query !== 'string' || !query.trim()) return [];
       const hits = (await searchWithEngineFallback(workspace, engineConfig, query, opts)).hits;
@@ -143,6 +148,7 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
       const exists = fs.existsSync(workspace.indexPath);
       const documents = await countIndexedDocuments(workspace);
       const providerStatus = await engineStatus(workspace, engineConfig);
+      const protectionState = await checkpointProtectionState(workspace, options);
       // Honest capability gate: semantic is ON only when a semantic provider is BOTH the active engine
       // AND ready (not a fallback to FTS). The default binary, or an unreachable sidecar, reports false.
       const p = providerStatus.provider;
@@ -170,6 +176,7 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
           semantic: semanticActive,
         },
         recallReadiness: recallReadiness(options, providerStatus.provider),
+        protectionState,
         sync: {
           enabled: false,
         },
