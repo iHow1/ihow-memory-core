@@ -43,7 +43,7 @@ async function collectTests(dir) {
   return files.sort();
 }
 
-function runPhase(label, files) {
+export function runPhase(label, files) {
   if (files.length === 0) throw new Error(`test_phase_empty:${label}`);
   console.log(`# test phase: ${label} (${files.length} file${files.length === 1 ? '' : 's'})`);
   return new Promise((resolve, reject) => {
