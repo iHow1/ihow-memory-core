@@ -12,6 +12,11 @@ const LOCK_TIMEOUT_MS = 5000;
 // immediately; the TTL is the backstop for when the PID can't be determined.
 const LOCK_STALE_MS = 60_000;
 
+// File locks coordinate separate processes. Within one process, let callers wait on a per-path queue
+// before starting the file-lock acquisition budget; otherwise a large local burst can spend the entire
+// timeout polling a lock held by an earlier caller from this same process.
+const localLockTails = new Map<string, Promise<void>>();
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -56,7 +61,23 @@ async function lockIsStale(lockPath: string): Promise<boolean> {
   return false;
 }
 
-export async function withWorkspaceLock<T>(workspace: Workspace, fn: () => Promise<T>): Promise<T> {
+async function waitForLocalLockTurn(lockPath: string): Promise<() => void> {
+  const previous = localLockTails.get(lockPath);
+  let releaseTurn!: () => void;
+  const turn = new Promise<void>((resolve) => { releaseTurn = resolve; });
+  localLockTails.set(lockPath, turn);
+  if (previous) await previous;
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseTurn();
+    if (localLockTails.get(lockPath) === turn) localLockTails.delete(lockPath);
+  };
+}
+
+async function withFileLock<T>(workspace: Workspace, fn: () => Promise<T>): Promise<T> {
   await fs.mkdir(path.dirname(workspace.lockPath), { recursive: true });
   const started = Date.now();
   let handle: fs.FileHandle | undefined;
@@ -87,7 +108,19 @@ export async function withWorkspaceLock<T>(workspace: Workspace, fn: () => Promi
   try {
     return await fn();
   } finally {
-    await handle.close();
-    await fs.rm(workspace.lockPath, { force: true });
+    try {
+      await handle.close();
+    } finally {
+      await fs.rm(workspace.lockPath, { force: true });
+    }
+  }
+}
+
+export async function withWorkspaceLock<T>(workspace: Workspace, fn: () => Promise<T>): Promise<T> {
+  const releaseLocalTurn = await waitForLocalLockTurn(workspace.lockPath);
+  try {
+    return await withFileLock(workspace, fn);
+  } finally {
+    releaseLocalTurn();
   }
 }
