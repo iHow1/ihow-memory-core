@@ -7,9 +7,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const repo = path.resolve(import.meta.dirname, '..');
-const releaseVersion = '0.1.0-alpha.27';
+const releaseVersion = '0.1.0-alpha.27.1';
 
-test('package and lock metadata expose the alpha.27 Hermes bridge contract', () => {
+test('package and lock metadata expose the alpha.27.1 Hermes bridge contract', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8'));
   const lock = JSON.parse(fs.readFileSync(path.join(repo, 'package-lock.json'), 'utf8'));
   const bridge = 'dist/hermes-bridge.js';

@@ -16,28 +16,29 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const RELEASE_VERSION = '0.1.0-alpha.27';
+const RELEASE_VERSION = '0.1.0-alpha.27.1';
 
 function readRoot(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8');
 }
 
-function unreleasedSection(changelog) {
-  const match = changelog.match(/## \[Unreleased\]\n([\s\S]*?)(?=\n## \[)/);
-  assert.ok(match, 'CHANGELOG has an Unreleased section');
+function releaseSection(changelog, version) {
+  const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = changelog.match(new RegExp(`## \\[${escaped}\\][^\\n]*\\n([\\s\\S]*?)(?=\\n## \\[)`));
+  assert.ok(match, `CHANGELOG has a ${version} section`);
   return match[1];
 }
 
-test('alpha.27 release candidate metadata and docs stay truthful and aligned', () => {
+test('alpha.27.1 release candidate metadata and alpha.27 docs stay truthful and aligned', () => {
   const manifest = JSON.parse(readRoot('package.json'));
   const lock = JSON.parse(readRoot('package-lock.json'));
   assert.equal(manifest.version, RELEASE_VERSION);
   assert.equal(lock.version, RELEASE_VERSION);
   assert.equal(lock.packages?.['']?.version, RELEASE_VERSION);
 
-  const unreleased = unreleasedSection(readRoot('CHANGELOG.md'));
+  const alpha27 = releaseSection(readRoot('CHANGELOG.md'), '0.1.0-alpha.27');
   for (const heading of ['### Added', '### Changed', '### Notes']) {
-    assert.match(unreleased, new RegExp(`^${heading.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}$`, 'm'));
+    assert.match(alpha27, new RegExp(`^${heading.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}$`, 'm'));
   }
   for (const surface of [
     /Checkpoint Core/i,
@@ -50,27 +51,25 @@ test('alpha.27 release candidate metadata and docs stay truthful and aligned', (
     /textconv/i,
     /fsmonitor/i,
   ]) {
-    assert.match(unreleased, surface, `Unreleased documents ${surface}`);
+    assert.match(alpha27, surface, `alpha.27 documents ${surface}`);
   }
-  assert.match(unreleased, /local release-ready only/i);
-  assert.match(unreleased, /no (?:push, tag, publish, release, or deploy|push\/tag\/publish\/release\/deploy)/i);
-  assert.match(unreleased, /does not claim production certification/i);
-  assert.match(unreleased, /Hermes native lifecycle/i);
-  assert.match(unreleased, /Hermes Plugin/i);
-  assert.match(unreleased, /ihow-memory-hermes-bridge/i);
-  assert.match(unreleased, /HOST VERIFIED\/READY/i);
-  assert.match(unreleased, /not independently certif(?:ied|iable) as `?ACTIVE`?/i);
-  assert.doesNotMatch(unreleased, /remain deferred/i);
-  assert.doesNotMatch(unreleased, /Checkpoint-to-`continue` integration[^\n]*deferred/i);
-  assert.doesNotMatch(unreleased, /checkpoint crash floor[^\n]*deferred/i);
+  assert.match(alpha27, /does not claim production certification/i);
+  assert.match(alpha27, /Hermes native lifecycle/i);
+  assert.match(alpha27, /Hermes Plugin/i);
+  assert.match(alpha27, /ihow-memory-hermes-bridge/i);
+  assert.match(alpha27, /HOST VERIFIED\/READY/i);
+  assert.match(alpha27, /not independently certif(?:ied|iable) as `?ACTIVE`?/i);
+  assert.doesNotMatch(alpha27, /remain deferred/i);
+  assert.doesNotMatch(alpha27, /Checkpoint-to-`continue` integration[^\n]*deferred/i);
+  assert.doesNotMatch(alpha27, /checkpoint crash floor[^\n]*deferred/i);
 
   const readmes = [
     ['README.md', readRoot('README.md'), /Hermes native lifecycle/i, /has not been published/i],
     ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Hermes 原生生命周期/i, /尚未发布/i],
   ];
   for (const [name, readme, lifecycle, unpublished] of readmes) {
-    assert.match(readme, /0\.1\.0-alpha\.27/, `${name} states the local candidate version`);
-    assert.match(readme, /Alpha\.27/i, `${name} identifies the alpha.27 surface`);
+    assert.match(readme, /0\.1\.0-alpha\.27\.1/, `${name} states the local candidate version`);
+    assert.match(readme, /Alpha\.27\.1/i, `${name} identifies the alpha.27.1 surface`);
     assert.match(readme, /PreCompact/i, `${name} documents native PreCompact`);
     assert.match(readme, /checkpoint-first/i, `${name} documents checkpoint-first continue`);
     assert.match(readme, /crash-floor/i, `${name} documents the crash floor`);

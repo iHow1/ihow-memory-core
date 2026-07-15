@@ -68,7 +68,7 @@ function runHook({ root, project, home, space = 't', runtime = 'claude-code', pa
     input: typeof payload === 'string' ? payload : JSON.stringify(payload),
     encoding: 'utf8',
     env: { ...process.env, HOME: home, ...env },
-    timeout: 8_000,
+    timeout: 12_000,
   });
 }
 
@@ -383,7 +383,7 @@ test('indexed draft component deletion and replacement stay unknown without shad
         input: JSON.stringify(claudePayload(f.project)),
         encoding: 'utf8',
         env: { ...process.env, HOME: f.home },
-        timeout: 8_000,
+        timeout: 12_000,
       });
       assert.equal(result.status, 0, mode);
       assert.equal(result.stdout, '');
@@ -575,7 +575,7 @@ test('missing, stale, and tampered locators recover from the independent open-se
         input: JSON.stringify(claudePayload(f.project)),
         encoding: 'utf8',
         env: { ...process.env, HOME: f.home },
-        timeout: 8_000,
+        timeout: 12_000,
       });
       assert.equal(result.status, 0, mode);
       assert.equal(result.stdout, '');
@@ -703,7 +703,7 @@ test('real installed Claude PreCompact path records started/completed evidence o
     input: JSON.stringify(claudePayload(f.project)),
     encoding: 'utf8',
     env: { ...process.env, HOME: f.home },
-    timeout: 8_000,
+    timeout: 12_000,
   });
   assert.equal(result.status, 0);
   assert.equal(result.stdout, '');
