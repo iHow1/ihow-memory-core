@@ -8,6 +8,20 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.27.1] — 2026-07-15
+
+### Fixed
+
+- **Explicit workspace precedence.** An explicit managed `root` now takes precedence over ambient `MEMORY_ROOT` / `IHOW_MEMORY_ROOT`, preventing embedded callers and temporary fixtures from being silently redirected into an existing shared memory root. An explicit `memoryRoot` remains authoritative when both options are provided.
+- **Hermetic test execution.** The test runner now passes child processes a copied environment with ambient memory, Hermes, and Codex routing roots removed. Unit and real subprocess integration tests prove dangerous routing keys are absent without mutating the parent environment.
+- **PreCompact harness timing.** Success-path parent test timeouts now sit above the production 8 s internal watchdog and 10 s host envelope, while the strict 300 ms fail-open path and production timeout contracts remain unchanged.
+
+### Notes
+
+- This patch changes test isolation and workspace option precedence; it does not clean or rewrite any existing shared memory root.
+
+## [0.1.0-alpha.27] — 2026-07-15
+
 ### Added
 
 - **Checkpoint Core.** Mutable, short-lived drafts now finalize into immutable hash-addressed `CheckpointArtifactV1` JSON with deterministic canonical hashing, a 32 KiB hard bound, explicit omission counts, atomic no-overwrite storage, dedup/supersedes, workspace locking, rejection audit, and read/list/inspect APIs. Claims and engine-collected anchors remain separate inputs, and secret/schema/integrity failures fail closed.
@@ -25,8 +39,8 @@ with pre-release tags.
 
 ### Notes
 
-- This checkout is local release-ready only: no push, tag, publish, release, or deploy is part of this change.
-- This alpha candidate does not claim production certification; runtime support remains limited to the documented alpha and single-machine smoke boundaries.
+- Alpha.27 was published under `v0.1.0-alpha.27` and the npm `next` dist-tag.
+- This alpha release does not claim production certification; runtime support remains limited to the documented alpha and single-machine smoke boundaries.
 
 ## [0.1.0-alpha.26] — 2026-07-11
 
