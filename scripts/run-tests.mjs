@@ -2,7 +2,7 @@
 // Copyright (c) 2026 iHow Memory
 //
 // Keep the broad suite parallel, but run the real PreCompact hook integration tests after it.
-// Those tests intentionally execute a production 2.5s fail-open watchdog. Running that watchdog
+// Those tests intentionally execute a production 8s fail-open watchdog. Running that watchdog
 // while every CPU is saturated by unrelated test workers tests scheduler contention rather than the
 // checkpoint invariants: the correct production outcome under that contention is to exit 0 without
 // an artifact, while the success-path assertions require a normal host budget.

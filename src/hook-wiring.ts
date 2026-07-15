@@ -538,7 +538,7 @@ export async function verifyRuntimeHookWiring(
     const expected = [
       { event: 'Stop', marker: 'hook-stop', entry: { type: 'command' as const, command: stopHookCommand(workspace), timeout: 30 } },
       { event: 'SessionStart', marker: 'hook-session-start', entry: { type: 'command' as const, command: sessionStartHookCommand(workspace, runtime), timeout: 30 } },
-      { event: 'PreCompact', marker: 'hook-pre-compact', entry: { type: 'command' as const, command: preCompactHookCommand(workspace, runtime), timeout: 3 } },
+      { event: 'PreCompact', marker: 'hook-pre-compact', entry: { type: 'command' as const, command: preCompactHookCommand(workspace, runtime), timeout: 10 } },
       { event: 'UserPromptSubmit', marker: 'hook-user-prompt-submit', entry: { type: 'command' as const, command: recallHookCommand(workspace, runtime), timeout: 30 } },
     ];
     const results = [];
@@ -571,7 +571,7 @@ export async function verifyRuntimeHookWiring(
     },
     {
       event: 'PreCompact', marker: 'hook-pre-compact',
-      entry: { type: 'command' as const, command: preCompactHookCommand(workspace, runtime), timeout: 3, statusMessage: 'Saving iHow Memory checkpoint' },
+      entry: { type: 'command' as const, command: preCompactHookCommand(workspace, runtime), timeout: 10, statusMessage: 'Saving iHow Memory checkpoint' },
     },
     {
       event: 'UserPromptSubmit', marker: 'hook-user-prompt-submit',

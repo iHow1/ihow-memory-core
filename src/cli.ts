@@ -314,8 +314,8 @@ async function runHookWithActivation(
 
 function preCompactBudgetMs(): number {
   const requested = Number(process.env.IHOW_PRECOMPACT_BUDGET_MS);
-  if (Number.isSafeInteger(requested) && requested >= 100 && requested <= 2_500) return requested;
-  return 2_500;
+  if (Number.isSafeInteger(requested) && requested >= 100 && requested <= 8_000) return requested;
+  return 8_000;
 }
 
 async function verifiedPreCompactGeneration(
@@ -1732,7 +1732,7 @@ async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<H
     'PreCompact',
     'hook-pre-compact',
     preCompactHookCommand(workspace, 'codex'),
-    { timeout: 3, statusMessage: 'Saving iHow Memory checkpoint' },
+    { timeout: 10, statusMessage: 'Saving iHow Memory checkpoint' },
     undefined,
     forceGeneration,
   );
@@ -1967,7 +1967,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
         }) && commandHookIsCurrent(hooks, 'SessionStart', 'hook-session-start', {
           type: 'command', command: sessionStartHookCommand(workspace, 'claude-code'), timeout: 30,
         }) && commandHookIsCurrent(hooks, 'PreCompact', 'hook-pre-compact', {
-          type: 'command', command: preCompactHookCommand(workspace, 'claude-code'), timeout: 3,
+          type: 'command', command: preCompactHookCommand(workspace, 'claude-code'), timeout: 10,
         });
         if (options.recall !== false) {
           wired = wired && commandHookIsCurrent(hooks, 'UserPromptSubmit', 'hook-user-prompt-submit', {
@@ -3002,7 +3002,7 @@ async function maybeInstallStopHook(options: ParsedArgs['options']): Promise<Hoo
   const forceGeneration = await hookGenerationNeedsRepair(workspace, 'claude-code', options);
   const addedStop = ensureCommandHook(hooks, 'Stop', 'hook-stop', stopHookCommand(workspace), { timeout: 30 }, undefined, forceGeneration);
   const addedStart = ensureCommandHook(hooks, 'SessionStart', 'hook-session-start', sessionStartHookCommand(workspace, 'claude-code'), { timeout: 30 }, undefined, forceGeneration);
-  const addedPreCompact = ensureCommandHook(hooks, 'PreCompact', 'hook-pre-compact', preCompactHookCommand(workspace, 'claude-code'), { timeout: 3 }, undefined, forceGeneration);
+  const addedPreCompact = ensureCommandHook(hooks, 'PreCompact', 'hook-pre-compact', preCompactHookCommand(workspace, 'claude-code'), { timeout: 10 }, undefined, forceGeneration);
   // RECALL (read path) installs by DEFAULT; `--no-recall` opts out. Reviewed memory is preferred, while
   // relevant machine-gated auto SOFT facts may surface by default. The shared selector blocks private,
   // flagged, audit-only, unreadable/stale, ambient status, and every behavior-bypass entry; it also applies

@@ -88,7 +88,7 @@ true. Wording must avoid "verified handoff" / "confirmed facts".
 - Claude Code and Codex native `PreCompact` are now wired by `setup` / `install-hook` to the bounded
   checkpoint core. The adapter is transcript-free, uses exact private project/session and semantic
   fingerprint indexes, preserves third-party Hook entries, and returns fail-open to the host under a
-  2.5 s watchdog.
+  8 s watchdog.
 - This does **not** change `continue` yet: `memory.continue` still reads the existing handoff/capture
   sources and does not consume checkpoint artifacts. The candidate also has no checkpoint crash-floor
   path and is not published.

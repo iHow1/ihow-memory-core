@@ -766,8 +766,12 @@ test('installed wiring is idempotent, preserves third-party PreCompact config, a
   assert.equal(await fs.readFile(claudePath, 'utf8'), first);
   const claude = JSON.parse(first);
   assert.equal(claude.keep, true);
-  assert.ok(claude.hooks.PreCompact.flatMap((group) => group.hooks ?? []).some((entry) => entry.command === 'echo third-party-precompact'));
-  assert.equal(claude.hooks.PreCompact.flatMap((group) => group.hooks ?? []).filter((entry) => entry.command.includes('hook-pre-compact')).length, 1);
+  assert.ok(claude.hooks.PreCompact.flatMap((group) => group.hooks ?? [])
+    .some((entry) => entry.command === 'echo third-party-precompact'));
+  const claudePreCompact = claude.hooks.PreCompact.flatMap((group) => group.hooks ?? [])
+    .filter((entry) => entry.command.includes('hook-pre-compact'));
+  assert.equal(claudePreCompact.length, 1);
+  assert.equal(claudePreCompact[0].timeout, 10, 'the host timeout stays above the internal 8s watchdog');
 
   const codexHome = path.join(f.base, 'codex-home');
   await fs.mkdir(codexHome);
@@ -775,7 +779,10 @@ test('installed wiring is idempotent, preserves third-party PreCompact config, a
     encoding: 'utf8', env: { ...process.env, HOME: f.home, CODEX_HOME: codexHome },
   });
   const codex = JSON.parse(await fs.readFile(path.join(codexHome, 'hooks.json'), 'utf8'));
-  assert.ok(codex.hooks.PreCompact.flatMap((group) => group.hooks ?? []).some((entry) => entry.command.includes('hook-pre-compact')));
+  const codexPreCompact = codex.hooks.PreCompact.flatMap((group) => group.hooks ?? [])
+    .filter((entry) => entry.command.includes('hook-pre-compact'));
+  assert.equal(codexPreCompact.length, 1);
+  assert.equal(codexPreCompact[0].timeout, 10, 'Codex host timeout stays above the internal 8s watchdog');
   assert.equal('SessionEnd' in codex.hooks, false);
   assert.equal(JSON.stringify(codex).includes('hook-session-end'), false);
 });
