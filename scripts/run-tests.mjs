@@ -14,6 +14,22 @@ import { fileURLToPath } from 'node:url';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testsRoot = path.join(repo, 'tests');
 const deadlineSensitive = new Set(['tests/native-precompact.test.mjs']);
+const dangerousAmbientRoutingKeys = [
+  'MEMORY_ROOT',
+  'IHOW_MEMORY_ROOT',
+  'IHOW_MEMORY_HOME',
+  'IHOW_MEMORY_STATE_ROOT',
+  'HERMES_HOME',
+  'IHOW_MEMORY_HERMES_BRIDGE',
+  'IHOW_MEMORY_HERMES_NODE',
+  'CODEX_HOME',
+];
+
+export function sanitizeTestEnv(env = process.env) {
+  const sanitized = { ...env };
+  for (const key of dangerousAmbientRoutingKeys) delete sanitized[key];
+  return sanitized;
+}
 
 async function collectTests(dir) {
   const files = [];
@@ -33,7 +49,7 @@ function runPhase(label, files) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['--test', ...files], {
       cwd: repo,
-      env: process.env,
+      env: sanitizeTestEnv(process.env),
       stdio: 'inherit',
     });
     child.once('error', reject);
@@ -44,11 +60,16 @@ function runPhase(label, files) {
   });
 }
 
-const allTests = await collectTests(testsRoot);
-const parallelTests = allTests.filter((file) => !deadlineSensitive.has(file));
-const deadlineTests = allTests.filter((file) => deadlineSensitive.has(file));
+async function main() {
+  const allTests = await collectTests(testsRoot);
+  const parallelTests = allTests.filter((file) => !deadlineSensitive.has(file));
+  const deadlineTests = allTests.filter((file) => deadlineSensitive.has(file));
 
-const parallelExit = await runPhase('parallel core suite', parallelTests);
-if (parallelExit !== 0) process.exit(parallelExit);
-const deadlineExit = await runPhase('isolated deadline-sensitive PreCompact integration', deadlineTests);
-process.exit(deadlineExit);
+  const parallelExit = await runPhase('parallel core suite', parallelTests);
+  if (parallelExit !== 0) return parallelExit;
+  return runPhase('isolated deadline-sensitive PreCompact integration', deadlineTests);
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exit(await main());
+}
