@@ -43,7 +43,7 @@ export function resolveSpace(options: WorkspaceOptions = {}): string {
 }
 
 export function resolveWorkspace(options: WorkspaceOptions = {}): Workspace {
-  const memoryRoot = options.memoryRoot || defaultMemoryRoot();
+  const memoryRoot = options.memoryRoot || (options.root ? undefined : defaultMemoryRoot());
   if (memoryRoot) return resolveExistingMemoryRootWorkspace(options, memoryRoot);
 
   const root = path.resolve(options.root || defaultRoot());
