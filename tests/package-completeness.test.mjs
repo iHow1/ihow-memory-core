@@ -55,15 +55,20 @@ test('alpha.27 release candidate metadata and docs stay truthful and aligned', (
   assert.match(unreleased, /local release-ready only/i);
   assert.match(unreleased, /no (?:push, tag, publish, release, or deploy|push\/tag\/publish\/release\/deploy)/i);
   assert.match(unreleased, /does not claim production certification/i);
+  assert.match(unreleased, /Hermes native lifecycle/i);
+  assert.match(unreleased, /Hermes Plugin/i);
+  assert.match(unreleased, /ihow-memory-hermes-bridge/i);
+  assert.match(unreleased, /HOST VERIFIED\/READY/i);
+  assert.match(unreleased, /not independently certif(?:ied|iable) as `?ACTIVE`?/i);
   assert.doesNotMatch(unreleased, /remain deferred/i);
   assert.doesNotMatch(unreleased, /Checkpoint-to-`continue` integration[^\n]*deferred/i);
   assert.doesNotMatch(unreleased, /checkpoint crash floor[^\n]*deferred/i);
 
   const readmes = [
-    ['README.md', readRoot('README.md')],
-    ['README.zh-CN.md', readRoot('README.zh-CN.md')],
+    ['README.md', readRoot('README.md'), /Hermes native lifecycle/i, /has not been published/i],
+    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Hermes 原生生命周期/i, /尚未发布/i],
   ];
-  for (const [name, readme] of readmes) {
+  for (const [name, readme, lifecycle, unpublished] of readmes) {
     assert.match(readme, /0\.1\.0-alpha\.27/, `${name} states the local candidate version`);
     assert.match(readme, /Alpha\.27/i, `${name} identifies the alpha.27 surface`);
     assert.match(readme, /PreCompact/i, `${name} documents native PreCompact`);
@@ -71,6 +76,12 @@ test('alpha.27 release candidate metadata and docs stay truthful and aligned', (
     assert.match(readme, /crash-floor/i, `${name} documents the crash floor`);
     assert.match(readme, /statusHash/, `${name} documents statusHash safety`);
     assert.match(readme, /local release-ready only/i, `${name} states the local-only boundary`);
+    assert.match(readme, lifecycle, `${name} documents the Hermes native lifecycle`);
+    assert.match(readme, /Hermes Plugin/i, `${name} documents the packaged Hermes Plugin`);
+    assert.match(readme, /ihow-memory-hermes-bridge/i, `${name} documents the packaged Hermes bridge`);
+    assert.match(readme, /HOST VERIFIED\/READY/i, `${name} uses the bounded Hermes host-verification status`);
+    assert.match(readme, /(?:not independently certif(?:ied|iable) as|不能独立认证为) `?ACTIVE`?/i, `${name} does not claim Hermes ACTIVE`);
+    assert.match(readme, unpublished, `${name} does not claim this checkout was published`);
     assert.doesNotMatch(readme, /not yet consumed by `memory\.continue`/i, `${name} removes stale continue deferral`);
     assert.doesNotMatch(readme, /does not yet feed `memory\.continue`/i, `${name} removes stale continue deferral`);
     assert.doesNotMatch(readme, /尚未接入 `memory\.continue`/, `${name} removes stale continue deferral`);

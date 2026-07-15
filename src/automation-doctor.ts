@@ -10,6 +10,7 @@ import {
   type ActivationEvidence,
 } from './activation-ledger.ts';
 import { verifyRuntimeHookWiring, type RuntimeHookWiring } from './hook-wiring.ts';
+import { inspectHermesLifecycleWiring, resolveHermesHome } from './hermes-wiring.ts';
 
 export type AutomationRuntime = 'claude-code' | 'codex' | 'openclaw' | 'hermes' | 'no-hook';
 export type AutomationStatus = 'OK' | 'WARN' | 'BROKEN';
@@ -34,6 +35,11 @@ export type RuntimeActivation = {
   reasonCode: ActivationReasonCode;
   configuredAt?: string;
   lastObservedAt?: string;
+};
+
+export type LifecycleWiringEvidence = {
+  state: 'current' | 'missing' | 'broken';
+  generationId?: string;
 };
 
 export type AutomationMatrixRow = {
@@ -175,7 +181,7 @@ function latest(rows: ActivationEvidence[], predicate: (row: ActivationEvidence)
 export function deriveRuntimeActivation(
   runtime: AutomationRuntime,
   allEvidence: ActivationEvidence[],
-  options: { wiring?: RuntimeHookWiring; now?: number } = {},
+  options: { wiring?: RuntimeHookWiring; lifecycleWiring?: LifecycleWiringEvidence; now?: number } = {},
 ): RuntimeActivation {
   const rows = evidenceForRuntime(allEvidence, runtime);
   const lastObservedAt = latest(rows, () => true)?.observedAt;
@@ -184,12 +190,39 @@ export function deriveRuntimeActivation(
   if (runtime === 'no-hook') {
     return { status: 'TOOLS ONLY', reasonCode: 'ACTIVATION_NO_HOOK_TOOLS_ONLY', lastObservedAt };
   }
-  if (runtime === 'openclaw' || runtime === 'hermes') {
+  if (runtime === 'openclaw') {
+    return { status: 'TOOLS ONLY', reasonCode: 'ACTIVATION_NO_VERIFIED_LIFECYCLE_TOOLS_ONLY', lastObservedAt };
+  }
+  if (runtime === 'hermes' && options.lifecycleWiring?.state !== 'current') {
+    if (options.lifecycleWiring?.state === 'broken') {
+      return { status: 'NEEDS REPAIR', reasonCode: 'ACTIVATION_WIRING_BROKEN', lastObservedAt };
+    }
     return { status: 'TOOLS ONLY', reasonCode: 'ACTIVATION_NO_VERIFIED_LIFECYCLE_TOOLS_ONLY', lastObservedAt };
   }
 
   const anyConfigured = latest(rows, (row) => row.status === 'configured');
   let configured = anyConfigured;
+  if (runtime === 'hermes' && options.lifecycleWiring?.state === 'current') {
+    const generationKey = options.lifecycleWiring.generationId;
+    if (!generationKey) {
+      return {
+        status: 'NEEDS REPAIR',
+        reasonCode: 'ACTIVATION_WIRING_GENERATION_UNCONFIRMED',
+        configuredAt: anyConfigured?.observedAt,
+        lastObservedAt,
+      };
+    }
+    const generationId = activationConfigurationId(generationKey);
+    configured = latest(rows, (row) => row.status === 'configured' && row.configuration?.id === generationId);
+    if (!configured) {
+      return {
+        status: 'NEEDS REPAIR',
+        reasonCode: 'ACTIVATION_WIRING_GENERATION_UNCONFIRMED',
+        configuredAt: anyConfigured?.observedAt,
+        lastObservedAt,
+      };
+    }
+  }
   if (options.wiring) {
     const wasEnabled = !!anyConfigured || options.wiring.managedPresent;
     if (options.wiring.state !== 'current') {
@@ -225,9 +258,14 @@ export function deriveRuntimeActivation(
   const synthetic = latest(rows, (row) => row.status === 'synthetic');
   const sameConfiguredGeneration = (row: ActivationEvidence): boolean =>
     !configured?.configuration || row.configuration?.id === configured.configuration.id;
-  const started = latest(rows, (row) => row.status === 'observed-live-started' && sameConfiguredGeneration(row));
-  const completed = latest(rows, (row) => row.status === 'observed-live-completed' && sameConfiguredGeneration(row));
-  const failed = latest(rows, (row) => row.status === 'failed' && sameConfiguredGeneration(row));
+  const trustedLifecycleEvidence = (row: ActivationEvidence): boolean =>
+    runtime !== 'hermes' || row.source === 'native-hook';
+  const started = latest(rows, (row) => row.status === 'observed-live-started' &&
+    sameConfiguredGeneration(row) && trustedLifecycleEvidence(row));
+  const completed = latest(rows, (row) => row.status === 'observed-live-completed' &&
+    sameConfiguredGeneration(row) && trustedLifecycleEvidence(row));
+  const failed = latest(rows, (row) => row.status === 'failed' &&
+    sameConfiguredGeneration(row) && trustedLifecycleEvidence(row));
 
   if (!configured) {
     if (synthetic) return { status: 'READY — WAITING FOR FIRST ACTIVITY', reasonCode: 'ACTIVATION_SYNTHETIC_ONLY', lastObservedAt };
@@ -267,13 +305,27 @@ export function deriveRuntimeActivation(
 export async function automationMatrix(
   workspace: Workspace,
   spec: { command?: string; args?: string[] },
-  options: { now?: number; hookOptions?: WorkspaceOptions & { globalHook?: boolean; recall?: boolean } } = {},
+  options: {
+    now?: number;
+    hookOptions?: WorkspaceOptions & { globalHook?: boolean; recall?: boolean };
+    hermesHome?: string;
+  } = {},
 ): Promise<{ rows: AutomationMatrixRow[]; metrics: ProbeMetrics; path: PathClassification; evidence: ActivationEvidence[] }> {
-  const [metrics, evidence, claudeWiring, codexWiring] = await Promise.all([
+  const hermesHome = resolveHermesHome(options.hermesHome);
+  const [metrics, evidence, claudeWiring, codexWiring, hermesWiring]: [
+    ProbeMetrics,
+    ActivationEvidence[],
+    RuntimeHookWiring,
+    RuntimeHookWiring,
+    LifecycleWiringEvidence & { reason?: string },
+  ] = await Promise.all([
     probeMetrics(workspace),
     readActivationEvidence(workspace).catch(() => []),
     verifyRuntimeHookWiring(workspace, 'claude-code', options.hookOptions),
     verifyRuntimeHookWiring(workspace, 'codex', options.hookOptions),
+    hermesHome
+      ? inspectHermesLifecycleWiring(hermesHome)
+      : Promise.resolve<LifecycleWiringEvidence & { reason?: string }>({ state: 'missing' }),
   ]);
   const wirings = new Map<string, RuntimeHookWiring>([
     ['claude-code', claudeWiring],
@@ -284,7 +336,11 @@ export async function automationMatrix(
   const rows = ROWS.map((row) => {
     const key = runtimeKey(row.runtime);
     const wiring = wirings.get(key);
-    const activation = deriveRuntimeActivation(key as AutomationRuntime, evidence, { wiring, now: options.now });
+    const activation = deriveRuntimeActivation(key as AutomationRuntime, evidence, {
+      wiring,
+      ...(key === 'hermes' ? { lifecycleWiring: hermesWiring } : {}),
+      now: options.now,
+    });
     const probeCalls = key === 'no-hook' ? noHookCalls(metrics) : (metrics.probeCallsByRuntime[key] ?? 0);
     const notes: string[] = [];
     let status: AutomationStatus = 'OK';
@@ -294,7 +350,8 @@ export async function automationMatrix(
     }
     if (activation.status === 'NEEDS REPAIR') {
       status = 'BROKEN';
-      notes.push(...(wiring?.notes.length ? wiring.notes : ['configured lifecycle wiring needs repair']));
+      if (key === 'hermes' && hermesWiring.reason) notes.push(`Hermes lifecycle wiring: ${hermesWiring.reason}`);
+      else notes.push(...(wiring?.notes.length ? wiring.notes : ['configured lifecycle wiring needs repair']));
     }
     if (key === 'no-hook' && probeCalls === 0) {
       status = status === 'BROKEN' ? status : 'WARN';

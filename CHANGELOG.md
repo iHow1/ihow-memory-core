@@ -15,6 +15,7 @@ with pre-release tags.
 - **Checkpoint-first continue.** `memory.continue` and the CLI now prefer complete checkpoints, then partial/shadow checkpoints, before transcript and floor-journal candidates; checkpoint claims remain explicitly UNVERIFIED until live machine anchors are recomputed.
 - **Protection state.** `status` reports the latest complete, partial, and floor evidence, stale/newer material, bounded or unknown worst-loss estimates, degraded lookup state, and activation degradation without erasing validated checkpoint evidence.
 - **Activation truth.** A local append-only evidence ledger and live Claude Code/Codex hook-wiring checks distinguish `ACTIVE`, `READY — WAITING FOR FIRST ACTIVITY`, `TOOLS ONLY`, and `NEEDS REPAIR`; static capability, synthetic probes, started-only events, and malformed/manual payloads do not count as live activation.
+- **Hermes native lifecycle package.** The npm surface now includes the Hermes Plugin (`plugin.yaml` and `__init__.py`) plus the `ihow-memory-hermes-bridge` executable for bounded lifecycle recall/checkpoint dispatch. Prior adapter-lane real-host evidence is represented only as `HOST VERIFIED/READY`; the merged package is not independently certifiable as `ACTIVE`, remains local release-ready only, and has not been published.
 
 ### Changed
 

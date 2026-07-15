@@ -26,6 +26,7 @@
   "files": [
     "bin/",
     "dist/",
+    "integrations/hermes/ihow-memory/",
     "LICENSE",
     "NOTICE",
     "TRADEMARK.md",
@@ -38,7 +39,8 @@
   ],
   "bin": {
     "ihow-memory": "bin/ihow-memory.mjs",
-    "ihow-memory-mcp": "dist/mcp/server.js"
+    "ihow-memory-mcp": "dist/mcp/server.js",
+    "ihow-memory-hermes-bridge": "dist/hermes-bridge.js"
   },
   "engines": {
     "node": ">=22.12"
