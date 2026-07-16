@@ -60,6 +60,7 @@ export type DatasetManifestV1 = {
   datasetId: string;
   datasetVersion: string;
   splits: Record<EvaluationSplitNameV1, DatasetManifestSplitV1>;
+  smokeCaseIds: string[];
   datasetSha256: string;
 };
 
@@ -68,6 +69,7 @@ export type DatasetManifestProjectionV1 = {
   datasetId: string;
   datasetVersion: string;
   splits: Array<DatasetManifestSplitV1 & { name: EvaluationSplitNameV1 }>;
+  smokeCaseIds: string[];
 };
 
 export type EvaluationObservationV1 = {
@@ -500,7 +502,9 @@ function validateManifestSplitV1(value: unknown, path: string): DatasetManifestS
 }
 
 function validateDatasetManifestContentV1(value: unknown, path: string): DatasetManifestV1 {
-  const item = exactRecord(value, ['schemaVersion', 'datasetId', 'datasetVersion', 'splits', 'datasetSha256'], path);
+  const item = exactRecord(value, [
+    'schemaVersion', 'datasetId', 'datasetVersion', 'splits', 'smokeCaseIds', 'datasetSha256',
+  ], path);
   exactSchemaVersion(item.schemaVersion, `${path}.schemaVersion`);
   nonEmptyString(item.datasetId, `${path}.datasetId`);
   nonEmptyString(item.datasetVersion, `${path}.datasetVersion`);
@@ -508,6 +512,8 @@ function validateDatasetManifestContentV1(value: unknown, path: string): Dataset
   validateManifestSplitV1(splits.train, `${path}.splits.train`);
   validateManifestSplitV1(splits.dev, `${path}.splits.dev`);
   validateManifestSplitV1(splits.holdout, `${path}.splits.holdout`);
+  const smokeCaseIds = idArray(item.smokeCaseIds, `${path}.smokeCaseIds`);
+  if (smokeCaseIds.length !== 12) fail(`${path}.smokeCaseIds`, 'must contain exactly 12 IDs');
   sha256(item.datasetSha256, `${path}.datasetSha256`);
   return item as DatasetManifestV1;
 }
@@ -518,6 +524,7 @@ export function datasetManifestProjectionV1(value: DatasetManifestV1): DatasetMa
     schemaVersion: 1,
     datasetId: manifest.datasetId,
     datasetVersion: manifest.datasetVersion,
+    smokeCaseIds: [...manifest.smokeCaseIds],
     splits: (['train', 'dev', 'holdout'] as const).map((name) => ({
       name,
       path: manifest.splits[name].path,
@@ -538,6 +545,54 @@ export function validateDatasetManifestV1(value: unknown, path = 'manifest'): Da
   const manifest = validateDatasetManifestContentV1(value, path);
   const expected = datasetManifestSha256V1(manifest);
   if (manifest.datasetSha256 !== expected) fail(`${path}.datasetSha256`, `must match canonical manifest projection ${expected}`);
+  return manifest;
+}
+
+export function validateManifestAgainstDatasetsV1(
+  manifestValue: unknown,
+  datasetsValue: unknown,
+  path = 'manifest',
+): DatasetManifestV1 {
+  const manifest = validateDatasetManifestV1(manifestValue, path);
+  if (!Array.isArray(datasetsValue) || datasetsValue.length !== 3) {
+    fail('datasets', 'must contain train, dev, holdout exactly once each');
+  }
+  const datasets = datasetsValue.map((dataset, index) => (
+    validateEvaluationDatasetSplitV1(dataset, `datasets[${index}]`)
+  ));
+  const splitNames = ['train', 'dev', 'holdout'] as const;
+  for (const name of splitNames) {
+    if (datasets.filter((dataset) => dataset.split === name).length !== 1) {
+      fail('datasets', 'must contain train, dev, holdout exactly once each');
+    }
+  }
+  const datasetsBySplit = new Map(datasets.map((dataset) => [dataset.split, dataset]));
+  for (const name of splitNames) {
+    const dataset = datasetsBySplit.get(name)!;
+    const manifestSplit = manifest.splits[name];
+    if (manifestSplit.caseCount !== dataset.cases.length) {
+      fail(`${path}.splits.${name}.caseCount`, `must match dataset case count ${dataset.cases.length}`);
+    }
+    if (manifestSplit.documentCount !== dataset.documents.length) {
+      fail(`${path}.splits.${name}.documentCount`, `must match dataset document count ${dataset.documents.length}`);
+    }
+    const expectedSha = canonicalSha256V1(dataset);
+    if (manifestSplit.sha256 !== expectedSha) {
+      fail(`${path}.splits.${name}.sha256`, `must match canonical dataset SHA ${expectedSha}`);
+    }
+  }
+  for (let index = 0; index < manifest.smokeCaseIds.length; index += 1) {
+    const smokeCaseId = manifest.smokeCaseIds[index]!;
+    const containingSplits = datasets
+      .filter((dataset) => dataset.cases.some((evaluationCase) => evaluationCase.caseId === smokeCaseId))
+      .map((dataset) => dataset.split);
+    if (containingSplits.length !== 1 || containingSplits[0] !== 'train') {
+      fail(
+        `${path}.smokeCaseIds[${index}]`,
+        `case ID ${smokeCaseId} must exist in train and no other split`,
+      );
+    }
+  }
   return manifest;
 }
 
@@ -669,7 +724,7 @@ function validateCurrentPerCaseV1(value: unknown, path: string): void {
   enumValue(item.category, [
     'fact', 'preference', 'status', 'temporal', 'recovery', 'paraphrase', 'no-answer',
   ], `${path}.category`);
-  enumValue(item.expected, ['answer', 'no-answer'], `${path}.expected`);
+  const expected = enumValue(item.expected, ['answer', 'no-answer'], `${path}.expected`);
   relPathArray(item.rankedIds, `${path}.rankedIds`);
   const injectedIds = relPathArray(item.injectedIds, `${path}.injectedIds`, { allowDuplicates: true });
   if (typeof item.predictedNoAnswer !== 'boolean') fail(`${path}.predictedNoAnswer`, 'must be boolean');
@@ -680,6 +735,12 @@ function validateCurrentPerCaseV1(value: unknown, path: string): void {
     'precisionAt3', 'recallAt3', 'recallAt5', 'recallAt10', 'mrr', 'ndcgAt10', 'injectedPathPrecision',
   ], `${path}.metrics`);
   for (const key of ['precisionAt3', 'recallAt3', 'recallAt5', 'recallAt10', 'mrr', 'ndcgAt10'] as const) {
+    if (expected === 'answer' && metrics[key] === null) {
+      fail(`${path}.metrics.${key}`, 'answer cases require all retrieval metrics to be non-null');
+    }
+    if (expected === 'no-answer' && metrics[key] !== null) {
+      fail(`${path}.metrics.${key}`, 'no-answer cases require all retrieval metrics to be null');
+    }
     if (metrics[key] !== null) fraction(metrics[key], `${path}.metrics.${key}`);
   }
   fraction(metrics.injectedPathPrecision, `${path}.metrics.injectedPathPrecision`);

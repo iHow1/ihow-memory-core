@@ -107,6 +107,11 @@ function observation(overrides = {}) {
   };
 }
 
+const smokeCaseIds = Array.from(
+  { length: 12 },
+  (_, index) => `case-smoke-${String(index + 1).padStart(2, '0')}`,
+);
+
 function manifest(overrides = {}) {
   const digestByte = { train: 'a', dev: 'b', holdout: 'c' };
   const split = (name) => ({
@@ -124,9 +129,30 @@ function manifest(overrides = {}) {
       dev: split('dev'),
       holdout: split('holdout'),
     },
+    smokeCaseIds: [...smokeCaseIds],
     datasetSha256: 'd'.repeat(64),
     ...overrides,
   };
+}
+
+function manifestDatasets() {
+  return [
+    dataset(smokeCaseIds.map((caseId) => answerCase({ caseId }))),
+    dataset([answerCase({ caseId: 'case-dev', split: 'dev' })], { split: 'dev' }),
+    dataset([answerCase({ caseId: 'case-holdout', split: 'holdout' })], { split: 'holdout' }),
+  ];
+}
+
+function matchingManifest(datasets = manifestDatasets()) {
+  const splits = Object.fromEntries(datasets.map((item) => [item.split, {
+    path: `eval/golden/v1/${item.split}.json`,
+    sha256: evaluation.canonicalSha256V1(item),
+    caseCount: item.cases.length,
+    documentCount: item.documents.length,
+  }]));
+  const value = manifest({ splits, datasetSha256: '0'.repeat(64) });
+  value.datasetSha256 = evaluation.datasetManifestSha256V1(value);
+  return value;
 }
 
 test('scores one answer case end-to-end and keeps the first ranked path occurrence', () => {
@@ -259,6 +285,104 @@ test('runtime validators strictly reject malformed V1 values and cross-schema in
   assert.throws(
     () => evaluation.validateEvaluationReportV1({ ...validReport, extra: true }),
     /unknown field/,
+  );
+
+  const answerMetricNull = structuredClone(validReport);
+  answerMetricNull.perCase[0].metrics.recallAt5 = null;
+  assert.throws(
+    () => evaluation.validateEvaluationReportV1(answerMetricNull),
+    /answer cases require all retrieval metrics to be non-null/,
+  );
+
+  const mixedReport = evaluation.scoreEvaluationRunV1({
+    datasets: [dataset([answerCase(), noAnswerCase()])],
+    observations: [observation(), observation({
+      caseId: 'case-none',
+      rankedIds: [],
+      injectedIds: [],
+    })],
+    config: baseConfig(),
+  });
+  const noAnswerMetricPresent = structuredClone(mixedReport);
+  noAnswerMetricPresent.perCase.find((item) => item.caseId === 'case-none').metrics.mrr = 0;
+  assert.throws(
+    () => evaluation.validateEvaluationReportV1(noAnswerMetricPresent),
+    /no-answer cases require all retrieval metrics to be null/,
+  );
+});
+
+test('manifest pins exactly twelve ordered smoke case IDs into dataset identity', () => {
+  const eleven = manifest({ smokeCaseIds: smokeCaseIds.slice(0, 11) });
+  const thirteen = manifest({ smokeCaseIds: [...smokeCaseIds, 'case-smoke-13'] });
+  const duplicate = manifest({ smokeCaseIds: [...smokeCaseIds.slice(0, 11), smokeCaseIds[0]] });
+  const empty = manifest({ smokeCaseIds: [...smokeCaseIds.slice(0, 11), ''] });
+
+  assert.throws(() => evaluation.validateDatasetManifestV1(eleven), /smokeCaseIds.*exactly 12/);
+  assert.throws(() => evaluation.validateDatasetManifestV1(thirteen), /smokeCaseIds.*exactly 12/);
+  assert.throws(() => evaluation.validateDatasetManifestV1(duplicate), /smokeCaseIds.*duplicate/);
+  assert.throws(() => evaluation.validateDatasetManifestV1(empty), /smokeCaseIds\[11\].*non-empty/);
+
+  const value = manifest({ datasetSha256: '0'.repeat(64) });
+  assert.deepEqual(evaluation.datasetManifestProjectionV1(value).smokeCaseIds, smokeCaseIds);
+  const originalSha = evaluation.datasetManifestSha256V1(value);
+
+  const changedId = structuredClone(value);
+  changedId.smokeCaseIds[0] = 'case-smoke-replacement';
+  assert.notEqual(evaluation.datasetManifestSha256V1(changedId), originalSha);
+
+  const changedOrder = structuredClone(value);
+  [changedOrder.smokeCaseIds[0], changedOrder.smokeCaseIds[1]] = [
+    changedOrder.smokeCaseIds[1],
+    changedOrder.smokeCaseIds[0],
+  ];
+  assert.notEqual(evaluation.datasetManifestSha256V1(changedOrder), originalSha);
+  assert.deepEqual(
+    evaluation.datasetManifestProjectionV1(changedOrder).smokeCaseIds.slice(0, 2),
+    [smokeCaseIds[1], smokeCaseIds[0]],
+    'manifest order is preserved as the pinned execution order',
+  );
+
+  const selfHashVariant = { ...value, datasetSha256: 'f'.repeat(64) };
+  assert.equal(evaluation.datasetManifestSha256V1(selfHashVariant), originalSha);
+});
+
+test('validates manifest counts, split hashes, and smoke membership against all datasets', () => {
+  assert.equal(typeof evaluation.validateManifestAgainstDatasetsV1, 'function');
+  const datasets = manifestDatasets();
+  const value = matchingManifest(datasets);
+  assert.doesNotThrow(() => evaluation.validateManifestAgainstDatasetsV1(value, datasets));
+
+  assert.throws(
+    () => evaluation.validateManifestAgainstDatasetsV1(value, [datasets[0], datasets[0], datasets[2]]),
+    /train, dev, holdout exactly once each/,
+  );
+
+  for (const invalidCaseId of ['case-missing', 'case-dev']) {
+    const invalidSmoke = structuredClone(value);
+    invalidSmoke.smokeCaseIds[0] = invalidCaseId;
+    invalidSmoke.datasetSha256 = evaluation.datasetManifestSha256V1(invalidSmoke);
+    assert.throws(
+      () => evaluation.validateManifestAgainstDatasetsV1(invalidSmoke, datasets),
+      new RegExp(`${invalidCaseId}.*train.*no other split`),
+    );
+  }
+
+  for (const countField of ['caseCount', 'documentCount']) {
+    const countMismatch = structuredClone(value);
+    countMismatch.splits.dev[countField] += 1;
+    countMismatch.datasetSha256 = evaluation.datasetManifestSha256V1(countMismatch);
+    assert.throws(
+      () => evaluation.validateManifestAgainstDatasetsV1(countMismatch, datasets),
+      new RegExp(`splits\\.dev\\.${countField}.*dataset`),
+    );
+  }
+
+  const shaMismatch = structuredClone(value);
+  shaMismatch.splits.holdout.sha256 = 'f'.repeat(64);
+  shaMismatch.datasetSha256 = evaluation.datasetManifestSha256V1(shaMismatch);
+  assert.throws(
+    () => evaluation.validateManifestAgainstDatasetsV1(shaMismatch, datasets),
+    /splits\.holdout\.sha256.*canonical dataset SHA/,
   );
 });
 
@@ -444,6 +568,7 @@ test('canonical JSON, dataset SHA, config SHA, and stable report identity are de
   assert.throws(() => evaluation.canonicalJsonV1({ invalid: undefined }), /JSON value/);
 
   const value = manifest({ datasetSha256: '0'.repeat(64) });
+  assert.deepEqual(evaluation.datasetManifestProjectionV1(value).smokeCaseIds, smokeCaseIds);
   assert.deepEqual(
     evaluation.datasetManifestProjectionV1(value).splits.map((entry) => entry.name),
     ['train', 'dev', 'holdout'],
