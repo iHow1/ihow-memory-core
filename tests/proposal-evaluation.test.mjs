@@ -165,6 +165,31 @@ function runInput() {
   };
 }
 
+function withOptionalStageCases(input, count = 5) {
+  for (let index = 0; index < count; index += 1) {
+    const evaluationCase = {
+      schemaVersion: 1,
+      caseId: `optional-stage-${index + 1}`,
+      sourceKind: 'runtime-event',
+      mustPropose: false,
+      expectedOutcome: 'stage',
+      negativeControlClass: null,
+      request: requestFor('runtime-event', 'fact', 200 + index),
+      expectedProposal: expected('fact', 'runtime-event'),
+      setup: { existingProposals: [], forgottenPaths: [] },
+    };
+    input.dataset.cases.push(evaluationCase);
+    input.observations.push(observationFor(evaluationCase));
+  }
+  input.config = configFor(input.dataset);
+  return input;
+}
+
+function resignReport(report) {
+  report.reportIdentitySha256 = evaluation.proposalReportIdentitySha256V1(report);
+  return report;
+}
+
 test('proposal evaluator has non-vacuous precision/recall and every hostile denominator', () => {
   assert.equal(typeof evaluation.scoreProposalEvaluationV1, 'function', 'proposal scoring behavior must exist');
   assert.equal(typeof evaluation.validateProposalEvaluationReportV1, 'function');
@@ -215,6 +240,67 @@ test('empty emissions and hostile staging cannot pass vacuously', () => {
   assert.equal(hostileReport.gates.safety.passed, false);
 });
 
+test('every expected outcome is enforced, including non-must expected-stage cases', () => {
+  const input = withOptionalStageCases(runInput());
+  const optionalStageIds = new Set(input.dataset.cases
+    .filter((item) => !item.mustPropose && item.expectedOutcome === 'stage')
+    .map((item) => item.caseId));
+  assert.equal(optionalStageIds.size, 5);
+  input.observations = input.observations.map((item) => optionalStageIds.has(item.caseId) ? {
+    ...item,
+    observedOutcome: 'ignore',
+    emittedProposals: [],
+    persistence: {
+      candidateDelta: 0,
+      eventDelta: 0,
+      durableDelta: 0,
+      historyDelta: 0,
+      ftsDelta: 0,
+      indexManifestDelta: 0,
+      eventTypes: [],
+    },
+  } : item);
+
+  const report = evaluation.scoreProposalEvaluationV1(input);
+  assert.equal(report.metrics.expectedOutcomeViolations, 5);
+  assert.equal(report.gates.integrity.passed, false);
+  assert.ok(report.gates.integrity.failures.includes('expectedOutcomeViolations'));
+  for (const item of report.perCase.filter((entry) => optionalStageIds.has(entry.caseId))) {
+    assert.equal(item.expectedOutcomeMatched, false);
+  }
+});
+
+test('every expected-stage case requires the exact candidate-only persistence contract', () => {
+  const input = withOptionalStageCases(runInput());
+  const expectedStageIds = new Set(input.dataset.cases
+    .filter((item) => item.expectedOutcome === 'stage')
+    .map((item) => item.caseId));
+  assert.equal(expectedStageIds.size, 13);
+  input.observations = input.observations.map((item) => expectedStageIds.has(item.caseId) ? {
+    ...item,
+    persistence: {
+      candidateDelta: 0,
+      eventDelta: 0,
+      durableDelta: 0,
+      historyDelta: 0,
+      ftsDelta: 0,
+      indexManifestDelta: 0,
+      eventTypes: [],
+    },
+  } : item);
+
+  const report = evaluation.scoreProposalEvaluationV1(input);
+  assert.equal(report.metrics.proposalPrecision.numerator, 13);
+  assert.equal(report.metrics.proposalPrecision.denominator, 13);
+  assert.equal(report.metrics.candidateOnlyStagingCount, 0);
+  assert.equal(report.metrics.candidateOnlyPersistenceViolations, 13);
+  assert.equal(report.gates.safety.passed, false);
+  assert.ok(report.gates.safety.failures.includes('candidateOnlyPersistenceViolations'));
+  for (const item of report.perCase.filter((entry) => expectedStageIds.has(entry.caseId))) {
+    assert.equal(item.persistenceContractMatched, false);
+  }
+});
+
 test('safe errors and stable report identity exclude operational timing/temp/cleanup fields', () => {
   assert.equal(typeof evaluation.safeProposalEvaluationErrorV1, 'function');
   assert.doesNotMatch(evaluation.safeProposalEvaluationErrorV1('token=REAL_SECRET_123456 at /tmp/private/path'), /REAL_SECRET|\/tmp\/private/);
@@ -226,4 +312,64 @@ test('safe errors and stable report identity exclude operational timing/temp/cle
   const second = evaluation.scoreProposalEvaluationV1(secondInput);
   assert.equal(first.reportIdentitySha256, second.reportIdentitySha256);
   assert.deepEqual(evaluation.proposalReportIdentityProjectionV1(first), evaluation.proposalReportIdentityProjectionV1(second));
+});
+
+test('report validator rejects an impossible re-signed ratio', () => {
+  const report = structuredClone(evaluation.scoreProposalEvaluationV1(runInput()));
+  report.metrics.proposalPrecision = { numerator: 999, denominator: 1, value: 999 };
+  resignReport(report);
+  assert.throws(() => evaluation.validateProposalEvaluationReportV1(report), /proposalPrecision/);
+});
+
+test('report validator recomputes every derivable aggregate from per-case data', () => {
+  const mutations = [
+    (report) => { report.metrics.proposalPrecision = { numerator: 7, denominator: 8, value: 7 / 8 }; },
+    (report) => { report.metrics.mustProposeRecall = { numerator: 7, denominator: 8, value: 7 / 8 }; },
+    (report) => { report.metrics.mustProposeStrata.sourceKinds.transcript = 3; },
+    (report) => { report.metrics.hostileControls.secret.executed = 2; },
+    (report) => { report.metrics.unsafeDurableWrites = 1; },
+    (report) => { report.metrics.unsafeIndexWrites = 1; },
+    (report) => { report.metrics.candidateOnlyStagingCount = 7; },
+    (report) => { report.metrics.candidateOnlyPersistenceViolations = 1; },
+    (report) => { report.metrics.expectedOutcomeViolations = 1; },
+    (report) => { report.metrics.runtimeErrors = 1; },
+  ];
+  for (const mutate of mutations) {
+    const report = structuredClone(evaluation.scoreProposalEvaluationV1(runInput()));
+    mutate(report);
+    resignReport(report);
+    assert.throws(() => evaluation.validateProposalEvaluationReportV1(report), /report\.metrics/);
+  }
+});
+
+test('report validator rejects re-signed unknown nested fields', () => {
+  const mutations = [
+    (report) => { report.metrics.unknownMetric = 0; },
+    (report) => { report.gates.unknownGate = { passed: true, failures: [] }; },
+    (report) => { report.perCase[0].unknownCaseField = false; },
+    (report) => { report.perCase[0].persistence.unknownPersistenceField = 0; },
+  ];
+  for (const mutate of mutations) {
+    const report = structuredClone(evaluation.scoreProposalEvaluationV1(runInput()));
+    mutate(report);
+    resignReport(report);
+    assert.throws(() => evaluation.validateProposalEvaluationReportV1(report), /unknown field/);
+  }
+});
+
+test('report validator rejects re-signed gate consistency contradictions', () => {
+  const subgatePassedWithFailure = structuredClone(evaluation.scoreProposalEvaluationV1(runInput()));
+  subgatePassedWithFailure.gates.quality.failures = ['forged_failure'];
+  resignReport(subgatePassedWithFailure);
+  assert.throws(() => evaluation.validateProposalEvaluationReportV1(subgatePassedWithFailure), /gates\.quality/);
+
+  const subgateFailedWithoutFailure = structuredClone(evaluation.scoreProposalEvaluationV1(runInput()));
+  subgateFailedWithoutFailure.gates.quality.passed = false;
+  resignReport(subgateFailedWithoutFailure);
+  assert.throws(() => evaluation.validateProposalEvaluationReportV1(subgateFailedWithoutFailure), /gates\.quality/);
+
+  const overallContradiction = structuredClone(evaluation.scoreProposalEvaluationV1(runInput()));
+  overallContradiction.gates.passed = false;
+  resignReport(overallContradiction);
+  assert.throws(() => evaluation.validateProposalEvaluationReportV1(overallContradiction), /gates\.passed/);
 });

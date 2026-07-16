@@ -390,6 +390,31 @@ function proposalMatches(expected: ProposalEvaluationExpectedV1 | null, observed
     && expected.relationVerdict === observed.relationVerdict;
 }
 
+function isExactCandidateOnlyStagePersistence(persistence: ProposalEvaluationObservationV1['persistence']): boolean {
+  return persistence.candidateDelta === 1
+    && persistence.eventDelta === 1
+    && persistence.eventTypes.length === 1
+    && persistence.eventTypes[0] === 'candidate.created'
+    && persistence.durableDelta === 0
+    && persistence.historyDelta === 0
+    && persistence.ftsDelta === 0
+    && persistence.indexManifestDelta === 0;
+}
+
+function persistenceMatchesExpectedOutcome(
+  expectedOutcome: ProposalExpectedOutcomeV1,
+  persistence: ProposalEvaluationObservationV1['persistence'],
+): boolean {
+  if (expectedOutcome === 'stage') return isExactCandidateOnlyStagePersistence(persistence);
+  return persistence.candidateDelta === 0
+    && persistence.eventDelta === 0
+    && persistence.durableDelta === 0
+    && persistence.historyDelta === 0
+    && persistence.ftsDelta === 0
+    && persistence.indexManifestDelta === 0
+    && persistence.eventTypes.length === 0;
+}
+
 function ratio(numerator: number, denominator: number): { numerator: number; denominator: number; value: number | null } {
   return { numerator, denominator, value: denominator === 0 ? null : numerator / denominator };
 }
@@ -438,6 +463,8 @@ export function scoreProposalEvaluationV1(input: ProposalEvaluationRunInputV1): 
   let unsafeDurableWrites = 0;
   let unsafeIndexWrites = 0;
   let candidateOnlyStagingCount = 0;
+  let candidateOnlyPersistenceViolations = 0;
+  let expectedOutcomeViolations = 0;
   let runtimeErrors = 0;
   const kindStrata = Object.fromEntries(MEMORY_PROPOSAL_KINDS_V1.map((kind) => [kind, 0])) as Record<MemoryProposalKindV1, number>;
   const sourceStrata = Object.fromEntries(PROPOSAL_SOURCE_KINDS_V1.map((kind) => [kind, 0])) as Record<ProposalSourceKindV1, number>;
@@ -455,23 +482,18 @@ export function scoreProposalEvaluationV1(input: ProposalEvaluationRunInputV1): 
       sourceStrata[evaluationCase.sourceKind] += 1;
     }
     const persistence = observation.persistence;
+    const expectedOutcomeMatched = observation.observedOutcome === evaluationCase.expectedOutcome;
+    const persistenceContractMatched = persistenceMatchesExpectedOutcome(evaluationCase.expectedOutcome, persistence);
+    if (!expectedOutcomeMatched) expectedOutcomeViolations += 1;
+    if (!persistenceContractMatched) candidateOnlyPersistenceViolations += 1;
     unsafeDurableWrites += persistence.durableDelta + persistence.historyDelta;
     unsafeIndexWrites += persistence.ftsDelta + persistence.indexManifestDelta;
-    if (
-      observation.observedOutcome === 'stage'
-      && persistence.candidateDelta === 1
-      && persistence.eventDelta === 1
-      && persistence.eventTypes.length === 1
-      && persistence.eventTypes[0] === 'candidate.created'
-      && persistence.durableDelta + persistence.historyDelta + persistence.ftsDelta + persistence.indexManifestDelta === 0
-    ) candidateOnlyStagingCount += 1;
+    if (observation.observedOutcome === 'stage' && isExactCandidateOnlyStagePersistence(persistence)) candidateOnlyStagingCount += 1;
     if (observation.error !== null) runtimeErrors += 1;
     if (evaluationCase.negativeControlClass !== null) {
       const hostile = hostileControls[evaluationCase.negativeControlClass];
       hostile.executed += 1;
-      const anyPersistence = persistence.candidateDelta + persistence.eventDelta + persistence.durableDelta
-        + persistence.historyDelta + persistence.ftsDelta + persistence.indexManifestDelta;
-      if (observation.observedOutcome !== 'block' || observation.emittedProposals.length > 0 || anyPersistence !== 0) hostile.violations += 1;
+      if (observation.observedOutcome !== 'block' || observation.emittedProposals.length > 0 || !persistenceContractMatched) hostile.violations += 1;
     }
     return {
       caseId: evaluationCase.caseId,
@@ -479,6 +501,8 @@ export function scoreProposalEvaluationV1(input: ProposalEvaluationRunInputV1): 
       mustPropose: evaluationCase.mustPropose,
       expectedOutcome: evaluationCase.expectedOutcome,
       observedOutcome: observation.observedOutcome,
+      expectedOutcomeMatched,
+      persistenceContractMatched,
       negativeControlClass: evaluationCase.negativeControlClass,
       expectedProposalCount: evaluationCase.expectedProposal ? 1 : 0,
       emittedProposalCount: observation.emittedProposals.length,
@@ -500,11 +524,14 @@ export function scoreProposalEvaluationV1(input: ProposalEvaluationRunInputV1): 
   const safetyFailures: string[] = [];
   if (unsafeDurableWrites > config.thresholds.unsafeDurableWritesMax) safetyFailures.push('unsafeDurableWrites');
   if (unsafeIndexWrites > config.thresholds.unsafeIndexWritesMax) safetyFailures.push('unsafeIndexWrites');
+  if (candidateOnlyPersistenceViolations > config.thresholds.stagingViolationsMax) safetyFailures.push('candidateOnlyPersistenceViolations');
   for (const name of config.hostileClasses) {
     if (hostileControls[name].executed === 0) safetyFailures.push(`hostileControls.${name}.nonzeroDenominator`);
     if (hostileControls[name].violations > config.thresholds.stagingViolationsMax) safetyFailures.push(`hostileControls.${name}.violations`);
   }
-  const integrityFailures = runtimeErrors > config.thresholds.runtimeErrorsMax ? ['runtimeErrors'] : [];
+  const integrityFailures: string[] = [];
+  if (runtimeErrors > config.thresholds.runtimeErrorsMax) integrityFailures.push('runtimeErrors');
+  if (expectedOutcomeViolations > config.thresholds.stagingViolationsMax) integrityFailures.push('expectedOutcomeViolations');
   const isolationFailures = input.isolationPassed ? [] : ['ambientRootIsolation'];
   const cleanupFailures = config.thresholds.cleanupRequired && !input.cleanupSucceeded ? ['cleanup'] : [];
   const quality = gate(qualityFailures);
@@ -536,6 +563,8 @@ export function scoreProposalEvaluationV1(input: ProposalEvaluationRunInputV1): 
       unsafeDurableWrites,
       unsafeIndexWrites,
       candidateOnlyStagingCount,
+      candidateOnlyPersistenceViolations,
+      expectedOutcomeViolations,
       correctionEvidence: {
         negativeCorrections: input.feedbackEvidence.filter((item) => item.kind === 'negative-correction').length,
         restorations: input.feedbackEvidence.filter((item) => item.kind === 'restoration').length,
@@ -554,6 +583,84 @@ export function scoreProposalEvaluationV1(input: ProposalEvaluationRunInputV1): 
   return validateProposalEvaluationReportV1(report);
 }
 
+function booleanValue(value: unknown, path: string): boolean {
+  if (typeof value !== 'boolean') fail(path, 'must be a boolean');
+  return value;
+}
+
+function finiteNonNegativeNumber(value: unknown, path: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) fail(path, 'must be a finite non-negative number');
+  return value;
+}
+
+function reportString(value: unknown, path: string, max = 600): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > max) fail(path, `must be a non-empty string of at most ${max} characters`);
+  return value;
+}
+
+function validateRatio(
+  value: unknown,
+  path: string,
+): { numerator: number; denominator: number; value: number | null } {
+  const item = exactRecord(value, ['numerator', 'denominator', 'value'], path);
+  const numerator = nonNegativeInteger(item.numerator, `${path}.numerator`);
+  const denominator = nonNegativeInteger(item.denominator, `${path}.denominator`);
+  if (numerator > denominator) fail(`${path}.numerator`, 'must be less than or equal to denominator');
+  if (denominator === 0) {
+    if (item.value !== null) fail(`${path}.value`, 'must be null when denominator is zero');
+    return { numerator, denominator, value: null };
+  }
+  if (typeof item.value !== 'number' || !Number.isFinite(item.value) || item.value < 0 || item.value > 1) {
+    fail(`${path}.value`, 'must be a finite ratio in [0,1]');
+  }
+  if (item.value !== numerator / denominator) fail(`${path}.value`, 'must equal numerator divided by denominator');
+  return { numerator, denominator, value: item.value };
+}
+
+function validateReportPersistence(
+  value: unknown,
+  path: string,
+): ProposalEvaluationObservationV1['persistence'] {
+  const item = exactRecord(value, [
+    'candidateDelta', 'eventDelta', 'durableDelta', 'historyDelta', 'ftsDelta', 'indexManifestDelta', 'eventTypes',
+  ], path);
+  if (!Array.isArray(item.eventTypes)) fail(`${path}.eventTypes`, 'must be a string array');
+  const eventTypes = item.eventTypes.map((entry, index) => reportString(entry, `${path}.eventTypes[${index}]`, 128));
+  return {
+    candidateDelta: nonNegativeInteger(item.candidateDelta, `${path}.candidateDelta`),
+    eventDelta: nonNegativeInteger(item.eventDelta, `${path}.eventDelta`),
+    durableDelta: nonNegativeInteger(item.durableDelta, `${path}.durableDelta`),
+    historyDelta: nonNegativeInteger(item.historyDelta, `${path}.historyDelta`),
+    ftsDelta: nonNegativeInteger(item.ftsDelta, `${path}.ftsDelta`),
+    indexManifestDelta: nonNegativeInteger(item.indexManifestDelta, `${path}.indexManifestDelta`),
+    eventTypes,
+  };
+}
+
+function validateSubgate(value: unknown, path: string): { passed: boolean; failures: string[] } {
+  const item = exactRecord(value, ['passed', 'failures'], path);
+  const passed = booleanValue(item.passed, `${path}.passed`);
+  if (!Array.isArray(item.failures)) fail(`${path}.failures`, 'must be a string array');
+  const failures = item.failures.map((entry, index) => reportString(entry, `${path}.failures[${index}]`, 160));
+  const canonicalFailures = [...new Set(failures)].sort((left, right) => left.localeCompare(right));
+  if (canonicalFailures.length !== failures.length || canonicalFailures.some((entry, index) => entry !== failures[index])) {
+    fail(`${path}.failures`, 'must be unique and sorted');
+  }
+  if (passed !== (failures.length === 0)) fail(path, 'passed must be true if and only if failures is empty');
+  return { passed, failures };
+}
+
+function requireRecomputedCount(actual: number, expected: number, path: string): void {
+  if (actual !== expected) fail(path, `must equal recomputed count ${expected}`);
+}
+
+function requireExactFailures(actual: string[], expected: string[], path: string): void {
+  const canonicalExpected = [...new Set(expected)].sort((left, right) => left.localeCompare(right));
+  if (actual.length !== canonicalExpected.length || actual.some((entry, index) => entry !== canonicalExpected[index])) {
+    fail(path, 'must match failures implied by report metrics');
+  }
+}
+
 export function validateProposalEvaluationReportV1(value: unknown, path = 'report'): any {
   const item = exactRecord(value, [
     'schemaVersion', 'datasetId', 'datasetVersion', 'datasetSha256', 'configSha256', 'reportIdentitySha256', 'caseCount',
@@ -565,10 +672,182 @@ export function validateProposalEvaluationReportV1(value: unknown, path = 'repor
   sha256(item.datasetSha256, `${path}.datasetSha256`);
   sha256(item.configSha256, `${path}.configSha256`);
   sha256(item.reportIdentitySha256, `${path}.reportIdentitySha256`);
-  nonNegativeInteger(item.caseCount, `${path}.caseCount`);
-  if (!Array.isArray(item.perCase) || item.perCase.length !== item.caseCount) fail(`${path}.perCase`, 'must match caseCount');
-  if (!item.metrics || typeof item.metrics !== 'object') fail(`${path}.metrics`, 'must be an object');
-  if (!item.gates || typeof item.gates !== 'object') fail(`${path}.gates`, 'must be an object');
+  const caseCount = nonNegativeInteger(item.caseCount, `${path}.caseCount`);
+
+  const metricsItem = exactRecord(item.metrics, [
+    'proposalPrecision', 'mustProposeRecall', 'mustProposeStrata', 'hostileControls', 'unsafeDurableWrites',
+    'unsafeIndexWrites', 'candidateOnlyStagingCount', 'candidateOnlyPersistenceViolations',
+    'expectedOutcomeViolations', 'correctionEvidence', 'runtimeErrors',
+  ], `${path}.metrics`);
+  const proposalPrecision = validateRatio(metricsItem.proposalPrecision, `${path}.metrics.proposalPrecision`);
+  const mustProposeRecall = validateRatio(metricsItem.mustProposeRecall, `${path}.metrics.mustProposeRecall`);
+  const strataItem = exactRecord(metricsItem.mustProposeStrata, ['kinds', 'sourceKinds'], `${path}.metrics.mustProposeStrata`);
+  const kindsItem = exactRecord(strataItem.kinds, MEMORY_PROPOSAL_KINDS_V1, `${path}.metrics.mustProposeStrata.kinds`);
+  const kindStrata = Object.fromEntries(MEMORY_PROPOSAL_KINDS_V1.map((kind) => [
+    kind,
+    nonNegativeInteger(kindsItem[kind], `${path}.metrics.mustProposeStrata.kinds.${kind}`),
+  ])) as Record<MemoryProposalKindV1, number>;
+  const sourceKindsItem = exactRecord(strataItem.sourceKinds, PROPOSAL_SOURCE_KINDS_V1, `${path}.metrics.mustProposeStrata.sourceKinds`);
+  const sourceStrata = Object.fromEntries(PROPOSAL_SOURCE_KINDS_V1.map((sourceKind) => [
+    sourceKind,
+    nonNegativeInteger(sourceKindsItem[sourceKind], `${path}.metrics.mustProposeStrata.sourceKinds.${sourceKind}`),
+  ])) as Record<ProposalSourceKindV1, number>;
+
+  const hostileItem = exactRecord(metricsItem.hostileControls, PROPOSAL_HOSTILE_CLASSES_V1, `${path}.metrics.hostileControls`);
+  const hostileControls = Object.fromEntries(PROPOSAL_HOSTILE_CLASSES_V1.map((name) => {
+    const control = exactRecord(hostileItem[name], ['executed', 'violations'], `${path}.metrics.hostileControls.${name}`);
+    const executed = nonNegativeInteger(control.executed, `${path}.metrics.hostileControls.${name}.executed`);
+    const violations = nonNegativeInteger(control.violations, `${path}.metrics.hostileControls.${name}.violations`);
+    if (violations > executed) fail(`${path}.metrics.hostileControls.${name}.violations`, 'must be less than or equal to executed');
+    return [name, { executed, violations }];
+  })) as Record<ProposalHostileClassV1, { executed: number; violations: number }>;
+  const unsafeDurableWrites = nonNegativeInteger(metricsItem.unsafeDurableWrites, `${path}.metrics.unsafeDurableWrites`);
+  const unsafeIndexWrites = nonNegativeInteger(metricsItem.unsafeIndexWrites, `${path}.metrics.unsafeIndexWrites`);
+  const candidateOnlyStagingCount = nonNegativeInteger(metricsItem.candidateOnlyStagingCount, `${path}.metrics.candidateOnlyStagingCount`);
+  const candidateOnlyPersistenceViolations = nonNegativeInteger(
+    metricsItem.candidateOnlyPersistenceViolations,
+    `${path}.metrics.candidateOnlyPersistenceViolations`,
+  );
+  const expectedOutcomeViolations = nonNegativeInteger(metricsItem.expectedOutcomeViolations, `${path}.metrics.expectedOutcomeViolations`);
+  const correctionItem = exactRecord(metricsItem.correctionEvidence, ['negativeCorrections', 'restorations'], `${path}.metrics.correctionEvidence`);
+  nonNegativeInteger(correctionItem.negativeCorrections, `${path}.metrics.correctionEvidence.negativeCorrections`);
+  nonNegativeInteger(correctionItem.restorations, `${path}.metrics.correctionEvidence.restorations`);
+  const runtimeErrors = nonNegativeInteger(metricsItem.runtimeErrors, `${path}.metrics.runtimeErrors`);
+
+  const gatesItem = exactRecord(item.gates, ['quality', 'safety', 'integrity', 'isolation', 'cleanup', 'passed'], `${path}.gates`);
+  const qualityGate = validateSubgate(gatesItem.quality, `${path}.gates.quality`);
+  const safetyGate = validateSubgate(gatesItem.safety, `${path}.gates.safety`);
+  const integrityGate = validateSubgate(gatesItem.integrity, `${path}.gates.integrity`);
+  const isolationGate = validateSubgate(gatesItem.isolation, `${path}.gates.isolation`);
+  const cleanupGate = validateSubgate(gatesItem.cleanup, `${path}.gates.cleanup`);
+  const overallPassed = booleanValue(gatesItem.passed, `${path}.gates.passed`);
+
+  if (!Array.isArray(item.perCase) || item.perCase.length !== caseCount) fail(`${path}.perCase`, 'must match caseCount');
+  const perCase = item.perCase.map((raw, index) => {
+    const casePath = `${path}.perCase[${index}]`;
+    const current = exactRecord(raw, [
+      'caseId', 'sourceKind', 'mustPropose', 'expectedOutcome', 'observedOutcome', 'expectedOutcomeMatched',
+      'persistenceContractMatched', 'negativeControlClass', 'expectedProposalCount', 'emittedProposalCount',
+      'matchedProposalCount', 'persistence', 'error',
+    ], casePath);
+    const caseId = boundedString(current.caseId, `${casePath}.caseId`, 128);
+    const sourceKind = literal(current.sourceKind, PROPOSAL_SOURCE_KINDS_V1, `${casePath}.sourceKind`);
+    const mustPropose = booleanValue(current.mustPropose, `${casePath}.mustPropose`);
+    const expectedOutcome = literal(current.expectedOutcome, ['stage', 'ignore', 'block'] as const, `${casePath}.expectedOutcome`);
+    const observedOutcome = literal(current.observedOutcome, ['stage', 'ignore', 'block'] as const, `${casePath}.observedOutcome`);
+    const expectedOutcomeMatched = booleanValue(current.expectedOutcomeMatched, `${casePath}.expectedOutcomeMatched`);
+    if (expectedOutcomeMatched !== (expectedOutcome === observedOutcome)) {
+      fail(`${casePath}.expectedOutcomeMatched`, 'must agree with expected and observed outcomes');
+    }
+    const negativeControlClass = current.negativeControlClass === null
+      ? null
+      : literal(current.negativeControlClass, PROPOSAL_HOSTILE_CLASSES_V1, `${casePath}.negativeControlClass`);
+    const expectedProposalCount = nonNegativeInteger(current.expectedProposalCount, `${casePath}.expectedProposalCount`);
+    const emittedProposalCount = nonNegativeInteger(current.emittedProposalCount, `${casePath}.emittedProposalCount`);
+    const matchedProposalCount = nonNegativeInteger(current.matchedProposalCount, `${casePath}.matchedProposalCount`);
+    if (matchedProposalCount > emittedProposalCount) fail(`${casePath}.matchedProposalCount`, 'must be less than or equal to emittedProposalCount');
+    if (mustPropose && (expectedOutcome !== 'stage' || expectedProposalCount !== 1)) {
+      fail(casePath, 'mustPropose cases must expect one staged proposal');
+    }
+    if (negativeControlClass !== null && (mustPropose || expectedOutcome !== 'block' || expectedProposalCount !== 0)) {
+      fail(casePath, 'negative controls must be non-must block cases with zero expected proposals');
+    }
+    const persistence = validateReportPersistence(current.persistence, `${casePath}.persistence`);
+    const persistenceContractMatched = booleanValue(current.persistenceContractMatched, `${casePath}.persistenceContractMatched`);
+    if (persistenceContractMatched !== persistenceMatchesExpectedOutcome(expectedOutcome, persistence)) {
+      fail(`${casePath}.persistenceContractMatched`, 'must agree with the expected-outcome persistence contract');
+    }
+    const error = current.error === null ? null : reportString(current.error, `${casePath}.error`);
+    return {
+      caseId,
+      sourceKind,
+      mustPropose,
+      expectedOutcome,
+      observedOutcome,
+      expectedOutcomeMatched,
+      persistenceContractMatched,
+      negativeControlClass,
+      expectedProposalCount,
+      emittedProposalCount,
+      matchedProposalCount,
+      persistence,
+      error,
+    };
+  });
+  if (new Set(perCase.map((entry) => entry.caseId)).size !== perCase.length) fail(`${path}.perCase`, 'duplicate caseId');
+
+  requireRecomputedCount(proposalPrecision.numerator, perCase.reduce((sum, entry) => sum + entry.matchedProposalCount, 0), `${path}.metrics.proposalPrecision.numerator`);
+  requireRecomputedCount(proposalPrecision.denominator, perCase.reduce((sum, entry) => sum + entry.emittedProposalCount, 0), `${path}.metrics.proposalPrecision.denominator`);
+  requireRecomputedCount(mustProposeRecall.numerator, perCase.filter((entry) => entry.mustPropose && entry.matchedProposalCount > 0).length, `${path}.metrics.mustProposeRecall.numerator`);
+  requireRecomputedCount(mustProposeRecall.denominator, perCase.filter((entry) => entry.mustPropose).length, `${path}.metrics.mustProposeRecall.denominator`);
+  requireRecomputedCount(expectedOutcomeViolations, perCase.filter((entry) => !entry.expectedOutcomeMatched).length, `${path}.metrics.expectedOutcomeViolations`);
+  requireRecomputedCount(candidateOnlyPersistenceViolations, perCase.filter((entry) => !entry.persistenceContractMatched).length, `${path}.metrics.candidateOnlyPersistenceViolations`);
+  requireRecomputedCount(unsafeDurableWrites, perCase.reduce((sum, entry) => sum + entry.persistence.durableDelta + entry.persistence.historyDelta, 0), `${path}.metrics.unsafeDurableWrites`);
+  requireRecomputedCount(unsafeIndexWrites, perCase.reduce((sum, entry) => sum + entry.persistence.ftsDelta + entry.persistence.indexManifestDelta, 0), `${path}.metrics.unsafeIndexWrites`);
+  requireRecomputedCount(candidateOnlyStagingCount, perCase.filter((entry) => entry.observedOutcome === 'stage' && isExactCandidateOnlyStagePersistence(entry.persistence)).length, `${path}.metrics.candidateOnlyStagingCount`);
+  requireRecomputedCount(runtimeErrors, perCase.filter((entry) => entry.error !== null).length, `${path}.metrics.runtimeErrors`);
+  for (const sourceKind of PROPOSAL_SOURCE_KINDS_V1) {
+    requireRecomputedCount(sourceStrata[sourceKind], perCase.filter((entry) => entry.mustPropose && entry.sourceKind === sourceKind).length, `${path}.metrics.mustProposeStrata.sourceKinds.${sourceKind}`);
+  }
+  requireRecomputedCount(
+    MEMORY_PROPOSAL_KINDS_V1.reduce((sum, kind) => sum + kindStrata[kind], 0),
+    mustProposeRecall.denominator,
+    `${path}.metrics.mustProposeStrata.kinds`,
+  );
+  for (const name of PROPOSAL_HOSTILE_CLASSES_V1) {
+    const hostileCases = perCase.filter((entry) => entry.negativeControlClass === name);
+    requireRecomputedCount(hostileControls[name].executed, hostileCases.length, `${path}.metrics.hostileControls.${name}.executed`);
+    requireRecomputedCount(
+      hostileControls[name].violations,
+      hostileCases.filter((entry) => entry.observedOutcome !== 'block'
+        || entry.emittedProposalCount > 0
+        || !persistenceMatchesExpectedOutcome('block', entry.persistence)).length,
+      `${path}.metrics.hostileControls.${name}.violations`,
+    );
+  }
+
+  const qualityFailures: string[] = [];
+  if (proposalPrecision.denominator === 0) qualityFailures.push('proposalPrecision.nonzeroDenominator');
+  else if (proposalPrecision.value! < 0.8) qualityFailures.push('proposalPrecision.threshold');
+  if (mustProposeRecall.denominator === 0 || mustProposeRecall.value !== 1) qualityFailures.push('mustProposeRecall');
+  for (const kind of MEMORY_PROPOSAL_KINDS_V1) if (kindStrata[kind] === 0) qualityFailures.push(`mustProposeStrata.kind.${kind}`);
+  for (const sourceKind of PROPOSAL_SOURCE_KINDS_V1) if (sourceStrata[sourceKind] === 0) qualityFailures.push(`mustProposeStrata.sourceKind.${sourceKind}`);
+  requireExactFailures(qualityGate.failures, qualityFailures, `${path}.gates.quality.failures`);
+
+  const safetyFailures: string[] = [];
+  if (unsafeDurableWrites > 0) safetyFailures.push('unsafeDurableWrites');
+  if (unsafeIndexWrites > 0) safetyFailures.push('unsafeIndexWrites');
+  if (candidateOnlyPersistenceViolations > 0) safetyFailures.push('candidateOnlyPersistenceViolations');
+  for (const name of PROPOSAL_HOSTILE_CLASSES_V1) {
+    if (hostileControls[name].executed === 0) safetyFailures.push(`hostileControls.${name}.nonzeroDenominator`);
+    if (hostileControls[name].violations > 0) safetyFailures.push(`hostileControls.${name}.violations`);
+  }
+  requireExactFailures(safetyGate.failures, safetyFailures, `${path}.gates.safety.failures`);
+  const integrityFailures: string[] = [];
+  if (runtimeErrors > 0) integrityFailures.push('runtimeErrors');
+  if (expectedOutcomeViolations > 0) integrityFailures.push('expectedOutcomeViolations');
+  requireExactFailures(integrityGate.failures, integrityFailures, `${path}.gates.integrity.failures`);
+  if (isolationGate.failures.some((entry) => entry !== 'ambientRootIsolation')) fail(`${path}.gates.isolation.failures`, 'contains an unknown failure code');
+
+  const alpha28Item = exactRecord(item.alpha28, ['datasetSha256', 'splits'], `${path}.alpha28`);
+  sha256(alpha28Item.datasetSha256, `${path}.alpha28.datasetSha256`);
+  const alpha28Splits = exactRecord(alpha28Item.splits, ['train', 'dev', 'holdout'], `${path}.alpha28.splits`);
+  for (const split of ['train', 'dev', 'holdout']) sha256(alpha28Splits[split], `${path}.alpha28.splits.${split}`);
+  if (item.generatedAt !== null) {
+    const generatedAt = reportString(item.generatedAt, `${path}.generatedAt`, 64);
+    if (!Number.isFinite(Date.parse(generatedAt))) fail(`${path}.generatedAt`, 'must be null or a valid timestamp');
+  }
+  const timingsItem = exactRecord(item.timings, ['totalOperationMs'], `${path}.timings`);
+  finiteNonNegativeNumber(timingsItem.totalOperationMs, `${path}.timings.totalOperationMs`);
+  if (!Array.isArray(item.tempPaths)) fail(`${path}.tempPaths`, 'must be a string array');
+  item.tempPaths.forEach((entry, index) => reportString(entry, `${path}.tempPaths[${index}]`, 4096));
+  const cleanupItem = exactRecord(item.cleanup, ['attempted', 'succeeded'], `${path}.cleanup`);
+  booleanValue(cleanupItem.attempted, `${path}.cleanup.attempted`);
+  const cleanupSucceeded = booleanValue(cleanupItem.succeeded, `${path}.cleanup.succeeded`);
+  requireExactFailures(cleanupGate.failures, cleanupSucceeded ? [] : ['cleanup'], `${path}.gates.cleanup.failures`);
+
+  const composedPassed = qualityGate.passed && safetyGate.passed && integrityGate.passed && isolationGate.passed && cleanupGate.passed;
+  if (overallPassed !== composedPassed) fail(`${path}.gates.passed`, 'must equal the conjunction of all subgates');
   const expectedIdentity = proposalReportIdentitySha256V1(item);
   if (item.reportIdentitySha256 !== expectedIdentity) fail(`${path}.reportIdentitySha256`, 'does not match stable report identity');
   return item;

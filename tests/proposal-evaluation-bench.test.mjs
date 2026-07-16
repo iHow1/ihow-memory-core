@@ -74,13 +74,21 @@ test('real core harness is isolated, candidate-only, cleans up, and repeats stab
     assert.equal(first.report.metrics.mustProposeRecall.value, 1);
     assert.equal(first.report.metrics.unsafeDurableWrites, 0);
     assert.equal(first.report.metrics.unsafeIndexWrites, 0);
+    assert.equal(first.report.metrics.expectedOutcomeViolations, 0);
+    assert.equal(first.report.metrics.candidateOnlyPersistenceViolations, 0);
     assert.deepEqual(first.report.metrics.correctionEvidence, { negativeCorrections: 1, restorations: 1 });
     assert.equal(first.report.cleanup.succeeded, true);
     for (const item of first.report.perCase) {
-      if (item.observedOutcome === 'stage') {
+      assert.equal(item.expectedOutcomeMatched, true, item.caseId);
+      assert.equal(item.persistenceContractMatched, true, item.caseId);
+      if (item.expectedOutcome === 'stage') {
         assert.equal(item.persistence.candidateDelta, 1);
         assert.equal(item.persistence.eventDelta, 1);
         assert.deepEqual(item.persistence.eventTypes, ['candidate.created']);
+      } else {
+        assert.equal(item.persistence.candidateDelta, 0);
+        assert.equal(item.persistence.eventDelta, 0);
+        assert.deepEqual(item.persistence.eventTypes, []);
       }
       assert.equal(item.persistence.durableDelta, 0);
       assert.equal(item.persistence.historyDelta, 0);
