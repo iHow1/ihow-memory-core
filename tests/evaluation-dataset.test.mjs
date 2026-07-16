@@ -13,6 +13,8 @@ import {
   validateEvaluationDatasetSplitV1,
   validateManifestAgainstDatasetsV1,
 } from '../src/evaluation.ts';
+import { defaultPromptRecallBoundary } from '../src/recall-quality.ts';
+import { isCuratedMemoryPath } from '../src/workspace.ts';
 
 const splitNames = ['train', 'dev', 'holdout'];
 const categories = ['fact', 'preference', 'status', 'temporal', 'recovery', 'paraphrase', 'no-answer'];
@@ -173,6 +175,60 @@ test('case IDs and canonical document paths are globally disjoint', () => {
     Object.fromEntries(datasets.map((dataset) => [dataset.split, dataset.documents.map((item) => item.documentId)])),
     'document path',
   );
+});
+
+test('all dataset identity surfaces use canonical memory paths accepted by promote and search', () => {
+  for (const dataset of datasets) {
+    const identityPaths = [
+      ...dataset.documents.map((item) => item.documentId),
+      ...dataset.cases.flatMap((item) => [
+        ...item.goldDocumentIds,
+        ...Object.values(item.safety).flat(),
+      ]),
+    ];
+
+    for (const identityPath of identityPaths) {
+      assert.match(identityPath, /^memory\//, `${identityPath} must use the canonical memory/ namespace`);
+    }
+  }
+});
+
+test('dataset paths exercise the real curated and blocked prompt-recall lanes', () => {
+  for (const dataset of datasets) {
+    const labelsByDocument = new Map(dataset.documents.map((item) => [item.documentId, new Set()]));
+    const goldDocumentIds = new Set(dataset.cases.flatMap((item) => item.goldDocumentIds));
+    for (const item of dataset.cases) {
+      for (const [label, ids] of Object.entries(item.safety)) {
+        for (const id of ids) labelsByDocument.get(id).add(label);
+      }
+    }
+
+    for (const document of dataset.documents) {
+      const labels = labelsByDocument.get(document.documentId);
+      const boundary = defaultPromptRecallBoundary(document.text, document.documentId);
+
+      if (goldDocumentIds.has(document.documentId)) {
+        assert.match(document.documentId, /^memory\/scopes\/evaluation\//);
+        assert.equal(isCuratedMemoryPath(document.documentId), true);
+        assert.deepEqual(boundary, { allowed: true });
+      } else if (labels.has('privateIds')) {
+        assert.match(document.documentId, /^memory\/scopes\/private\//);
+        assert.equal(isCuratedMemoryPath(document.documentId), true);
+        assert.deepEqual(boundary, { allowed: false, reason: 'private' });
+      } else if (labels.has('auditOnlyIds')) {
+        assert.match(document.documentId, /\/_events\//);
+        assert.equal(isCuratedMemoryPath(document.documentId), true);
+        assert.deepEqual(boundary, { allowed: false, reason: 'audit-only' });
+      } else if (labels.has('flaggedIds') || labels.has('forbiddenIds') || labels.has('harmfulIds')) {
+        assert.match(document.documentId, /^memory\/scopes\/flagged\//);
+        assert.equal(isCuratedMemoryPath(document.documentId), true);
+        assert.deepEqual(boundary, { allowed: false, reason: 'flagged' });
+      } else {
+        assert.match(document.documentId, /^memory\/eval\/golden\/v1\/corpus\//);
+        assert.equal(isCuratedMemoryPath(document.documentId), false);
+      }
+    }
+  }
 });
 
 test('manifest pins the exact ordered twelve-case train smoke set', () => {
