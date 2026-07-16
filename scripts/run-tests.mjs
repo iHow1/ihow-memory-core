@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 iHow Memory
 //
-// Keep the broad suite parallel, but run the real PreCompact hook integration tests after it.
-// Those tests intentionally execute a production 8s fail-open watchdog. Running that watchdog
-// while every CPU is saturated by unrelated test workers tests scheduler contention rather than the
-// checkpoint invariants: the correct production outcome under that contention is to exit 0 without
-// an artifact, while the success-path assertions require a normal host budget.
+// Keep the broad suite parallel, but run deadline-sensitive integration tests after it. The real
+// PreCompact hook tests execute a production 8s fail-open watchdog, while the vector timeout test
+// deliberately contrasts a 200ms status preflight with the index phase's 4000ms ceiling. Running
+// either family while every CPU is saturated by unrelated workers tests scheduler contention rather
+// than the production checkpoint or index-timeout contract that its assertions are meant to cover.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -13,7 +13,10 @@ import { fileURLToPath } from 'node:url';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testsRoot = path.join(repo, 'tests');
-const deadlineSensitive = new Set(['tests/native-precompact.test.mjs']);
+const deadlineSensitive = new Set([
+  'tests/native-precompact.test.mjs',
+  'tests/vector-index-timeout.test.mjs',
+]);
 const dangerousAmbientRoutingKeys = [
   'MEMORY_ROOT',
   'IHOW_MEMORY_ROOT',
@@ -29,6 +32,13 @@ export function sanitizeTestEnv(env = process.env) {
   const sanitized = { ...env };
   for (const key of dangerousAmbientRoutingKeys) delete sanitized[key];
   return sanitized;
+}
+
+export function partitionTestPhases(files) {
+  return {
+    parallelTests: files.filter((file) => !deadlineSensitive.has(file)),
+    deadlineTests: files.filter((file) => deadlineSensitive.has(file)),
+  };
 }
 
 async function collectTests(dir) {
@@ -62,12 +72,11 @@ export function runPhase(label, files) {
 
 async function main() {
   const allTests = await collectTests(testsRoot);
-  const parallelTests = allTests.filter((file) => !deadlineSensitive.has(file));
-  const deadlineTests = allTests.filter((file) => deadlineSensitive.has(file));
+  const { parallelTests, deadlineTests } = partitionTestPhases(allTests);
 
   const parallelExit = await runPhase('parallel core suite', parallelTests);
   if (parallelExit !== 0) return parallelExit;
-  return runPhase('isolated deadline-sensitive PreCompact integration', deadlineTests);
+  return runPhase('isolated deadline-sensitive integrations', deadlineTests);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

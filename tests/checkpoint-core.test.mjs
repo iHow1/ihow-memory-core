@@ -2103,13 +2103,14 @@ test('parent timeout SIGKILL still waits for pinned-guardian cleanup after the a
       testTimeoutMs: 200,
     },
   );
+  const rejection = assert.rejects(operation, /checkpoint_internal_failure/);
   await waitForFile(path.join(controlDirectory, 'after-write-before-final-check.ready'));
   await fs.rename(path.join(paths.artifacts, claimName), path.join(paths.artifacts, 'attacker-stash'));
   await fs.rename(paths.artifacts, movedArtifacts);
   await fs.mkdir(paths.artifacts, { mode: 0o700 });
   await fs.writeFile(path.join(paths.artifacts, claimName), replacement, { flag: 'wx', mode: 0o600 });
 
-  await assert.rejects(operation, /checkpoint_internal_failure/);
+  await rejection;
   assert.deepEqual(await fs.readdir(movedArtifacts), [], 'timeout rejection is delayed until guardian cleanup completes');
   assert.equal(await fs.readFile(path.join(paths.artifacts, claimName), 'utf8'), replacement);
 });

@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { sanitizeTestEnv } from '../scripts/run-tests.mjs';
+import { partitionTestPhases, sanitizeTestEnv } from '../scripts/run-tests.mjs';
 
 const runTestsModule = new URL('../scripts/run-tests.mjs', import.meta.url).href;
 
@@ -21,6 +21,22 @@ const dangerousRoutingKeys = [
   'IHOW_MEMORY_HERMES_NODE',
   'CODEX_HOME',
 ];
+
+test('partitionTestPhases separates deadline-sensitive tests from the parallel core', () => {
+  const phases = partitionTestPhases([
+    'tests/ordinary.test.mjs',
+    'tests/vector-index-timeout.test.mjs',
+    'tests/native-precompact.test.mjs',
+  ]);
+
+  assert.deepEqual(phases, {
+    parallelTests: ['tests/ordinary.test.mjs'],
+    deadlineTests: [
+      'tests/vector-index-timeout.test.mjs',
+      'tests/native-precompact.test.mjs',
+    ],
+  });
+});
 
 test('sanitizeTestEnv copies process.env without ambient memory routing', () => {
   const originalValues = new Map(
