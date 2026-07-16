@@ -31,6 +31,7 @@ import type { ForgetOutcome, RememberOutcome } from './forget.ts';
 import { organizeDraft, exportVaultFromDraft } from './gardener.ts';
 import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraftOptions } from './gardener.ts';
 import { checkpointProtectionState, createCheckpointService, type CheckpointService } from './checkpoints.ts';
+import { proposeMemoryV1, type MemoryProposalRequestV1, type MemoryProposalResultV1 } from './memory-proposals.ts';
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -50,6 +51,8 @@ export type MemoryCore = {
   forgotten(): Promise<Array<{ path: string; snippet: string }>>;
   organize(opts?: OrganizeDraftOptions): Promise<GardenerDraft>;
   export_vault(fromDraft: string, opts?: ExportVaultOptions): Promise<ExportVaultResult>;
+  // alpha.29: explicit, bounded, review-first formation. This path never calls write_candidate/auto-promote/indexing.
+  propose_memory(request: MemoryProposalRequestV1): Promise<MemoryProposalResultV1[]>;
   // alpha.27 Stage 2: bounded checkpoint core only. No hooks, continue integration, UX, or implicit promotion.
   checkpoints: CheckpointService;
 };
@@ -248,6 +251,9 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     },
     async export_vault(fromDraft, opts = {}) {
       return await exportVaultFromDraft(workspace, fromDraft, opts);
+    },
+    async propose_memory(request) {
+      return await proposeMemoryV1(workspace, request);
     },
   };
 }
