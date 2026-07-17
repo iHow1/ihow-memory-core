@@ -45,10 +45,10 @@ export type TurnReceiptIdentityV1 = {
 export type TurnReceiptV1 = TurnReceiptIdentityV1 & {
   schemaVersion: 1;
   state: 'OPEN' | 'COMMITTED';
-  inputSource: string;
+  inputSourceHash: string;
   inputContentSha256: string;
   openedAt: string;
-  finalSource?: string;
+  finalSourceHash?: string;
   finalContentSha256?: string;
   committedAt?: string;
   deltaState: TurnReceiptDeltaStateV1;
@@ -56,24 +56,31 @@ export type TurnReceiptV1 = TurnReceiptIdentityV1 & {
 
 export type TurnReceiptOpenInputV1 = TurnReceiptIdentityV1 & {
   schemaVersion: 1;
-  inputSource: string;
+  inputSourceHash: string;
   inputContentSha256: string;
   openedAt: string;
 };
 
 export type TurnReceiptCommitInputV1 = TurnReceiptIdentityV1 & {
   schemaVersion: 1;
-  inputSource: string;
+  inputSourceHash: string;
   inputContentSha256: string;
-  finalSource: string;
+  finalSourceHash: string;
   finalContentSha256: string;
   committedAt: string;
   deltaState: TurnReceiptDeltaStateV1;
 };
 
 export type TurnReceiptListOptions = {
+  offset?: number;
   limit?: number;
   currentOnly?: boolean;
+};
+
+export type TurnReceiptPageV1 = {
+  items: TurnReceiptV1[];
+  total: number;
+  nextOffset: number | null;
 };
 
 export type Citation = {

@@ -12,10 +12,10 @@ import { absoluteFromMemoryPath, relativeToSpace } from '../workspace.ts';
 // root but points outside passes the lexical check yet escapes on the real filesystem. Resolve
 // real paths and re-verify the target is still inside the managed root before any read/write.
 //
-// Returns the resolved real path. Callers MUST operate on the returned path, not on the original
-// `target`: reading/writing the original re-resolves symlinks a second time, opening a TOCTOU
-// window where the link is swapped between this check and the use. Acting on the already-resolved
-// real path closes that window.
+// Returns the resolved real path. This proves static containment at the instant of the check; it is
+// not a general replacement for fd-relative openat()/renameat(), which Node does not expose. Readers
+// pair it with O_NOFOLLOW + inode checks. Private writers additionally pin/check the directory and
+// define an owner-private containment root as their mutation boundary.
 export async function assertRealPathWithin(rootDir: string, target: string): Promise<string> {
   const realRoot = await fs.realpath(rootDir);
   let realTarget: string;
@@ -32,19 +32,184 @@ export async function assertRealPathWithin(rootDir: string, target: string): Pro
   return realTarget;
 }
 
-export async function atomicWriteFile(filePath: string, content: string, containmentRoot?: string): Promise<void> {
+export type AtomicWriteFileOptions = {
+  directoryMode?: number;
+  fileMode?: number;
+  durable?: boolean;
+  // Use one deterministic temp name. The caller MUST serialize writers (turn receipts use the
+  // workspace lock); in exchange, crash debris is bounded to one private file and cleaned next time.
+  boundedTemp?: boolean;
+};
+
+function directorySyncUnsupported(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'EINVAL'
+    || code === 'ENOTSUP'
+    || code === 'EOPNOTSUPP'
+    || (process.platform === 'win32' && code === 'EPERM');
+}
+
+async function syncDirectory(handle: fs.FileHandle): Promise<void> {
+  try {
+    await handle.sync();
+  } catch (error) {
+    if (!directorySyncUnsupported(error)) throw error;
+  }
+}
+
+async function removeBoundedStaleTemp(tmpPath: string): Promise<void> {
+  let entry: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    entry = await fs.lstat(tmpPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (entry.isDirectory()) throw new Error('atomic_write_temp_invalid');
+  await fs.unlink(tmpPath);
+}
+
+export async function atomicWriteFile(
+  filePath: string,
+  content: string,
+  containmentRoot?: string,
+  options: AtomicWriteFileOptions = {},
+): Promise<void> {
   const dir = path.dirname(filePath);
-  await fs.mkdir(dir, { recursive: true });
-  // The parent dir now exists; if any of its components is a symlink that escapes the managed
-  // root, reject before writing. (Renaming over a symlinked *file* replaces the link, so guarding
-  // the parent directory is sufficient.)
+  await fs.mkdir(dir, {
+    recursive: true,
+    ...(options.directoryMode === undefined ? {} : { mode: options.directoryMode }),
+  });
+  // Reject static parent-directory symlinks that escape the managed root. Secure callers below also
+  // require an exact non-symlink directory and compare its pinned inode immediately before rename.
+  // Node still lacks renameat/openat: a malicious same-UID process allowed to mutate the owner-private
+  // containment root is outside this helper's threat boundary, and this code does not claim otherwise.
   if (containmentRoot) await assertRealPathWithin(containmentRoot, dir);
+  let directoryHandle: fs.FileHandle | undefined;
+  let expectedDirectory: { dev: number; ino: number; real: string } | undefined;
+  if (options.directoryMode !== undefined || options.durable || options.boundedTemp) {
+    const entry = await fs.lstat(dir);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error('path_outside_memory_workspace');
+    const real = await fs.realpath(dir);
+    directoryHandle = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
+    try {
+      if (options.directoryMode !== undefined) await directoryHandle.chmod(options.directoryMode);
+      const [opened, current] = await Promise.all([directoryHandle.stat(), fs.stat(real)]);
+      if (
+        !opened.isDirectory()
+        || !current.isDirectory()
+        || opened.dev !== current.dev
+        || opened.ino !== current.ino
+        || (options.directoryMode !== undefined
+          && process.platform !== 'win32'
+          && (opened.mode & 0o777) !== options.directoryMode)
+      ) throw new Error('path_outside_memory_workspace');
+      expectedDirectory = { dev: opened.dev, ino: opened.ino, real };
+    } catch (error) {
+      await directoryHandle.close();
+      directoryHandle = undefined;
+      throw error;
+    }
+  }
+
+  const assertDirectoryStillPinned = async (): Promise<void> => {
+    if (!directoryHandle || !expectedDirectory) return;
+    const [opened, current, real] = await Promise.all([
+      directoryHandle.stat(),
+      fs.stat(dir),
+      fs.realpath(dir),
+    ]);
+    if (
+      !opened.isDirectory()
+      || !current.isDirectory()
+      || opened.dev !== expectedDirectory.dev
+      || opened.ino !== expectedDirectory.ino
+      || current.dev !== expectedDirectory.dev
+      || current.ino !== expectedDirectory.ino
+      || real !== expectedDirectory.real
+    ) throw new Error('path_outside_memory_workspace');
+  };
+
   const tmpPath = path.join(
     dir,
-    `.${path.basename(filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`,
+    options.boundedTemp
+      ? `.${path.basename(filePath)}.tmp`
+      : `.${path.basename(filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`,
   );
-  await fs.writeFile(tmpPath, content, 'utf8');
-  await fs.rename(tmpPath, filePath);
+  let tempHandle: fs.FileHandle | undefined;
+  let tempCreated = false;
+  let committed = false;
+  let tempIdentity: { dev: number; ino: number } | undefined;
+  try {
+    if (options.boundedTemp) await removeBoundedStaleTemp(tmpPath);
+    await assertDirectoryStillPinned();
+    const fileMode = options.fileMode ?? 0o666;
+    tempHandle = await fs.open(
+      tmpPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      fileMode,
+    );
+    tempCreated = true;
+    // Creation mode is already no broader than requested (umask can only remove bits). chmod here
+    // restores an exact private mode before content is written, never after broader exposure.
+    if (options.fileMode !== undefined) await tempHandle.chmod(options.fileMode);
+    const tempStat = await tempHandle.stat();
+    if (
+      !tempStat.isFile()
+      || tempStat.size !== 0
+      || tempStat.nlink !== 1
+      || (options.fileMode !== undefined
+        && process.platform !== 'win32'
+        && (tempStat.mode & 0o777) !== options.fileMode)
+    ) throw new Error('atomic_write_temp_invalid');
+    tempIdentity = { dev: tempStat.dev, ino: tempStat.ino };
+    await tempHandle.writeFile(content, 'utf8');
+    if (options.durable) await tempHandle.sync();
+    await tempHandle.close();
+    tempHandle = undefined;
+    await assertDirectoryStillPinned();
+    await fs.rename(tmpPath, filePath);
+    committed = true;
+    if (options.fileMode !== undefined && process.platform !== 'win32') {
+      const finalStat = await fs.lstat(filePath);
+      if (
+        !finalStat.isFile()
+        || finalStat.isSymbolicLink()
+        || finalStat.nlink !== 1
+        || !tempIdentity
+        || finalStat.dev !== tempIdentity.dev
+        || finalStat.ino !== tempIdentity.ino
+        || (finalStat.mode & 0o777) !== options.fileMode
+      ) {
+        throw new Error('atomic_write_final_invalid');
+      }
+    }
+    if (options.durable && directoryHandle) await syncDirectory(directoryHandle);
+  } catch (error) {
+    const failures: unknown[] = [error];
+    if (tempHandle) {
+      try {
+        await tempHandle.close();
+      } catch (closeError) {
+        failures.push(closeError);
+      } finally {
+        tempHandle = undefined;
+      }
+    }
+    if (tempCreated && !committed) {
+      try {
+        await fs.unlink(tmpPath);
+      } catch (cleanupError) {
+        if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+          failures.push(cleanupError);
+        }
+      }
+    }
+    if (failures.length > 1) throw new AggregateError(failures, 'atomic_write_cleanup_failed');
+    throw error;
+  } finally {
+    if (directoryHandle) await directoryHandle.close();
+  }
 }
 
 export async function appendFileAtomic(filePath: string, line: string): Promise<void> {

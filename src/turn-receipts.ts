@@ -10,6 +10,7 @@ import type {
   TurnReceiptIdentityV1,
   TurnReceiptListOptions,
   TurnReceiptOpenInputV1,
+  TurnReceiptPageV1,
   TurnReceiptV1,
   Workspace,
 } from './types.ts';
@@ -17,8 +18,12 @@ import { atomicWriteFile, assertRealPathWithin } from './store/files.ts';
 import { withWorkspaceLock } from './store/lock.ts';
 
 const HASH_RE = /^[a-f0-9]{64}$/;
+const SOURCE_HASH_RE = /^sha256:[a-f0-9]{64}$/;
 const SAFE_ID_RE = /^[A-Za-z0-9._:-]+$/;
 const MAX_STORE_BYTES = 4 * 1024 * 1024;
+// B1 deliberately fails closed at this capacity: there is no eviction. Callers can enumerate every
+// record through TurnReceiptPageV1 before the limit is reached. Archival/rotation is deferred to B3
+// and must land before this receipt store is presented as a user-facing completion mechanism.
 const MAX_RECEIPTS = 4096;
 const MAX_LIST_LIMIT = 100;
 
@@ -29,11 +34,12 @@ type TurnReceiptStoreV1 = {
 
 export type TurnReceiptService = {
   hashSessionId(sessionId: unknown): string;
+  hashSourceId(rawSourceId: unknown): string;
   open(input: unknown): Promise<TurnReceiptV1>;
   commit(input: unknown): Promise<TurnReceiptV1>;
   read(identity: unknown): Promise<TurnReceiptV1 | null>;
-  list(options?: unknown): Promise<TurnReceiptV1[]>;
-  gaps(options?: unknown): Promise<TurnReceiptV1[]>;
+  list(options?: unknown): Promise<TurnReceiptPageV1>;
+  gaps(options?: unknown): Promise<TurnReceiptPageV1>;
 };
 
 export function hashTurnReceiptSessionId(sessionId: unknown): string {
@@ -44,11 +50,25 @@ export function hashTurnReceiptSessionId(sessionId: unknown): string {
   return crypto.createHash('sha256').update('turn-receipt-session-v1\0').update(sessionId).digest('hex');
 }
 
-function receiptStorePaths(workspace: Workspace): { containmentRoot: string; file: string } {
+export function hashTurnReceiptSourceId(rawSourceId: unknown): string {
+  if (typeof rawSourceId !== 'string' || !rawSourceId.trim() || /\p{Cc}/u.test(rawSourceId)) {
+    throw new Error('turn_receipt_source_id_invalid');
+  }
+  if (Buffer.byteLength(rawSourceId, 'utf8') > 512) throw new Error('turn_receipt_source_id_too_large');
+  const digest = crypto.createHash('sha256')
+    .update('turn-receipt-source-v1\0')
+    .update(rawSourceId)
+    .digest('hex');
+  return `sha256:${digest}`;
+}
+
+function receiptStorePaths(workspace: Workspace): { containmentRoot: string; directory: string; file: string } {
   const containmentRoot = workspace.mode === 'existing-memory-root' ? workspace.mcpDir : workspace.spaceDir;
+  const directory = path.join(containmentRoot, 'turn-receipts');
   return {
     containmentRoot,
-    file: path.join(containmentRoot, 'turn-receipts', 'v1.json'),
+    directory,
+    file: path.join(directory, 'v1.json'),
   };
 }
 
@@ -103,12 +123,10 @@ function boundedId(value: unknown, field: string, max: number): string {
   return result;
 }
 
-function sourcePointer(value: unknown, field: string): string {
-  const result = boundedString(value, field, 512);
-  if (/\s/u.test(result) || /^(?:data|javascript):/i.test(result)) {
-    throw new Error(`turn_receipt_${field}_invalid`);
-  }
-  return result;
+function sourceHash(value: unknown, field: string): string {
+  if (typeof value !== 'string') throw new Error(`turn_receipt_${field}_required`);
+  if (!SOURCE_HASH_RE.test(value)) throw new Error(`turn_receipt_${field}_invalid`);
+  return value;
 }
 
 function sha256(value: unknown, field: string): string {
@@ -156,7 +174,7 @@ function parseOpenInput(input: unknown): TurnReceiptOpenInputV1 {
   assertAllowedKeys(record, [
     'schemaVersion',
     ...IDENTITY_KEYS,
-    'inputSource',
+    'inputSourceHash',
     'inputContentSha256',
     'openedAt',
   ]);
@@ -164,7 +182,7 @@ function parseOpenInput(input: unknown): TurnReceiptOpenInputV1 {
   return {
     schemaVersion: 1,
     ...parseIdentityFields(record),
-    inputSource: sourcePointer(record.inputSource, 'input_source'),
+    inputSourceHash: sourceHash(record.inputSourceHash, 'input_source_hash'),
     inputContentSha256: sha256(record.inputContentSha256, 'input_content_sha256'),
     openedAt: timestamp(record.openedAt, 'opened_at'),
   };
@@ -180,9 +198,9 @@ function parseCommitInput(input: unknown): TurnReceiptCommitInputV1 {
   assertAllowedKeys(record, [
     'schemaVersion',
     ...IDENTITY_KEYS,
-    'inputSource',
+    'inputSourceHash',
     'inputContentSha256',
-    'finalSource',
+    'finalSourceHash',
     'finalContentSha256',
     'committedAt',
     'deltaState',
@@ -191,9 +209,9 @@ function parseCommitInput(input: unknown): TurnReceiptCommitInputV1 {
   return {
     schemaVersion: 1,
     ...parseIdentityFields(record),
-    inputSource: sourcePointer(record.inputSource, 'input_source'),
+    inputSourceHash: sourceHash(record.inputSourceHash, 'input_source_hash'),
     inputContentSha256: sha256(record.inputContentSha256, 'input_content_sha256'),
-    finalSource: sourcePointer(record.finalSource, 'final_source'),
+    finalSourceHash: sourceHash(record.finalSourceHash, 'final_source_hash'),
     finalContentSha256: sha256(record.finalContentSha256, 'final_content_sha256'),
     committedAt: timestamp(record.committedAt, 'committed_at'),
     deltaState: deltaState(record.deltaState),
@@ -210,15 +228,15 @@ function logicalTurnKey(identity: TurnReceiptIdentityV1): string {
 
 function sameInputEvidence(
   existing: TurnReceiptV1,
-  input: Pick<TurnReceiptOpenInputV1, 'inputSource' | 'inputContentSha256'>,
+  input: Pick<TurnReceiptOpenInputV1, 'inputSourceHash' | 'inputContentSha256'>,
 ): boolean {
-  return existing.inputSource === input.inputSource
+  return existing.inputSourceHash === input.inputSourceHash
     && existing.inputContentSha256 === input.inputContentSha256;
 }
 
 function sameCommittedEvidence(existing: TurnReceiptV1, input: TurnReceiptCommitInputV1): boolean {
   return existing.state === 'COMMITTED'
-    && existing.finalSource === input.finalSource
+    && existing.finalSourceHash === input.finalSourceHash
     && existing.finalContentSha256 === input.finalContentSha256
     && existing.deltaState === input.deltaState;
 }
@@ -232,7 +250,7 @@ function canonicalOpenReceipt(input: TurnReceiptOpenInputV1): TurnReceiptV1 {
     sessionHash: input.sessionHash,
     turnId: input.turnId,
     revision: input.revision,
-    inputSource: input.inputSource,
+    inputSourceHash: input.inputSourceHash,
     inputContentSha256: input.inputContentSha256,
     openedAt: input.openedAt,
     deltaState: 'not_emitted',
@@ -240,8 +258,8 @@ function canonicalOpenReceipt(input: TurnReceiptOpenInputV1): TurnReceiptV1 {
 }
 
 function canonicalCommittedReceipt(
-  existing: TurnReceiptIdentityV1 & Pick<TurnReceiptV1, 'inputSource' | 'inputContentSha256' | 'openedAt'>,
-  input: Pick<TurnReceiptCommitInputV1, 'finalSource' | 'finalContentSha256' | 'committedAt' | 'deltaState'>,
+  existing: TurnReceiptIdentityV1 & Pick<TurnReceiptV1, 'inputSourceHash' | 'inputContentSha256' | 'openedAt'>,
+  input: Pick<TurnReceiptCommitInputV1, 'finalSourceHash' | 'finalContentSha256' | 'committedAt' | 'deltaState'>,
 ): TurnReceiptV1 {
   return {
     schemaVersion: 1,
@@ -251,10 +269,10 @@ function canonicalCommittedReceipt(
     sessionHash: existing.sessionHash,
     turnId: existing.turnId,
     revision: existing.revision,
-    inputSource: existing.inputSource,
+    inputSourceHash: existing.inputSourceHash,
     inputContentSha256: existing.inputContentSha256,
     openedAt: existing.openedAt,
-    finalSource: input.finalSource,
+    finalSourceHash: input.finalSourceHash,
     finalContentSha256: input.finalContentSha256,
     committedAt: input.committedAt,
     deltaState: input.deltaState,
@@ -264,8 +282,8 @@ function canonicalCommittedReceipt(
 function validatePersistedReceipt(input: unknown): TurnReceiptV1 {
   const record = assertRecord(input);
   assertAllowedKeys(record, [
-    'schemaVersion', 'state', ...IDENTITY_KEYS, 'inputSource', 'inputContentSha256', 'openedAt',
-    'finalSource', 'finalContentSha256', 'committedAt', 'deltaState',
+    'schemaVersion', 'state', ...IDENTITY_KEYS, 'inputSourceHash', 'inputContentSha256', 'openedAt',
+    'finalSourceHash', 'finalContentSha256', 'committedAt', 'deltaState',
   ]);
   if (record.schemaVersion !== 1 || (record.state !== 'OPEN' && record.state !== 'COMMITTED')) {
     throw new Error('turn_receipt_store_invalid');
@@ -273,13 +291,13 @@ function validatePersistedReceipt(input: unknown): TurnReceiptV1 {
   const base = {
     schemaVersion: 1,
     ...parseIdentityFields(record),
-    inputSource: sourcePointer(record.inputSource, 'input_source'),
+    inputSourceHash: sourceHash(record.inputSourceHash, 'input_source_hash'),
     inputContentSha256: sha256(record.inputContentSha256, 'input_content_sha256'),
     openedAt: timestamp(record.openedAt, 'opened_at'),
   } as const;
   if (record.state === 'OPEN') {
     if (record.deltaState !== 'not_emitted') throw new Error('turn_receipt_store_invalid');
-    if (record.finalSource !== undefined || record.finalContentSha256 !== undefined || record.committedAt !== undefined) {
+    if (record.finalSourceHash !== undefined || record.finalContentSha256 !== undefined || record.committedAt !== undefined) {
       throw new Error('turn_receipt_store_invalid');
     }
     return canonicalOpenReceipt(base);
@@ -287,7 +305,7 @@ function validatePersistedReceipt(input: unknown): TurnReceiptV1 {
   const committedAt = timestamp(record.committedAt, 'committed_at');
   if (Date.parse(committedAt) < Date.parse(base.openedAt)) throw new Error('turn_receipt_store_invalid');
   return canonicalCommittedReceipt(base, {
-    finalSource: sourcePointer(record.finalSource, 'final_source'),
+    finalSourceHash: sourceHash(record.finalSourceHash, 'final_source_hash'),
     finalContentSha256: sha256(record.finalContentSha256, 'final_content_sha256'),
     committedAt,
     deltaState: deltaState(record.deltaState),
@@ -315,8 +333,11 @@ async function readStoreFile(file: string, containmentRoot: string): Promise<str
       throw error;
     }
     const [opened, realStat] = await Promise.all([handle.stat(), fs.stat(real)]);
-    if (!opened.isFile() || opened.dev !== realStat.dev || opened.ino !== realStat.ino) {
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== realStat.dev || opened.ino !== realStat.ino) {
       throw new Error('turn_receipt_path_outside_store');
+    }
+    if (process.platform !== 'win32' && (opened.mode & 0o777) !== 0o600) {
+      throw new Error('turn_receipt_store_permissions_invalid');
     }
     if (opened.size > MAX_STORE_BYTES) throw new Error('turn_receipt_store_too_large');
     return await handle.readFile('utf8');
@@ -325,8 +346,91 @@ async function readStoreFile(file: string, containmentRoot: string): Promise<str
   }
 }
 
+async function ensurePrivateReceiptDirectory(containmentRoot: string, directory: string): Promise<void> {
+  const lexicalRelative = path.relative(path.resolve(containmentRoot), path.resolve(directory));
+  if (lexicalRelative.startsWith('..') || path.isAbsolute(lexicalRelative)) {
+    throw new Error('turn_receipt_path_outside_store');
+  }
+  const rootEntry = await fs.lstat(containmentRoot);
+  if (rootEntry.isSymbolicLink() || !rootEntry.isDirectory()) {
+    throw new Error('turn_receipt_path_outside_store');
+  }
+  const containmentHandle = await fs.open(
+    containmentRoot,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY,
+  );
+  try {
+    await containmentHandle.chmod(0o700);
+    const rootStat = await containmentHandle.stat();
+    if (
+      !rootStat.isDirectory()
+      || rootStat.dev !== rootEntry.dev
+      || rootStat.ino !== rootEntry.ino
+      || (process.platform !== 'win32' && (rootStat.mode & 0o777) !== 0o700)
+    ) throw new Error('turn_receipt_path_outside_store');
+
+    let created = false;
+    try {
+      await fs.mkdir(directory, { mode: 0o700 });
+      created = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+
+    const entry = await fs.lstat(directory);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error('turn_receipt_path_outside_store');
+
+    let realDirectory: string;
+    try {
+      realDirectory = await assertRealPathWithin(containmentRoot, directory);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'path_outside_memory_workspace') {
+        throw new Error('turn_receipt_path_outside_store');
+      }
+      throw error;
+    }
+
+    const directoryHandle = await fs.open(
+      directory,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY,
+    );
+    try {
+      await directoryHandle.chmod(0o700);
+      const [opened, current, currentReal] = await Promise.all([
+        directoryHandle.stat(),
+        fs.stat(realDirectory),
+        fs.realpath(directory),
+      ]);
+      if (
+        !opened.isDirectory()
+        || !current.isDirectory()
+        || opened.dev !== current.dev
+        || opened.ino !== current.ino
+        || currentReal !== realDirectory
+        || (process.platform !== 'win32' && (opened.mode & 0o777) !== 0o700)
+      ) throw new Error('turn_receipt_path_outside_store');
+    } finally {
+      await directoryHandle.close();
+    }
+
+    if (created) {
+      try {
+        await containmentHandle.sync();
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        const unsupported = code === 'EINVAL' || code === 'ENOTSUP' || code === 'EOPNOTSUPP'
+          || (process.platform === 'win32' && code === 'EPERM');
+        if (!unsupported) throw error;
+      }
+    }
+  } finally {
+    await containmentHandle.close();
+  }
+}
+
 async function loadStoreUnlocked(workspace: Workspace): Promise<TurnReceiptStoreV1> {
-  const { containmentRoot, file } = receiptStorePaths(workspace);
+  const { containmentRoot, directory, file } = receiptStorePaths(workspace);
+  await ensurePrivateReceiptDirectory(containmentRoot, directory);
   const raw = await readStoreFile(file, containmentRoot);
   if (raw === null) return { schemaVersion: 1, receipts: [] };
   let parsed: unknown;
@@ -355,7 +459,13 @@ async function saveStoreUnlocked(workspace: Workspace, store: TurnReceiptStoreV1
   if (Buffer.byteLength(serialized, 'utf8') > MAX_STORE_BYTES) throw new Error('turn_receipt_store_too_large');
   const { containmentRoot, file } = receiptStorePaths(workspace);
   try {
-    await atomicWriteFile(file, serialized, containmentRoot);
+    await atomicWriteFile(file, serialized, containmentRoot, {
+      directoryMode: 0o700,
+      fileMode: 0o600,
+      durable: true,
+      // withWorkspaceLock serializes writers, so this single deterministic temp bounds crash debris.
+      boundedTemp: true,
+    });
   } catch (error) {
     if (error instanceof Error && error.message === 'path_outside_memory_workspace') {
       throw new Error('turn_receipt_path_outside_store');
@@ -367,16 +477,32 @@ async function saveStoreUnlocked(workspace: Workspace, store: TurnReceiptStoreV1
 function parseListOptions(input: unknown): TurnReceiptListOptions {
   if (input === undefined) return {};
   const record = assertRecord(input);
-  assertAllowedKeys(record, ['limit', 'currentOnly']);
+  assertAllowedKeys(record, ['offset', 'limit', 'currentOnly']);
   if (record.currentOnly !== undefined && typeof record.currentOnly !== 'boolean') {
     throw new Error('turn_receipt_current_only_invalid');
   }
   if (record.limit !== undefined && (!Number.isSafeInteger(record.limit) || (record.limit as number) < 1 || (record.limit as number) > MAX_LIST_LIMIT)) {
     throw new Error('turn_receipt_list_limit_invalid');
   }
+  if (record.offset !== undefined && (!Number.isSafeInteger(record.offset) || (record.offset as number) < 0 || (record.offset as number) > MAX_RECEIPTS)) {
+    throw new Error('turn_receipt_list_offset_invalid');
+  }
   return {
+    ...(record.offset !== undefined ? { offset: record.offset as number } : {}),
     ...(record.limit !== undefined ? { limit: record.limit as number } : {}),
     ...(record.currentOnly !== undefined ? { currentOnly: record.currentOnly } : {}),
+  };
+}
+
+function pageReceipts(receipts: TurnReceiptV1[], options: TurnReceiptListOptions): TurnReceiptPageV1 {
+  const offset = options.offset ?? 0;
+  const limit = options.limit ?? MAX_LIST_LIMIT;
+  const items = receipts.slice(offset, offset + limit);
+  const next = offset + items.length;
+  return {
+    items,
+    total: receipts.length,
+    nextOffset: next < receipts.length ? next : null,
   };
 }
 
@@ -408,6 +534,7 @@ function currentReceipts(receipts: readonly TurnReceiptV1[]): TurnReceiptV1[] {
 export function createTurnReceiptService(workspace: Workspace): TurnReceiptService {
   return {
     hashSessionId: hashTurnReceiptSessionId,
+    hashSourceId: hashTurnReceiptSourceId,
     async open(raw) {
       const input = parseOpenInput(raw);
       return await withWorkspaceLock(workspace, async () => {
@@ -442,7 +569,7 @@ export function createTurnReceiptService(workspace: Workspace): TurnReceiptServi
           throw new Error('turn_receipt_timestamp_order_invalid');
         }
         const committed = canonicalCommittedReceipt(existing, {
-          finalSource: input.finalSource,
+          finalSourceHash: input.finalSourceHash,
           finalContentSha256: input.finalContentSha256,
           committedAt: input.committedAt,
           deltaState: input.deltaState,
@@ -465,7 +592,7 @@ export function createTurnReceiptService(workspace: Workspace): TurnReceiptServi
       return await withWorkspaceLock(workspace, async () => {
         const store = await loadStoreUnlocked(workspace);
         const receipts = sortReceipts(options.currentOnly ? currentReceipts(store.receipts) : [...store.receipts]);
-        return receipts.slice(0, options.limit ?? MAX_LIST_LIMIT);
+        return pageReceipts(receipts, options);
       });
     },
     async gaps(rawOptions) {
@@ -476,7 +603,7 @@ export function createTurnReceiptService(workspace: Workspace): TurnReceiptServi
         const receipts = sortReceipts(candidates.filter((receipt) => (
           receipt.state === 'OPEN' || receipt.deltaState !== 'explicit_none'
         )));
-        return receipts.slice(0, options.limit ?? MAX_LIST_LIMIT);
+        return pageReceipts(receipts, options);
       });
     },
   };
