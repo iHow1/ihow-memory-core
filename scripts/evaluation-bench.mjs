@@ -6,7 +6,16 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import { openCore } from '../src/core.ts';
-import { selectPromptRecall, renderPromptRecall } from '../src/prompt-recall.ts';
+import {
+  PROMPT_RECALL_INCLUDE_LIMIT,
+  PROMPT_RECALL_MAX_CHARS,
+  PROMPT_RECALL_MIN_LEXICAL_TERMS,
+  PROMPT_RECALL_MIN_QUERY_COVERAGE,
+  PROMPT_RECALL_SEARCH_LIMIT,
+  PROMPT_RECALL_SNIPPET_CAP,
+  selectPromptRecall,
+  renderPromptRecall,
+} from '../src/prompt-recall.ts';
 import { absoluteFromMemoryPath, resolveWorkspace } from '../src/workspace.ts';
 import {
   canonicalJsonV1,
@@ -25,7 +34,6 @@ const MODE_SPLITS = Object.freeze({
   full: ['train', 'dev', 'holdout'],
 });
 const DATASET_RELATIVE_DIR = path.join('eval', 'golden', 'v1');
-const SEARCH_LIMIT = 10;
 const SPACE_PREFIX = 'alpha28-eval';
 
 export const QUALITY_THRESHOLDS_V1 = Object.freeze({
@@ -41,13 +49,25 @@ export const QUALITY_THRESHOLDS_V1 = Object.freeze({
 
 const PROMPT_RECALL_OPTIONS = Object.freeze({
   semanticFloor: null,
-  searchLimit: SEARCH_LIMIT,
-  includeLimit: 3,
-  maxChars: 1200,
-  snippetCap: 280,
+  searchLimit: PROMPT_RECALL_SEARCH_LIMIT,
+  includeLimit: PROMPT_RECALL_INCLUDE_LIMIT,
+  maxChars: PROMPT_RECALL_MAX_CHARS,
+  snippetCap: PROMPT_RECALL_SNIPPET_CAP,
   includeAuto: false,
   autoDefaultOn: false,
   nowMs: 0,
+});
+
+export const EVALUATION_RECALL_POLICY_V1 = Object.freeze({
+  schemaVersion: 1,
+  candidateDepth: PROMPT_RECALL_SEARCH_LIMIT,
+  lexicalMinDistinctTerms: PROMPT_RECALL_MIN_LEXICAL_TERMS,
+  lexicalMinQueryCoverage: PROMPT_RECALL_MIN_QUERY_COVERAGE,
+  includeLimit: PROMPT_RECALL_INCLUDE_LIMIT,
+  maxChars: PROMPT_RECALL_MAX_CHARS,
+  snippetCap: PROMPT_RECALL_SNIPPET_CAP,
+  reranker: 'off',
+  temporalEntitySchemaVersion: 1,
 });
 
 const DANGEROUS_ENVIRONMENT_KEYS = [
@@ -422,7 +442,7 @@ export async function runEvaluationBench(options = {}) {
         let rendered;
         let operationError = null;
         try {
-          const hits = await core.search(evaluationCase.query, { limit: SEARCH_LIMIT });
+          const hits = await core.search(evaluationCase.query, { limit: PROMPT_RECALL_SEARCH_LIMIT });
           rankedIds = hits.map((hit) => hit.path);
           const selection = await selectPromptRecall(
             core.workspace,
@@ -463,6 +483,7 @@ export async function runEvaluationBench(options = {}) {
       tokenMethod: 'unicode-whitespace-v1',
       datasetSha256: manifest.datasetSha256,
       qualityThresholds: { ...QUALITY_THRESHOLDS_V1 },
+      recallPolicy: { ...EVALUATION_RECALL_POLICY_V1 },
     };
     report = scoreEvaluationRunV1({
       datasets: selectedDatasets,

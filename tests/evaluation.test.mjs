@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const evaluation = await import('../src/evaluation.ts').catch(() => ({}));
+const recall = await import('../src/prompt-recall.ts').catch(() => ({}));
 
 function qualityThresholds(overrides = {}) {
   return {
@@ -28,6 +29,21 @@ function baseConfig(overrides = {}) {
     tokenMethod: 'unicode-whitespace-v1',
     datasetSha256: 'a'.repeat(64),
     qualityThresholds: qualityThresholds(),
+    ...overrides,
+  };
+}
+
+function productionRecallPolicy(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    candidateDepth: recall.PROMPT_RECALL_SEARCH_LIMIT,
+    lexicalMinDistinctTerms: recall.PROMPT_RECALL_MIN_LEXICAL_TERMS,
+    lexicalMinQueryCoverage: recall.PROMPT_RECALL_MIN_QUERY_COVERAGE,
+    includeLimit: recall.PROMPT_RECALL_INCLUDE_LIMIT,
+    maxChars: recall.PROMPT_RECALL_MAX_CHARS,
+    snippetCap: recall.PROMPT_RECALL_SNIPPET_CAP,
+    reranker: 'off',
+    temporalEntitySchemaVersion: 1,
     ...overrides,
   };
 }
@@ -309,6 +325,28 @@ test('runtime validators strictly reject malformed V1 values and cross-schema in
     () => evaluation.validateEvaluationReportV1(noAnswerMetricPresent),
     /no-answer cases require all retrieval metrics to be null/,
   );
+});
+
+test('keeps legacy config identity byte-identical and strictly identities the optional production recall policy', () => {
+  const legacy = baseConfig();
+  assert.equal(
+    evaluation.evaluationRunConfigSha256V1(legacy),
+    '261e8bb1c7c4eae365f2c3719e50e2f03db374887939f23e1285eb5b1fad6a62',
+    'pre-alpha30 config SHA remains byte-identical when recallPolicy is absent',
+  );
+
+  const withPolicy = baseConfig({ recallPolicy: productionRecallPolicy() });
+  assert.deepEqual(evaluation.validateEvaluationRunConfigV1(withPolicy).recallPolicy, productionRecallPolicy());
+  assert.notEqual(evaluation.evaluationRunConfigSha256V1(withPolicy), evaluation.evaluationRunConfigSha256V1(legacy));
+
+  const changedDepth = structuredClone(withPolicy);
+  changedDepth.recallPolicy.candidateDepth = 24;
+  assert.notEqual(evaluation.canonicalSha256V1(changedDepth), evaluation.canonicalSha256V1(withPolicy));
+  assert.throws(() => evaluation.validateEvaluationRunConfigV1(changedDepth), /candidateDepth/);
+
+  const nestedExtra = structuredClone(withPolicy);
+  nestedExtra.recallPolicy.extra = true;
+  assert.throws(() => evaluation.validateEvaluationRunConfigV1(nestedExtra), /unknown field/);
 });
 
 test('manifest pins exactly twelve ordered smoke case IDs into dataset identity', () => {

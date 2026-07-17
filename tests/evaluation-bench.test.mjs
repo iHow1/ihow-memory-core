@@ -15,8 +15,17 @@ import {
   validateEvaluationReportV1,
 } from '../src/evaluation.ts';
 import {
+  EVALUATION_RECALL_POLICY_V1,
   runEvaluationBench,
 } from '../scripts/evaluation-bench.mjs';
+import {
+  PROMPT_RECALL_INCLUDE_LIMIT,
+  PROMPT_RECALL_MAX_CHARS,
+  PROMPT_RECALL_MIN_LEXICAL_TERMS,
+  PROMPT_RECALL_MIN_QUERY_COVERAGE,
+  PROMPT_RECALL_SEARCH_LIMIT,
+  PROMPT_RECALL_SNIPPET_CAP,
+} from '../src/prompt-recall.ts';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const BENCH_SCRIPT = fileURLToPath(new URL('../scripts/evaluation-bench.mjs', import.meta.url));
@@ -172,6 +181,26 @@ test('package scripts add the three evaluation modes without changing the existi
   assert.equal(packageJson.scripts['eval:full'], 'node --experimental-strip-types scripts/evaluation-bench.mjs full');
   assert.equal(packageJson.scripts.test, 'node scripts/run-tests.mjs');
   assert.equal(packageJson.scripts.typecheck, 'tsc --noEmit');
+});
+
+test('harness policy and both candidate-depth consumers use the imported production constants', async () => {
+  assert.deepEqual(EVALUATION_RECALL_POLICY_V1, {
+    schemaVersion: 1,
+    candidateDepth: PROMPT_RECALL_SEARCH_LIMIT,
+    lexicalMinDistinctTerms: PROMPT_RECALL_MIN_LEXICAL_TERMS,
+    lexicalMinQueryCoverage: PROMPT_RECALL_MIN_QUERY_COVERAGE,
+    includeLimit: PROMPT_RECALL_INCLUDE_LIMIT,
+    maxChars: PROMPT_RECALL_MAX_CHARS,
+    snippetCap: PROMPT_RECALL_SNIPPET_CAP,
+    reranker: 'off',
+    temporalEntitySchemaVersion: 1,
+  });
+  assert.equal(PROMPT_RECALL_SEARCH_LIMIT, 25);
+  const source = await fs.readFile(BENCH_SCRIPT, 'utf8');
+  assert.match(source, /core\.search\(evaluationCase\.query, \{ limit: PROMPT_RECALL_SEARCH_LIMIT \}\)/);
+  assert.match(source, /searchLimit: PROMPT_RECALL_SEARCH_LIMIT/);
+  assert.match(source, /recallPolicy: \{ \.\.\.EVALUATION_RECALL_POLICY_V1 \}/);
+  assert.doesNotMatch(source, /const SEARCH_LIMIT\s*=/);
 });
 
 test('smoke runs the real FTS write_candidate/promote/search/selector/render path in pinned order', async (t) => {

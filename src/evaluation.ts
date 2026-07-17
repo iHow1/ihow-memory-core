@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 iHow Memory
 import { createHash } from 'node:crypto';
+import {
+  PROMPT_RECALL_INCLUDE_LIMIT,
+  PROMPT_RECALL_MAX_CHARS,
+  PROMPT_RECALL_MIN_LEXICAL_TERMS,
+  PROMPT_RECALL_MIN_QUERY_COVERAGE,
+  PROMPT_RECALL_SEARCH_LIMIT,
+  PROMPT_RECALL_SNIPPET_CAP,
+} from './prompt-recall.ts';
 
 export type EvaluationSplitNameV1 = 'train' | 'dev' | 'holdout';
 export type EvaluationCategoryV1 =
@@ -95,6 +103,18 @@ export type EvaluationQualityThresholdsV1 = {
   injectedPathPrecision: number;
 };
 
+export type EvaluationRecallPolicyV1 = {
+  schemaVersion: 1;
+  candidateDepth: 25;
+  lexicalMinDistinctTerms: 2;
+  lexicalMinQueryCoverage: 0.40;
+  includeLimit: 3;
+  maxChars: 1200;
+  snippetCap: 280;
+  reranker: 'off';
+  temporalEntitySchemaVersion: 1;
+};
+
 export type EvaluationRunConfigV1 = {
   schemaVersion: 1;
   mode: EvaluationModeV1;
@@ -107,6 +127,7 @@ export type EvaluationRunConfigV1 = {
   tokenMethod: EvaluationTokenMethodV1;
   datasetSha256: string;
   qualityThresholds: EvaluationQualityThresholdsV1;
+  recallPolicy?: EvaluationRecallPolicyV1;
 };
 
 export type EvaluationAnswerMetricsV1 = {
@@ -280,7 +301,12 @@ export function canonicalSha256V1(value: unknown): string {
 
 export const canonicalJsonSha256V1 = canonicalSha256V1;
 
-function exactRecord(value: unknown, keys: readonly string[], path: string): UnknownRecord {
+function exactRecord(
+  value: unknown,
+  keys: readonly string[],
+  path: string,
+  requiredKeys: readonly string[] = keys,
+): UnknownRecord {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     fail(path, 'must be an object');
   }
@@ -289,7 +315,7 @@ function exactRecord(value: unknown, keys: readonly string[], path: string): Unk
   for (const key of Object.keys(record)) {
     if (!allowed.has(key)) fail(`${path}.${key}`, 'unknown field');
   }
-  for (const key of keys) {
+  for (const key of requiredKeys) {
     if (!Object.hasOwn(record, key)) fail(`${path}.${key}`, 'required field is missing');
   }
   return record;
@@ -612,8 +638,37 @@ function validateQualityThresholdsV1(value: unknown, path: string): EvaluationQu
   return item as EvaluationQualityThresholdsV1;
 }
 
+function exactNumber(value: unknown, expected: number, path: string): void {
+  if (value !== expected) fail(path, `must be exactly ${expected}`);
+}
+
+function validateEvaluationRecallPolicyV1(value: unknown, path: string): EvaluationRecallPolicyV1 {
+  const keys = [
+    'schemaVersion',
+    'candidateDepth',
+    'lexicalMinDistinctTerms',
+    'lexicalMinQueryCoverage',
+    'includeLimit',
+    'maxChars',
+    'snippetCap',
+    'reranker',
+    'temporalEntitySchemaVersion',
+  ] as const;
+  const item = exactRecord(value, keys, path);
+  exactSchemaVersion(item.schemaVersion, `${path}.schemaVersion`);
+  exactNumber(item.candidateDepth, PROMPT_RECALL_SEARCH_LIMIT, `${path}.candidateDepth`);
+  exactNumber(item.lexicalMinDistinctTerms, PROMPT_RECALL_MIN_LEXICAL_TERMS, `${path}.lexicalMinDistinctTerms`);
+  exactNumber(item.lexicalMinQueryCoverage, PROMPT_RECALL_MIN_QUERY_COVERAGE, `${path}.lexicalMinQueryCoverage`);
+  exactNumber(item.includeLimit, PROMPT_RECALL_INCLUDE_LIMIT, `${path}.includeLimit`);
+  exactNumber(item.maxChars, PROMPT_RECALL_MAX_CHARS, `${path}.maxChars`);
+  exactNumber(item.snippetCap, PROMPT_RECALL_SNIPPET_CAP, `${path}.snippetCap`);
+  if (item.reranker !== 'off') fail(`${path}.reranker`, 'must be exactly off');
+  exactNumber(item.temporalEntitySchemaVersion, 1, `${path}.temporalEntitySchemaVersion`);
+  return item as EvaluationRecallPolicyV1;
+}
+
 export function validateEvaluationRunConfigV1(value: unknown, path = 'config'): EvaluationRunConfigV1 {
-  const item = exactRecord(value, [
+  const required = [
     'schemaVersion',
     'mode',
     'splits',
@@ -621,7 +676,8 @@ export function validateEvaluationRunConfigV1(value: unknown, path = 'config'): 
     'tokenMethod',
     'datasetSha256',
     'qualityThresholds',
-  ], path);
+  ] as const;
+  const item = exactRecord(value, [...required, 'recallPolicy'], path, required);
   exactSchemaVersion(item.schemaVersion, `${path}.schemaVersion`);
   const mode = enumValue(item.mode, ['smoke', 'batch', 'full'], `${path}.mode`);
   if (!Array.isArray(item.splits)) fail(`${path}.splits`, 'must be an array');
@@ -647,6 +703,7 @@ export function validateEvaluationRunConfigV1(value: unknown, path = 'config'): 
   enumValue(item.tokenMethod, ['unicode-whitespace-v1'], `${path}.tokenMethod`);
   sha256(item.datasetSha256, `${path}.datasetSha256`);
   validateQualityThresholdsV1(item.qualityThresholds, `${path}.qualityThresholds`);
+  if (Object.hasOwn(item, 'recallPolicy')) validateEvaluationRecallPolicyV1(item.recallPolicy, `${path}.recallPolicy`);
   return item as EvaluationRunConfigV1;
 }
 
