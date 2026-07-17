@@ -14,6 +14,59 @@ const PRIVATE_DURABLE_OPTIONS = Object.freeze({
   boundedTemp: true,
 });
 
+test('legacy default-options atomic write creates and replaces a regular file without temp debris', async (t) => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-atomic-write-legacy-')));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const directory = path.join(root, 'legacy-store');
+  const filePath = path.join(directory, 'governance.json');
+
+  await assert.doesNotReject(async () => {
+    await atomicWriteFile(filePath, 'first-content', root);
+  });
+  assert.equal(await fs.readFile(filePath, 'utf8'), 'first-content');
+  const firstStat = await fs.lstat(filePath);
+  assert.equal(firstStat.isFile(), true);
+  assert.equal(firstStat.isSymbolicLink(), false);
+  assert.deepEqual(await fs.readdir(directory), ['governance.json']);
+
+  await assert.doesNotReject(async () => {
+    await atomicWriteFile(filePath, 'replacement-content', root);
+  });
+  assert.equal(await fs.readFile(filePath, 'utf8'), 'replacement-content');
+  const replacementStat = await fs.lstat(filePath);
+  assert.equal(replacementStat.isFile(), true);
+  assert.equal(replacementStat.isSymbolicLink(), false);
+  assert.deepEqual(await fs.readdir(directory), ['governance.json']);
+});
+
+test('legacy default-options atomic write removes temp debris after an ordinary rename failure', async (t) => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-atomic-write-legacy-failure-')));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const directory = path.join(root, 'legacy-store');
+  const filePath = path.join(directory, 'existing-target');
+  const sentinel = path.join(filePath, 'sentinel.txt');
+  await fs.mkdir(filePath, { recursive: true });
+  await fs.writeFile(sentinel, 'unchanged-object');
+
+  let observedError;
+  await assert.rejects(
+    async () => await atomicWriteFile(filePath, 'replacement-content', root),
+    (error) => {
+      observedError = error;
+      return true;
+    },
+  );
+
+  assert.equal(observedError instanceof AggregateError, false);
+  assert.notEqual(observedError.message, 'atomic_write_cleanup_failed');
+  assert.equal(observedError.syscall, 'rename');
+  assert.ok(['EISDIR', 'ENOTDIR', 'EPERM'].includes(observedError.code), `unexpected rename error: ${observedError.code}`);
+  const targetStat = await fs.lstat(filePath);
+  assert.equal(targetStat.isDirectory(), true);
+  assert.equal(await fs.readFile(sentinel, 'utf8'), 'unchanged-object');
+  assert.deepEqual(await fs.readdir(directory), ['existing-target']);
+});
+
 test('private durable atomic writes clean stale temp and preserve final bytes on rename failure', async (t) => {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-atomic-write-')));
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
