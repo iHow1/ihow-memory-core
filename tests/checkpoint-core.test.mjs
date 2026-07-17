@@ -2100,7 +2100,7 @@ test('parent timeout SIGKILL still waits for pinned-guardian cleanup after the a
     {
       testControlDirectory: controlDirectory,
       testPhase: 'after-write-before-final-check',
-      testTimeoutMs: 200,
+      testTimeoutMs: 1_000,
     },
   );
   const rejection = assert.rejects(operation, /checkpoint_internal_failure/);

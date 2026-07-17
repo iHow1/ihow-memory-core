@@ -25,6 +25,7 @@ const dangerousRoutingKeys = [
 test('partitionTestPhases separates deadline-sensitive tests from the parallel core', () => {
   const phases = partitionTestPhases([
     'tests/ordinary.test.mjs',
+    'tests/checkpoint-core.test.mjs',
     'tests/vector-index-timeout.test.mjs',
     'tests/native-precompact.test.mjs',
   ]);
@@ -32,6 +33,7 @@ test('partitionTestPhases separates deadline-sensitive tests from the parallel c
   assert.deepEqual(phases, {
     parallelTests: ['tests/ordinary.test.mjs'],
     deadlineTests: [
+      'tests/checkpoint-core.test.mjs',
       'tests/vector-index-timeout.test.mjs',
       'tests/native-precompact.test.mjs',
     ],

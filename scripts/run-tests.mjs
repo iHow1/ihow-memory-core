@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testsRoot = path.join(repo, 'tests');
 const deadlineSensitive = new Set([
+  'tests/checkpoint-core.test.mjs',
   'tests/native-precompact.test.mjs',
   'tests/vector-index-timeout.test.mjs',
 ]);
