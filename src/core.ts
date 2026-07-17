@@ -32,6 +32,7 @@ import { organizeDraft, exportVaultFromDraft } from './gardener.ts';
 import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraftOptions } from './gardener.ts';
 import { checkpointProtectionState, createCheckpointService, type CheckpointService } from './checkpoints.ts';
 import { proposeMemoryV1, type MemoryProposalRequestV1, type MemoryProposalResultV1 } from './memory-proposals.ts';
+import { createTurnReceiptService, type TurnReceiptService } from './turn-receipts.ts';
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -55,6 +56,8 @@ export type MemoryCore = {
   propose_memory(request: MemoryProposalRequestV1): Promise<MemoryProposalResultV1[]>;
   // alpha.27 Stage 2: bounded checkpoint core only. No hooks, continue integration, UX, or implicit promotion.
   checkpoints: CheckpointService;
+  // Deterministic per-logical-turn loss evidence. No host adapter or model invocation lives here.
+  turnReceipts: TurnReceiptService;
 };
 
 function excerpt(content: string, max = 300): string {
@@ -66,10 +69,12 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
   const workspace = await ensureWorkspace(resolveWorkspace(options));
   const engineConfig = resolveEngineConfig(options);
   const checkpoints = await createCheckpointService(workspace, options);
+  const turnReceipts = createTurnReceiptService(workspace);
 
   return {
     workspace,
     checkpoints,
+    turnReceipts,
     async search(query, opts = {}) {
       if (typeof query !== 'string' || !query.trim()) return [];
       const hits = (await searchWithEngineFallback(workspace, engineConfig, query, opts)).hits;

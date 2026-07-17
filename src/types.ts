@@ -32,6 +32,50 @@ export type Workspace = {
   lockPath: string;
 };
 
+export type TurnReceiptDeltaStateV1 = 'explicit_none' | 'not_emitted' | 'extraction_failed';
+
+export type TurnReceiptIdentityV1 = {
+  runtime: string;
+  projectId: string;
+  sessionHash: string;
+  turnId: string;
+  revision: number;
+};
+
+export type TurnReceiptV1 = TurnReceiptIdentityV1 & {
+  schemaVersion: 1;
+  state: 'OPEN' | 'COMMITTED';
+  inputSource: string;
+  inputContentSha256: string;
+  openedAt: string;
+  finalSource?: string;
+  finalContentSha256?: string;
+  committedAt?: string;
+  deltaState: TurnReceiptDeltaStateV1;
+};
+
+export type TurnReceiptOpenInputV1 = TurnReceiptIdentityV1 & {
+  schemaVersion: 1;
+  inputSource: string;
+  inputContentSha256: string;
+  openedAt: string;
+};
+
+export type TurnReceiptCommitInputV1 = TurnReceiptIdentityV1 & {
+  schemaVersion: 1;
+  inputSource: string;
+  inputContentSha256: string;
+  finalSource: string;
+  finalContentSha256: string;
+  committedAt: string;
+  deltaState: TurnReceiptDeltaStateV1;
+};
+
+export type TurnReceiptListOptions = {
+  limit?: number;
+  currentOnly?: boolean;
+};
+
 export type Citation = {
   path: string;
   snippet: string;
