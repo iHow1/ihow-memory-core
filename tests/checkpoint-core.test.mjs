@@ -2690,6 +2690,7 @@ test('file-worker parent timeout waits for pinned cleanup after IPC termination 
     testPhase: 'after-finalize-before-final-check',
     testTimeoutMs: 200,
   });
+  const rejection = assert.rejects(operation, /checkpoint_internal_failure/);
   await waitForFile(path.join(controlDirectory, 'after-finalize-before-final-check.ready'));
   const owned = await fs.stat(path.join(paths.drafts, finalName), { bigint: true });
   await fs.rename(path.join(paths.drafts, finalName), path.join(paths.drafts, 'attacker-renamed'));
@@ -2697,7 +2698,7 @@ test('file-worker parent timeout waits for pinned cleanup after IPC termination 
   await fs.mkdir(paths.drafts, { mode: 0o700 });
   await fs.writeFile(path.join(paths.drafts, finalName), 'timeout-replacement-must-survive', 'utf8');
 
-  await assert.rejects(operation, /checkpoint_internal_failure/);
+  await rejection;
   assert.deepEqual(await fs.readdir(movedDrafts), []);
   assert.equal(await fs.readFile(path.join(paths.drafts, finalName), 'utf8'), 'timeout-replacement-must-survive');
   await assertDirectoryHasNoInode(movedDrafts, owned);
