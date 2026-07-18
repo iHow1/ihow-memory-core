@@ -9,6 +9,7 @@ import { openCore } from './core.ts';
 import { contextProbe } from './context-probe.ts';
 import { containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
 import { CheckpointValidationError, type CheckpointMachineAnchors } from './checkpoint-schema.ts';
+import { appendEvent } from './store/events.ts';
 
 import {
   runtimeEventToContextProbe,
@@ -34,7 +35,98 @@ const FILE_ANCHOR_MAX_BYTES = 1024 * 1024;
 type HermesBridgeEvent = RuntimeLifecycleEvent & {
   prompt?: unknown;
   checkpointClaims?: unknown;
+  turnReceipt?: unknown;
+  diagnostic?: unknown;
 };
+
+const HASH_RE = /^[a-f0-9]{64}$/;
+const SOURCE_HASH_RE = /^sha256:[a-f0-9]{64}$/;
+const COMMIT_NOT_PROVEN_REASONS = new Set([
+  'identity_invalid',
+  'durable_marker_missing',
+  'pending_not_found',
+  'final_evidence_invalid',
+  'final_conflict',
+  'end_not_successful',
+  'final_evidence_missing',
+  'transport_failure',
+  'input_conflict',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function exactKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(record).length === keys.length && keys.every((key) => key in record);
+}
+
+function parseReceiptAction(value: unknown): { action: 'open' | 'commit'; receipt: Record<string, unknown> } | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || !exactKeys(value, ['action', 'receipt'])) {
+    throw new Error('hermes_turn_receipt_action_invalid');
+  }
+  const receipt = value.receipt;
+  const openKeys = [
+    'schemaVersion', 'runtime', 'projectId', 'sessionHash', 'turnId', 'revision',
+    'inputSourceHash', 'inputContentSha256', 'openedAt',
+  ] as const;
+  const commitKeys = [
+    'schemaVersion', 'runtime', 'projectId', 'sessionHash', 'turnId', 'revision',
+    'inputSourceHash', 'inputContentSha256', 'finalSourceHash', 'finalContentSha256',
+    'committedAt', 'deltaState',
+  ] as const;
+  if (value.action !== 'open' && value.action !== 'commit') {
+    throw new Error('hermes_turn_receipt_action_invalid');
+  }
+  const action = value.action as 'open' | 'commit';
+  const keys = action === 'open' ? openKeys : commitKeys;
+  if (!isRecord(receipt) || !exactKeys(receipt, keys)) {
+    throw new Error(action === 'commit' ? 'hermes_turn_receipt_commit_invalid' : 'hermes_turn_receipt_action_invalid');
+  }
+  if (
+    receipt.schemaVersion !== 1
+    || receipt.runtime !== 'hermes'
+    || receipt.revision !== 1
+    || typeof receipt.projectId !== 'string' || !HASH_RE.test(receipt.projectId)
+    || typeof receipt.sessionHash !== 'string' || !HASH_RE.test(receipt.sessionHash)
+    || typeof receipt.turnId !== 'string' || !HASH_RE.test(receipt.turnId)
+    || typeof receipt.inputSourceHash !== 'string' || !SOURCE_HASH_RE.test(receipt.inputSourceHash)
+    || typeof receipt.inputContentSha256 !== 'string' || !HASH_RE.test(receipt.inputContentSha256)
+  ) throw new Error(`hermes_turn_receipt_${value.action}_invalid`);
+  if (value.action === 'open') {
+    if (typeof receipt.openedAt !== 'string' || new Date(receipt.openedAt).toISOString() !== receipt.openedAt) {
+      throw new Error('hermes_turn_receipt_open_invalid');
+    }
+  } else if (
+    typeof receipt.finalSourceHash !== 'string' || !SOURCE_HASH_RE.test(receipt.finalSourceHash)
+    || typeof receipt.finalContentSha256 !== 'string' || !HASH_RE.test(receipt.finalContentSha256)
+    || typeof receipt.committedAt !== 'string'
+    || new Date(receipt.committedAt).toISOString() !== receipt.committedAt
+    || receipt.deltaState !== 'not_emitted'
+  ) throw new Error('hermes_turn_receipt_commit_invalid');
+  return { action: value.action, receipt };
+}
+
+function parseCommitDiagnostic(value: unknown): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error('hermes_commit_diagnostic_invalid');
+  const correlated = 'sessionHash' in value || 'turnId' in value;
+  const keys = correlated
+    ? ['code', 'reason', 'sessionHash', 'turnId'] as const
+    : ['code', 'reason'] as const;
+  if (
+    !exactKeys(value, keys)
+    || value.code !== 'commit_not_proven'
+    || typeof value.reason !== 'string'
+    || !COMMIT_NOT_PROVEN_REASONS.has(value.reason)
+    || (correlated && (
+      typeof value.sessionHash !== 'string' || !HASH_RE.test(value.sessionHash)
+      || typeof value.turnId !== 'string' || !HASH_RE.test(value.turnId)
+    ))
+  ) throw new Error('hermes_commit_diagnostic_invalid');
+  return { ...value };
+}
 
 function errorCode(error: unknown): string {
   return error instanceof Error && /^[a-z0-9_]+$/.test(error.message)
@@ -157,6 +249,17 @@ async function main(): Promise<void> {
   }
   const request = runtimeEventToContextProbe(event);
   const core = await openCore({ cwd: event.cwd });
+  const receiptAction = parseReceiptAction(event.turnReceipt);
+  const diagnostic = parseCommitDiagnostic(event.diagnostic);
+  if (receiptAction?.action === 'open') await core.turnReceipts.open(receiptAction.receipt);
+  if (receiptAction?.action === 'commit') await core.turnReceipts.commit(receiptAction.receipt);
+  if (diagnostic) {
+    await appendEvent(core.workspace, {
+      type: 'memory.context_probe',
+      actor: 'hermes',
+      metadata: diagnostic,
+    });
+  }
   if (!request) {
     process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
     return;
