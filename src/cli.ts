@@ -9,6 +9,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { parse as parseToml } from './vendor/smol-toml/parse.ts';
 import { openCore } from './core.ts';
 import { defaultRoot, ensureWorkspace, resolveWorkspace } from './workspace.ts';
 import { indexWithEngineFallback, resolveEngineConfig, semanticRecallFloor } from './engine/retrieval.ts';
@@ -597,7 +598,7 @@ function initBackupGuidance(runtime?: string): string {
   if (runtime === 'codex') return 'Before editing Codex config, copy the existing config file or commit it first.';
   if (runtime === 'claude-code') return 'Before editing Claude Code MCP settings, make a copy of the current settings file.';
   if (runtime === 'cursor') return 'Before editing Cursor MCP settings, copy the current MCP/settings JSON.';
-  if (runtime === 'workbuddy') return 'Before connect writes ~/.workbuddy/mcp.json, it backs the file up; you can also copy it yourself first.';
+  if (runtime === 'workbuddy') return 'Before connect writes ~/.workbuddy/.mcp.json, it backs the file up; you can also copy it yourself first.';
   if (runtime === 'claude-desktop') return 'Before editing Claude Desktop config, copy claude_desktop_config.json; connect also backs it up.';
   if (runtime === 'opencode') return 'Before editing OpenCode config, copy ~/.config/opencode/opencode.json; connect also backs it up.';
   if (runtime === 'openclaw') return 'Before editing OpenClaw config, copy ~/.openclaw/openclaw.json; connect also backs it up.';
@@ -1000,6 +1001,116 @@ function parseCodexMcpGet(stdout: string): NormalizedMcpSpec | null {
   }
 }
 
+const CODEX_READ_ONLY_AUTO_APPROVE_TOOLS = [
+  'memory.status',
+  'memory.continue',
+  'memory.search',
+  'memory.read',
+  'memory.context_probe',
+] as const;
+
+function tomlTable(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function codexMissingReadOnlyApprovals(raw: string): readonly string[] {
+  const config = tomlTable(parseToml(raw));
+  const servers = tomlTable(config?.mcp_servers);
+  const server = tomlTable(servers?.['ihow-memory']);
+  const tools = tomlTable(server?.tools);
+  return CODEX_READ_ONLY_AUTO_APPROVE_TOOLS.filter((tool) => {
+    // Any existing per-tool table is an explicit user/vendor policy. Preserve it even when it is
+    // stricter than approve (for example prompt/deny) or carries fields we do not understand.
+    return !tools || !Object.prototype.hasOwnProperty.call(tools, tool);
+  });
+}
+
+function codexReadOnlyApprovalBlock(tools: readonly string[]): string {
+  return tools.map((tool) => (
+    `[mcp_servers.ihow-memory.tools.${JSON.stringify(tool)}]\napproval_mode = "approve"`
+  )).join('\n\n');
+}
+
+type CodexConfigSnapshot = {
+  target: string;
+  existed: boolean;
+  raw: string;
+};
+
+async function snapshotCodexConfigBeforeRegistrationEdit(): Promise<CodexConfigSnapshot> {
+  const target = path.join(codexHomeDir(), 'config.toml');
+  let raw = '';
+  try {
+    raw = await fs.readFile(target, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { target, existed: false, raw: '' };
+    throw new Error(`codex_config_cannot_read_before_registration_edit: ${target}: ${(error as Error).message}`);
+  }
+  try {
+    parseToml(raw);
+  } catch (error) {
+    throw new Error(`codex_config_unparseable_refusing_registration_edit: ${target}: ${(error as Error).message}`);
+  }
+  return { target, existed: true, raw };
+}
+
+async function restoreCodexConfigSnapshot(snapshot: CodexConfigSnapshot): Promise<void> {
+  if (!snapshot.existed) {
+    await fs.rm(snapshot.target, { force: true });
+    return;
+  }
+  const nonce = `${Date.now()}-${process.pid}-${crypto.randomUUID()}`;
+  const tmp = `${snapshot.target}.ihow-restore-${nonce}`;
+  try {
+    await fs.writeFile(tmp, snapshot.raw, 'utf8');
+    await fs.rename(tmp, snapshot.target);
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function ensureCodexReadOnlyApprovals(options: { dryRun?: boolean }): Promise<{
+  changed: boolean;
+  backup: string;
+  target: string;
+}> {
+  const target = path.join(codexHomeDir(), 'config.toml');
+  let raw: string;
+  try {
+    raw = await fs.readFile(target, 'utf8');
+  } catch (error) {
+    throw new Error(`codex_config_cannot_read_after_mcp_add: ${target}: ${(error as Error).message}`);
+  }
+  let missing: readonly string[];
+  try {
+    missing = codexMissingReadOnlyApprovals(raw);
+  } catch (error) {
+    throw new Error(`codex_config_unparseable_refusing_approval_edit: ${target}: ${(error as Error).message}`);
+  }
+  if (missing.length === 0) return { changed: false, backup: '', target };
+  if (options.dryRun) return { changed: true, backup: '', target };
+
+  const separator = raw.length > 0 && !raw.endsWith('\n') ? '\n\n' : raw.length > 0 ? '\n' : '';
+  const next = `${raw}${separator}${codexReadOnlyApprovalBlock(missing)}\n`;
+  const nonce = `${Date.now()}-${process.pid}-${crypto.randomUUID()}`;
+  const backup = `${target}.ihow-bak-${nonce}`;
+  const tmp = `${target}.ihow-tmp-${nonce}`;
+  await fs.copyFile(target, backup);
+  try {
+    await fs.writeFile(tmp, next, 'utf8');
+    // Parse the exact staged bytes before the atomic same-directory swap.
+    parseToml(await fs.readFile(tmp, 'utf8'));
+    await fs.rename(tmp, target);
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw new Error(`codex_config_approval_edit_failed: ${target}: ${(error as Error).message}`);
+  }
+  return { changed: true, backup, target };
+}
+
 function parseYamlScalar(raw: string): string {
   const value = raw.trim();
   if (value.startsWith('"')) {
@@ -1329,10 +1440,12 @@ function connectViaClaudeCli(
 
 // codex uses the official CLI (codex mcp add). It has no cwd field -> rely on the absolute entry path.
 // `mcp get --json` gives an exact command/argv/env comparison; only a differing entry is removed/re-added.
-function connectViaCodexCli(
+// After registration, add narrowly scoped approval_mode="approve" entries for iHow's read-only tools so
+// Codex non-interactive calls work without granting server-wide or write/governance-tool approval.
+async function connectViaCodexCli(
   spec: { command: string; args: string[] },
   options: { dryRun?: boolean },
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   if (!commandExists('codex')) {
     throw new Error('codex_cli_not_found: install the Codex CLI to connect codex (or run init for manual TOML).');
   }
@@ -1351,18 +1464,29 @@ function connectViaCodexCli(
     );
   }
   if (options.dryRun) {
+    const approvals = exists
+      ? await ensureCodexReadOnlyApprovals({ dryRun: true })
+      : { changed: true, backup: '', target: path.join(codexHomeDir(), 'config.toml') };
     return {
       ok: true, runtime: 'codex', method: 'official-cli:codex',
-      alreadyExists: exists, unchanged, changed: !unchanged, dryRun: true,
+      alreadyExists: exists, unchanged: unchanged && !approvals.changed,
+      changed: !unchanged || approvals.changed, approvalsChanged: approvals.changed, dryRun: true,
     };
   }
   if (unchanged) {
+    const approvals = await ensureCodexReadOnlyApprovals(options);
     return {
       ok: true, runtime: 'codex', method: 'official-cli:codex',
-      target: `${codexConfigLabel('config.toml')} (codex mcp add)`,
-      alreadyExists: true, unchanged: true, changed: false, replaced: false,
+      target: `${codexConfigLabel('config.toml')} (codex mcp add + per-tool read-only approvals)`,
+      alreadyExists: true,
+      unchanged: !approvals.changed,
+      changed: approvals.changed,
+      replaced: false,
+      approvalsChanged: approvals.changed,
+      backup: approvals.backup,
     };
   }
+  const configSnapshot = await snapshotCodexConfigBeforeRegistrationEdit();
   if (exists) {
     const remove = spawnSync('codex', ['mcp', 'remove', 'ihow-memory'], { encoding: 'utf8' });
     if (remove.status !== 0) {
@@ -1375,6 +1499,19 @@ function connectViaCodexCli(
     if (exists && existing) {
       const rollback = spawnSync('codex', codexAddArgs(existing), { encoding: 'utf8' });
       if (rollback.status === 0) {
+        try {
+          await restoreCodexConfigSnapshot(configSnapshot);
+        } catch (restoreError) {
+          throw new RuntimeConnectFailure(
+            `codex_mcp_add_failed_rollback_config_restore_failed: ${detail}; restore=${(restoreError as Error).message}`,
+            'codex', true,
+          );
+        }
+        const verify = spawnSync('codex', ['mcp', 'get', 'ihow-memory', '--json'], { encoding: 'utf8' });
+        const restored = verify.status === 0 ? parseCodexMcpGet(verify.stdout || '') : null;
+        if (!restored || !isDeepStrictEqual(restored, existing)) {
+          throw new RuntimeConnectFailure(`codex_mcp_add_failed_rollback_verification_failed: ${detail}`, 'codex', true);
+        }
         throw new RuntimeConnectFailure(
           `codex_mcp_add_failed_rolled_back: ${detail}`,
           'codex', false, specUsesDesiredBundle(existing, desired),
@@ -1388,10 +1525,63 @@ function connectViaCodexCli(
     if (exists) throw new RuntimeConnectFailure(`codex_mcp_add_failed_after_remove: ${detail}`, 'codex', true);
     throw new Error(`codex_mcp_add_failed: ${detail}`);
   }
+  let approvals: Awaited<ReturnType<typeof ensureCodexReadOnlyApprovals>>;
+  try {
+    approvals = await ensureCodexReadOnlyApprovals(options);
+  } catch (approvalError) {
+    const detail = approvalError instanceof Error ? approvalError.message : String(approvalError);
+    if (exists && existing) {
+      const removeNew = spawnSync('codex', ['mcp', 'remove', 'ihow-memory'], { encoding: 'utf8' });
+      const rollback = removeNew.status === 0
+        ? spawnSync('codex', codexAddArgs(existing), { encoding: 'utf8' })
+        : null;
+      if (removeNew.status === 0 && rollback?.status === 0) {
+        try {
+          await restoreCodexConfigSnapshot(configSnapshot);
+        } catch (restoreError) {
+          throw new RuntimeConnectFailure(
+            `codex_approval_edit_failed_rollback_config_restore_failed: ${detail}; restore=${(restoreError as Error).message}`,
+            'codex', true,
+          );
+        }
+        const verify = spawnSync('codex', ['mcp', 'get', 'ihow-memory', '--json'], { encoding: 'utf8' });
+        const restored = verify.status === 0 ? parseCodexMcpGet(verify.stdout || '') : null;
+        if (restored && isDeepStrictEqual(restored, existing)) {
+          throw new RuntimeConnectFailure(
+            `codex_approval_edit_failed_rolled_back: ${detail}`,
+            'codex', false, specUsesDesiredBundle(existing, desired),
+          );
+        }
+      }
+      throw new RuntimeConnectFailure(
+        `codex_approval_edit_failed_and_rollback_failed: ${detail}`,
+        'codex', true,
+      );
+    }
+
+    const removeNew = spawnSync('codex', ['mcp', 'remove', 'ihow-memory'], { encoding: 'utf8' });
+    if (removeNew.status === 0) {
+      try {
+        await restoreCodexConfigSnapshot(configSnapshot);
+      } catch (restoreError) {
+        throw new RuntimeConnectFailure(
+          `codex_approval_edit_failed_config_restore_failed: ${detail}; restore=${(restoreError as Error).message}`,
+          'codex', true,
+        );
+      }
+      const verifyAbsent = spawnSync('codex', ['mcp', 'get', 'ihow-memory', '--json'], { encoding: 'utf8' });
+      if (verifyAbsent.status !== 0) {
+        throw new RuntimeConnectFailure(`codex_approval_edit_failed_rolled_back: ${detail}`, 'codex', false);
+      }
+    }
+    throw new RuntimeConnectFailure(`codex_approval_edit_failed_and_rollback_failed: ${detail}`, 'codex', true);
+  }
   return {
     ok: true, runtime: 'codex', method: 'official-cli:codex',
-    target: `${codexConfigLabel('config.toml')} (codex mcp add)`,
+    target: `${codexConfigLabel('config.toml')} (codex mcp add + per-tool read-only approvals)`,
     alreadyExists: exists, unchanged: false, changed: true, replaced: exists,
+    approvalsChanged: approvals.changed,
+    backup: approvals.backup,
   };
 }
 
@@ -1480,7 +1670,7 @@ async function connectRuntime(
     if (process.platform === 'win32') {
       throw new Error('codex_connect_windows_unsupported: on Windows, run `ihow-memory init --runtime codex` and paste the printed snippet into ~/.codex/config.toml (codex CLI auto-config is not yet wired for Windows).');
     }
-    return connectViaCodexCli(spec, options);
+    return await connectViaCodexCli(spec, options);
   }
   if (runtime === 'hermes') {
     if (process.platform === 'win32') {
@@ -1492,12 +1682,13 @@ async function connectRuntime(
     return writeJsonMcpConfig(path.join(home, '.cursor', 'mcp.json'), runtime, spec, options); // no official CLI
   }
   if (runtime === 'workbuddy') {
-    // WorkBuddy (Tencent) stores user MCP servers in a local JSON file (global: ~/.workbuddy/mcp.json),
+    // WorkBuddy (Tencent) stores user MCP servers in a local JSON file (global: ~/.workbuddy/.mcp.json),
     // same mcpServers/stdio model as Cursor. Use an absolute node path (process.execPath): WorkBuddy's
-    // GUI launch context may not have a complete PATH. Do NOT touch ~/.workbuddy/.mcp.json (runtime
-    // proxy, auto-regenerated), connectors/**/mcp.json (connector marketplace), or mcp-approvals.json.
+    // GUI launch context may not have a complete PATH. This is the path written/read by
+    // `CODEBUDDY_CONFIG_DIR=~/.workbuddy codebuddy mcp add -s user`. Do NOT touch
+    // connectors/**/mcp.json (connector marketplace) or mcp-approvals.json.
     const workbuddySpec = { command: process.execPath, args: spec.args };
-    return writeJsonMcpConfig(path.join(home, '.workbuddy', 'mcp.json'), runtime, workbuddySpec, options);
+    return writeJsonMcpConfig(path.join(home, '.workbuddy', '.mcp.json'), runtime, workbuddySpec, options);
   }
   if (runtime === 'claude-desktop') {
     // Claude Desktop (Anthropic Electron app): standard mcpServers JSON. macOS keeps it under

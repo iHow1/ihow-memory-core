@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { makeCodexMcpShim } from './helpers/codex-mcp-shim.mjs';
 
 const CLI = fileURLToPath(new URL('../bin/ihow-memory.mjs', import.meta.url));
 const run = (home, args) => execFileSync(process.execPath, [CLI, ...args], {
@@ -80,8 +81,7 @@ test('setup --runtime codex installs hooks + proactive AGENTS loop (idempotent, 
     await fs.rm(bin, { recursive: true, force: true });
   });
   const codex = path.join(bin, 'codex');
-  await fs.writeFile(codex, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory"; exit 0; fi\nexit 0\n', 'utf8');
-  await fs.chmod(codex, 0o755);
+  await makeCodexMcpShim(bin);
   await fs.mkdir(path.join(home, '.codex'), { recursive: true });
   const agents = path.join(home, '.codex', 'AGENTS.md');
   await fs.writeFile(agents, '# Existing Codex Rules\n\nKEEP-CODEX-CONTENT\n', 'utf8');

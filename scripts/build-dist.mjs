@@ -39,6 +39,12 @@ for (const sourcePath of await sourceFiles(sourceDir)) {
   if (shebang) await fs.chmod(outputPath, 0o755);
 }
 
+// The pinned TOML parser is vendored into src/ so frozen `.runtime` generations remain self-contained.
+// Preserve its BSD-3 license alongside the built vendor modules; runtime integrity covers this file too.
+const vendoredTomlLicense = path.join('vendor', 'smol-toml', 'LICENSE');
+await fs.mkdir(path.join(outputDir, 'vendor', 'smol-toml'), { recursive: true });
+await fs.copyFile(path.join(sourceDir, vendoredTomlLicense), path.join(outputDir, vendoredTomlLicense));
+
 // Optional embedding-provider sidecars: copied VERBATIM (already .mjs — no type-strip) from examples/
 // into dist/providers/ so they ship in the tarball (dist/ is in package.json "files", examples/ is not).
 // They are spawned as a SUBPROCESS on explicit opt-in only, never imported into the default graph — the

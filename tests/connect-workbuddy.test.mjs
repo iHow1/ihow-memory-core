@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Regression tests for `connect --runtime workbuddy`. connect writes a user config file
-// (~/.workbuddy/mcp.json), so these pin the safety contract: never clobber, always back up,
+// Regression tests for `connect --runtime workbuddy`. WorkBuddy's official user-scope CLI writes
+// ~/.workbuddy/.mcp.json, so these pin the safety contract: never clobber, always back up,
 // only upsert the ihow-memory entry, and never touch WorkBuddy's runtime/connector files.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -30,7 +30,7 @@ function connectArgs(home, extra = []) {
 test('workbuddy connect preserves existing servers, upserts ihow-memory as stdio, backs up', (t) => {
   const home = makeHome(t, 'merge');
   fs.mkdirSync(path.join(home, '.workbuddy'), { recursive: true });
-  const cfg = path.join(home, '.workbuddy', 'mcp.json');
+  const cfg = path.join(home, '.workbuddy', '.mcp.json');
   fs.writeFileSync(cfg, JSON.stringify({ mcpServers: { chrome: { command: '/x/node', args: ['c.js'] } } }, null, 2));
   init(home);
   run(home, connectArgs(home));
@@ -45,15 +45,15 @@ test('workbuddy connect preserves existing servers, upserts ihow-memory as stdio
     fs.readdirSync(path.join(home, '.workbuddy')).some((f) => f.includes('.ihow-bak-')),
     'backed up the existing config before writing',
   );
-  // Never touch WorkBuddy's runtime proxy / connector / approvals files.
-  assert.ok(!fs.existsSync(path.join(home, '.workbuddy', '.mcp.json')), 'did not create the runtime proxy file');
+  // Never touch WorkBuddy's connector marketplace / approvals files.
+  assert.ok(!fs.existsSync(path.join(home, '.workbuddy', 'mcp.json')), 'did not create the ineffective legacy path');
   assert.ok(!fs.existsSync(path.join(home, '.workbuddy', 'mcp-approvals.json')), 'did not forge approvals');
 });
 
 test('workbuddy connect refuses to clobber an unparseable config', (t) => {
   const home = makeHome(t, 'refuse');
   fs.mkdirSync(path.join(home, '.workbuddy'), { recursive: true });
-  const cfg = path.join(home, '.workbuddy', 'mcp.json');
+  const cfg = path.join(home, '.workbuddy', '.mcp.json');
   fs.writeFileSync(cfg, '{ not valid json');
   init(home);
   assert.throws(() => run(home, connectArgs(home)), 'connect exits non-zero rather than overwrite');
@@ -64,14 +64,14 @@ test('workbuddy connect --dry-run writes nothing', (t) => {
   const home = makeHome(t, 'dryrun');
   init(home);
   run(home, connectArgs(home, ['--dry-run']));
-  assert.ok(!fs.existsSync(path.join(home, '.workbuddy', 'mcp.json')), 'dry-run created no config file');
+  assert.ok(!fs.existsSync(path.join(home, '.workbuddy', '.mcp.json')), 'dry-run created no config file');
 });
 
 test('workbuddy connect creates a fresh config when none exists', (t) => {
   const home = makeHome(t, 'fresh');
   init(home);
   run(home, connectArgs(home));
-  const cfg = path.join(home, '.workbuddy', 'mcp.json');
+  const cfg = path.join(home, '.workbuddy', '.mcp.json');
   assert.ok(fs.existsSync(cfg), 'created the config file');
   const out = JSON.parse(fs.readFileSync(cfg, 'utf8'));
   assert.equal(out.mcpServers['ihow-memory'].type, 'stdio');

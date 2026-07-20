@@ -15,6 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { makeCodexMcpShim } from './helpers/codex-mcp-shim.mjs';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
 const HERMETIC_PATH = '/usr/bin:/bin';
@@ -39,9 +40,7 @@ async function exists(p) {
 }
 async function makeCodexShim(t) {
   const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-bin-'));
-  const shim = path.join(bin, 'codex');
-  await fs.writeFile(shim, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory"; exit 0; fi\nexit 0\n', 'utf8');
-  await fs.chmod(shim, 0o755);
+  await makeCodexMcpShim(bin);
   t.after(async () => { await fs.rm(bin, { recursive: true, force: true }); });
   return bin;
 }

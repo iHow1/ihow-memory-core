@@ -35,6 +35,8 @@ test('alpha.31 prerelease metadata and docs stay truthful and aligned', () => {
   assert.equal(manifest.version, RELEASE_VERSION);
   assert.equal(lock.version, RELEASE_VERSION);
   assert.equal(lock.packages?.['']?.version, RELEASE_VERSION);
+  assert.deepEqual(manifest.dependencies ?? {}, {}, 'the frozen runtime must not depend on external node_modules');
+  assert.deepEqual(lock.packages?.['']?.dependencies ?? {}, {}, 'lockfile preserves the zero-runtime-dependency contract');
 
   const alpha31 = releaseSection(readRoot('CHANGELOG.md'), RELEASE_VERSION);
   for (const surface of [
@@ -122,6 +124,8 @@ test('every relative import in a packed module is itself in the tarball (fresh i
     'dist/native-precompact.js',
     'dist/proposal-review-state.js',
     'dist/store/checkpoints.js',
+    'dist/vendor/smol-toml/parse.js',
+    'dist/vendor/smol-toml/LICENSE',
   ]) {
     assert.ok(packed.has(required), `tarball must include ${required}`);
   }

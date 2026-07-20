@@ -35,6 +35,7 @@ const load = () => { try { return JSON.parse(fs.readFileSync(statePath, 'utf8'))
 const loadControl = () => { try { return JSON.parse(fs.readFileSync(controlPath, 'utf8')); } catch { return {}; } };
 const saveControl = (value) => { if (!controlPath) return; fs.mkdirSync(path.dirname(controlPath), { recursive: true }); fs.writeFileSync(controlPath, JSON.stringify(value)); };
 const consumeAddFailure = () => { const control = loadControl(); if (!(control.addFailures > 0)) return false; control.addFailures -= 1; saveControl(control); return true; };
+const consumeApprovalCorruption = () => { const control = loadControl(); if (!(control.approvalCorruptions > 0)) return false; control.approvalCorruptions -= 1; saveControl(control); return true; };
 const save = (value) => {
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
   if (value === null) { try { fs.unlinkSync(statePath); } catch {} return; }
@@ -152,6 +153,22 @@ if (argv[1] === 'list') {
 if (argv[1] === 'remove') {
   log('remove', state);
   save(null);
+  const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME, '.codex');
+  const configPath = path.join(codexHome, 'config.toml');
+  try {
+    const lines = fs.readFileSync(configPath, 'utf8').split('\\n');
+    const start = lines.findIndex((line) => line.trim() === '[mcp_servers.ihow-memory]');
+    if (start >= 0) {
+      let end = start + 1;
+      while (end < lines.length) {
+        const header = lines[end].trim();
+        if (header.startsWith('[') && !header.startsWith('[mcp_servers.ihow-memory.')) break;
+        end += 1;
+      }
+      lines.splice(start, end - start);
+      fs.writeFileSync(configPath, lines.join('\\n'));
+    }
+  } catch {}
   process.exit(0);
 }
 if (argv[1] === 'add') {
@@ -168,6 +185,28 @@ if (argv[1] === 'add') {
   if (consumeAddFailure()) { log('add-failed', normalized); process.stderr.write('simulated add failure\\n'); process.exit(2); }
   log('add', normalized);
   save(normalized);
+  const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME, '.codex');
+  const configPath = path.join(codexHome, 'config.toml');
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  let config = '';
+  try { config = fs.readFileSync(configPath, 'utf8'); } catch {}
+  const header = '[mcp_servers.ihow-memory]';
+  if (!config.includes(header)) {
+    config += (config && !config.endsWith('\\n') ? '\\n\\n' : config ? '\\n' : '')
+      + header + '\\ncommand = ' + JSON.stringify(normalized.command) + '\\n';
+  } else {
+    const start = config.indexOf(header) + header.length;
+    const next = config.indexOf('\\n[', start);
+    const end = next < 0 ? config.length : next;
+    const body = config.slice(start, end);
+    const commandLine = 'command = ' + JSON.stringify(normalized.command);
+    const updated = /^command\s*=.*$/m.test(body)
+      ? body.replace(/^command\s*=.*$/m, commandLine)
+      : '\\n' + commandLine + body;
+    config = config.slice(0, start) + updated + config.slice(end);
+  }
+  fs.writeFileSync(configPath, config);
+  if (consumeApprovalCorruption()) fs.appendFileSync(configPath, '\\n[broken-approval-edit');
   process.exit(0);
 }
 process.exit(0);
@@ -240,11 +279,24 @@ async function mutations(logPath) {
   }
 }
 
-function runJson({ runtime, home, bin, statePath, logPath, root, cwd, command = 'setup', extraEnv = {}, allowFailure = false }) {
+const CODEX_READ_ONLY_TOOLS = [
+  'memory.status',
+  'memory.continue',
+  'memory.search',
+  'memory.read',
+  'memory.context_probe',
+];
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function runJson({ runtime, home, bin, statePath, logPath, root, cwd, command = 'setup', extraEnv = {}, extraArgs = [], allowFailure = false }) {
   const args = [command, '--runtime', runtime, '--json', '--root', root, '--space', 'official-cli-idempotency'];
   if (cwd) args.push('--cwd', cwd);
   if (runtime === 'claude-code') args.push('--no-install-skill', '--no-install-hook');
   if (runtime === 'codex') args.push('--no-install-hook');
+  args.push(...extraArgs);
   let stdout;
   try {
     stdout = execFileSync(process.execPath, [CLI, ...args], {
@@ -484,6 +536,164 @@ test('Claude human parser uncertainty without canonical snapshot is mutation-fre
   assert.equal(setupResult.applied, false);
   assert.match(setupResult.skipped[0].error, /visible_user_spec_unavailable_refusing_remove/);
   assert.deepEqual(await mutations(fixture.logPath), [], 'setup remains mutation-free under parser uncertainty');
+});
+
+test('codex official CLI adds per-tool approve only for the iHow read-only tools', async (t) => {
+  const home = await realTemp('ihow-codex-approvals-home-');
+  const codexHome = path.join(home, 'isolated-codex');
+  const bin = await realTemp('ihow-codex-approvals-bin-');
+  const root = await realTemp('ihow-codex-approvals-root-');
+  const cwd = await realTemp('ihow-codex-approvals-cwd-');
+  const statePath = path.join(home, '.stub', 'codex-state.json');
+  const logPath = path.join(home, '.stub', 'codex-mutations.jsonl');
+  await fs.mkdir(path.dirname(logPath), { recursive: true });
+  await makeCodexStub(bin);
+  t.after(async () => {
+    for (const dir of [home, bin, root, cwd]) await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const result = runJson({
+    runtime: 'codex', home, bin, statePath, logPath, root, cwd,
+    extraEnv: { CODEX_HOME: codexHome },
+  });
+  assert.equal(result.applied, true);
+  const config = await fs.readFile(path.join(codexHome, 'config.toml'), 'utf8');
+  for (const tool of CODEX_READ_ONLY_TOOLS) {
+    assert.match(
+      config,
+      new RegExp(`\\[mcp_servers\\.ihow-memory\\.tools\\."${escapeRegex(tool)}"\\]\\napproval_mode = "approve"`),
+      `${tool} is non-interactively usable`,
+    );
+  }
+  assert.doesNotMatch(config, /default_tools_approval_mode\s*=\s*"approve"/, 'never approves a whole server');
+  for (const tool of [
+    'memory.forget', 'memory.promote', 'memory.durable_promote', 'memory.write_candidate',
+    'memory.remember', 'memory.journal', 'memory.organize',
+  ]) {
+    assert.doesNotMatch(config, new RegExp(`tools\\."${escapeRegex(tool)}"`), `${tool} remains gated`);
+  }
+});
+
+test('codex read-only approvals are idempotent and preserve stricter user policy', async (t) => {
+  const home = await realTemp('ihow-codex-policy-home-');
+  const codexHome = path.join(home, 'isolated-codex');
+  const bin = await realTemp('ihow-codex-policy-bin-');
+  const root = await realTemp('ihow-codex-policy-root-');
+  const cwd = await realTemp('ihow-codex-policy-cwd-');
+  const statePath = path.join(home, '.stub', 'codex-state.json');
+  const logPath = path.join(home, '.stub', 'codex-mutations.jsonl');
+  await fs.mkdir(path.dirname(logPath), { recursive: true });
+  await fs.mkdir(codexHome, { recursive: true });
+  await makeCodexStub(bin);
+  t.after(async () => {
+    for (const dir of [home, bin, root, cwd]) await fs.rm(dir, { recursive: true, force: true });
+  });
+  const common = { runtime: 'codex', home, bin, statePath, logPath, root, cwd, extraEnv: { CODEX_HOME: codexHome } };
+  runJson({ ...common, command: 'connect' });
+  const configPath = path.join(codexHome, 'config.toml');
+  let seeded = await fs.readFile(configPath, 'utf8');
+  seeded = seeded.replace(
+    '[mcp_servers.ihow-memory.tools."memory.status"]\napproval_mode = "approve"',
+    '[mcp_servers.ihow-memory.tools."memory.status"]\napproval_mode = "prompt"\nvendor_field = "preserve-me"',
+  );
+  seeded = seeded.replace(
+    /\n\[mcp_servers\.ihow-memory\.tools\."memory\.read"\]\napproval_mode = "approve"\n?/,
+    '\n',
+  );
+  await fs.writeFile(configPath, seeded);
+  await fs.writeFile(logPath, '', 'utf8');
+
+  const repaired = runJson({ ...common, command: 'connect' });
+  const once = await fs.readFile(configPath, 'utf8');
+  assert.equal(repaired.changed, true);
+  assert.equal(repaired.approvalsChanged, true);
+  assert.match(once, /approval_mode = "prompt"/);
+  assert.match(once, /vendor_field = "preserve-me"/);
+  assert.equal((once.match(/\[mcp_servers\.ihow-memory\.tools\."memory\.status"\]/g) || []).length, 1);
+  assert.match(once, /\[mcp_servers\.ihow-memory\.tools\."memory\.read"\]\napproval_mode = "approve"/);
+  assert.deepEqual(await mutations(logPath), [], 'approval repair does not replace the MCP registration');
+
+  const rerun = runJson({ ...common, command: 'connect' });
+  const twice = await fs.readFile(configPath, 'utf8');
+  assert.equal(twice, once, 'second setup is byte-identical');
+  assert.equal(rerun.changed, false, 'idempotent rerun reports no applied change');
+  assert.equal(rerun.unchanged, true);
+});
+
+test('codex dry-run and malformed TOML are mutation-free', async (t) => {
+  const home = await realTemp('ihow-codex-safe-edit-home-');
+  const codexHome = path.join(home, 'isolated-codex');
+  const bin = await realTemp('ihow-codex-safe-edit-bin-');
+  const root = await realTemp('ihow-codex-safe-edit-root-');
+  const cwd = await realTemp('ihow-codex-safe-edit-cwd-');
+  const statePath = path.join(home, '.stub', 'codex-state.json');
+  const logPath = path.join(home, '.stub', 'codex-mutations.jsonl');
+  await fs.mkdir(path.dirname(logPath), { recursive: true });
+  await fs.mkdir(codexHome, { recursive: true });
+  await makeCodexStub(bin);
+  t.after(async () => {
+    for (const dir of [home, bin, root, cwd]) await fs.rm(dir, { recursive: true, force: true });
+  });
+  const common = { runtime: 'codex', home, bin, statePath, logPath, root, cwd, extraEnv: { CODEX_HOME: codexHome } };
+  runJson({ ...common, command: 'connect' });
+  const configPath = path.join(codexHome, 'config.toml');
+  let withoutSearch = await fs.readFile(configPath, 'utf8');
+  withoutSearch = withoutSearch.replace(
+    /\n\[mcp_servers\.ihow-memory\.tools\."memory\.search"\]\napproval_mode = "approve"\n?/,
+    '\n',
+  );
+  await fs.writeFile(configPath, withoutSearch);
+  await fs.writeFile(logPath, '', 'utf8');
+  const beforeDryRunFiles = (await fs.readdir(codexHome)).sort();
+  const dry = runJson({
+    ...common, command: 'connect', extraArgs: ['--dry-run'],
+  });
+  assert.equal(dry.changed, true);
+  assert.equal(dry.approvalsChanged, true);
+  assert.equal(await fs.readFile(configPath, 'utf8'), withoutSearch, 'dry-run preserves bytes');
+  assert.deepEqual((await fs.readdir(codexHome)).sort(), beforeDryRunFiles, 'dry-run creates no backup/temp files');
+  assert.deepEqual(await mutations(logPath), []);
+
+  await fs.writeFile(configPath, '{ invalid toml');
+  const before = await fs.readFile(configPath, 'utf8');
+  const failed = runJson({
+    ...common, allowFailure: true,
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(await fs.readFile(configPath, 'utf8'), before);
+  assert.deepEqual(await mutations(logPath), [], 'malformed TOML fails before registration mutation');
+});
+
+test('codex rolls back a new registration when approval editing fails after add', async (t) => {
+  const home = await realTemp('ihow-codex-approval-rollback-home-');
+  const codexHome = path.join(home, 'isolated-codex');
+  const bin = await realTemp('ihow-codex-approval-rollback-bin-');
+  const root = await realTemp('ihow-codex-approval-rollback-root-');
+  const cwd = await realTemp('ihow-codex-approval-rollback-cwd-');
+  const statePath = path.join(home, '.stub', 'codex-state.json');
+  const logPath = path.join(home, '.stub', 'codex-mutations.jsonl');
+  const controlPath = path.join(home, '.stub', 'codex-control.json');
+  await fs.mkdir(path.dirname(logPath), { recursive: true });
+  await fs.mkdir(codexHome, { recursive: true });
+  await makeCodexStub(bin);
+  t.after(async () => {
+    for (const dir of [home, bin, root, cwd]) await fs.rm(dir, { recursive: true, force: true });
+  });
+  const configPath = path.join(codexHome, 'config.toml');
+  const original = 'model = "keep-me"\n';
+  await fs.writeFile(configPath, original);
+  await fs.writeFile(controlPath, JSON.stringify({ approvalCorruptions: 1 }));
+
+  const result = runJson({
+    runtime: 'codex', home, bin, statePath, logPath, root, cwd, allowFailure: true,
+    extraEnv: { CODEX_HOME: codexHome, IHOW_OFFICIAL_CLI_CONTROL: controlPath },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.applied, false, 'successful rollback leaves no applied config change');
+  assert.equal(result.restart.required, false);
+  assert.equal(await fs.readFile(configPath, 'utf8'), original, 'original config bytes restored');
+  assert.equal(await fs.access(statePath).then(() => true, () => false), false, 'new registration removed');
+  assert.deepEqual((await mutations(logPath)).map((entry) => entry.op), ['add', 'remove']);
 });
 
 test('Hermes official CLI compares command/argv/env and replaces environment drift', async (t) => {
