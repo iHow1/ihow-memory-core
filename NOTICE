@@ -13,3 +13,11 @@ You may obtain a copy of the License in the accompanying LICENSE file or at:
 iHow Memory is local-first: the open-source core runs entirely on the user's
 machine with no telemetry and no required network calls. See README for the
 privacy statement.
+
+Third-party software
+--------------------
+
+This product includes portions of smol-toml 1.7.0,
+Copyright (c) Squirrel Chat et al., used under the BSD 3-Clause License.
+The complete license is retained with the vendored source and included in the
+published runtime at dist/vendor/smol-toml/LICENSE.

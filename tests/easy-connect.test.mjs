@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { makeCodexMcpShim } from './helpers/codex-mcp-shim.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = path.join(REPO, 'src', 'cli.ts');
@@ -41,9 +42,7 @@ function runConnect({ cwd, home, bin, args = [] }) {
 
 async function makeCodexShim() {
   const bin = await mkdtempReal('ihow-bin-');
-  const shim = path.join(bin, 'codex');
-  await fs.writeFile(shim, '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 1; fi\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "ihow-memory"; exit 0; fi\nexit 0\n', 'utf8');
-  await fs.chmod(shim, 0o755);
+  await makeCodexMcpShim(bin);
   return bin;
 }
 

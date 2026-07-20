@@ -2,9 +2,10 @@
 
 WorkBuddy (Tencent CodeBuddy's desktop AI agent) speaks the Model Context Protocol, so it can use iHow Memory as a governed, local, cross-tool memory layer — the same memory your Claude Code / Codex / Cursor sessions write to.
 
-> One-command `connect` supports WorkBuddy. WorkBuddy stores user MCP servers in a local
-> JSON file (`~/.workbuddy/mcp.json`) and accepts stdio servers, so `connect` writes there
-> directly — with a backup, preserving your existing servers.
+> One-command `connect` supports WorkBuddy. Current WorkBuddy/CodeBuddy CLI builds store
+> user-scope MCP servers in `~/.workbuddy/.mcp.json`, so `connect` writes there directly
+> with a backup, preserving every existing server. Project-local MCP configuration remains
+> owned by WorkBuddy and is not modified by this user-scope command.
 
 ## Prerequisites
 
@@ -21,9 +22,9 @@ npx ihow-memory connect --runtime workbuddy
 This:
 
 - provisions a managed memory workspace under `~/.ihow-memory/`,
-- upserts an `ihow-memory` entry into `~/.workbuddy/mcp.json` (stdio, absolute `node` path),
+- upserts an `ihow-memory` entry into `~/.workbuddy/.mcp.json` (stdio, absolute `node` path),
 - **backs up** the existing file first and **preserves** every other MCP server you already have,
-- never touches WorkBuddy's runtime proxy (`~/.workbuddy/.mcp.json`), connector files, or approvals.
+- never touches WorkBuddy's connector marketplace files or `mcp-approvals.json`.
 
 Preview without writing:
 
@@ -55,7 +56,7 @@ Writes are governed: the agent only **proposes** (`write_candidate`); promotion 
 
 ## Manual alternative
 
-If you prefer to edit config by hand, `npx ihow-memory init` prints a generic MCP snippet. Add it to `~/.workbuddy/mcp.json` (global) or `<project>/.workbuddy/mcp.json` (per project) under `mcpServers`:
+If you prefer to edit config by hand, `npx ihow-memory init` prints a generic MCP snippet. Add it to `~/.workbuddy/.mcp.json` under `mcpServers` for the current user. If you intentionally use a project-local WorkBuddy configuration, follow that WorkBuddy version's own project-scope documentation instead of copying the user path:
 
 ```json
 {
