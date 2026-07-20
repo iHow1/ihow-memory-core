@@ -29,7 +29,7 @@ function releaseSection(changelog, version) {
   return match[1];
 }
 
-test('alpha.31 release candidate metadata and docs stay truthful and aligned', () => {
+test('alpha.31 prerelease metadata and docs stay truthful and aligned', () => {
   const manifest = JSON.parse(readRoot('package.json'));
   const lock = JSON.parse(readRoot('package-lock.json'));
   assert.equal(manifest.version, RELEASE_VERSION);
@@ -45,20 +45,31 @@ test('alpha.31 release candidate metadata and docs stay truthful and aligned', (
     /bge-m3/i,
     /Hermes/i,
     /rollback/i,
+    /organize[^\n]*tick/i,
+    /proposal review state/i,
+    /Grounded Media/i,
+    /Activity Ledger/i,
   ]) assert.match(alpha31, surface, `alpha.31 documents ${surface}`);
   assert.match(alpha31, /local release-ready/i);
-  assert.match(alpha31, /(?:has )?not been published/i);
+  assert.match(alpha31, /npm `?next`?[^\n]*(?:source of truth|availability)/i);
+  assert.match(alpha31, /(?:publication|published)[^\n]*(?:does not|doesn['’]t)[^\n]*(?:runtime activation|production certification)/i);
   assert.match(alpha31, /report-only/i);
   assert.match(alpha31, /does not automatically rewrite authoritative memory/i);
+  assert.match(alpha31, /EQUAL_UNTRUSTED/i);
+  assert.match(alpha31, /COMMITTED[^\n]*(?:does not|doesn['’]t)[^\n]*(?:success|successful)/i);
+  assert.match(alpha31, /(?:no|not)[^\n]*(?:APPLIED|authoritative write)/i);
 
   const readmes = [
-    ['README.md', readRoot('README.md'), /Alpha\.31 local candidate/i, /has not been published/i],
-    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.31 本地候选/i, /尚未发布/i],
+    ['README.md', readRoot('README.md'), /Alpha\.31 prerelease/i, /npm `?@?next`?[^\n]*(?:source of truth|availability)/i],
+    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.31 预发布版/i, /npm `?@?next`?[^\n]*(?:真相源|可用)/i],
   ];
-  for (const [name, readme, versionLabel, unpublished] of readmes) {
-    assert.match(readme, /0\.1\.0-alpha\.31/, `${name} states the local candidate version`);
+  for (const [name, readme, versionLabel, registryTruth] of readmes) {
+    assert.match(readme, /0\.1\.0-alpha\.31/, `${name} states the prerelease version`);
     assert.match(readme, versionLabel, `${name} identifies the alpha.31 surface`);
-    assert.match(readme, unpublished, `${name} does not claim this checkout was published`);
+    assert.match(readme, registryTruth, `${name} identifies npm next as availability truth`);
+    assert.match(readme, /report-only/i, `${name} preserves report-only consolidation truth`);
+    assert.match(readme, /EQUAL_UNTRUSTED/i, `${name} preserves grounded-media trust boundaries`);
+    assert.match(readme, /COMMITTED/i, `${name} preserves activity-ledger verdict boundaries`);
   }
 
   const alpha27 = releaseSection(readRoot('CHANGELOG.md'), '0.1.0-alpha.27');
@@ -104,9 +115,12 @@ test('every relative import in a packed module is itself in the tarball (fresh i
     'dist/checkpoint-schema.js',
     'dist/checkpoints.js',
     'dist/floor.js',
+    'dist/grounded-media.js',
     'dist/handoff.js',
+    'dist/live-activity-ledger.js',
     'dist/mcp/server.js',
     'dist/native-precompact.js',
+    'dist/proposal-review-state.js',
     'dist/store/checkpoints.js',
   ]) {
     assert.ok(packed.has(required), `tarball must include ${required}`);

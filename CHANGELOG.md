@@ -16,6 +16,8 @@ with pre-release tags.
 - **Deterministic turn evidence.** Adds content-bound turn receipts, durable input evidence, replay preconditions, legacy atomic-write coverage, checkpoint receipt prerequisites, and the Hermes turn-receipt bridge.
 - **Ordinary-language governed capture.** Adds bounded preference/fact/event/procedure intent extraction for normal conversation, with normalization, secret screening, provenance, review-first governance, and real Hermes lifecycle coverage.
 - **Measured semantic activation.** Adds a reproducible semantic gate and real `bge-m3` / 1024-dimension Metal evidence for English, Chinese, paraphrase, no-answer, freshness, privacy, restart identity, latency, dimension truth, index concurrency, and fallback behavior.
+- **Review-first recurring organization.** Adds an idempotent, receipt-bound organize report tick with TTL and workspace locking, plus a proposal review state ledger for `PROPOSED → APPROVED / REJECTED / EXPIRED`. These are review/report primitives only: there is no `APPLIED` state and no authoritative write path.
+- **Privacy-bounded evidence primitives.** Adds Grounded Media metadata evidence and a bounded Activity Ledger. Grounded Media stores no raw attachment content and reports only `EQUAL_UNTRUSTED`; the Activity Ledger binds transition intent, CAS, TTL, dedupe, capacity, and integrity evidence, while `COMMITTED` does not imply task success.
 
 ### Changed
 
@@ -26,7 +28,7 @@ with pre-release tags.
 
 ### Notes
 
-- Alpha.31 is a **local release-ready candidate** built on the complete Alpha.30 milestone; it has not been published, pushed, tagged, deployed, or activated by a runtime restart.
+- Alpha.31 is a **local release-ready prerelease** built on the complete Alpha.30 milestone. npm `next` is the source of truth for package availability; publication does not imply runtime activation or production certification.
 - Safe Memory Gardener remains review-first. Automatic continuous consolidation is currently **report-only** by policy: it may identify duplicate, stale, conflict, or supersession candidates, but it does not automatically rewrite authoritative memory.
 - Team cloud, RBAC/SSO/SLA, a full temporal/entity graph, and broad production-user soak remain outside this candidate's proven scope.
 
