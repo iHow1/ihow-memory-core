@@ -114,14 +114,14 @@ test('rollback-runtime previews by default and atomically swaps only a self-veri
   const beforeCurrent = await fs.readFile(path.join(runtime, 'package.json'), 'utf8');
   const beforePrevious = await fs.readFile(path.join(previous, 'package.json'), 'utf8');
   const preview = JSON.parse(run(['rollback-runtime', '--json'], root));
-  assert.deepEqual({ ok: preview.ok, applied: preview.applied, from: preview.from, to: preview.to }, { ok: true, applied: false, from: '0.1.0-alpha.31', to: '0.0.0-previous' });
+  assert.deepEqual({ ok: preview.ok, applied: preview.applied, from: preview.from, to: preview.to }, { ok: true, applied: false, from: '0.1.0-alpha.31.1', to: '0.0.0-previous' });
   assert.equal(await fs.readFile(path.join(runtime, 'package.json'), 'utf8'), beforeCurrent, 'preview leaves current bytes unchanged');
   assert.equal(await fs.readFile(path.join(previous, 'package.json'), 'utf8'), beforePrevious, 'preview leaves previous bytes unchanged');
 
   const applied = JSON.parse(run(['rollback-runtime', '--apply', '--json'], root));
-  assert.deepEqual({ ok: applied.ok, applied: applied.applied, from: applied.from, to: applied.to }, { ok: true, applied: true, from: '0.1.0-alpha.31', to: '0.0.0-previous' });
+  assert.deepEqual({ ok: applied.ok, applied: applied.applied, from: applied.from, to: applied.to }, { ok: true, applied: true, from: '0.1.0-alpha.31.1', to: '0.0.0-previous' });
   assert.equal(JSON.parse(await fs.readFile(path.join(runtime, 'package.json'), 'utf8')).version, '0.0.0-previous');
-  assert.equal(JSON.parse(await fs.readFile(path.join(previous, 'package.json'), 'utf8')).version, '0.1.0-alpha.31', 'the displaced current generation becomes the next recovery source');
+  assert.equal(JSON.parse(await fs.readFile(path.join(previous, 'package.json'), 'utf8')).version, '0.1.0-alpha.31.1', 'the displaced current generation becomes the next recovery source');
 
   await fs.writeFile(path.join(previous, 'core.js'), 'tampered previous', 'utf8');
   const refused = JSON.parse(run(['rollback-runtime', '--apply', '--json'], root));

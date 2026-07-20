@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const RELEASE_VERSION = '0.1.0-alpha.31';
+const RELEASE_VERSION = '0.1.0-alpha.31.1';
 
 function readRoot(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8');
@@ -29,7 +29,7 @@ function releaseSection(changelog, version) {
   return match[1];
 }
 
-test('alpha.31 prerelease metadata and docs stay truthful and aligned', () => {
+test('alpha.31.1 prerelease metadata and docs stay truthful and aligned', () => {
   const manifest = JSON.parse(readRoot('package.json'));
   const lock = JSON.parse(readRoot('package-lock.json'));
   assert.equal(manifest.version, RELEASE_VERSION);
@@ -38,7 +38,22 @@ test('alpha.31 prerelease metadata and docs stay truthful and aligned', () => {
   assert.deepEqual(manifest.dependencies ?? {}, {}, 'the frozen runtime must not depend on external node_modules');
   assert.deepEqual(lock.packages?.['']?.dependencies ?? {}, {}, 'lockfile preserves the zero-runtime-dependency contract');
 
-  const alpha31 = releaseSection(readRoot('CHANGELOG.md'), RELEASE_VERSION);
+  const changelog = readRoot('CHANGELOG.md');
+  const alpha311 = releaseSection(changelog, RELEASE_VERSION);
+  assert.match(alpha311, /WorkBuddy/i);
+  assert.match(alpha311, /\.workbuddy\/\.mcp\.json/);
+  assert.match(alpha311, /Codex/i);
+  assert.match(alpha311, /per-tool/i);
+  assert.match(alpha311, /read-only/i);
+  assert.match(alpha311, /rollback/i);
+  assert.match(alpha311, /self-contained/i);
+  assert.match(alpha311, /BSD-3-Clause/i);
+  assert.match(alpha311, /npm `?next`?[^\n]*(?:source of truth|availability)/i);
+  assert.match(alpha311, /(?:publication|published)[^\n]*(?:does not|doesn['’]t)[^\n]*(?:runtime activation|production certification)/i);
+  assert.match(alpha311, /TOOLS ONLY/i);
+  assert.doesNotMatch(alpha311, /all[^\n]*ACTIVE/i);
+
+  const alpha31 = releaseSection(changelog, '0.1.0-alpha.31');
   for (const surface of [
     /Alpha\.30/i,
     /turn receipt/i,
@@ -62,19 +77,25 @@ test('alpha.31 prerelease metadata and docs stay truthful and aligned', () => {
   assert.match(alpha31, /(?:no|not)[^\n]*(?:APPLIED|authoritative write)/i);
 
   const readmes = [
-    ['README.md', readRoot('README.md'), /Alpha\.31 prerelease/i, /npm `?@?next`?[^\n]*(?:source of truth|availability)/i],
-    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.31 预发布版/i, /npm `?@?next`?[^\n]*(?:真相源|可用)/i],
+    ['README.md', readRoot('README.md'), /Alpha\.31\.1 prerelease/i, /npm `?@?next`?[^\n]*(?:source of truth|availability)/i],
+    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.31\.1 预发布版/i, /npm `?@?next`?[^\n]*(?:真相源|可用)/i],
   ];
   for (const [name, readme, versionLabel, registryTruth] of readmes) {
-    assert.match(readme, /0\.1\.0-alpha\.31/, `${name} states the prerelease version`);
-    assert.match(readme, versionLabel, `${name} identifies the alpha.31 surface`);
+    assert.match(readme, /0\.1\.0-alpha\.31\.1/, `${name} states the prerelease version`);
+    assert.match(readme, versionLabel, `${name} identifies the alpha.31.1 surface`);
     assert.match(readme, registryTruth, `${name} identifies npm next as availability truth`);
+    assert.match(readme, /\.workbuddy\/\.mcp\.json/, `${name} states WorkBuddy's effective user-scope path`);
+    assert.doesNotMatch(readme, /\.workbuddy\/mcp\.json/, `${name} does not advertise WorkBuddy's obsolete user-scope path`);
     assert.match(readme, /report-only/i, `${name} preserves report-only consolidation truth`);
     assert.match(readme, /EQUAL_UNTRUSTED/i, `${name} preserves grounded-media trust boundaries`);
     assert.match(readme, /COMMITTED/i, `${name} preserves activity-ledger verdict boundaries`);
   }
 
-  const alpha27 = releaseSection(readRoot('CHANGELOG.md'), '0.1.0-alpha.27');
+  const workbuddyGuide = readRoot('examples/connect-workbuddy.md');
+  assert.match(workbuddyGuide, /\.workbuddy\/\.mcp\.json/, 'WorkBuddy guide states the effective user-scope path');
+  assert.doesNotMatch(workbuddyGuide, /\.workbuddy\/mcp\.json/, 'WorkBuddy guide does not advertise the obsolete user-scope path');
+
+  const alpha27 = releaseSection(changelog, '0.1.0-alpha.27');
   for (const heading of ['### Added', '### Changed', '### Notes']) {
     assert.match(alpha27, new RegExp(`^${heading.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}$`, 'm'));
   }

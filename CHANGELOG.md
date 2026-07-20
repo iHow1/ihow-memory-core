@@ -8,6 +8,21 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.31.1] — 2026-07-20
+
+### Fixed
+
+- **WorkBuddy effective user scope.** User-level MCP setup now writes `~/.workbuddy/.mcp.json`, the configuration read by current WorkBuddy/CodeBuddy CLI builds, while preserving existing servers, backing up the original file, using an atomic replacement, keeping dry-run mutation-free, and failing closed on malformed JSON. Connector marketplace files and `mcp-approvals.json` remain untouched.
+- **Codex least-privilege MCP approval.** Setup now adds per-tool `approval_mode = "approve"` only for the five missing read-only continuity tools (`memory.status`, `memory.continue`, `memory.search`, `memory.read`, and `memory.context_probe`). Existing per-tool tables—including stricter `prompt` or `deny` policy and unknown fields—remain authoritative; write, delete, and governance tools are never auto-approved.
+- **Codex transactional repair.** TOML is parsed before registration changes; a failed approval edit restores byte-identical configuration and the prior MCP registration, then verifies the official CLI state before reporting rollback success. Malformed TOML fails closed, and dry-run remains mutation-free.
+- **Self-contained frozen runtime.** The locked `smol-toml` parser subset is vendored with its BSD-3-Clause license and copied into `dist`, preserving the zero-runtime-dependency contract for workspace-frozen `.runtime` bundles and packed installs.
+
+### Notes
+
+- This is an Alpha.31 runtime-adapter patch. It proves the documented MCP tool paths and least-privilege setup behavior; it does not claim every host lifecycle is `ACTIVE`. Hosts without verified lifecycle evidence remain `TOOLS ONLY`, `READY — WAITING FOR FIRST ACTIVITY`, or `NEEDS REPAIR` as reported by `doctor`.
+- npm `next` is the source of truth for package availability. Publication does not imply runtime activation or production certification, and it does not automatically replace an already frozen local runtime; run `upgrade` and restart the relevant host separately.
+- Safe Memory Gardener remains review-first and report-only; this patch does not add automatic authoritative-memory rewriting. Team cloud, tenant isolation, authentication, RBAC/SSO/SLA, and broad production-user soak remain outside the proven scope.
+
 ## [0.1.0-alpha.31] — 2026-07-20
 
 ### Added
