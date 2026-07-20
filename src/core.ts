@@ -28,8 +28,8 @@ import { engineStatus, indexWithEngineFallback, resolveEngineConfig, searchWithE
 import { recallReadiness } from './recall-readiness.ts';
 import { filterForgotten, forgetPath, listForgotten, rememberPath } from './forget.ts';
 import type { ForgetOutcome, RememberOutcome } from './forget.ts';
-import { organizeDraft, exportVaultFromDraft } from './gardener.ts';
-import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraftOptions } from './gardener.ts';
+import { organizeDraft, organizeReportTick, exportVaultFromDraft } from './gardener.ts';
+import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraftOptions, OrganizeReportTickOptions, OrganizeReportTickResult } from './gardener.ts';
 import { checkpointProtectionState, createCheckpointService, type CheckpointService } from './checkpoints.ts';
 import { proposeMemoryV1, type MemoryProposalRequestV1, type MemoryProposalResultV1 } from './memory-proposals.ts';
 import { createTurnReceiptService, type TurnReceiptService } from './turn-receipts.ts';
@@ -58,6 +58,7 @@ export type MemoryCore = {
   remember(needle: string, opts?: { actor?: string }): Promise<RememberOutcome>;
   forgotten(): Promise<Array<{ path: string; snippet: string }>>;
   organize(opts?: OrganizeDraftOptions): Promise<GardenerDraft>;
+  organize_tick(opts?: OrganizeReportTickOptions): Promise<OrganizeReportTickResult>;
   export_vault(fromDraft: string, opts?: ExportVaultOptions): Promise<ExportVaultResult>;
   // alpha.29: explicit, bounded, review-first formation. This path never calls write_candidate/auto-promote/indexing.
   propose_memory(request: MemoryProposalRequestV1): Promise<MemoryProposalResultV1[]>;
@@ -265,6 +266,9 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     },
     async organize(opts = {}) {
       return await organizeDraft(workspace, opts);
+    },
+    async organize_tick(opts = {}) {
+      return await organizeReportTick(workspace, opts);
     },
     async export_vault(fromDraft, opts = {}) {
       return await exportVaultFromDraft(workspace, fromDraft, opts);

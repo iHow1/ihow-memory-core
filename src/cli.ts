@@ -118,6 +118,7 @@ type ParsedArgs = {
     fromDraft?: string;
     scope?: string;
     since?: string;
+    ttlMs?: number;
     draft?: boolean;
     format?: 'markdown';
     importSource?: 'claude-code' | 'markdown';
@@ -469,12 +470,24 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--scope') {
       const value = tail[++index];
       options.scope = value;
-      if (command !== 'organize') rest.push('--scope', value);
+      if (command !== 'organize' && command !== 'organize-tick') rest.push('--scope', value);
     }
     else if (arg === '--since') {
       const value = tail[++index];
       options.since = value;
-      if (command !== 'organize') rest.push('--since', value);
+      if (command !== 'organize' && command !== 'organize-tick') rest.push('--since', value);
+    }
+    else if (arg === '--ttl') {
+      const value = tail[++index] || '';
+      if (command !== 'organize-tick') {
+        rest.push('--ttl', value);
+      } else {
+        const match = value.match(/^(\d+)([hdw])$/i);
+        if (!match || Number(match[1]) <= 0) throw new Error('invalid_organize_tick_ttl');
+        const n = Number(match[1]);
+        const mult = match[2].toLowerCase() === 'h' ? 3_600_000 : match[2].toLowerCase() === 'd' ? 86_400_000 : 7 * 86_400_000;
+        options.ttlMs = n * mult;
+      }
     }
     else if (arg === '--draft') options.draft = true;
     else if (arg === '--format') {
@@ -2325,6 +2338,7 @@ Usage:
   ihow-memory benchmark [--json]   # deterministic LOCAL proof of the verify-first guarantees: the three-color resume verdict discriminates (GREEN narrow · drift→RED · uncertainty→YELLOW) and the no-false-green floor isolates unverified/standing-rule content while blocking secret/fabricated-anchor content. Re-run for the same result; exit non-zero if any guarantee fails.
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
   ihow-memory organize --scope project [--since 7d] --draft --json   # Safe Memory Gardener alpha.24: review-first JSON draft with evidence pointers, duplicate/stale review flags, redaction safety status, and organize audit event. Never rewrites curated memory and does not automate enterprise policy.
+  ihow-memory organize-tick --scope project [--since 7d] [--ttl 1h] --json   # Alpha.31 report-only scheduler primitive: idempotent within a bounded TTL/source-manifest window, zero authority writes, no model, no daemon installation.
   ihow-memory export-vault --from-draft <draft_id> --format markdown [--json]   # export a gardener draft to an Obsidian-compatible Markdown view/editor artifact with evidence links + export audit event. The export is not source of truth.
   ihow-memory enable-semantic [--host url] [--model name] [--space name] [--json]   # OPT-IN: turn on the additive semantic lane for this space. Probes a LOCAL Ollama (default http://localhost:11434, model nomic-embed-text) and only enables if it is reachable AND the model is pulled; persists <space>/.runtime/semantic.json so connect/setup launch the MCP server with the spawned embedding sidecar. Successful activation proves availability, not retrieval-quality lift; prompt bypass stays fail-closed without a measured model floor. The default install stays zero-dependency FTS5 (capabilities.semantic=false) until you run this; the lane is additive — search falls back to FTS if the provider is down. Re-run setup/connect + restart the runtime to apply.
   ihow-memory disable-semantic [--space name] [--json]   # reverse enable-semantic: remove the opt-in marker and return to the default FTS5 engine (re-run setup/connect + restart to apply)
@@ -4782,6 +4796,22 @@ async function main(): Promise<void> {
       console.log(`path: ${draft.draft_path}`);
       console.log(`audit event: ${draft.audit_event_id}`);
       console.log('mode: review-first (curated memory not rewritten)');
+    }
+    return;
+  }
+  if (command === 'organize-tick') {
+    const result = await core.organize_tick({
+      scope: options.scope || 'project',
+      since: options.since,
+      actor: options.actor || 'scheduler',
+      ttlMs: options.ttlMs,
+    });
+    if (options.json) printJson(result);
+    else {
+      console.log(`organize tick: ${result.status} ${result.run_id}`);
+      console.log(`draft: ${result.draft_id}`);
+      console.log(`expires: ${result.expires_at}`);
+      console.log('mode: report-only (authority writes=0; no daemon installed)');
     }
     return;
   }

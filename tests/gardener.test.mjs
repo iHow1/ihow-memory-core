@@ -5,11 +5,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openCore } from '../src/core.ts';
 import { containsSecretLikeContent } from '../src/governance.ts';
-import { gardenerDraftPath } from '../src/gardener.ts';
+import { gardenerDraftPath, organizeReportTick } from '../src/gardener.ts';
 import { seedEnterpriseGardenerFixture, WORKFLOW_EVENTS } from './fixtures/enterprise-gardener.mjs';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
@@ -29,6 +29,20 @@ async function writeMemory(core, rel, body) {
   await fs.mkdir(path.dirname(p), { recursive: true });
   await fs.writeFile(p, body, 'utf8');
   return p;
+}
+
+async function runNode(args, options = {}) {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('exit', (code) => code === 0 ? resolve(stdout) : reject(new Error(`child_exit_${code}: ${stderr}`)));
+  });
 }
 
 function normalizeDraft(d) {
@@ -73,6 +87,123 @@ test('organize draft from deterministic fixture is stable and evidence-backed', 
     if (item.claim_kind === 'evidence') assert.ok(item.evidence.length > 0, `${item.id} has evidence`);
     else assert.match(item.claim_kind, /inference|open-question/);
   }
+});
+
+test('report-only tick is idempotent inside a TTL window and proves zero authority writes', async (t) => {
+  const core = await coreFor(t);
+  await fixture(core);
+  const authority = path.join(core.workspace.memoryDir, 'scopes/project/alpha.md');
+  const before = await fs.readFile(authority);
+  const now = Date.parse('2026-07-20T03:00:00.000Z');
+
+  const first = await organizeReportTick(core.workspace, { scope: 'project', actor: 'dream', ttlMs: 3_600_000, nowMs: now });
+  const eventsAfterFirst = (await core.audit()).filter((event) => event.type === 'memory.organized');
+  const draftBeforeReplay = await fs.readFile(path.join(core.workspace.spaceDir, first.draft_path));
+  const second = await organizeReportTick(core.workspace, { scope: 'project', actor: 'dream', ttlMs: 3_600_000, nowMs: now + 30_000 });
+  const eventsAfterSecond = (await core.audit()).filter((event) => event.type === 'memory.organized');
+
+  assert.equal(first.status, 'created');
+  assert.equal(second.status, 'reused');
+  assert.equal(second.run_id, first.run_id);
+  assert.equal(second.draft_id, first.draft_id);
+  assert.equal(second.source_manifest_sha256, first.source_manifest_sha256);
+  assert.equal(second.expires_at, first.expires_at);
+  assert.equal(eventsAfterSecond.length, eventsAfterFirst.length, 'replay adds no organize audit event');
+  assert.deepEqual(await fs.readFile(path.join(core.workspace.spaceDir, first.draft_path)), draftBeforeReplay, 'replay does not overwrite the draft');
+  assert.deepEqual(await fs.readFile(authority), before, 'tick never writes authoritative memory');
+  assert.deepEqual(first.safety, { mode: 'report-only', authority_writes: 0, rollback_required: false });
+});
+
+test('report-only tick creates a new run only when source bytes or the TTL window changes', async (t) => {
+  const core = await coreFor(t);
+  await fixture(core);
+  const now = Date.parse('2026-07-20T03:00:00.000Z');
+  const first = await organizeReportTick(core.workspace, { scope: 'project', ttlMs: 60_000, nowMs: now });
+
+  await fs.appendFile(path.join(core.workspace.memoryDir, 'scopes/project/open.md'), '- Fact: a new source byte changes the report manifest.\n');
+  const changed = await organizeReportTick(core.workspace, { scope: 'project', ttlMs: 60_000, nowMs: now + 1_000 });
+  assert.notEqual(changed.source_manifest_sha256, first.source_manifest_sha256);
+  assert.notEqual(changed.run_id, first.run_id);
+  assert.equal(changed.status, 'created');
+
+  const expired = await organizeReportTick(core.workspace, { scope: 'project', ttlMs: 60_000, nowMs: now + 61_000 });
+  assert.equal(expired.status, 'created');
+  assert.notEqual(expired.run_id, changed.run_id, 'a new TTL window produces a new run even with unchanged source bytes');
+  assert.equal(expired.source_manifest_sha256, changed.source_manifest_sha256);
+});
+
+test('concurrent report-only ticks converge on one created run and one organize event', async (t) => {
+  const core = await coreFor(t);
+  await fixture(core);
+  const opts = { scope: 'project', ttlMs: 60_000, nowMs: Date.parse('2026-07-20T03:00:00.000Z') };
+  const results = await Promise.all(Array.from({ length: 8 }, () => organizeReportTick(core.workspace, opts)));
+  assert.equal(new Set(results.map((result) => result.run_id)).size, 1);
+  assert.equal(results.filter((result) => result.status === 'created').length, 1);
+  assert.equal(results.filter((result) => result.status === 'reused').length, 7);
+  assert.equal((await core.audit()).filter((event) => event.type === 'memory.organized').length, 1);
+});
+
+test('report-only tick refuses a tampered receipt or missing draft instead of claiming reuse', async (t) => {
+  const core = await coreFor(t);
+  await fixture(core);
+  const opts = { scope: 'project', ttlMs: 60_000, nowMs: Date.parse('2026-07-20T03:00:00.000Z') };
+  const created = await organizeReportTick(core.workspace, opts);
+  const runsDir = path.join(core.workspace.spaceDir, 'gardener', 'runs');
+  const [receiptName] = await fs.readdir(runsDir);
+  const receiptPath = path.join(runsDir, receiptName);
+  const receipt = JSON.parse(await fs.readFile(receiptPath, 'utf8'));
+
+  await fs.writeFile(receiptPath, `${JSON.stringify({ ...receipt, safety: { ...receipt.safety, authority_writes: 1 } }, null, 2)}\n`);
+  await assert.rejects(organizeReportTick(core.workspace, opts), /gardener_report_receipt_invalid/);
+
+  await fs.writeFile(receiptPath, `${JSON.stringify({ ...receipt, draft_path: '../../outside.json' }, null, 2)}\n`);
+  await assert.rejects(organizeReportTick(core.workspace, opts), /gardener_report_receipt_invalid/);
+
+  const draftPath = path.join(core.workspace.spaceDir, created.draft_path);
+  const draft = JSON.parse(await fs.readFile(draftPath, 'utf8'));
+  await fs.writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+  await fs.writeFile(draftPath, `${JSON.stringify({ ...draft, current_state_summary: { ...draft.current_state_summary, text: 'tampered' } }, null, 2)}\n`);
+  await assert.rejects(organizeReportTick(core.workspace, opts), /gardener_report_draft_invalid/);
+
+  await fs.writeFile(draftPath, `${JSON.stringify(draft, null, 2)}\n`);
+  await fs.rm(draftPath);
+  await assert.rejects(organizeReportTick(core.workspace, opts), /gardener_report_draft_missing/);
+});
+
+test('programmatic invalid TTL is normalized before any audit or draft side effect', async (t) => {
+  const core = await coreFor(t);
+  await fixture(core);
+  const result = await organizeReportTick(core.workspace, { scope: 'project', ttlMs: Number.NaN, nowMs: Date.parse('2026-07-20T03:00:00.000Z') });
+  assert.equal(result.status, 'created');
+  assert.equal(Date.parse(result.expires_at) - Date.parse(result.window_started_at), 3_600_000);
+  assert.equal((await core.audit()).filter((event) => event.type === 'memory.organized').length, 1);
+});
+
+test('non-manifest draft-input drift opens a new run instead of false tamper until TTL expiry', async (t) => {
+  const core = await coreFor(t);
+  await fixture(core);
+  const now = Date.parse('2026-07-20T03:00:00.000Z');
+  const first = await organizeReportTick(core.workspace, { scope: 'project', ttlMs: 60_000, nowMs: now });
+  await writeMemory(core, 'scopes/private/another-private.md', '- Fact: remains outside project scope.\n');
+  const second = await organizeReportTick(core.workspace, { scope: 'project', ttlMs: 60_000, nowMs: now + 1_000 });
+  assert.equal(second.status, 'created');
+  assert.notEqual(second.run_id, first.run_id);
+  assert.equal(second.source_manifest_sha256, first.source_manifest_sha256);
+});
+
+test('two CLI processes racing in one window converge through the cross-process workspace lock', async (t) => {
+  const root = await mkdtempReal('ihow-gardener-race-cli-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const core = await openCore({ root, space: 'race' });
+  await fixture(core);
+  const env = { ...process.env, IHOW_MEMORY_HOME: root };
+  const args = [CLI, 'organize-tick', '--root', root, '--space', 'race', '--scope', 'project', '--ttl', '1h', '--json'];
+  const outputs = await Promise.all([runNode(args, { env }), runNode(args, { env })]);
+  const results = outputs.map((output) => JSON.parse(output));
+  assert.equal(new Set(results.map((result) => result.run_id)).size, 1);
+  assert.equal(results.filter((result) => result.status === 'created').length, 1);
+  assert.equal(results.filter((result) => result.status === 'reused').length, 1);
+  assert.equal((await core.audit()).filter((event) => event.type === 'memory.organized').length, 1);
 });
 
 test('duplicate/stale candidates are flagged, not deleted or rewritten', async (t) => {
@@ -269,4 +400,24 @@ test('CLI organize/export surfaces work with JSON', async (t) => {
   assert.match(md, /Project Orchard/);
   assert.match(md, /Evidence:/);
   assert.equal(containsSecretLikeContent(md), false, 'CLI export Markdown is detector-clean');
+});
+
+test('CLI organize-tick exposes the report-only idempotent scheduler primitive', async (t) => {
+  const root = await mkdtempReal('ihow-gardener-tick-cli-');
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const core = await openCore({ root, space: 'tick-cli' });
+  await fixture(core);
+  const env = { ...process.env, IHOW_MEMORY_HOME: root };
+  const args = [CLI, 'organize-tick', '--root', root, '--space', 'tick-cli', '--scope', 'project', '--ttl', '1h', '--json'];
+  const first = JSON.parse(execFileSync(process.execPath, args, { encoding: 'utf8', env }));
+  const second = JSON.parse(execFileSync(process.execPath, args, { encoding: 'utf8', env }));
+  assert.equal(first.status, 'created');
+  assert.equal(second.status, 'reused');
+  assert.equal(second.run_id, first.run_id);
+  assert.deepEqual(first.safety, { mode: 'report-only', authority_writes: 0, rollback_required: false });
+  assert.equal((await core.audit()).filter((event) => event.type === 'memory.organized').length, 1);
+  assert.throws(
+    () => execFileSync(process.execPath, [CLI, 'organize-tick', '--root', root, '--space', 'tick-cli', '--ttl', '0h', '--json'], { encoding: 'utf8', env }),
+    /Command failed/,
+  );
 });
