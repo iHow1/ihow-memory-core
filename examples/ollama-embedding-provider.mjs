@@ -48,6 +48,106 @@ const EMBED_TIMEOUT_MS = Number(process.env.OLLAMA_EMBED_TIMEOUT_MS || 20000);
 // embeds with the SAME model enable-semantic verified — no env-vs-engine divergence (red-team r-alpha18-2).
 let activeModel = EMBED_MODEL;
 
+// Explicit resource boundaries for the dependency-free JSON sidecar. These limits are intentionally
+// conservative but comfortably above the frozen A1 fixture and common local embedding dimensions.
+const MAX_SIDECAR_BYTES = 16 * 1024 * 1024;
+const MAX_SIDECAR_DOCS = 10_000;
+const MAX_VECTOR_DIMENSION = 8_192;
+// 256 KiB accommodates 8,192 finite JSON numbers even at long decimal/exponent spellings plus the
+// response object overhead, while preventing a local provider from making JSON.parse allocate from an
+// unbounded body. The response is rejected from Content-Length when possible and otherwise while streaming.
+const MAX_EMBED_RESPONSE_BYTES = 256 * 1024;
+const MAX_PREVIEW_CHARS = 2_000;
+const MAX_PREVIEW_UTF8_BYTES = 6_000;
+
+function validateVector(vec, expectedDims = 0) {
+  if (!Array.isArray(vec) || vec.length === 0 || vec.length > MAX_VECTOR_DIMENSION) {
+    throw new Error('ollama_embedding_invalid_dimension');
+  }
+  if (!vec.every((value) => typeof value === 'number' && Number.isFinite(value))) {
+    throw new Error('ollama_embedding_invalid_vector');
+  }
+  if (expectedDims && vec.length !== expectedDims) throw new Error('ollama_embedding_dimension_mismatch');
+  return vec.length;
+}
+
+function isCanonicalMemoryMarkdownPath(value) {
+  if (typeof value !== 'string' || !value.startsWith('memory/') || !value.endsWith('.md')) return false;
+  if (value.includes('\\') || /[\0-\x1f\x7f]/.test(value) || path.posix.isAbsolute(value)) return false;
+  const parts = value.split('/');
+  if (parts.length < 2 || parts.some((part) => !part || part === '.' || part === '..')) return false;
+  return path.posix.normalize(value) === value;
+}
+
+function validateStore(store, { allowEmpty = false } = {}) {
+  if (!store || typeof store !== 'object' || Array.isArray(store)) throw new Error('ollama_sidecar_invalid_structure');
+  if (store.model !== activeModel) throw new Error('ollama_sidecar_model_mismatch');
+  if (!Array.isArray(store.docs) || (!allowEmpty && store.docs.length === 0)) {
+    throw new Error('ollama_sidecar_invalid_docs');
+  }
+  if (store.docs.length > MAX_SIDECAR_DOCS) throw new Error('ollama_sidecar_too_many_docs');
+
+  let dims = 0;
+  for (const doc of store.docs) {
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error('ollama_sidecar_invalid_doc');
+    if (!isCanonicalMemoryMarkdownPath(doc.path)) throw new Error('ollama_sidecar_invalid_path');
+    if (typeof doc.preview !== 'string') throw new Error('ollama_sidecar_invalid_preview');
+    if ([...doc.preview].length > MAX_PREVIEW_CHARS || Buffer.byteLength(doc.preview, 'utf8') > MAX_PREVIEW_UTF8_BYTES) {
+      throw new Error('ollama_sidecar_preview_too_large');
+    }
+    try {
+      dims = dims || validateVector(doc.vec);
+      validateVector(doc.vec, dims);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'ollama_embedding_invalid_dimension') {
+        throw new Error('ollama_sidecar_invalid_dimension');
+      }
+      if (error instanceof Error && error.message === 'ollama_embedding_invalid_vector') {
+        throw new Error('ollama_sidecar_invalid_vector');
+      }
+      throw new Error('ollama_sidecar_dimension_mismatch');
+    }
+  }
+  return { docs: store.docs, dims };
+}
+
+async function readBoundedEmbeddingJson(res) {
+  const declaredLength = res.headers.get('content-length');
+  if (declaredLength !== null) {
+    const bytes = Number(declaredLength);
+    if (Number.isFinite(bytes) && bytes > MAX_EMBED_RESPONSE_BYTES) {
+      await res.body?.cancel().catch(() => {});
+      throw new Error('ollama_embedding_response_too_large');
+    }
+  }
+  if (!res.body) throw new Error('ollama_embedding_invalid_json');
+
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_EMBED_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new Error('ollama_embedding_response_too_large');
+      }
+      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === 'ollama_embedding_response_too_large') throw error;
+    throw new Error('ollama_embedding_invalid_json');
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks, total).toString('utf8'));
+  } catch {
+    throw new Error('ollama_embedding_invalid_json');
+  }
+}
+
 async function ollamaEmbed(text) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), EMBED_TIMEOUT_MS);
@@ -59,9 +159,9 @@ async function ollamaEmbed(text) {
       signal: ctrl.signal,
     });
     if (!res.ok) throw new Error(`ollama_http_${res.status}`);
-    const json = await res.json();
+    const json = await readBoundedEmbeddingJson(res);
     const vec = json.embedding;
-    if (!Array.isArray(vec) || vec.length === 0) throw new Error('ollama_empty_embedding');
+    validateVector(vec);
     return vec;
   } finally {
     clearTimeout(timer);
@@ -120,9 +220,16 @@ function snippetFrom(content, query) {
 
 // Bound concurrency for index embeds. The engine gives index() an independent
 // `vectorIndexTimeoutMs` budget (10 minutes by default, configurable up to 1 hour), separate from the
-// interactive status/search timeout. Concurrency still keeps rebuild latency practical; keep the
-// fan-out modest so we don't thrash a small box.
-const INDEX_CONCURRENCY = Number(process.env.OLLAMA_EMBED_CONCURRENCY || 8);
+// interactive status/search timeout. Default to serial work for CPU-only Ollama; an explicit positive
+// integer override is capped at 8 so a malformed or aggressive value cannot create unbounded fan-out.
+function indexConcurrency(value) {
+  if (value === undefined || value === '') return 1;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) return 1;
+  return Math.min(parsed, 8);
+}
+
+const INDEX_CONCURRENCY = indexConcurrency(process.env.OLLAMA_EMBED_CONCURRENCY);
 
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
@@ -154,21 +261,67 @@ async function buildIndex(ws) {
       continue;
     }
     candidates.push({ rel, body: stripFrontmatter(content) });
+    if (candidates.length > MAX_SIDECAR_DOCS) throw new Error('ollama_sidecar_too_many_docs');
   }
   const embedded = await mapLimit(candidates, INDEX_CONCURRENCY, async (c) => {
-    return { path: c.rel, vec: await ollamaEmbed(c.body), preview: c.body.slice(0, 2000) };
+    return { path: c.rel, vec: await ollamaEmbed(c.body), preview: c.body.slice(0, MAX_PREVIEW_CHARS) };
   });
-  await fsp.mkdir(path.dirname(sidecarPath(ws)), { recursive: true });
-  await fsp.writeFile(sidecarPath(ws), JSON.stringify({ model: activeModel, docs: embedded }), 'utf8');
+  let embeddingDims = 0;
+  for (const doc of embedded) {
+    validateVector(doc.vec, embeddingDims);
+    embeddingDims ||= doc.vec.length;
+  }
+  const store = { model: activeModel, docs: embedded };
+  validateStore(store, { allowEmpty: true });
+  const serialized = JSON.stringify(store);
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_SIDECAR_BYTES) throw new Error('ollama_sidecar_too_large');
+  const target = sidecarPath(ws);
+  const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+  } catch {
+    throw new Error('ollama_sidecar_prepare_failed');
+  }
+  try {
+    await fsp.writeFile(temp, serialized, 'utf8');
+  } catch {
+    await fsp.rm(temp, { force: true }).catch(() => {});
+    throw new Error('ollama_sidecar_write_failed');
+  }
+  try {
+    await fsp.rename(temp, target);
+  } catch {
+    await fsp.rm(temp, { force: true }).catch(() => {});
+    throw new Error('ollama_sidecar_replace_failed');
+  }
   return embedded.length;
 }
 
 function loadIndex(ws) {
+  const target = sidecarPath(ws);
+  let stat;
   try {
-    return JSON.parse(fs.readFileSync(sidecarPath(ws), 'utf8'));
-  } catch {
-    return { docs: [] };
+    stat = fs.statSync(target);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') throw new Error('ollama_sidecar_missing');
+    throw new Error('ollama_sidecar_unreadable');
   }
+  if (!stat.isFile()) throw new Error('ollama_sidecar_unreadable');
+  if (stat.size > MAX_SIDECAR_BYTES) throw new Error('ollama_sidecar_too_large');
+  let raw;
+  try {
+    raw = fs.readFileSync(target, 'utf8');
+  } catch (error) {
+    if (error && error.code === 'ENOENT') throw new Error('ollama_sidecar_missing');
+    throw new Error('ollama_sidecar_unreadable');
+  }
+  let store;
+  try {
+    store = JSON.parse(raw);
+  } catch {
+    throw new Error('ollama_sidecar_invalid_json');
+  }
+  return validateStore(store);
 }
 
 async function main() {
@@ -195,8 +348,14 @@ async function main() {
   if (method === 'status') {
     // Probe Ollama reachability + model presence; ready:false makes the engine fall back to FTS.
     try {
-      await ollamaEmbed('readiness probe');
-      process.stdout.write(JSON.stringify({ id: 'vector-gguf', model: activeModel, ready: true, cloud: false }) + '\n');
+      const probe = await ollamaEmbed('readiness probe');
+      process.stdout.write(JSON.stringify({
+        id: 'vector-gguf',
+        model: activeModel,
+        ready: true,
+        cloud: false,
+        dimension: probe.length,
+      }) + '\n');
     } catch (error) {
       process.stdout.write(
         JSON.stringify({
@@ -218,6 +377,11 @@ async function main() {
   if (method === 'search') {
     const store = loadIndex(ws);
     const qvec = await ollamaEmbed(req.query || '');
+    try {
+      validateVector(qvec, store.dims);
+    } catch {
+      throw new Error('ollama_sidecar_dimension_mismatch');
+    }
     const limit = Math.max(1, Math.min(Number((req.opts && req.opts.limit) || 5), 25));
     const scored = store.docs
       .map((d) => ({ path: d.path, score: cosine(qvec, d.vec), preview: d.preview }))
@@ -228,6 +392,7 @@ async function main() {
       const snippet = snippetFrom(d.preview, req.query || '');
       return { path: d.path, snippet, score: d.score, source: 'vector-gguf', citation: { path: d.path, snippet } };
     });
+    if (hits.length === 0) throw new Error('ollama_sidecar_empty_search');
     process.stdout.write(JSON.stringify({ hits }) + '\n');
     return;
   }

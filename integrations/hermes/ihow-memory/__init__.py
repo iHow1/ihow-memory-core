@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import threading
 import time
+import re
+import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -25,23 +27,90 @@ logger = logging.getLogger(__name__)
 _MAX_CONTEXT_CHARS = 8_000
 _MAX_PROMPT_DIGEST_CHARS = 2_000
 _MAX_RECEIPT_ID_BYTES = 512
-_MAX_RECEIPT_TEXT_BYTES = 2_000
 _MAX_PROJECT_ROOT_BYTES = 4_096
+_MAX_SIDECAR_ARGUMENT_BYTES = 16_384
+_MAX_COMPILED_DELTA_BYTES = 8 * 1_024
 _MAX_PENDING_RECEIPTS = 256
 _PENDING_RECEIPT_TTL_SECONDS = 3_600
 _pending_receipts_lock = threading.RLock()
 _pending_receipts: OrderedDict[str, dict[str, Any]] = OrderedDict()
-_COMMIT_NOT_PROVEN_REASONS = frozenset({
-    "identity_invalid",
-    "durable_marker_missing",
-    "pending_not_found",
-    "final_evidence_invalid",
-    "final_conflict",
-    "end_not_successful",
-    "final_evidence_missing",
-    "transport_failure",
-    "input_conflict",
+_MAX_RECEIPT_ALIASES = 256
+_RECEIPT_ALIAS_TTL_SECONDS = 3_600
+_receipt_aliases: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_LOWER_HEX_64_RE = re.compile(r"^[a-f0-9]{64}$")
+_DURABLE_INPUT_KEYS = frozenset({
+    "schemaVersion",
+    "identityDomain",
+    "sessionHash",
+    "turnId",
+    "inputSourceHash",
+    "inputContentSha256",
 })
+_MEMORY_DELTA_KINDS = frozenset({"preference", "fact", "event", "procedure"})
+_ECMASCRIPT_WHITESPACE = (
+    "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+_ECMASCRIPT_WHITESPACE_RE = re.compile(f"[{re.escape(_ECMASCRIPT_WHITESPACE)}]+")
+_SECRET_LIKE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\b(api[_-]?key|secret|token|password|passwd|pwd|cookie|authorization|bearer|refresh[_-]?token|access[_-]?token|private[_-]?key|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?access[_-]?key[_-]?id)\b\s*[:=]",
+    r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}",
+    r"\bsk-[A-Za-z0-9_-]{16,}\b",
+    r"\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b",
+    r"\b(?:github_pat_[0-9A-Za-z_]{20,}|gh[oprsu]_[0-9A-Za-z]{16,})\b",
+    r"\bAKIA[0-9A-Z]{16}\b",
+    r"\bAIza[0-9A-Za-z_-]{35}\b",
+    r"\bya29\.[0-9A-Za-z._-]{20,}",
+    r"\bxox[baprs]-[0-9A-Za-z-]{10,}",
+    r"\bSK[0-9a-f]{32}\b",
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+    r"-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA )?PRIVATE KEY-----",
+    r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
+    r"(?:账号|账户|邮箱|密码|密钥|令牌)\s*[:：=]\s*\S+",
+    r"\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/:@]+@\S+",
+    r"\bAuthorization\s*:\s*Bearer\s+\S+",
+    r"\bBearer\s+\S*@\S+",
+    r"\bBearer\s+(?=[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-]))(?=\S*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])",
+))
+_DELTA_TOOL_DESCRIPTION = (
+    "Control-only terminal sidecar for the same final response. This is not a user command and "
+    "must not trigger a second LLM, API, or tool round. Emit exactly one typed memory delta or "
+    "explicit_none only when the response is terminal."
+)
+_DELTA_TOOL_PARAMETERS = {
+    "oneOf": [
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "schemaVersion": {"type": "integer", "const": 1},
+                "status": {"type": "string", "const": "emitted"},
+                "proposal": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["preference", "fact", "event", "procedure"]},
+                        "subject": {"type": "string", "minLength": 1, "maxLength": 120},
+                        "key": {"type": "string", "minLength": 1, "maxLength": 120},
+                        "value": {"type": "string", "minLength": 1, "maxLength": 1_200},
+                    },
+                    "required": ["kind", "subject", "key", "value"],
+                },
+            },
+            "required": ["schemaVersion", "status", "proposal"],
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "schemaVersion": {"type": "integer", "const": 1},
+                "status": {"type": "string", "const": "explicit_none"},
+            },
+            "required": ["schemaVersion", "status"],
+        },
+    ],
+}
 
 
 
@@ -57,8 +126,142 @@ def _sha256(domain: str, value: str) -> str:
     return hashlib.sha256((domain + value).encode("utf-8")).hexdigest()
 
 
+def _canonical_sha256(value: Any) -> str:
+    canonical = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ) + "\n"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _utf16_length(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _normalize_proposal_text(value: str) -> str:
+    # This mirrors Core normalizeProposalTextV1: NFKC, ECMAScript trim, then Unicode whitespace collapse.
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = normalized.strip(_ECMASCRIPT_WHITESPACE)
+    return _ECMASCRIPT_WHITESPACE_RE.sub(" ", normalized)
+
+
+def _exact_model_text(value: Any, maximum: int) -> Optional[str]:
+    if not isinstance(value, str) or not value:
+        return None
+    if _utf16_length(value) > maximum or _normalize_proposal_text(value) != value:
+        return None
+    return value
+
+
+def _contains_secret_like_content(value: str) -> bool:
+    return any(pattern.search(value) is not None for pattern in _SECRET_LIKE_PATTERNS)
+
+
+def _exact_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("ihow_memory_delta_duplicate_json_key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("ihow_memory_delta_non_json_number")
+
+
 def _receipt_correlation_key(session_hash: str, turn_id: str) -> str:
     return _sha256("hermes-turn-receipt-correlation-v1\0", session_hash + "\0" + turn_id)
+
+
+def _is_lower_hex_64(value: Any) -> bool:
+    return isinstance(value, str) and _LOWER_HEX_64_RE.fullmatch(value) is not None
+
+
+def _durable_input_evidence(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict) or set(value) != _DURABLE_INPUT_KEYS:
+        return None
+    if type(value.get("schemaVersion")) is not int or value["schemaVersion"] != 1:
+        return None
+    if value.get("identityDomain") != "hermes-transcript-v1":
+        return None
+    if not _is_lower_hex_64(value.get("sessionHash")):
+        return None
+    if not _is_lower_hex_64(value.get("turnId")):
+        return None
+    source_hash = value.get("inputSourceHash")
+    if not isinstance(source_hash, str) or not source_hash.startswith("sha256:"):
+        return None
+    if not _is_lower_hex_64(source_hash[7:]):
+        return None
+    if not _is_lower_hex_64(value.get("inputContentSha256")):
+        return None
+    return value
+
+
+def _pending_key(receipt: dict[str, Any]) -> str:
+    return _receipt_correlation_key(receipt["sessionHash"], receipt["turnId"])
+
+
+def _raw_alias_key(kwargs: dict[str, Any]) -> Optional[str]:
+    session_hash, turn_hash = _bounded_correlation(kwargs)
+    if not session_hash or not turn_hash:
+        return None
+    return _receipt_correlation_key(session_hash, turn_hash)
+
+
+def _prune_receipt_aliases_locked(now: float) -> None:
+    stale_before = now - _RECEIPT_ALIAS_TTL_SECONDS
+    stale = [key for key, value in _receipt_aliases.items() if value["_touched"] < stale_before]
+    for key in stale:
+        _receipt_aliases.pop(key, None)
+    while len(_receipt_aliases) > _MAX_RECEIPT_ALIASES:
+        _receipt_aliases.popitem(last=False)
+
+
+def _bind_receipt_alias(kwargs: dict[str, Any], pending_key: str) -> None:
+    alias_key = _raw_alias_key(kwargs)
+    if alias_key is None:
+        return
+    now = time.monotonic()
+    with _pending_receipts_lock:
+        _prune_receipt_aliases_locked(now)
+        existing = _receipt_aliases.get(alias_key)
+        if existing is not None and existing.get("pendingKey") != pending_key:
+            existing.clear()
+            existing.update({"poisoned": True, "_touched": now})
+        elif existing is None:
+            _receipt_aliases[alias_key] = {"pendingKey": pending_key, "_touched": now}
+        else:
+            existing["_touched"] = now
+        _receipt_aliases.move_to_end(alias_key)
+        _prune_receipt_aliases_locked(now)
+
+
+def _resolve_receipt_alias(kwargs: dict[str, Any]) -> Optional[str]:
+    alias_key = _raw_alias_key(kwargs)
+    if alias_key is None:
+        return None
+    now = time.monotonic()
+    with _pending_receipts_lock:
+        _prune_receipt_aliases_locked(now)
+        alias = _receipt_aliases.get(alias_key)
+        if alias is None or alias.get("poisoned") is True:
+            return None
+        pending_key = alias.get("pendingKey")
+        if not isinstance(pending_key, str) or pending_key not in _pending_receipts:
+            _receipt_aliases.pop(alias_key, None)
+            return None
+        alias["_touched"] = now
+        _receipt_aliases.move_to_end(alias_key)
+        return pending_key
+
+
+def _clear_receipt_alias(kwargs: dict[str, Any]) -> None:
+    alias_key = _raw_alias_key(kwargs)
+    if alias_key is None:
+        return
+    with _pending_receipts_lock:
+        _receipt_aliases.pop(alias_key, None)
 
 
 def _prune_pending_receipts_locked(now: float) -> None:
@@ -70,18 +273,20 @@ def _prune_pending_receipts_locked(now: float) -> None:
         _pending_receipts.popitem(last=False)
 
 
-def _retain_open_receipt(receipt: dict[str, Any]) -> None:
+def _retain_open_receipt(receipt: dict[str, Any]) -> str:
     now = time.monotonic()
-    key = _receipt_correlation_key(receipt["sessionHash"], receipt["turnId"])
+    key = _pending_key(receipt)
     with _pending_receipts_lock:
         _prune_pending_receipts_locked(now)
         existing = _pending_receipts.get(key)
         if existing is not None and _same_input_evidence(existing, receipt):
             existing["_touched"] = now
             _pending_receipts.move_to_end(key)
-            return
+            return key
         _pending_receipts[key] = {
             "schemaVersion": receipt["schemaVersion"],
+            "identityDomain": receipt["identityDomain"],
+            "origin": receipt["origin"],
             "runtime": receipt["runtime"],
             "projectId": receipt["projectId"],
             "sessionHash": receipt["sessionHash"],
@@ -94,40 +299,14 @@ def _retain_open_receipt(receipt: dict[str, Any]) -> None:
         }
         _pending_receipts.move_to_end(key)
         _prune_pending_receipts_locked(now)
+        return key
 
 
 def _same_input_evidence(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return all(left.get(field) == right.get(field) for field in (
-        "schemaVersion", "runtime", "projectId", "sessionHash", "turnId", "revision",
-        "inputSourceHash", "inputContentSha256",
+        "schemaVersion", "identityDomain", "origin", "runtime", "projectId", "sessionHash",
+        "turnId", "revision", "inputSourceHash", "inputContentSha256",
     ))
-
-
-def _invalidate_conflicting_open_receipt(receipt: dict[str, Any]) -> bool:
-    """Drop stale pending evidence before Core observes a conflicting OPEN."""
-    now = time.monotonic()
-    key = _receipt_correlation_key(receipt["sessionHash"], receipt["turnId"])
-    with _pending_receipts_lock:
-        _prune_pending_receipts_locked(now)
-        existing = _pending_receipts.get(key)
-        if existing is None or _same_input_evidence(existing, receipt):
-            return False
-        _pending_receipts.pop(key, None)
-        return True
-
-
-def _commit_not_proven(
-    reason: str,
-    session_hash: Optional[str] = None,
-    turn_id: Optional[str] = None,
-) -> dict[str, Any]:
-    if reason not in _COMMIT_NOT_PROVEN_REASONS:
-        raise ValueError("ihow_memory_commit_not_proven_reason_invalid")
-    diagnostic: dict[str, Any] = {"code": "commit_not_proven", "reason": reason}
-    if session_hash and turn_id:
-        diagnostic["sessionHash"] = session_hash
-        diagnostic["turnId"] = turn_id
-    return diagnostic
 
 
 def _bounded_correlation(kwargs: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
@@ -141,159 +320,220 @@ def _bounded_correlation(kwargs: dict[str, Any]) -> tuple[Optional[str], Optiona
     )
 
 
-def _attach_commit_diagnostic(event: dict[str, Any], diagnostic: dict[str, Any]) -> None:
+def _attach_commit_diagnostic(
+    event: dict[str, Any],
+    diagnostic: dict[str, Any],
+    *,
+    preserve_prompt: bool = False,
+) -> None:
     event.pop("sessionId", None)
-    event.pop("prompt", None)
+    if not preserve_prompt:
+        event.pop("prompt", None)
     event.pop("checkpointClaims", None)
     event["diagnostic"] = diagnostic
 
 
-def _dispatch_commit_diagnostic(
-    event_name: str,
-    kwargs: dict[str, Any],
-    reason: str,
-    correlation: tuple[Optional[str], Optional[str]],
-) -> None:
-    """Best-effort one-shot diagnostic dispatch; never calls itself."""
+def _tool_call_name(call: Any) -> Optional[str]:
     try:
-        event = _metadata_event(event_name, kwargs)
-        _attach_commit_diagnostic(event, _commit_not_proven(reason, *correlation))
-        _dispatch(event)
+        function = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
+        name = function.get("name") if isinstance(function, dict) else getattr(function, "name", None)
+        return name if isinstance(name, str) else None
     except Exception:
-        pass
+        return None
 
 
-def _stage_final_receipt(kwargs: dict[str, Any]) -> Optional[dict[str, Any]]:
-    session_id = _bounded_identity(kwargs.get("session_id"))
-    turn_id = _bounded_identity(kwargs.get("turn_id"))
-    history = kwargs.get("conversation_history")
-    if not session_id or not turn_id:
-        return _commit_not_proven("identity_invalid")
-    session_hash = _sha256("turn-receipt-session-v1\0", session_id)
-    hashed_turn_id = _sha256("turn-receipt-turn-v1\0", turn_id)
-    correlation = (session_hash, hashed_turn_id)
-    if not isinstance(history, list) or not history:
-        return _commit_not_proven("durable_marker_missing", *correlation)
-    tail = history[-1]
-    if not isinstance(tail, dict) or tail.get("_db_persisted") is not True:
-        return _commit_not_proven("durable_marker_missing", *correlation)
-    if tail.get("role") != "assistant":
-        return _commit_not_proven("final_evidence_invalid", *correlation)
-    content = tail.get("content")
-    if not isinstance(content, str):
-        return _commit_not_proven("final_evidence_invalid", *correlation)
+def _tool_call_arguments(call: Any) -> Any:
+    function = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
+    return function.get("arguments") if isinstance(function, dict) else getattr(function, "arguments", None)
+
+
+def _strip_delta_tool_calls(assistant_message: Any) -> tuple[list[Any], list[Any]]:
+    """Strip the control call from the host-owned mutable list before inspecting its arguments."""
+    if isinstance(assistant_message, dict):
+        calls = assistant_message.get("tool_calls")
+    else:
+        calls = getattr(assistant_message, "tool_calls", None)
+    if calls is None:
+        calls = []
+    if not isinstance(calls, (list, tuple)):
+        raise ValueError("ihow_memory_tool_calls_invalid")
+    sidecars: list[Any] = []
+    remaining: list[Any] = []
+    for call in calls:
+        name = _tool_call_name(call)
+        if name == "ihow_memory_delta":
+            sidecars.append(call)
+        else:
+            remaining.append(call)
+        # Only an explicitly named iHow sidecar belongs to this plugin. Preserve every other call,
+        # including an opaque/malformed generic call, so this observer never changes host execution.
+    if isinstance(calls, list):
+        calls[:] = remaining
+    elif isinstance(assistant_message, dict):
+        assistant_message["tool_calls"] = remaining
+    else:
+        setattr(assistant_message, "tool_calls", remaining)
+    return sidecars, remaining
+
+
+def _classify_delta_sidecars(sidecars: list[Any]) -> tuple[str, Optional[dict[str, str]]]:
+    if not sidecars:
+        return "not_emitted", None
+    if len(sidecars) != 1:
+        return "extraction_failed", None
     try:
-        if len(content.encode("utf-8")) > _MAX_RECEIPT_TEXT_BYTES:
-            return _commit_not_proven("final_evidence_invalid", *correlation)
-    except UnicodeEncodeError:
-        return _commit_not_proven("final_evidence_invalid", *correlation)
-    key = _receipt_correlation_key(session_hash, hashed_turn_id)
-    final_source_hash = "sha256:" + _sha256("turn-receipt-source-v1\0", "hermes-final/" + turn_id)
-    final_content_hash = _sha256("", content)
-    diagnostic = None
+        arguments = _tool_call_arguments(sidecars[0])
+        if not isinstance(arguments, str):
+            return "extraction_failed", None
+        if len(arguments.encode("utf-8")) > _MAX_SIDECAR_ARGUMENT_BYTES:
+            return "extraction_failed", None
+        payload = json.loads(
+            arguments,
+            object_pairs_hook=_exact_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        if not isinstance(payload, dict) or type(payload.get("schemaVersion")) is not int:
+            return "extraction_failed", None
+        status = payload.get("status")
+        if status == "explicit_none":
+            if set(payload) != {"schemaVersion", "status"} or payload["schemaVersion"] != 1:
+                return "extraction_failed", None
+            return "explicit_none", None
+        if status != "emitted" or set(payload) != {"schemaVersion", "status", "proposal"}:
+            return "extraction_failed", None
+        if payload["schemaVersion"] != 1 or not isinstance(payload.get("proposal"), dict):
+            return "extraction_failed", None
+        proposal = payload["proposal"]
+        if set(proposal) != {"kind", "subject", "key", "value"}:
+            return "extraction_failed", None
+        kind = proposal.get("kind")
+        subject = _exact_model_text(proposal.get("subject"), 120)
+        key = _exact_model_text(proposal.get("key"), 120)
+        value = _exact_model_text(proposal.get("value"), 1_200)
+        if kind not in _MEMORY_DELTA_KINDS or subject is None or key is None or value is None:
+            return "extraction_failed", None
+        semantic = {"kind": kind, "subject": subject, "key": key, "value": value}
+        if _contains_secret_like_content(json.dumps(semantic, ensure_ascii=False, sort_keys=True)):
+            return "extraction_failed", None
+        return "emitted", semantic
+    except Exception:
+        return "extraction_failed", None
+
+
+def _stage_delta_sidecar(kwargs: dict[str, Any]) -> None:
+    assistant_message = kwargs.get("assistant_message")
+    try:
+        sidecars, remaining = _strip_delta_tool_calls(assistant_message)
+    except Exception:
+        # Unsupported host container shapes remain entirely host-owned. Without a mutable list/tuple
+        # boundary this observer cannot prove which calls it may remove, so it must not mutate any of
+        # them or stage typed memory state.
+        return
+    if remaining:
+        return
+    content = assistant_message.get("content") if isinstance(assistant_message, dict) else getattr(assistant_message, "content", None)
+    if not isinstance(content, str) or not content.strip(_ECMASCRIPT_WHITESPACE):
+        return
+    key = _resolve_receipt_alias(kwargs)
+    if key is None:
+        return
     now = time.monotonic()
     with _pending_receipts_lock:
         _prune_pending_receipts_locked(now)
         pending = _pending_receipts.get(key)
-        if pending is None:
-            return _commit_not_proven("pending_not_found", *correlation)
-        if "finalContentSha256" in pending:
-            if (
-                pending["finalSourceHash"] != final_source_hash
-                or pending["finalContentSha256"] != final_content_hash
-            ):
-                pending.pop("finalSourceHash", None)
-                pending.pop("finalContentSha256", None)
-                pending["finalConflict"] = True
-                diagnostic = _commit_not_proven("final_conflict", *correlation)
-        elif pending.get("finalConflict") is True:
-            pending["_touched"] = now
-            _pending_receipts.move_to_end(key)
+        if pending is None or "deltaState" in pending:
             return
-        else:
-            pending["finalSourceHash"] = final_source_hash
-            pending["finalContentSha256"] = final_content_hash
+    state, semantic = _classify_delta_sidecars(sidecars)
+    now = time.monotonic()
+    with _pending_receipts_lock:
+        _prune_pending_receipts_locked(now)
+        pending = _pending_receipts.get(key)
+        if pending is None or "deltaState" in pending:
+            return
+        for field in ("deltaState", "deltaProposal", "deltaObservedAt"):
+            pending.pop(field, None)
+        if state == "emitted" and semantic is not None:
+            observed_at = _now_millis()
+            sizing = dict(pending)
+            sizing["deltaProposal"] = semantic
+            sizing["deltaObservedAt"] = observed_at
+            sizing["finalContentSha256"] = "0" * 64
+            sizing["finalSourceHash"] = "sha256:" + "0" * 64
+            proposal = _proposal_input(sizing)
+            hash_input = {
+                "schemaVersion": 1,
+                "receiptIdentity": {
+                    "runtime": sizing["runtime"],
+                    "projectId": sizing["projectId"],
+                    "sessionHash": sizing["sessionHash"],
+                    "turnId": sizing["turnId"],
+                    "revision": sizing["revision"],
+                },
+                "finalEvidence": {
+                    "finalSourceHash": sizing["finalSourceHash"],
+                    "finalContentSha256": sizing["finalContentSha256"],
+                    "committedAt": observed_at,
+                },
+                "proposal": proposal,
+            }
+            envelope = {**hash_input, "deltaHash": _canonical_sha256(hash_input)}
+            canonical = json.dumps(
+                envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ) + "\n"
+            if len(canonical.encode("utf-8")) > _MAX_COMPILED_DELTA_BYTES:
+                state = "extraction_failed"
+            else:
+                pending["deltaProposal"] = semantic
+                pending["deltaObservedAt"] = observed_at
+        pending["deltaState"] = state
         pending["_touched"] = now
         _pending_receipts.move_to_end(key)
-        return diagnostic
 
 
-def _pending_receipts_snapshot() -> list[dict[str, Any]]:
-    """Return a test-only copy containing bounded hash metadata and no raw Hermes values."""
-    now = time.monotonic()
-    with _pending_receipts_lock:
-        _prune_pending_receipts_locked(now)
-        return [
-            {key: value for key, value in pending.items() if key != "_touched"}
-            for pending in _pending_receipts.values()
-            if "finalContentSha256" in pending or pending.get("finalConflict") is True
-        ]
-
-
-def _has_staged_final_receipt(session_hash: Optional[str], turn_id: Optional[str]) -> bool:
-    if not session_hash or not turn_id:
-        return False
-    key = _receipt_correlation_key(session_hash, turn_id)
-    now = time.monotonic()
-    with _pending_receipts_lock:
-        _prune_pending_receipts_locked(now)
-        pending = _pending_receipts.get(key)
-        return pending is not None and "finalContentSha256" in pending
-
-
-def _take_commit_receipt_action(kwargs: dict[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
-    session_id = _bounded_identity(kwargs.get("session_id"))
-    turn_id = _bounded_identity(kwargs.get("turn_id"))
-    if not session_id or not turn_id:
-        return None, _commit_not_proven("identity_invalid")
-    session_hash = _sha256("turn-receipt-session-v1\0", session_id)
-    hashed_turn_id = _sha256("turn-receipt-turn-v1\0", turn_id)
-    key = _receipt_correlation_key(session_hash, hashed_turn_id)
-    now = time.monotonic()
-    with _pending_receipts_lock:
-        _prune_pending_receipts_locked(now)
-        pending = _pending_receipts.pop(key, None)
-    correlation = (session_hash, hashed_turn_id)
-    if pending is None:
-        return None, _commit_not_proven("pending_not_found", *correlation)
-    if kwargs.get("completed") is not True or kwargs.get("interrupted") is not False:
-        return None, _commit_not_proven("end_not_successful", *correlation)
-    if pending.get("finalConflict") is True:
-        return None, _commit_not_proven("final_conflict", *correlation)
-    if "finalSourceHash" not in pending or "finalContentSha256" not in pending:
-        return None, _commit_not_proven("final_evidence_missing", *correlation)
-    committed_at = _now_millis()
-    if committed_at < pending["openedAt"]:
-        committed_at = pending["openedAt"]
+def _proposal_input(pending: dict[str, Any]) -> dict[str, Any]:
+    semantic = pending["deltaProposal"]
     return {
-        "action": "commit",
-        "receipt": {
-            "schemaVersion": pending["schemaVersion"],
-            "runtime": pending["runtime"],
-            "projectId": pending["projectId"],
-            "sessionHash": pending["sessionHash"],
-            "turnId": pending["turnId"],
-            "revision": pending["revision"],
-            "inputSourceHash": pending["inputSourceHash"],
-            "inputContentSha256": pending["inputContentSha256"],
-            "finalSourceHash": pending["finalSourceHash"],
-            "finalContentSha256": pending["finalContentSha256"],
-            "committedAt": committed_at,
-            "deltaState": "not_emitted",
+        "schemaVersion": 1,
+        "kind": semantic["kind"],
+        "text": (
+            f"[memory:{semantic['kind']}] subject={semantic['subject']} | "
+            f"key={semantic['key']} | value={semantic['value']}"
+        ),
+        "subject": semantic["subject"],
+        "key": semantic["key"],
+        "value": semantic["value"],
+        "scope": {
+            "declaredVisibility": "project",
+            "effectiveVisibility": "project",
+            "projectScope": pending["projectId"],
+            "sourcePath": None,
+            "frontmatter": None,
         },
-    }, None
-
-
-def _pending_receipts_stats() -> dict[str, int]:
-    """Return test-only bounded-structure metadata without receipt values."""
-    now = time.monotonic()
-    with _pending_receipts_lock:
-        _prune_pending_receipts_locked(now)
-        return {
-            "count": len(_pending_receipts),
-            "maxCount": _MAX_PENDING_RECEIPTS,
-            "ttlSeconds": _PENDING_RECEIPT_TTL_SECONDS,
-        }
+        "provenance": {
+            "sourceKind": "runtime-event",
+            "sourceId": "hermes-final:" + pending["finalContentSha256"],
+            "runtime": "hermes",
+            "observedAt": pending["deltaObservedAt"],
+            "sourceSha256": pending["finalContentSha256"],
+            "evidenceLocator": "memory-delta:proposal:0",
+        },
+        "relation": {
+            "verdict": "review_required",
+            "targetProposalIds": [],
+            "targetPaths": [],
+            "reviewRequired": True,
+            "destructive": False,
+            "reason": "ordinary_language_typed_sidecar",
+        },
+        "review": {"mode": "review-first", "state": "pending"},
+        "safety": {
+            "outcome": "candidate-only",
+            "directDurableWrite": False,
+            "indexWrite": False,
+            "destructive": False,
+            "autoPromote": False,
+        },
+    }
 
 
 def _bounded_identity(value: Any) -> Optional[str]:
@@ -335,33 +575,23 @@ def _project_root() -> str:
 
 
 def _open_receipt_action(kwargs: dict[str, Any]) -> Optional[dict[str, Any]]:
-    session_id = _bounded_identity(kwargs.get("session_id"))
-    turn_id = _bounded_identity(kwargs.get("turn_id"))
-    user_message = kwargs.get("user_message")
-    history = kwargs.get("conversation_history")
-    if not session_id or not turn_id or not isinstance(user_message, str):
-        return None
-    if not user_message or len(user_message.encode("utf-8")) > _MAX_RECEIPT_TEXT_BYTES:
-        return None
-    if not isinstance(history, list) or not history:
-        return None
-    tail = history[-1]
-    if not isinstance(tail, dict) or tail.get("_db_persisted") is not True:
-        return None
-    if tail.get("role") != "user" or tail.get("content") != user_message:
+    evidence = _durable_input_evidence(kwargs.get("durable_transcript_input"))
+    if evidence is None:
         return None
     project_id = _sha256("turn-receipt-project-v1\0", _project_root())
     return {
         "action": "open",
         "receipt": {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
+            "identityDomain": evidence["identityDomain"],
+            "origin": "native-hook",
             "runtime": "hermes",
             "projectId": project_id,
-            "sessionHash": _sha256("turn-receipt-session-v1\0", session_id),
-            "turnId": _sha256("turn-receipt-turn-v1\0", turn_id),
+            "sessionHash": evidence["sessionHash"],
+            "turnId": evidence["turnId"],
             "revision": 1,
-            "inputSourceHash": "sha256:" + _sha256("turn-receipt-source-v1\0", turn_id),
-            "inputContentSha256": _sha256("", user_message),
+            "inputSourceHash": evidence["inputSourceHash"],
+            "inputContentSha256": evidence["inputContentSha256"],
             "openedAt": _now_millis(),
         },
     }
@@ -482,53 +712,41 @@ def _on_session_reset(**kwargs: Any) -> None:
 
 
 def _on_pre_llm_call(**kwargs: Any) -> Optional[dict[str, str]]:
-    input_conflict = False
-    correlation = (None, None)
     try:
         event = _metadata_event("runtime.before_prompt", kwargs)
         receipt_action = _open_receipt_action(kwargs)
-        if receipt_action:
-            input_conflict = _invalidate_conflicting_open_receipt(receipt_action["receipt"])
-            if input_conflict:
-                correlation = (
-                    receipt_action["receipt"]["sessionHash"],
-                    receipt_action["receipt"]["turnId"],
-                )
+        if receipt_action is None:
+            hook_turn_diagnostic = _bounded_correlation(kwargs)[1]
+            _attach_commit_diagnostic(event, {
+                "code": "durable_transcript_input_invalid",
+                **({"hookTurnDiagnostic": hook_turn_diagnostic} if hook_turn_diagnostic else {}),
+            }, preserve_prompt=True)
+        else:
             event["turnReceipt"] = receipt_action
         result = _dispatch(event)
         if not isinstance(result, dict):
             return None
         if receipt_action:
-            _retain_open_receipt(receipt_action["receipt"])
+            pending_key = _retain_open_receipt(receipt_action["receipt"])
+            _bind_receipt_alias(kwargs, pending_key)
         context = result.get("context")
         if not isinstance(context, str) or not context.strip():
             return None
         return {"context": context[:_MAX_CONTEXT_CHARS]}
     except Exception:
-        if input_conflict:
-            _dispatch_commit_diagnostic(
-                "runtime.before_prompt", kwargs, "input_conflict", correlation,
-            )
         logger.debug("ihow_memory_hermes_hook_failed_open")
         return None
 
 
 def _on_post_llm_call(**kwargs: Any) -> None:
-    correlation = _bounded_correlation(kwargs)
-    final_staged = False
+    _safe_dispatch("runtime.after_turn", kwargs)
+
+
+def _on_post_api_request(**kwargs: Any) -> None:
     try:
-        event = _metadata_event("runtime.after_turn", kwargs)
-        diagnostic = _stage_final_receipt(kwargs)
-        final_staged = diagnostic is None and _has_staged_final_receipt(*correlation)
-        if diagnostic:
-            _attach_commit_diagnostic(event, diagnostic)
-        _dispatch(event)
+        _stage_delta_sidecar(kwargs)
     except Exception:
-        if final_staged:
-            _dispatch_commit_diagnostic(
-                "runtime.after_turn", kwargs, "transport_failure", correlation,
-            )
-        logger.debug("ihow_memory_hermes_hook_failed_open")
+        logger.debug("ihow_memory_hermes_sidecar_failed_closed")
 
 
 def _on_session_finalize(**kwargs: Any) -> None:
@@ -536,21 +754,77 @@ def _on_session_finalize(**kwargs: Any) -> None:
 
 
 def _on_session_end(**kwargs: Any) -> None:
-    receipt_action = None
     try:
         event = _metadata_event("runtime.session_end", kwargs)
-        receipt_action, diagnostic = _take_commit_receipt_action(kwargs)
-        if receipt_action:
-            event["turnReceipt"] = receipt_action
-        if diagnostic:
-            _attach_commit_diagnostic(event, diagnostic)
+        hook_turn_diagnostic = _bounded_correlation(kwargs)[1]
+        _attach_commit_diagnostic(event, {
+            "code": "durable_transcript_revision_pending",
+            **({"hookTurnDiagnostic": hook_turn_diagnostic} if hook_turn_diagnostic else {}),
+        })
         _dispatch(event)
     except Exception:
-        if receipt_action:
-            _dispatch_commit_diagnostic(
-                "runtime.session_end", kwargs, "transport_failure", _bounded_correlation(kwargs),
-            )
         logger.debug("ihow_memory_hermes_hook_failed_open")
+    finally:
+        _clear_receipt_alias(kwargs)
+
+
+_DURABLE_REVISION_KEYS = frozenset({
+    "schemaVersion",
+    "sessionHash",
+    "revision",
+    "manifestPath",
+    "transcriptPath",
+    "contentSha256",
+    "committedAt",
+})
+_DURABLE_REVISION_OBSERVER_KEYS = _DURABLE_REVISION_KEYS | {"telemetry_schema_version"}
+
+
+def _durable_revision_publication(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict) or set(value) - _DURABLE_REVISION_OBSERVER_KEYS:
+        return None
+    if not _DURABLE_REVISION_KEYS.issubset(value):
+        return None
+    publication = {field: value[field] for field in _DURABLE_REVISION_KEYS}
+    if type(publication.get("schemaVersion")) is not int or publication["schemaVersion"] != 1:
+        return None
+    if not _is_lower_hex_64(publication.get("sessionHash")):
+        return None
+    if type(publication.get("revision")) is not int or publication["revision"] < 1:
+        return None
+    if not _is_lower_hex_64(publication.get("contentSha256")):
+        return None
+    session_hash = publication["sessionHash"]
+    revision = publication["revision"]
+    if publication.get("manifestPath") != f"manifests/{session_hash}.json":
+        return None
+    if publication.get("transcriptPath") != f"revisions/{session_hash}/{revision}.json":
+        return None
+    committed_at = publication.get("committedAt")
+    if not isinstance(committed_at, str) or not committed_at or len(committed_at) > 64:
+        return None
+    return publication
+
+
+def _on_durable_transcript_revision(**kwargs: Any) -> None:
+    try:
+        publication = _durable_revision_publication(kwargs)
+        if publication is None:
+            return
+        _dispatch({
+            "schemaVersion": 1,
+            "event": "runtime.durable_transcript_revision",
+            "runtime": "hermes",
+            "projectId": _sha256("turn-receipt-project-v1\0", _project_root()),
+            "observedAt": _now(),
+            "publication": dict(publication),
+        })
+    except Exception:
+        logger.debug("ihow_memory_hermes_durable_revision_failed_open")
+
+
+def _delta_tool_handler(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    return {"ok": False, "error": "ihow_memory_delta_control_sidecar_must_not_execute"}
 
 
 def register(ctx: Any) -> None:
@@ -560,3 +834,19 @@ def register(ctx: Any) -> None:
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
     ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_hook("on_durable_transcript_revision", _on_durable_transcript_revision)
+    # Old hook-only test hosts do not expose register_tool. Real Hermes does, and the control hook/tool
+    # must be installed together so a sidecar can never be declared without its strip-first interceptor.
+    if callable(getattr(ctx, "register_tool", None)):
+        ctx.register_hook("post_api_request", _on_post_api_request)
+        ctx.register_tool(
+            name="ihow_memory_delta",
+            toolset="ihow_memory",
+            schema={
+                "name": "ihow_memory_delta",
+                "description": _DELTA_TOOL_DESCRIPTION,
+                "parameters": _DELTA_TOOL_PARAMETERS,
+            },
+            handler=_delta_tool_handler,
+            description=_DELTA_TOOL_DESCRIPTION,
+        )

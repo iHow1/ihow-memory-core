@@ -67,4 +67,7 @@ print(json.dumps({"hooks": sorted(mgr._hooks), "results": results}, sort_keys=Tr
   assert.equal(output.results.length, 1);
   assert.equal(typeof output.results[0].context, 'string');
   assert.match(output.results[0].context, /Host loaded recall|real Hermes PluginManager/i);
+  const receiptPath = path.join(memoryRoot, '_mcp', 'turn-receipts', 'v1.json');
+  assert.equal(await fs.stat(receiptPath).then(() => true).catch(() => false), false,
+    'missing B3 evidence must preserve recall without creating an OPEN receipt');
 });

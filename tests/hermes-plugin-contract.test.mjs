@@ -33,7 +33,7 @@ ctx = Ctx()
 module.register(ctx)
 assert set(ctx.hooks) == {
     "on_session_start", "on_session_reset", "pre_llm_call", "post_llm_call",
-    "on_session_finalize", "on_session_end",
+    "on_session_finalize", "on_session_end", "on_durable_transcript_revision",
 }
 os.environ["HERMES_HOME"] = str(home)
 os.environ["IHOW_MEMORY_HERMES_EVENT_LOG"] = str(home / "events.ndjson")
@@ -61,7 +61,7 @@ print(json.dumps({"start": start, "pre": pre, "post": post, "finalize": finalize
   });
 }
 
-test('Hermes plugin registers six lifecycle hooks and remains fail-open', async () => {
+test('Hermes plugin registers the durable lifecycle hook and remains fail-open', async () => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-hermes-plugin-'));
   const plugin = await copyPlugin(home);
   const run = runPython({ plugin, home, mode: 'failure' });
@@ -104,7 +104,7 @@ test('plugin manifest declares the exact hook contract', async () => {
   const manifest = await fs.readFile(path.join(pluginSource, 'plugin.yaml'), 'utf8');
   for (const hook of [
     'on_session_start', 'on_session_reset', 'pre_llm_call', 'post_llm_call',
-    'on_session_finalize', 'on_session_end',
+    'on_session_finalize', 'on_session_end', 'on_durable_transcript_revision',
   ]) assert.match(manifest, new RegExp(`- ${hook}`));
   assert.doesNotMatch(manifest, /pre_compact/);
 });

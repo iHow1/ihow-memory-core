@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 iHow Memory
 import { spawn } from 'node:child_process';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import type {
   RetrievalEngine,
   RetrievalEngineStatus,
@@ -21,6 +23,104 @@ import { containsSecretLikeContent } from '../governance.ts';
 // durable paths are always slug-safe, so a normal hit is never dropped.
 function gateSearchHits(hits: SearchResult[]): SearchResult[] {
   return hits.filter((hit) => hit && typeof hit.path === 'string' && !containsSecretLikeContent(hit.path));
+}
+
+const RELATION_READ_MAX = 16 * 1024;
+const RELATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+
+function frontmatterId(value: string): string | null {
+  const trimmed = value.trim();
+  const unquoted = (trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))
+    ? trimmed.slice(1, -1)
+    : trimmed;
+  return RELATION_ID.test(unquoted) ? unquoted : null;
+}
+
+async function relationMetadata(spaceDir: string, hitPath: string): Promise<{ documentId?: string; supersededBy?: string } | null> {
+  if (!hitPath || hitPath.includes('\0') || path.isAbsolute(hitPath)) return null;
+  const root = await fs.realpath(spaceDir);
+  const candidate = path.resolve(root, hitPath);
+  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) return null;
+  const real = await fs.realpath(candidate);
+  if (real !== root && !real.startsWith(`${root}${path.sep}`)) return null;
+  const handle = await fs.open(real, 'r');
+  try {
+    const buffer = Buffer.alloc(RELATION_READ_MAX);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const text = buffer.subarray(0, bytesRead).toString('utf8');
+    if (!text.startsWith('---\n') && !text.startsWith('---\r\n')) return {};
+    const openerEnd = text.indexOf('\n') + 1;
+    const closingMatch = /(?:^|\n)---\r?(?=\n|$)/g;
+    closingMatch.lastIndex = openerEnd;
+    const closing = closingMatch.exec(text);
+    if (!closing) return null;
+    const close = closing.index + (closing[0].startsWith('\n') ? 1 : 0);
+    const block = text.slice(openerEnd, close);
+    const result: { documentId?: string; supersededBy?: string } = {};
+    const seen = new Set<string>();
+    for (const line of block.split(/\r?\n/)) {
+      const match = line.match(/^\s*(document_id|superseded_by)\s*:\s*(.*?)\s*$/);
+      if (!match) continue;
+      if (seen.has(match[1])) return null;
+      seen.add(match[1]);
+      const id = frontmatterId(match[2]);
+      if (!id) return null;
+      if (match[1] === 'document_id') result.documentId = id;
+      else result.supersededBy = id;
+    }
+    return result;
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function orderSupersededHits(
+  workspace: Pick<Workspace, 'spaceDir'>,
+  hits: SearchResult[],
+  limit: number,
+): Promise<SearchResult[]> {
+  const count = Math.max(0, Math.min(Number(limit) || 0, 25));
+  if (hits.length > count || hits.length > 25) return hits;
+  try {
+    const metadata = await Promise.all(hits.map((hit) => relationMetadata(workspace.spaceDir, hit.path)));
+    if (metadata.some((item) => item === null)) return hits;
+    const byId = new Map<string, number>();
+    for (let i = 0; i < metadata.length; i++) {
+      const id = metadata[i]?.documentId;
+      if (!id) continue;
+      if (byId.has(id)) return hits;
+      byId.set(id, i);
+    }
+    const edges = new Map<string, string>();
+    for (const item of metadata) {
+      if (!item?.documentId || !item.supersededBy || !byId.has(item.supersededBy)) continue;
+      if (item.documentId === item.supersededBy) return hits;
+      edges.set(item.documentId, item.supersededBy);
+    }
+    for (const start of edges.keys()) {
+      const seen = new Set<string>();
+      let cursor: string | undefined = start;
+      while (cursor && edges.has(cursor)) {
+        if (seen.has(cursor)) return hits;
+        seen.add(cursor);
+        cursor = edges.get(cursor);
+      }
+    }
+    if (!edges.size) return hits;
+    const ordered = [...hits];
+    for (const item of metadata) {
+      if (!item?.documentId || !item.supersededBy || !edges.has(item.documentId)) continue;
+      const staleIndex = ordered.findIndex((hit) => metadata[hits.indexOf(hit)]?.documentId === item.documentId);
+      const currentIndex = ordered.findIndex((hit) => metadata[hits.indexOf(hit)]?.documentId === item.supersededBy);
+      if (staleIndex < 0 || currentIndex < 0 || currentIndex < staleIndex) continue;
+      const [current] = ordered.splice(currentIndex, 1);
+      const adjustedStale = ordered.findIndex((hit) => metadata[hits.indexOf(hit)]?.documentId === item.documentId);
+      ordered.splice(adjustedStale, 0, current);
+    }
+    return ordered;
+  } catch {
+    return hits;
+  }
 }
 
 type EngineConfig = {
@@ -101,6 +201,12 @@ function splitCommand(input: string): string[] {
   return input.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((part) => part.replace(/^["']|["']$/g, '')) || [];
 }
 
+function validProviderDimension(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= 8192
+    ? Number(value)
+    : undefined;
+}
+
 class VectorProcessEngine implements RetrievalEngine {
   id = 'vector-gguf';
 
@@ -142,6 +248,7 @@ class VectorProcessEngine implements RetrievalEngine {
       model: typeof status.model === 'string' ? status.model : this.config.vectorModel || null,
       ready: status.ready === true,
       cloud: status.cloud === true,
+      dimension: validProviderDimension(status.dimension),
       lastError: typeof status.lastError === 'string' ? status.lastError : undefined,
     };
   }
@@ -220,7 +327,7 @@ async function writeReadyManifest(workspace: Workspace, status: RetrievalEngineS
   await writeProviderManifest(workspace, {
     providerId: status.id,
     modelId: status.model,
-    dims: null,
+    dims: status.dimension ?? null,
     createdAt: new Date().toISOString(),
     corpusFingerprint: null,
     status: status.ready ? 'ready' : 'error',
@@ -241,6 +348,7 @@ async function writeReadyManifest(workspace: Workspace, status: RetrievalEngineS
         model: status.model,
         ready: status.ready,
         cloud: status.cloud,
+        dimension: status.dimension,
         lastError: status.lastError,
         capabilities: {
           semantic: true,
@@ -366,12 +474,13 @@ export function fuseRrf(ftsHits: SearchResult[], vectorHits: SearchResult[], lim
   const fold = (hits: SearchResult[], prefer: boolean): void => {
     hits.forEach((hit, rank) => {
       if (!hit || typeof hit.path !== 'string') return;
-      const contribution = 1 / (RRF_K + rank + 1);
+      const semanticLane = !prefer && isSemanticSourced(hit);
+      const contribution = (semanticLane ? 1.25 : 1) / (RRF_K + rank + 1);
       // C3: preserve the semantic lane's raw cosine as `semanticScore` BEFORE any representation swap —
       // on a shared path the FTS shape wins below, which would otherwise erase the only evidence that the
       // semantic engine surfaced this path (an FTS stopword co-match must not veto the paraphrase win).
       // Only a semantic-sourced lane may stamp it (a second lexical lane could never smuggle evidence in).
-      const semScore = isSemanticSourced(hit) && Number.isFinite(Number(hit.score)) ? Number(hit.score) : undefined;
+      const semScore = semanticLane && Number.isFinite(Number(hit.score)) ? Number(hit.score) : undefined;
       const existing = acc.get(hit.path);
       if (existing) {
         existing.score += contribution;
@@ -414,6 +523,25 @@ export async function searchWithEngineFallback(
     return { hits: gateSearchHits(ftsHits) };
   }
 
+  // The manifest is the authoritative index-readiness record. A reachable provider plus an old sidecar
+  // cannot recover a failed build during search; only indexWithEngineFallback may write readiness again.
+  const manifest = await readProviderManifest(workspace);
+  const manifestRequested = manifest?.providers?.[config.requestedId];
+  if (
+    (manifest?.status === 'fallback' || manifest?.status === 'error') &&
+    (manifest.fallbackFrom === config.requestedId || manifestRequested?.ready === false)
+  ) {
+    const fallback = {
+      from: config.requestedId,
+      to: 'fts' as const,
+      reason: manifest.lastError || manifestRequested?.lastError || 'vector_index_not_ready',
+    };
+    return {
+      hits: gateSearchHits(ftsHits.map((hit) => ({ ...hit, fallback }))),
+      fallback,
+    };
+  }
+
   // Semantic lane is OPT-IN. Run it ALONGSIDE FTS (not instead of) and RRF-fuse: vector hits re-order
   // the list but ride the same FTS floor. If the sidecar/provider is unreachable or not ready, we fall
   // back to the FTS hits we already have — semantic is additive, never load-bearing for availability.
@@ -426,7 +554,8 @@ export async function searchWithEngineFallback(
     const vectorHits = await requested.search(workspace, query, { ...opts, limit: vectorLimit });
     await writeReadyManifest(workspace, status);
     const limit = Math.max(1, Math.min(Number(opts.limit || 5), 25));
-    return { hits: gateSearchHits(fuseRrf(ftsHits, vectorHits, limit)) };
+    const gated = gateSearchHits(fuseRrf(ftsHits, vectorHits, limit));
+    return { hits: await orderSupersededHits(workspace, gated, limit) };
   } catch (error) {
     const fallback = {
       from: requested.id,
@@ -467,6 +596,34 @@ export async function engineStatus(workspace: Workspace, config: EngineConfig): 
   }
 
   const requested = vectorEngine(config);
+  const manifest = await readProviderManifest(workspace);
+  const requestedManifestStatus = manifest?.providers?.[requested.id];
+  if (
+    (manifest?.status === 'fallback' || manifest?.status === 'error') &&
+    (manifest.fallbackFrom === requested.id || requestedManifestStatus?.ready === false)
+  ) {
+    const reason = manifest.lastError || requestedManifestStatus?.lastError || 'vector_index_not_ready';
+    const requestedStatus = {
+      id: requested.id,
+      model: requestedManifestStatus?.model || config.vectorModel || null,
+      ready: false,
+      cloud: requestedManifestStatus?.cloud === true,
+      lastError: reason,
+    };
+    return {
+      provider: {
+        id: 'fts',
+        model: null,
+        ready: true,
+        cloud: false,
+        lastError: reason,
+        fallback: true,
+        fallbackFrom: requested.id,
+        requested: requestedStatus,
+      },
+      manifestLastError: reason,
+    };
+  }
   try {
     const requestedStatus = await requested.status(workspace);
     if (!requestedStatus.ready) throw new Error(requestedStatus.lastError || 'vector_provider_not_ready');

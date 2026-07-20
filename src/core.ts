@@ -33,6 +33,13 @@ import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraf
 import { checkpointProtectionState, createCheckpointService, type CheckpointService } from './checkpoints.ts';
 import { proposeMemoryV1, type MemoryProposalRequestV1, type MemoryProposalResultV1 } from './memory-proposals.ts';
 import { createTurnReceiptService, type TurnReceiptService } from './turn-receipts.ts';
+import {
+  createCaptureIntentService,
+  type CaptureIntentRecoveryResultV1,
+  type CaptureTurnDeltaOptionsV1,
+  type CaptureTurnDeltaResultV1,
+  type MemoryDeltaV1,
+} from './capture-intents.ts';
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -58,6 +65,8 @@ export type MemoryCore = {
   checkpoints: CheckpointService;
   // Deterministic per-logical-turn loss evidence. No host adapter or model invocation lives here.
   turnReceipts: TurnReceiptService;
+  captureTurnDelta(input: MemoryDeltaV1, options?: CaptureTurnDeltaOptionsV1): Promise<CaptureTurnDeltaResultV1>;
+  recoverCaptureIntents(): Promise<CaptureIntentRecoveryResultV1>;
 };
 
 function excerpt(content: string, max = 300): string {
@@ -70,11 +79,14 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
   const engineConfig = resolveEngineConfig(options);
   const checkpoints = await createCheckpointService(workspace, options);
   const turnReceipts = createTurnReceiptService(workspace);
+  const captureIntents = createCaptureIntentService(workspace, turnReceipts);
 
   return {
     workspace,
     checkpoints,
     turnReceipts,
+    captureTurnDelta: captureIntents.captureTurnDelta,
+    recoverCaptureIntents: captureIntents.recoverCaptureIntents,
     async search(query, opts = {}) {
       if (typeof query !== 'string' || !query.trim()) return [];
       const hits = (await searchWithEngineFallback(workspace, engineConfig, query, opts)).hits;

@@ -73,7 +73,21 @@ async function fakeOllama(mode, model = 'nomic-embed-text') {
 // ASYNC on purpose: the fake Ollama http server runs in THIS test process's event loop, so the CLI must
 // run without blocking it (execFileSync would freeze the loop and the stub could never answer).
 async function runCli(home, args, extraEnv = {}) {
-  const env = { ...process.env, IHOW_MEMORY_HOME: home, IHOW_MEMORY_STATE_ROOT: path.join(home, '.state'), ...extraEnv };
+  const env = { ...process.env, ...extraEnv };
+  for (const key of [
+    'MEMORY_ROOT',
+    'IHOW_MEMORY_ROOT',
+    'IHOW_MEMORY_HOME',
+    'IHOW_MEMORY_STATE_ROOT',
+    'IHOW_MEMORY_INDEX',
+    'IHOW_MEMORY_INDEX_PATH',
+    'HERMES_HOME',
+    'XDG_CONFIG_HOME',
+    'XDG_DATA_HOME',
+    'XDG_STATE_HOME',
+  ]) delete env[key];
+  env.IHOW_MEMORY_HOME = home;
+  env.IHOW_MEMORY_STATE_ROOT = path.join(home, '.state');
   try {
     const { stdout, stderr } = await execFileAsync(process.execPath, [CLI, ...args], { encoding: 'utf8', env });
     return { code: 0, stdout, stderr };
@@ -85,6 +99,34 @@ const ws = (home, space) => resolveWorkspace({ root: home, stateRoot: path.join(
 const tmpHome = (t) => fs.mkdtemp(path.join(os.tmpdir(), 'ihow-sem-')).then((home) => {
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); });
   return home;
+});
+
+test('runCli isolates child workspace/state routing from hostile ambient and extraEnv roots', async (t) => {
+  const home = await tmpHome(t);
+  const hostileBase = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-sem-hostile-'));
+  t.after(async () => { await fs.rm(hostileBase, { recursive: true, force: true }); });
+  const hostileEnv = Object.fromEntries([
+    'MEMORY_ROOT',
+    'IHOW_MEMORY_ROOT',
+    'IHOW_MEMORY_HOME',
+    'IHOW_MEMORY_STATE_ROOT',
+    'IHOW_MEMORY_INDEX',
+    'IHOW_MEMORY_INDEX_PATH',
+    'HERMES_HOME',
+    'XDG_CONFIG_HOME',
+    'XDG_DATA_HOME',
+    'XDG_STATE_HOME',
+  ].map((key) => [key, path.join(hostileBase, key.toLowerCase())]));
+
+  const r = await runCli(home, ['status', '--space', 'isolation-canary', '--json'], hostileEnv);
+  assert.equal(r.code, 0, r.stderr);
+  const status = JSON.parse(r.stdout);
+  const expectedSpaceDir = path.join(home, 'isolation-canary');
+  assert.equal(status.workspace.mode, 'managed-space');
+  assert.equal(status.workspace.path, expectedSpaceDir);
+  assert.equal(status.workspace.memoryRoot, path.join(expectedSpaceDir, 'memory'));
+  assert.equal(status.index.path, path.join(expectedSpaceDir, 'index.sqlite'));
+  assert.deepEqual(await fs.readdir(hostileBase), [], 'hostile routing roots remain untouched');
 });
 
 test('RED LINE: no semantic.json ⇒ mcpServerSpec injects nothing (default stays zero-dependency FTS5)', async (t) => {

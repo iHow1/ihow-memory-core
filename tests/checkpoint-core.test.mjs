@@ -2688,7 +2688,7 @@ test('file-worker parent timeout waits for pinned cleanup after IPC termination 
   const operation = writeCheckpointDraftUnlocked(core.workspace, updated, {
     testControlDirectory: controlDirectory,
     testPhase: 'after-finalize-before-final-check',
-    testTimeoutMs: 200,
+    testTimeoutMs: 1_000,
   });
   const rejection = assert.rejects(operation, /checkpoint_internal_failure/);
   await waitForFile(path.join(controlDirectory, 'after-finalize-before-final-check.ready'));

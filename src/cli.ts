@@ -634,6 +634,17 @@ async function targetMatchesIntegrity(target: string, expected: Record<string, s
   }
 }
 
+async function runtimeBundleSelfVerifying(target: string): Promise<boolean> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(path.join(target, 'package.json'), 'utf8')) as RuntimeBundleManifest;
+    const files = parsed.integrity?.files;
+    if (parsed.type !== 'module' || typeof parsed.version !== 'string' || !files || Object.keys(files).length === 0) return false;
+    return targetMatchesIntegrity(target, files);
+  } catch {
+    return false;
+  }
+}
+
 async function runtimeBundleHealthy(workspace: Awaited<ReturnType<typeof ensureWorkspace>>): Promise<boolean> {
   const source = path.join(packageDir(), 'dist');
   const target = path.join(workspace.spaceDir, '.runtime');
@@ -684,7 +695,11 @@ async function installRuntimeBundle(
   const nonce = `${process.pid}-${crypto.randomUUID()}`;
   const staged = path.join(workspace.spaceDir, `.runtime.ihow-tmp-${nonce}`);
   const backup = path.join(workspace.spaceDir, `.runtime.ihow-bak-${nonce}`);
+  const previous = path.join(workspace.spaceDir, '.runtime.previous');
+  const previousBackup = path.join(workspace.spaceDir, `.runtime.previous.ihow-bak-${nonce}`);
   let movedOld = false;
+  let movedPrevious = false;
+  let retainOldAsPrevious = false;
   try {
     await fs.cp(source, staged, { recursive: true });
     const [expected, stagedIntegrity] = await Promise.all([
@@ -699,6 +714,15 @@ async function installRuntimeBundle(
       integrity: { files: expected },
     };
     await fs.writeFile(path.join(staged, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    retainOldAsPrevious = await runtimeBundleSelfVerifying(target);
+    if (retainOldAsPrevious) {
+      try {
+        await fs.rename(previous, previousBackup);
+        movedPrevious = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
     try {
       await fs.rename(target, backup);
       movedOld = true;
@@ -706,7 +730,9 @@ async function installRuntimeBundle(
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
     await fs.rename(staged, target);
-    if (movedOld) await fs.rm(backup, { recursive: true, force: true }).catch(() => {});
+    if (movedOld && retainOldAsPrevious) await fs.rename(backup, previous);
+    else if (movedOld) await fs.rm(backup, { recursive: true, force: true }).catch(() => {});
+    if (movedPrevious) await fs.rm(previousBackup, { recursive: true, force: true }).catch(() => {});
     return target;
   } catch (error) {
     await fs.rm(staged, { recursive: true, force: true }).catch(() => {});
@@ -717,12 +743,70 @@ async function installRuntimeBundle(
         await fs.rename(backup, target).catch(() => {});
       }
     }
+    if (movedPrevious) {
+      try {
+        await fs.access(previous);
+      } catch {
+        await fs.rename(previousBackup, previous).catch(() => {});
+      }
+    }
     throw error;
   } finally {
     await fs.rm(staged, { recursive: true, force: true }).catch(() => {});
-    // If rollback itself failed, leave the backup in place for manual recovery rather than deleting
-    // the last known-good bundle. Successful swaps/remediations remove it above.
+    // If rollback itself failed, leave backup/previousBackup in place for manual recovery rather than
+    // deleting the last known-good generation. Successful swaps remove their transient backups above.
   }
+}
+
+async function runtimeBundleVersionAt(target: string): Promise<string | null> {
+  try {
+    const raw = await fs.readFile(path.join(target, 'package.json'), 'utf8');
+    return (JSON.parse(raw) as { version?: string }).version || null;
+  } catch {
+    return null;
+  }
+}
+
+async function swapRuntimeGenerations(workspace: ReturnType<typeof resolveWorkspace>): Promise<void> {
+  const current = path.join(workspace.spaceDir, '.runtime');
+  const previous = path.join(workspace.spaceDir, '.runtime.previous');
+  const swap = path.join(workspace.spaceDir, `.runtime.ihow-swap-${process.pid}-${crypto.randomUUID()}`);
+  await fs.rename(current, swap);
+  try {
+    await fs.rename(previous, current);
+  } catch (error) {
+    await fs.rename(swap, current).catch(() => {});
+    throw error;
+  }
+  try {
+    await fs.rename(swap, previous);
+  } catch (error) {
+    await fs.rename(current, previous).catch(() => {});
+    await fs.rename(swap, current).catch(() => {});
+    throw error;
+  }
+}
+
+async function rollbackRuntimeBundle(options: ParsedArgs['options']): Promise<Record<string, unknown>> {
+  const workspace = resolveWorkspace(options);
+  const current = path.join(workspace.spaceDir, '.runtime');
+  const previous = path.join(workspace.spaceDir, '.runtime.previous');
+  const [currentValid, previousValid, from, to] = await Promise.all([
+    runtimeBundleSelfVerifying(current),
+    runtimeBundleSelfVerifying(previous),
+    runtimeBundleVersionAt(current),
+    runtimeBundleVersionAt(previous),
+  ]);
+  if (!previousValid) return { ok: false, applied: false, reason: 'previous_runtime_bundle_integrity_failed', from, to };
+  if (!currentValid) return { ok: false, applied: false, reason: 'current_runtime_bundle_integrity_failed', from, to };
+  if (!options.apply) return { ok: true, applied: false, mode: 'dry-run', from, to, restartRequired: false };
+  await swapRuntimeGenerations(workspace);
+  const probe = await probeMcpServer(mcpServerSpec(workspace));
+  if (!probe.ok) {
+    await swapRuntimeGenerations(workspace).catch(() => {});
+    return { ok: false, applied: false, reason: 'rollback_runtime_probe_failed', from, to, detail: probe.detail };
+  }
+  return { ok: true, applied: true, from, to, serverReachable: true, detail: probe.detail, restartRequired: true };
 }
 
 // Version stamped into a connected workspace's frozen .runtime bundle (the code the MCP server actually
@@ -2258,6 +2342,7 @@ Usage:
   ihow-memory forget --list [--json]                   # list everything currently forgotten (path + first line)
   ihow-memory remember <text-or-path> [--json]         # reverse a forget: the entry surfaces again in search/recall
   ihow-memory upgrade [--space name] [--root path]   # re-stamp the connected server bundle after 'npm update' (then restart the runtime)
+  ihow-memory rollback-runtime [--space name] [--root path] [--apply] [--json]   # verify and preview the exact previous runtime bundle; --apply atomically swaps generations, probes the restored server, and requires a runtime restart
   ihow-memory migrate-local-day [--memory-root path] [--apply]   # one-time: re-bucket UTC-named journal/event files to local-day (dry-run unless --apply)
   ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
   ihow-memory reset --space name [--root path]
@@ -3624,7 +3709,7 @@ async function runRecallHook(options: ParsedArgs['options'], payload?: Record<st
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   const { command, options, rest } = parsed;
-  if (command === 'help' || command === '--help' || command === '-h') {
+  if (command === 'help' || command === '--help' || command === '-h' || rest.includes('--help') || rest.includes('-h')) {
     help(rest.includes('--all'));
     return;
   }
@@ -4440,6 +4525,22 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'rollback-runtime') {
+    const result = await rollbackRuntimeBundle(options);
+    if (options.json) printJson(result);
+    else if (result.ok && result.applied) {
+      console.log(`runtime bundle rolled back: v${result.from ?? 'unknown'} → v${result.to ?? 'unknown'}`);
+      console.log(`✓ restored server bundle round-trips (${result.detail})`);
+      console.log('Restart your connected runtime(s) so they load the restored server.');
+    } else if (result.ok) {
+      console.log(`runtime rollback preview: v${result.from ?? 'unknown'} → v${result.to ?? 'unknown'} (no changes; re-run with --apply)`);
+    } else {
+      console.error(`runtime rollback refused: ${result.reason}`);
+    }
+    if (!result.ok) process.exitCode = 1;
+    return;
+  }
+
   if (command === 'upgrade') {
     // Re-stamp the frozen .runtime bundle from the freshly-installed dist so a connected runtime stops
     // running the old MCP server. (npm update alone does not refresh .runtime — see runtimeBundleVersion.)
@@ -4452,12 +4553,25 @@ async function main(): Promise<void> {
     // (which loads the new bundle) to confirm it starts and round-trips. An already-running server keeps
     // running the old code until the runtime restarts — which is exactly why we still say "restart".
     const probe = await probeMcpServer(mcpServerSpec(workspace));
+    let rolledBack = false;
+    let rollbackDetail: string | null = null;
+    if (!probe.ok) {
+      try {
+        await swapRuntimeGenerations(workspace);
+        const restored = await probeMcpServer(mcpServerSpec(workspace));
+        rolledBack = restored.ok;
+        rollbackDetail = restored.detail;
+      } catch (error) {
+        rollbackDetail = error instanceof Error ? error.message : String(error);
+      }
+    }
     if (options.json) {
-      printJson({ ok: probe.ok, from: before, to: after, runtimeDir: path.join(workspace.spaceDir, '.runtime'), serverReachable: probe.ok, detail: probe.detail });
+      printJson({ ok: probe.ok, from: before, to: after, runtimeDir: path.join(workspace.spaceDir, '.runtime'), serverReachable: probe.ok, detail: probe.detail, rolledBack, rollbackDetail });
     } else {
       console.log(before && before !== after ? `upgraded runtime bundle: v${before} → v${after}` : `runtime bundle refreshed (v${after})`);
       console.log(probe.ok ? `✓ new server bundle round-trips (${probe.detail})` : `⚠ the re-stamped server did NOT round-trip — ${probe.detail}`);
-      console.log('Restart your connected runtime(s) so they load the new server.');
+      if (!probe.ok) console.log(rolledBack ? `✓ restored previous runtime bundle (${rollbackDetail})` : `✗ automatic runtime rollback failed — ${rollbackDetail || 'unknown error'}`);
+      console.log(probe.ok ? 'Restart your connected runtime(s) so they load the new server.' : rolledBack ? 'The previous runtime bundle is active on disk; restart only if you need to reload it.' : 'Do not restart connected runtimes until the runtime bundle is repaired.');
     }
     if (!probe.ok) process.exitCode = 1;
     return;

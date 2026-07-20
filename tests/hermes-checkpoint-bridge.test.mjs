@@ -76,6 +76,134 @@ test('Hermes finalize creates a bounded session-end checkpoint and returns only 
   assert.equal(artifact.state.objective, 'Finish Hermes runtime adapter');
 });
 
+test('Hermes finalize without exact receipt binding downgrades claimed complete coverage', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
+  const run = invokeBridge(event({
+    cwd: project,
+    event: 'runtime.session_finalize',
+    checkpointClaims: {
+      completed: ['cooperative draft claimed complete before receipt closure'],
+      coverage: { complete: true, eventCount: 7 },
+    },
+  }), { MEMORY_ROOT: memoryRoot, IHOW_MEMORY_STATE_ROOT: stateRoot });
+
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  const artifact = await finalizedArtifact(memoryRoot);
+  assert.equal(artifact.coverage.complete, false);
+  assert.equal(artifact.coverage.eventCount, 7);
+  assert.equal(artifact.trigger.reasonCode, 'hermes_lifecycle_checkpoint_receipt_binding_unavailable');
+});
+
+function receiptIdentity() {
+  return {
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+    turnId: '3'.repeat(64),
+    revision: 1,
+  };
+}
+
+function openReceipt(identity = receiptIdentity()) {
+  return {
+    schemaVersion: 1,
+    ...identity,
+    inputSourceHash: `sha256:${'4'.repeat(64)}`,
+    inputContentSha256: '5'.repeat(64),
+    openedAt: '2026-07-18T12:00:00.000Z',
+  };
+}
+
+function commitReceipt(identity = receiptIdentity(), deltaState = 'not_emitted') {
+  const opened = openReceipt(identity);
+  const { openedAt: _openedAt, ...inputEvidence } = opened;
+  return {
+    ...inputEvidence,
+    finalSourceHash: `sha256:${'6'.repeat(64)}`,
+    finalContentSha256: '7'.repeat(64),
+    committedAt: '2026-07-18T12:00:01.000Z',
+    deltaState,
+  };
+}
+
+async function openTurnReceipt(env, cwd, identity = receiptIdentity()) {
+  const run = invokeBridge(event({
+    cwd,
+    event: 'runtime.before_prompt',
+    turnReceipt: { action: 'open', receipt: openReceipt(identity) },
+  }), env);
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+}
+
+test('Hermes session_end with a not_emitted receipt downgrades claimed complete coverage', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
+  const env = { MEMORY_ROOT: memoryRoot, IHOW_MEMORY_STATE_ROOT: stateRoot };
+  const identity = receiptIdentity();
+  await openTurnReceipt(env, project, identity);
+
+  const run = invokeBridge(event({
+    cwd: project,
+    event: 'runtime.session_end',
+    turnReceipt: { action: 'commit', receipt: commitReceipt(identity, 'not_emitted') },
+    checkpointClaims: {
+      completed: ['host claimed complete while memory extraction remains open'],
+      coverage: { complete: true, eventCount: 8 },
+    },
+  }), env);
+
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  const artifact = await finalizedArtifact(memoryRoot);
+  assert.equal(artifact.coverage.complete, false);
+  assert.equal(artifact.coverage.eventCount, 8);
+  assert.equal(artifact.trigger.reasonCode, 'hermes_lifecycle_checkpoint_receipt_gaps');
+});
+
+test('Hermes session_end preserves claimed complete only when every known receipt is closed', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
+  const env = { MEMORY_ROOT: memoryRoot, IHOW_MEMORY_STATE_ROOT: stateRoot };
+  const identity = receiptIdentity();
+  await openTurnReceipt(env, project, identity);
+
+  const run = invokeBridge(event({
+    cwd: project,
+    event: 'runtime.session_end',
+    turnReceipt: { action: 'commit', receipt: commitReceipt(identity, 'explicit_none') },
+    checkpointClaims: {
+      completed: ['host complete and every known receipt is closed'],
+      coverage: { complete: true, eventCount: 9 },
+    },
+  }), env);
+
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  const artifact = await finalizedArtifact(memoryRoot);
+  assert.equal(artifact.coverage.complete, true);
+  assert.equal(artifact.coverage.eventCount, 9);
+  assert.equal(artifact.trigger.reasonCode, 'hermes_lifecycle_checkpoint');
+});
+
+test('known closed receipts never upgrade an originally partial checkpoint claim', async (t) => {
+  const { memoryRoot, stateRoot, project } = await roots(t);
+  const env = { MEMORY_ROOT: memoryRoot, IHOW_MEMORY_STATE_ROOT: stateRoot };
+  const identity = receiptIdentity();
+  await openTurnReceipt(env, project, identity);
+
+  const run = invokeBridge(event({
+    cwd: project,
+    event: 'runtime.session_end',
+    turnReceipt: { action: 'commit', receipt: commitReceipt(identity, 'explicit_none') },
+    checkpointClaims: {
+      pending: ['cooperative draft remains partial'],
+      coverage: { complete: false, eventCount: 10 },
+    },
+  }), env);
+
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  const artifact = await finalizedArtifact(memoryRoot);
+  assert.equal(artifact.coverage.complete, false);
+  assert.equal(artifact.coverage.eventCount, 10);
+  assert.equal(artifact.trigger.reasonCode, 'hermes_lifecycle_checkpoint');
+});
+
 test('Hermes session_end does not create a checkpoint without bounded claims', async (t) => {
   const { memoryRoot, stateRoot, project } = await roots(t);
   const run = invokeBridge(event({ cwd: project, event: 'runtime.session_end' }), {

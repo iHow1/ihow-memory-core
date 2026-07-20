@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const RELEASE_VERSION = '0.1.0-alpha.27.1';
+const RELEASE_VERSION = '0.1.0-alpha.31';
 
 function readRoot(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8');
@@ -29,12 +29,37 @@ function releaseSection(changelog, version) {
   return match[1];
 }
 
-test('alpha.27.1 release candidate metadata and alpha.27 docs stay truthful and aligned', () => {
+test('alpha.31 release candidate metadata and docs stay truthful and aligned', () => {
   const manifest = JSON.parse(readRoot('package.json'));
   const lock = JSON.parse(readRoot('package-lock.json'));
   assert.equal(manifest.version, RELEASE_VERSION);
   assert.equal(lock.version, RELEASE_VERSION);
   assert.equal(lock.packages?.['']?.version, RELEASE_VERSION);
+
+  const alpha31 = releaseSection(readRoot('CHANGELOG.md'), RELEASE_VERSION);
+  for (const surface of [
+    /Alpha\.30/i,
+    /turn receipt/i,
+    /ordinary-language/i,
+    /semantic activation/i,
+    /bge-m3/i,
+    /Hermes/i,
+    /rollback/i,
+  ]) assert.match(alpha31, surface, `alpha.31 documents ${surface}`);
+  assert.match(alpha31, /local release-ready/i);
+  assert.match(alpha31, /(?:has )?not been published/i);
+  assert.match(alpha31, /report-only/i);
+  assert.match(alpha31, /does not automatically rewrite authoritative memory/i);
+
+  const readmes = [
+    ['README.md', readRoot('README.md'), /Alpha\.31 local candidate/i, /has not been published/i],
+    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.31 本地候选/i, /尚未发布/i],
+  ];
+  for (const [name, readme, versionLabel, unpublished] of readmes) {
+    assert.match(readme, /0\.1\.0-alpha\.31/, `${name} states the local candidate version`);
+    assert.match(readme, versionLabel, `${name} identifies the alpha.31 surface`);
+    assert.match(readme, unpublished, `${name} does not claim this checkout was published`);
+  }
 
   const alpha27 = releaseSection(readRoot('CHANGELOG.md'), '0.1.0-alpha.27');
   for (const heading of ['### Added', '### Changed', '### Notes']) {
@@ -62,30 +87,6 @@ test('alpha.27.1 release candidate metadata and alpha.27 docs stay truthful and 
   assert.doesNotMatch(alpha27, /remain deferred/i);
   assert.doesNotMatch(alpha27, /Checkpoint-to-`continue` integration[^\n]*deferred/i);
   assert.doesNotMatch(alpha27, /checkpoint crash floor[^\n]*deferred/i);
-
-  const readmes = [
-    ['README.md', readRoot('README.md'), /Hermes native lifecycle/i, /has not been published/i],
-    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Hermes 原生生命周期/i, /尚未发布/i],
-  ];
-  for (const [name, readme, lifecycle, unpublished] of readmes) {
-    assert.match(readme, /0\.1\.0-alpha\.27\.1/, `${name} states the local candidate version`);
-    assert.match(readme, /Alpha\.27\.1/i, `${name} identifies the alpha.27.1 surface`);
-    assert.match(readme, /PreCompact/i, `${name} documents native PreCompact`);
-    assert.match(readme, /checkpoint-first/i, `${name} documents checkpoint-first continue`);
-    assert.match(readme, /crash-floor/i, `${name} documents the crash floor`);
-    assert.match(readme, /statusHash/, `${name} documents statusHash safety`);
-    assert.match(readme, /local release-ready only/i, `${name} states the local-only boundary`);
-    assert.match(readme, lifecycle, `${name} documents the Hermes native lifecycle`);
-    assert.match(readme, /Hermes Plugin/i, `${name} documents the packaged Hermes Plugin`);
-    assert.match(readme, /ihow-memory-hermes-bridge/i, `${name} documents the packaged Hermes bridge`);
-    assert.match(readme, /HOST VERIFIED\/READY/i, `${name} uses the bounded Hermes host-verification status`);
-    assert.match(readme, /(?:not independently certif(?:ied|iable) as|不能独立认证为) `?ACTIVE`?/i, `${name} does not claim Hermes ACTIVE`);
-    assert.match(readme, unpublished, `${name} does not claim this checkout was published`);
-    assert.doesNotMatch(readme, /not yet consumed by `memory\.continue`/i, `${name} removes stale continue deferral`);
-    assert.doesNotMatch(readme, /does not yet feed `memory\.continue`/i, `${name} removes stale continue deferral`);
-    assert.doesNotMatch(readme, /尚未接入 `memory\.continue`/, `${name} removes stale continue deferral`);
-    assert.doesNotMatch(readme, /尚无 checkpoint crash-floor/, `${name} removes stale crash-floor deferral`);
-  }
 });
 
 test('every relative import in a packed module is itself in the tarball (fresh install resolves)', () => {

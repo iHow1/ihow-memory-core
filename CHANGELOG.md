@@ -8,6 +8,28 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.31] — 2026-07-20
+
+### Added
+
+- **Alpha.30 evaluation and review-first foundation.** Carries forward the Alpha.30 golden train/dev/holdout datasets, deterministic evaluation harness, fail-closed memory-proposal evaluation, temporal-entity recall calibration, and deadline-observer stability fixes.
+- **Deterministic turn evidence.** Adds content-bound turn receipts, durable input evidence, replay preconditions, legacy atomic-write coverage, checkpoint receipt prerequisites, and the Hermes turn-receipt bridge.
+- **Ordinary-language governed capture.** Adds bounded preference/fact/event/procedure intent extraction for normal conversation, with normalization, secret screening, provenance, review-first governance, and real Hermes lifecycle coverage.
+- **Measured semantic activation.** Adds a reproducible semantic gate and real `bge-m3` / 1024-dimension Metal evidence for English, Chinese, paraphrase, no-answer, freshness, privacy, restart identity, latency, dimension truth, index concurrency, and fallback behavior.
+
+### Changed
+
+- **Hermes lifecycle closure.** Tightens adapter routing aliases, durable transcript revision handling, checkpoint/receipt correlation, shared contracts, fail-open host isolation, and plugin E2E coverage.
+- **Canonical test isolation.** Keeps broad files parallel, serializes only deadline-sensitive files after fresh low-load qualification, and detects competing runners by executable/argv boundaries rather than prompt-text substrings.
+- **CLI help safety.** Any subcommand `--help` / `-h` exits before setup, upgrade, workspace, configuration, or runtime-bundle writes.
+- **Runtime rollback identity.** Alpha.31 requires previous-bundle recovery to bind exact integrity manifests rather than trusting version equality.
+
+### Notes
+
+- Alpha.31 is a **local release-ready candidate** built on the complete Alpha.30 milestone; it has not been published, pushed, tagged, deployed, or activated by a runtime restart.
+- Safe Memory Gardener remains review-first. Automatic continuous consolidation is currently **report-only** by policy: it may identify duplicate, stale, conflict, or supersession candidates, but it does not automatically rewrite authoritative memory.
+- Team cloud, RBAC/SSO/SLA, a full temporal/entity graph, and broad production-user soak remain outside this candidate's proven scope.
+
 ## [0.1.0-alpha.27.1] — 2026-07-15
 
 ### Fixed

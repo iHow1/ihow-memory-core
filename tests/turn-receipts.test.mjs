@@ -22,6 +22,11 @@ function expectedSourceHash(rawSourceId) {
 
 const INPUT_SOURCE_HASH = expectedSourceHash('host-inputs/turn-001');
 const FINAL_SOURCE_HASH = expectedSourceHash('host-transcript/turn-001/revision-1');
+const DELTA_LINKAGE = Object.freeze({
+  deltaId: `ci1_${'c'.repeat(64)}`,
+  deltaHash: 'd'.repeat(64),
+  proposalId: `mp1_${'e'.repeat(64)}`,
+});
 
 async function createTestCore(t) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-turn-receipts-')));
@@ -209,12 +214,13 @@ test('same identity/revision with conflicting source or content hashes fails clo
   );
 });
 
-test('supports all delta states and gaps exclude only COMMITTED explicit_none', async (t) => {
+test('supports all delta states and gaps exclude COMMITTED explicit_none and emitted', async (t) => {
   const core = await createTestCore(t);
   const identities = {
     explicit: { ...BASE_IDENTITY, turnId: 'turn-explicit' },
     notEmitted: { ...BASE_IDENTITY, turnId: 'turn-not-emitted' },
     failed: { ...BASE_IDENTITY, turnId: 'turn-extraction' },
+    emitted: { ...BASE_IDENTITY, turnId: 'turn-emitted' },
     open: { ...BASE_IDENTITY, turnId: 'turn-open' },
   };
 
@@ -222,12 +228,16 @@ test('supports all delta states and gaps exclude only COMMITTED explicit_none', 
   await core.turnReceipts.commit(commitInput(identities.explicit, { deltaState: 'explicit_none' }));
   await core.turnReceipts.commit(commitInput(identities.notEmitted, { deltaState: 'not_emitted' }));
   await core.turnReceipts.commit(commitInput(identities.failed, { deltaState: 'extraction_failed' }));
+  await core.turnReceipts.commit(commitInput(identities.emitted, {
+    deltaState: 'emitted',
+    deltaLinkage: DELTA_LINKAGE,
+  }));
 
   const allDeltaStates = (await core.turnReceipts.list()).items
     .filter((receipt) => receipt.state === 'COMMITTED')
     .map((receipt) => receipt.deltaState)
     .sort();
-  assert.deepEqual(allDeltaStates, ['explicit_none', 'extraction_failed', 'not_emitted']);
+  assert.deepEqual(allDeltaStates, ['emitted', 'explicit_none', 'extraction_failed', 'not_emitted']);
 
   const gaps = (await core.turnReceipts.gaps()).items;
   assert.deepEqual(
@@ -238,6 +248,96 @@ test('supports all delta states and gaps exclude only COMMITTED explicit_none', 
       'turn-open:OPEN:not_emitted',
     ],
   );
+});
+
+test('emitted linkage is exact, state-bound, and part of same-commit idempotency', async (t) => {
+  const core = await createTestCore(t);
+  const missing = { ...BASE_IDENTITY, turnId: 'turn-emitted-missing-linkage' };
+  const forbidden = { ...BASE_IDENTITY, turnId: 'turn-non-emitted-linkage' };
+  const emitted = { ...BASE_IDENTITY, turnId: 'turn-emitted-linkage' };
+  for (const identity of [missing, forbidden, emitted]) await core.turnReceipts.open(openInput(identity));
+
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(missing, { deltaState: 'emitted' })),
+    /turn_receipt_delta_linkage_required/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(forbidden, {
+      deltaState: 'explicit_none',
+      deltaLinkage: DELTA_LINKAGE,
+    })),
+    /turn_receipt_delta_linkage_forbidden/,
+  );
+
+  const committed = await core.turnReceipts.commit(commitInput(emitted, {
+    deltaState: 'emitted',
+    deltaLinkage: DELTA_LINKAGE,
+  }));
+  assert.deepEqual(committed.deltaLinkage, DELTA_LINKAGE);
+  assert.deepEqual(await core.turnReceipts.commit(commitInput(emitted, {
+    deltaState: 'emitted',
+    deltaLinkage: DELTA_LINKAGE,
+  })), committed);
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(emitted, {
+      deltaState: 'emitted',
+      deltaLinkage: { ...DELTA_LINKAGE, deltaHash: 'f'.repeat(64) },
+    })),
+    /turn_receipt_conflict/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(emitted, {
+      deltaState: 'emitted',
+      deltaLinkage: { ...DELTA_LINKAGE, deltaId: `ci1_${'f'.repeat(64)}` },
+    })),
+    /turn_receipt_conflict/,
+  );
+});
+
+test('emitted linkage requires exact three strictly formatted fields', async (t) => {
+  const invalidLinkages = [
+    { deltaHash: DELTA_LINKAGE.deltaHash, proposalId: DELTA_LINKAGE.proposalId },
+    { ...DELTA_LINKAGE, deltaId: `ci1_${'C'.repeat(64)}` },
+    { ...DELTA_LINKAGE, deltaHash: 'D'.repeat(64) },
+    { ...DELTA_LINKAGE, proposalId: `mp1_${'E'.repeat(64)}` },
+    { ...DELTA_LINKAGE, unexpected: true },
+  ];
+  for (const [index, deltaLinkage] of invalidLinkages.entries()) {
+    const core = await createTestCore(t);
+    const identity = { ...BASE_IDENTITY, turnId: `turn-invalid-linkage-${index}` };
+    await core.turnReceipts.open(openInput(identity));
+    await assert.rejects(
+      async () => await core.turnReceipts.commit(commitInput(identity, {
+        deltaState: 'emitted',
+        deltaLinkage,
+      })),
+      /turn_receipt_(?:delta_id|delta_hash|proposal_id|unknown_field)/,
+    );
+  }
+});
+
+test('unknown, missing, malformed, or state-invalid persisted linkage fails closed and preserves exact bytes', async (t) => {
+  const invalidLinkages = [
+    { deltaState: 'emitted', deltaLinkage: { deltaHash: DELTA_LINKAGE.deltaHash, proposalId: DELTA_LINKAGE.proposalId } },
+    { deltaState: 'emitted', deltaLinkage: { ...DELTA_LINKAGE, deltaId: `ci1_${'C'.repeat(64)}` } },
+    { deltaState: 'emitted', deltaLinkage: { ...DELTA_LINKAGE, unexpected: true } },
+    { deltaState: 'explicit_none', deltaLinkage: DELTA_LINKAGE },
+  ];
+  for (const [index, overrides] of invalidLinkages.entries()) {
+    const core = await createTestCore(t);
+    const malformed = storedCommittedReceipt(
+      { ...BASE_IDENTITY, turnId: `turn-persisted-malformed-linkage-${index}` },
+      overrides,
+    );
+    const { file, bytes: before } = await plantStore(core, [malformed]);
+
+    await assert.rejects(
+      async () => await core.turnReceipts.list(),
+      /turn_receipt_(?:store_invalid|delta_id_(?:required|invalid)|unknown_field)/,
+    );
+    const after = await fs.readFile(file);
+    assert.equal(Buffer.compare(after, before), 0);
+  }
 });
 
 test('preserves older revisions in numeric order while currentOnly lists the newest revision', async (t) => {
@@ -264,6 +364,180 @@ test('preserves older revisions in numeric order while currentOnly lists the new
   assert.deepEqual(await core.turnReceipts.read(revision1), committed1);
   assert.deepEqual((await core.turnReceipts.list()).items.map((receipt) => receipt.revision), [1, 2, 10]);
   assert.deepEqual((await core.turnReceipts.list({ currentOnly: true })).items, [opened10]);
+});
+
+test('list and gaps project exactly one runtime/project/session binding before pagination and current revision selection', async (t) => {
+  const core = await createTestCore(t);
+  const targetBinding = {
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  };
+  const identities = [
+    { ...targetBinding, turnId: 'target-open', revision: 1 },
+    { ...targetBinding, turnId: 'target-revised', revision: 1 },
+    { ...targetBinding, turnId: 'target-revised', revision: 2 },
+    { ...targetBinding, projectId: '3'.repeat(64), turnId: 'other-project', revision: 1 },
+    { ...targetBinding, sessionHash: '4'.repeat(64), turnId: 'other-session', revision: 1 },
+    { ...targetBinding, runtime: 'codex', turnId: 'other-runtime', revision: 1 },
+  ];
+  for (const identity of identities) {
+    await core.turnReceipts.open(openInput(identity, {
+      inputSourceHash: expectedSourceHash(`projection/${identity.turnId}/${identity.revision}`),
+      openedAt: `2026-07-17T12:00:0${identity.revision}.000Z`,
+    }));
+  }
+  await core.turnReceipts.commit(commitInput(identities[1], {
+    inputSourceHash: expectedSourceHash('projection/target-revised/1'),
+    deltaState: 'not_emitted',
+  }));
+
+  const projected = await core.turnReceipts.list({
+    ...targetBinding,
+    currentOnly: true,
+    offset: 0,
+    limit: 1,
+  });
+  assert.equal(projected.total, 2, 'total is computed after exact binding and current-revision projection');
+  assert.equal(projected.items.length, 1);
+  assert.equal(projected.nextOffset, 1);
+  assert.ok(projected.items.every((receipt) => (
+    receipt.runtime === targetBinding.runtime
+    && receipt.projectId === targetBinding.projectId
+    && receipt.sessionHash === targetBinding.sessionHash
+  )));
+
+  const gaps = await core.turnReceipts.gaps({ ...targetBinding, currentOnly: true });
+  assert.deepEqual(
+    gaps.items.map((receipt) => `${receipt.turnId}:${receipt.revision}`).sort(),
+    ['target-open:1', 'target-revised:2'],
+  );
+  assert.equal(gaps.total, 2);
+  assert.equal(gaps.nextOffset, null);
+});
+
+test('receipt projection is all-or-none and rejects malformed or attacker-controlled binding fields', async (t) => {
+  const core = await createTestCore(t);
+  const exact = {
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  };
+  for (const options of [
+    { runtime: exact.runtime },
+    { projectId: exact.projectId },
+    { sessionHash: exact.sessionHash },
+    { runtime: exact.runtime, projectId: exact.projectId },
+    { ...exact, runtime: 'hermes\nattacker' },
+    { ...exact, projectId: '1'.repeat(63) },
+    { ...exact, sessionHash: 'A'.repeat(64) },
+    { ...exact, sessionId: 'raw-session' },
+  ]) {
+    await assert.rejects(
+      async () => await core.turnReceipts.list(options),
+      /turn_receipt_(?:projection_required|runtime_invalid|project_id_invalid|session_hash_invalid|unknown_field)/,
+    );
+    await assert.rejects(
+      async () => await core.turnReceipts.gaps(options),
+      /turn_receipt_(?:projection_required|runtime_invalid|project_id_invalid|session_hash_invalid|unknown_field)/,
+    );
+  }
+});
+
+test('known receipt coverage is unknown when an exact binding has no receipts', async (t) => {
+  const core = await createTestCore(t);
+  assert.deepEqual(await core.turnReceipts.knownCoverage({
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  }), {
+    status: 'unknown',
+    reasonCode: 'turn_receipt_no_known_receipts',
+    knownReceiptCount: 0,
+    gapCount: 0,
+  });
+});
+
+test('known receipt coverage is partial when any current revision remains open or un-emitted', async (t) => {
+  const core = await createTestCore(t);
+  const binding = {
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  };
+  const identities = [
+    { ...binding, turnId: 'open-gap', revision: 1 },
+    { ...binding, turnId: 'not-emitted-gap', revision: 1 },
+    { ...binding, turnId: 'extraction-gap', revision: 1 },
+    { ...binding, turnId: 'closed', revision: 1 },
+    { ...binding, turnId: 'revised-gap', revision: 1 },
+    { ...binding, turnId: 'revised-gap', revision: 2 },
+  ];
+  for (const identity of identities) {
+    await core.turnReceipts.open(openInput(identity, {
+      inputSourceHash: expectedSourceHash(`coverage/${identity.turnId}/${identity.revision}`),
+      openedAt: `2026-07-17T12:00:0${identity.revision}.000Z`,
+    }));
+  }
+  await core.turnReceipts.commit(commitInput(identities[1], {
+    inputSourceHash: expectedSourceHash('coverage/not-emitted-gap/1'),
+    deltaState: 'not_emitted',
+  }));
+  await core.turnReceipts.commit(commitInput(identities[2], {
+    inputSourceHash: expectedSourceHash('coverage/extraction-gap/1'),
+    deltaState: 'extraction_failed',
+  }));
+  await core.turnReceipts.commit(commitInput(identities[3], {
+    inputSourceHash: expectedSourceHash('coverage/closed/1'),
+    deltaState: 'explicit_none',
+  }));
+  await core.turnReceipts.commit(commitInput(identities[4], {
+    inputSourceHash: expectedSourceHash('coverage/revised-gap/1'),
+    deltaState: 'explicit_none',
+  }));
+
+  assert.deepEqual(await core.turnReceipts.knownCoverage(binding), {
+    status: 'partial',
+    reasonCode: 'turn_receipt_known_gaps',
+    knownReceiptCount: 5,
+    gapCount: 4,
+  });
+});
+
+test('known receipt coverage reports only that every known current receipt is closed', async (t) => {
+  const core = await createTestCore(t);
+  const binding = {
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  };
+  const explicit = { ...binding, turnId: 'known-explicit-none', revision: 1 };
+  const emitted = { ...binding, turnId: 'known-emitted', revision: 1 };
+  for (const identity of [explicit, emitted]) {
+    await core.turnReceipts.open(openInput(identity, {
+      inputSourceHash: expectedSourceHash(`known-closed/${identity.turnId}`),
+    }));
+  }
+  await core.turnReceipts.commit(commitInput(explicit, {
+    inputSourceHash: expectedSourceHash('known-closed/known-explicit-none'),
+    deltaState: 'explicit_none',
+  }));
+  await core.turnReceipts.commit(commitInput(emitted, {
+    inputSourceHash: expectedSourceHash('known-closed/known-emitted'),
+    deltaState: 'emitted',
+    deltaLinkage: DELTA_LINKAGE,
+  }));
+
+  const coverage = await core.turnReceipts.knownCoverage(binding);
+  assert.equal(coverage.status, 'known_closed');
+  assert.deepEqual({ ...coverage, snapshotSha256: undefined }, {
+    status: 'known_closed',
+    reasonCode: 'turn_receipt_all_known_receipts_closed',
+    knownReceiptCount: 2,
+    gapCount: 0,
+    snapshotSha256: undefined,
+  });
+  assert.match(coverage.snapshotSha256, /^[a-f0-9]{64}$/);
 });
 
 test('rejects unknown, oversized, raw-content, raw-source, and unhashed identity fields', async (t) => {
