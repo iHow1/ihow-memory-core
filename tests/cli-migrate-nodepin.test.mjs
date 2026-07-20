@@ -51,3 +51,28 @@ test('generated MCP config pins an absolute node, not bare "node"', async (t) =>
   assert.match(line, /command\s*=\s*".*node.*"/, 'must be an absolute path to a node binary');
   assert.ok(path.isAbsolute(line.split('"')[1]), 'command path is absolute');
 });
+
+test('subcommand --help exits before setup or upgrade can write', async (t) => {
+  const sandbox = await mkdtempReal('ihow-cli-help-');
+  const home = path.join(sandbox, 'home');
+  const cwd = path.join(sandbox, 'cwd');
+  await fs.mkdir(home);
+  await fs.mkdir(cwd);
+  t.after(async () => { await fs.rm(sandbox, { recursive: true, force: true }); });
+
+  for (const command of ['setup', 'upgrade']) {
+    const root = path.join(sandbox, `${command}-root`);
+    const out = execFileSync(process.execPath, [CLI, command, '--help', '--root', root, '--space', 'help-probe'], {
+      cwd,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: home,
+        PATH: '/usr/bin:/bin',
+        IHOW_HANDOFF_METRICS: '0',
+      },
+    });
+    assert.match(out, /Start here|Full command reference/, `${command} --help prints help`);
+    await assert.rejects(fs.access(root), `${command} --help must not materialize a workspace`);
+  }
+});

@@ -3,7 +3,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import type { CheckpointProtectionState, CheckpointProtectionSummary, Workspace, WorkspaceOptions } from './types.ts';
+import type {
+  CheckpointProtectionState,
+  CheckpointProtectionSummary,
+  TurnReceiptKnownClosedPreconditionV1,
+  Workspace,
+  WorkspaceOptions,
+} from './types.ts';
 import { gitAnchors, gitWorktreeStatusHash, repoRoot } from './anchors.ts';
 import { withWorkspaceLock } from './store/lock.ts';
 import {
@@ -54,6 +60,10 @@ import {
 } from './store/checkpoints.ts';
 import { readActivationEvidence } from './activation-ledger.ts';
 import { readEventsAllLanes } from './store/events.ts';
+import {
+  assertTurnReceiptKnownClosedPreconditionUnlocked,
+  validateTurnReceiptKnownClosedPreconditionV1,
+} from './turn-receipts.ts';
 
 export type CheckpointMachineAnchorProvider = () => CheckpointMachineAnchors | Promise<CheckpointMachineAnchors>;
 
@@ -81,6 +91,7 @@ export function collectLiveCheckpointMachineAnchors(projectDir: string): Checkpo
 export type CheckpointDraftFinalizationPrecondition = {
   expectedUpdatedAt: string;
   expectedContentSha256: string;
+  receiptCoverage?: TurnReceiptKnownClosedPreconditionV1;
 };
 
 export type CheckpointListItem = {
@@ -136,11 +147,29 @@ function digest(text: string): string {
 
 export function checkpointDraftFinalizationPrecondition(
   draft: CheckpointDraftV1,
+  receiptCoverage?: unknown,
 ): CheckpointDraftFinalizationPrecondition {
   return {
     expectedUpdatedAt: draft.updatedAt,
     expectedContentSha256: digest(canonicalCheckpointJson(draft)),
+    ...(receiptCoverage === undefined
+      ? {}
+      : { receiptCoverage: validateTurnReceiptKnownClosedPreconditionV1(receiptCoverage) }),
   };
+}
+
+function normalizeCheckpointDraftFinalizationPrecondition(
+  precondition: CheckpointDraftFinalizationPrecondition | undefined,
+): CheckpointDraftFinalizationPrecondition | undefined {
+  if (!precondition || precondition.receiptCoverage === undefined) return precondition;
+  try {
+    return {
+      ...precondition,
+      receiptCoverage: validateTurnReceiptKnownClosedPreconditionV1(precondition.receiptCoverage),
+    };
+  } catch {
+    throw new Error('checkpoint_receipt_coverage_precondition_invalid');
+  }
 }
 
 function assertCheckpointDraftFinalizationPrecondition(
@@ -810,6 +839,7 @@ export async function createCheckpointService(
     async finalizeDraft(draftId, request, collectMachineAnchors, precondition) {
       return await rejected(workspace, 'artifact.finalize', async () => {
         const finalized = validateFinalizeRequest(request);
+        const normalizedPrecondition = normalizeCheckpointDraftFinalizationPrecondition(precondition);
         if (typeof collectMachineAnchors !== 'function') throw new CheckpointValidationError('checkpoint_machine_anchor_provider_required');
 
         // Recovery deliberately runs before anchor collection. If the immutable artifact landed but the
@@ -817,7 +847,7 @@ export async function createCheckpointService(
         const recovered = await withWorkspaceLock(workspace, async () => {
           const draft = await readCheckpointDraftUnlocked(workspace, draftId);
           assertProjectMatchesService(draft, project);
-          assertCheckpointDraftFinalizationPrecondition(draft, precondition);
+          assertCheckpointDraftFinalizationPrecondition(draft, normalizedPrecondition);
           const marked = await recoverDraftMarkerUnlocked(workspace, draft, project, finalized);
           if (marked) return marked;
           const artifact = await recoverDraftFinalizationUnlocked(workspace, draft, project, finalized);
@@ -849,7 +879,7 @@ export async function createCheckpointService(
           assertProjectMatchesService(draft, project);
           // This is the authoritative CAS: after it passes, the workspace lock excludes updateDraft
           // until the artifact, audit, draft marker, and locator commit have completed.
-          assertCheckpointDraftFinalizationPrecondition(draft, precondition);
+          assertCheckpointDraftFinalizationPrecondition(draft, normalizedPrecondition);
           const marked = await recoverDraftMarkerUnlocked(workspace, draft, project, finalized);
           if (marked) return { artifact: marked, deduplicated: true };
           const crashedArtifact = await recoverDraftFinalizationUnlocked(workspace, draft, project, finalized);
@@ -858,6 +888,13 @@ export async function createCheckpointService(
           // contradiction while this process was outside the workspace lock.
           await assertNoAuditOnlyFinalizationUnlocked(workspace, draft.draftId);
           await validateSupersedesUnlocked(workspace, draft, finalized.supersedes);
+          // Receipt coverage is a second-domain CAS. Recovery above wins if an immutable artifact or
+          // finalization intent already landed; otherwise a newly opened/current receipt invalidates
+          // the stale known-closed snapshot before any new artifact, intent, or audit write.
+          await assertTurnReceiptKnownClosedPreconditionUnlocked(
+            workspace,
+            normalizedPrecondition?.receiptCoverage,
+          );
           // Collection and normalization failures are deferred until after this second locked
           // reconciliation. The provider may have durably finalized (or introduced an audit-only
           // contradiction) immediately before throwing or exposing a failing getter.

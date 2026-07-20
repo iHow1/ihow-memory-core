@@ -1,6 +1,6 @@
 {
   "name": "ihow-memory",
-  "version": "0.1.0-alpha.27.1",
+  "version": "0.1.0-alpha.31",
   "type": "module",
   "description": "Local-first shared memory for AI agents with zero-dependency FTS, citations, governance, and MCP.",
   "keywords": [
@@ -54,6 +54,10 @@
     "activation-proof": "node scripts/activation-proof.mjs",
     "proof": "node scripts/proof.mjs",
     "test": "node scripts/run-tests.mjs",
+    "eval:smoke": "node --experimental-strip-types scripts/evaluation-bench.mjs smoke",
+    "eval:batch": "node --experimental-strip-types scripts/evaluation-bench.mjs batch",
+    "eval:full": "node --experimental-strip-types scripts/evaluation-bench.mjs full",
+    "eval:proposals": "node --experimental-strip-types scripts/proposal-evaluation.mjs",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run build",
     "secret-scan": "node scripts/secret-scan.mjs"

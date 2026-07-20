@@ -118,6 +118,7 @@ type ParsedArgs = {
     fromDraft?: string;
     scope?: string;
     since?: string;
+    ttlMs?: number;
     draft?: boolean;
     format?: 'markdown';
     importSource?: 'claude-code' | 'markdown';
@@ -469,12 +470,24 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--scope') {
       const value = tail[++index];
       options.scope = value;
-      if (command !== 'organize') rest.push('--scope', value);
+      if (command !== 'organize' && command !== 'organize-tick') rest.push('--scope', value);
     }
     else if (arg === '--since') {
       const value = tail[++index];
       options.since = value;
-      if (command !== 'organize') rest.push('--since', value);
+      if (command !== 'organize' && command !== 'organize-tick') rest.push('--since', value);
+    }
+    else if (arg === '--ttl') {
+      const value = tail[++index] || '';
+      if (command !== 'organize-tick') {
+        rest.push('--ttl', value);
+      } else {
+        const match = value.match(/^(\d+)([hdw])$/i);
+        if (!match || Number(match[1]) <= 0) throw new Error('invalid_organize_tick_ttl');
+        const n = Number(match[1]);
+        const mult = match[2].toLowerCase() === 'h' ? 3_600_000 : match[2].toLowerCase() === 'd' ? 86_400_000 : 7 * 86_400_000;
+        options.ttlMs = n * mult;
+      }
     }
     else if (arg === '--draft') options.draft = true;
     else if (arg === '--format') {
@@ -634,6 +647,17 @@ async function targetMatchesIntegrity(target: string, expected: Record<string, s
   }
 }
 
+async function runtimeBundleSelfVerifying(target: string): Promise<boolean> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(path.join(target, 'package.json'), 'utf8')) as RuntimeBundleManifest;
+    const files = parsed.integrity?.files;
+    if (parsed.type !== 'module' || typeof parsed.version !== 'string' || !files || Object.keys(files).length === 0) return false;
+    return targetMatchesIntegrity(target, files);
+  } catch {
+    return false;
+  }
+}
+
 async function runtimeBundleHealthy(workspace: Awaited<ReturnType<typeof ensureWorkspace>>): Promise<boolean> {
   const source = path.join(packageDir(), 'dist');
   const target = path.join(workspace.spaceDir, '.runtime');
@@ -684,7 +708,11 @@ async function installRuntimeBundle(
   const nonce = `${process.pid}-${crypto.randomUUID()}`;
   const staged = path.join(workspace.spaceDir, `.runtime.ihow-tmp-${nonce}`);
   const backup = path.join(workspace.spaceDir, `.runtime.ihow-bak-${nonce}`);
+  const previous = path.join(workspace.spaceDir, '.runtime.previous');
+  const previousBackup = path.join(workspace.spaceDir, `.runtime.previous.ihow-bak-${nonce}`);
   let movedOld = false;
+  let movedPrevious = false;
+  let retainOldAsPrevious = false;
   try {
     await fs.cp(source, staged, { recursive: true });
     const [expected, stagedIntegrity] = await Promise.all([
@@ -699,6 +727,15 @@ async function installRuntimeBundle(
       integrity: { files: expected },
     };
     await fs.writeFile(path.join(staged, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    retainOldAsPrevious = await runtimeBundleSelfVerifying(target);
+    if (retainOldAsPrevious) {
+      try {
+        await fs.rename(previous, previousBackup);
+        movedPrevious = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
     try {
       await fs.rename(target, backup);
       movedOld = true;
@@ -706,7 +743,9 @@ async function installRuntimeBundle(
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
     await fs.rename(staged, target);
-    if (movedOld) await fs.rm(backup, { recursive: true, force: true }).catch(() => {});
+    if (movedOld && retainOldAsPrevious) await fs.rename(backup, previous);
+    else if (movedOld) await fs.rm(backup, { recursive: true, force: true }).catch(() => {});
+    if (movedPrevious) await fs.rm(previousBackup, { recursive: true, force: true }).catch(() => {});
     return target;
   } catch (error) {
     await fs.rm(staged, { recursive: true, force: true }).catch(() => {});
@@ -717,12 +756,70 @@ async function installRuntimeBundle(
         await fs.rename(backup, target).catch(() => {});
       }
     }
+    if (movedPrevious) {
+      try {
+        await fs.access(previous);
+      } catch {
+        await fs.rename(previousBackup, previous).catch(() => {});
+      }
+    }
     throw error;
   } finally {
     await fs.rm(staged, { recursive: true, force: true }).catch(() => {});
-    // If rollback itself failed, leave the backup in place for manual recovery rather than deleting
-    // the last known-good bundle. Successful swaps/remediations remove it above.
+    // If rollback itself failed, leave backup/previousBackup in place for manual recovery rather than
+    // deleting the last known-good generation. Successful swaps remove their transient backups above.
   }
+}
+
+async function runtimeBundleVersionAt(target: string): Promise<string | null> {
+  try {
+    const raw = await fs.readFile(path.join(target, 'package.json'), 'utf8');
+    return (JSON.parse(raw) as { version?: string }).version || null;
+  } catch {
+    return null;
+  }
+}
+
+async function swapRuntimeGenerations(workspace: ReturnType<typeof resolveWorkspace>): Promise<void> {
+  const current = path.join(workspace.spaceDir, '.runtime');
+  const previous = path.join(workspace.spaceDir, '.runtime.previous');
+  const swap = path.join(workspace.spaceDir, `.runtime.ihow-swap-${process.pid}-${crypto.randomUUID()}`);
+  await fs.rename(current, swap);
+  try {
+    await fs.rename(previous, current);
+  } catch (error) {
+    await fs.rename(swap, current).catch(() => {});
+    throw error;
+  }
+  try {
+    await fs.rename(swap, previous);
+  } catch (error) {
+    await fs.rename(current, previous).catch(() => {});
+    await fs.rename(swap, current).catch(() => {});
+    throw error;
+  }
+}
+
+async function rollbackRuntimeBundle(options: ParsedArgs['options']): Promise<Record<string, unknown>> {
+  const workspace = resolveWorkspace(options);
+  const current = path.join(workspace.spaceDir, '.runtime');
+  const previous = path.join(workspace.spaceDir, '.runtime.previous');
+  const [currentValid, previousValid, from, to] = await Promise.all([
+    runtimeBundleSelfVerifying(current),
+    runtimeBundleSelfVerifying(previous),
+    runtimeBundleVersionAt(current),
+    runtimeBundleVersionAt(previous),
+  ]);
+  if (!previousValid) return { ok: false, applied: false, reason: 'previous_runtime_bundle_integrity_failed', from, to };
+  if (!currentValid) return { ok: false, applied: false, reason: 'current_runtime_bundle_integrity_failed', from, to };
+  if (!options.apply) return { ok: true, applied: false, mode: 'dry-run', from, to, restartRequired: false };
+  await swapRuntimeGenerations(workspace);
+  const probe = await probeMcpServer(mcpServerSpec(workspace));
+  if (!probe.ok) {
+    await swapRuntimeGenerations(workspace).catch(() => {});
+    return { ok: false, applied: false, reason: 'rollback_runtime_probe_failed', from, to, detail: probe.detail };
+  }
+  return { ok: true, applied: true, from, to, serverReachable: true, detail: probe.detail, restartRequired: true };
 }
 
 // Version stamped into a connected workspace's frozen .runtime bundle (the code the MCP server actually
@@ -2241,6 +2338,7 @@ Usage:
   ihow-memory benchmark [--json]   # deterministic LOCAL proof of the verify-first guarantees: the three-color resume verdict discriminates (GREEN narrow · drift→RED · uncertainty→YELLOW) and the no-false-green floor isolates unverified/standing-rule content while blocking secret/fabricated-anchor content. Re-run for the same result; exit non-zero if any guarantee fails.
   ihow-memory reindex [--memory-root path] [--state-root path] [--json]
   ihow-memory organize --scope project [--since 7d] --draft --json   # Safe Memory Gardener alpha.24: review-first JSON draft with evidence pointers, duplicate/stale review flags, redaction safety status, and organize audit event. Never rewrites curated memory and does not automate enterprise policy.
+  ihow-memory organize-tick --scope project [--since 7d] [--ttl 1h] --json   # Alpha.31 report-only scheduler primitive: idempotent within a bounded TTL/source-manifest window, zero authority writes, no model, no daemon installation.
   ihow-memory export-vault --from-draft <draft_id> --format markdown [--json]   # export a gardener draft to an Obsidian-compatible Markdown view/editor artifact with evidence links + export audit event. The export is not source of truth.
   ihow-memory enable-semantic [--host url] [--model name] [--space name] [--json]   # OPT-IN: turn on the additive semantic lane for this space. Probes a LOCAL Ollama (default http://localhost:11434, model nomic-embed-text) and only enables if it is reachable AND the model is pulled; persists <space>/.runtime/semantic.json so connect/setup launch the MCP server with the spawned embedding sidecar. Successful activation proves availability, not retrieval-quality lift; prompt bypass stays fail-closed without a measured model floor. The default install stays zero-dependency FTS5 (capabilities.semantic=false) until you run this; the lane is additive — search falls back to FTS if the provider is down. Re-run setup/connect + restart the runtime to apply.
   ihow-memory disable-semantic [--space name] [--json]   # reverse enable-semantic: remove the opt-in marker and return to the default FTS5 engine (re-run setup/connect + restart to apply)
@@ -2258,6 +2356,7 @@ Usage:
   ihow-memory forget --list [--json]                   # list everything currently forgotten (path + first line)
   ihow-memory remember <text-or-path> [--json]         # reverse a forget: the entry surfaces again in search/recall
   ihow-memory upgrade [--space name] [--root path]   # re-stamp the connected server bundle after 'npm update' (then restart the runtime)
+  ihow-memory rollback-runtime [--space name] [--root path] [--apply] [--json]   # verify and preview the exact previous runtime bundle; --apply atomically swaps generations, probes the restored server, and requires a runtime restart
   ihow-memory migrate-local-day [--memory-root path] [--apply]   # one-time: re-bucket UTC-named journal/event files to local-day (dry-run unless --apply)
   ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
   ihow-memory reset --space name [--root path]
@@ -3624,7 +3723,7 @@ async function runRecallHook(options: ParsedArgs['options'], payload?: Record<st
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   const { command, options, rest } = parsed;
-  if (command === 'help' || command === '--help' || command === '-h') {
+  if (command === 'help' || command === '--help' || command === '-h' || rest.includes('--help') || rest.includes('-h')) {
     help(rest.includes('--all'));
     return;
   }
@@ -4440,6 +4539,22 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'rollback-runtime') {
+    const result = await rollbackRuntimeBundle(options);
+    if (options.json) printJson(result);
+    else if (result.ok && result.applied) {
+      console.log(`runtime bundle rolled back: v${result.from ?? 'unknown'} → v${result.to ?? 'unknown'}`);
+      console.log(`✓ restored server bundle round-trips (${result.detail})`);
+      console.log('Restart your connected runtime(s) so they load the restored server.');
+    } else if (result.ok) {
+      console.log(`runtime rollback preview: v${result.from ?? 'unknown'} → v${result.to ?? 'unknown'} (no changes; re-run with --apply)`);
+    } else {
+      console.error(`runtime rollback refused: ${result.reason}`);
+    }
+    if (!result.ok) process.exitCode = 1;
+    return;
+  }
+
   if (command === 'upgrade') {
     // Re-stamp the frozen .runtime bundle from the freshly-installed dist so a connected runtime stops
     // running the old MCP server. (npm update alone does not refresh .runtime — see runtimeBundleVersion.)
@@ -4452,12 +4567,25 @@ async function main(): Promise<void> {
     // (which loads the new bundle) to confirm it starts and round-trips. An already-running server keeps
     // running the old code until the runtime restarts — which is exactly why we still say "restart".
     const probe = await probeMcpServer(mcpServerSpec(workspace));
+    let rolledBack = false;
+    let rollbackDetail: string | null = null;
+    if (!probe.ok) {
+      try {
+        await swapRuntimeGenerations(workspace);
+        const restored = await probeMcpServer(mcpServerSpec(workspace));
+        rolledBack = restored.ok;
+        rollbackDetail = restored.detail;
+      } catch (error) {
+        rollbackDetail = error instanceof Error ? error.message : String(error);
+      }
+    }
     if (options.json) {
-      printJson({ ok: probe.ok, from: before, to: after, runtimeDir: path.join(workspace.spaceDir, '.runtime'), serverReachable: probe.ok, detail: probe.detail });
+      printJson({ ok: probe.ok, from: before, to: after, runtimeDir: path.join(workspace.spaceDir, '.runtime'), serverReachable: probe.ok, detail: probe.detail, rolledBack, rollbackDetail });
     } else {
       console.log(before && before !== after ? `upgraded runtime bundle: v${before} → v${after}` : `runtime bundle refreshed (v${after})`);
       console.log(probe.ok ? `✓ new server bundle round-trips (${probe.detail})` : `⚠ the re-stamped server did NOT round-trip — ${probe.detail}`);
-      console.log('Restart your connected runtime(s) so they load the new server.');
+      if (!probe.ok) console.log(rolledBack ? `✓ restored previous runtime bundle (${rollbackDetail})` : `✗ automatic runtime rollback failed — ${rollbackDetail || 'unknown error'}`);
+      console.log(probe.ok ? 'Restart your connected runtime(s) so they load the new server.' : rolledBack ? 'The previous runtime bundle is active on disk; restart only if you need to reload it.' : 'Do not restart connected runtimes until the runtime bundle is repaired.');
     }
     if (!probe.ok) process.exitCode = 1;
     return;
@@ -4668,6 +4796,22 @@ async function main(): Promise<void> {
       console.log(`path: ${draft.draft_path}`);
       console.log(`audit event: ${draft.audit_event_id}`);
       console.log('mode: review-first (curated memory not rewritten)');
+    }
+    return;
+  }
+  if (command === 'organize-tick') {
+    const result = await core.organize_tick({
+      scope: options.scope || 'project',
+      since: options.since,
+      actor: options.actor || 'scheduler',
+      ttlMs: options.ttlMs,
+    });
+    if (options.json) printJson(result);
+    else {
+      console.log(`organize tick: ${result.status} ${result.run_id}`);
+      console.log(`draft: ${result.draft_id}`);
+      console.log(`expires: ${result.expires_at}`);
+      console.log('mode: report-only (authority writes=0; no daemon installed)');
     }
     return;
   }

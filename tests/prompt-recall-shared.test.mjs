@@ -184,9 +184,17 @@ test('shared selector: bypass/status/default-auto decisions are identical and pr
 
 test('hook explain: excluded-only and off-topic prompts emit safe diagnostics; explain-off remains exactly 0 bytes', async (t) => {
   const f = await fixture(t, 'ihow-shared-empty');
-  await writeEntry(path.join(f.team, 'flagged.md'), ['flagged: true'], 'ZXEMPTYFLAGGED forbidden flagged body.');
-  await writeEntry(path.join(f.team, 'private.md'), ['visibility: private'], 'ZXEMPTYPRIVATE forbidden private body.');
-  await writeEntry(path.join(f.team, 'audit.md'), ['visibility: audit-only'], 'ZXEMPTYAUDIT forbidden audit body.');
+  const structured = (alias) => [
+    'temporal_entity_schema_version: 1',
+    'entity_id: "secure entity"',
+    `entity_aliases: [${JSON.stringify(alias)},"secure entity"]`,
+    'relation: "forbidden"',
+    'value: "perfect entity match"',
+    'observed_at: "2026-07-01T00:00:00.000Z"',
+  ];
+  await writeEntry(path.join(f.team, 'flagged.md'), ['flagged: true', ...structured('ZXEMPTYFLAGGED')], 'ZXEMPTYFLAGGED forbidden flagged body.');
+  await writeEntry(path.join(f.team, 'private.md'), ['visibility: private', ...structured('ZXEMPTYPRIVATE')], 'ZXEMPTYPRIVATE forbidden private body.');
+  await writeEntry(path.join(f.team, 'audit.md'), ['visibility: audit-only', ...structured('ZXEMPTYAUDIT')], 'ZXEMPTYAUDIT forbidden audit body.');
   await writeEntry(path.join(f.team, 'reviewed.md'), ['status: "promoted"'], 'ZXEMPTYREVIEWED asteroidwidget preference is compact spacing.');
   reindex(f.memoryRoot, f.stateRoot, f.home);
 
@@ -306,4 +314,38 @@ test('shared selector parity: recency collapse keeps one current source in every
   assert.doesNotMatch(h.hookSpecificOutput.additionalContext, /uses cluster-alpha for billing routing/);
   assert.match(c.injectText, /cluster-beta/);
   assert.doesNotMatch(c.injectText, /uses cluster-alpha for billing routing/);
+});
+
+test('shared selector parity: explicit structured supersession agrees in every runtime', async (t) => {
+  const f = await fixture(t, 'ihow-shared-structured');
+  const common = [
+    'temporal_entity_schema_version: 1',
+    'entity_id: "project atlas"',
+    'entity_aliases: ["Project Atlas","project atlas"]',
+    'relation: "billing cluster"',
+    'valid_from: "2026-07-01T00:00:00.000Z"',
+    'valid_to: null',
+    'confidence: 1',
+  ];
+  await writeEntry(
+    path.join(f.team, 'structured-old.md'),
+    [...common, 'value: "cluster-alpha"', 'observed_at: "2026-07-01T00:00:00.000Z"', 'supersedes: []'],
+    'ZXSTRUCTURED atlas billing cluster route alpha.',
+  );
+  await writeEntry(
+    path.join(f.team, 'structured-new.md'),
+    [...common, 'value: "cluster-beta"', 'observed_at: "2026-07-02T00:00:00.000Z"', 'supersedes: ["memory/scopes/team/structured-old.md"]'],
+    'ZXSTRUCTURED atlas billing cluster route beta.',
+  );
+  reindex(f.memoryRoot, f.stateRoot, f.home);
+
+  const prompt = 'what is the ZXSTRUCTURED atlas billing cluster route?';
+  const h = hook(prompt, f.memoryRoot, f.stateRoot, f.home, { IHOW_RECALL_EXPLAIN: '1' }).json;
+  const p = preview(prompt, f.memoryRoot, f.stateRoot, f.home);
+  const c = contextProbe(prompt, f.memoryRoot, f.stateRoot, f.cwd, f.home);
+  const expected = ['memory/scopes/team/structured-new.md'];
+  assert.deepEqual(h.structuredContent.included.map((item) => item.path), expected);
+  assert.deepEqual(p.included.map((item) => item.path), expected);
+  assert.deepEqual(c.citations, expected);
+  assert.equal(h.structuredContent.excluded.counts.superseded, 1);
 });

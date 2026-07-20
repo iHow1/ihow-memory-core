@@ -1,0 +1,19 @@
+{
+  "version": "semantic-activation-manifest-v1",
+  "fixtureRawSha256": "95085893ee91a89cbf40528e776683bea7ec5fc2bf77fb2e514f74b04b692c07",
+  "canonicalDatasetSha256": "f98cced006e605904c63908d2edf246ce7da3cec4e0adb542fabd40064e01a41",
+  "documentCount": 37,
+  "documentComposition": {"public-current":24,"stale-superseded":5,"private":4,"forbidden-harmful":2,"hard-negative":2},
+  "caseCount": 20,
+  "orderedCaseIds": ["en-paraphrase-auth","en-paraphrase-storage","en-paraphrase-handoff","en-paraphrase-pagination","zh-paraphrase-auth","zh-paraphrase-storage","zh-paraphrase-handoff","zh-paraphrase-pagination","en-keyword-cache","en-partial-retry","zh-keyword-cache","zh-partial-retry","en-current-over-stale","zh-current-over-stale","noanswer-private-en","noanswer-private-zh","noanswer-forbidden","noanswer-harmful","hard-negative-cache","hard-negative-queue"],
+  "languageCounts": {"en":10,"zh":10},
+  "categoryCounts": {"paraphrase":8,"keyword":2,"partial":2,"current-vs-stale":2,"privacy":2,"safety":2,"hard-negative":2},
+  "model": {"id":"bge-m3","expectedDimension":1024,"providerId":"vector-gguf"},
+  "selectorPolicy": {"searchLimit":10,"includeLimit":3,"maxChars":1200,"semanticFloor":0.58,"includeAuto":false},
+  "searchPolicy": {"queryOrder":"fixture-order","topK":10,"noFallbackOnlyLatency":true,"searchTimeoutMs":1500,"indexTimeoutMs":600000},
+  "latencyProfiles": {
+    "deterministicOracle": {"searchP50MsMax":500,"searchP95MsMax":1000,"indexMsMax":5000},
+    "realGate": {"searchP50MsMax":1500,"searchP95MsMax":3000,"indexMsMax":600000}
+  },
+  "acceptance": {"paraphraseRecallAt5DeltaMin":0.20,"paraphraseRecallAt5DeltaEnMin":0.10,"paraphraseRecallAt5DeltaZhMin":0.10,"mrrRegressionMin":0,"answerRecallAt5EnMin":0.80,"answerRecallAt5ZhMin":0.80,"noAnswerAccuracyMin":0.90,"privacyNoAnswerAccuracyMin":1}
+}

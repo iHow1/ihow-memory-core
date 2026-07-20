@@ -28,9 +28,18 @@ import { engineStatus, indexWithEngineFallback, resolveEngineConfig, searchWithE
 import { recallReadiness } from './recall-readiness.ts';
 import { filterForgotten, forgetPath, listForgotten, rememberPath } from './forget.ts';
 import type { ForgetOutcome, RememberOutcome } from './forget.ts';
-import { organizeDraft, exportVaultFromDraft } from './gardener.ts';
-import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraftOptions } from './gardener.ts';
+import { organizeDraft, organizeReportTick, exportVaultFromDraft } from './gardener.ts';
+import type { ExportVaultOptions, ExportVaultResult, GardenerDraft, OrganizeDraftOptions, OrganizeReportTickOptions, OrganizeReportTickResult } from './gardener.ts';
 import { checkpointProtectionState, createCheckpointService, type CheckpointService } from './checkpoints.ts';
+import { proposeMemoryV1, type MemoryProposalRequestV1, type MemoryProposalResultV1 } from './memory-proposals.ts';
+import { createTurnReceiptService, type TurnReceiptService } from './turn-receipts.ts';
+import {
+  createCaptureIntentService,
+  type CaptureIntentRecoveryResultV1,
+  type CaptureTurnDeltaOptionsV1,
+  type CaptureTurnDeltaResultV1,
+  type MemoryDeltaV1,
+} from './capture-intents.ts';
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -49,9 +58,16 @@ export type MemoryCore = {
   remember(needle: string, opts?: { actor?: string }): Promise<RememberOutcome>;
   forgotten(): Promise<Array<{ path: string; snippet: string }>>;
   organize(opts?: OrganizeDraftOptions): Promise<GardenerDraft>;
+  organize_tick(opts?: OrganizeReportTickOptions): Promise<OrganizeReportTickResult>;
   export_vault(fromDraft: string, opts?: ExportVaultOptions): Promise<ExportVaultResult>;
+  // alpha.29: explicit, bounded, review-first formation. This path never calls write_candidate/auto-promote/indexing.
+  propose_memory(request: MemoryProposalRequestV1): Promise<MemoryProposalResultV1[]>;
   // alpha.27 Stage 2: bounded checkpoint core only. No hooks, continue integration, UX, or implicit promotion.
   checkpoints: CheckpointService;
+  // Deterministic per-logical-turn loss evidence. No host adapter or model invocation lives here.
+  turnReceipts: TurnReceiptService;
+  captureTurnDelta(input: MemoryDeltaV1, options?: CaptureTurnDeltaOptionsV1): Promise<CaptureTurnDeltaResultV1>;
+  recoverCaptureIntents(): Promise<CaptureIntentRecoveryResultV1>;
 };
 
 function excerpt(content: string, max = 300): string {
@@ -63,10 +79,15 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
   const workspace = await ensureWorkspace(resolveWorkspace(options));
   const engineConfig = resolveEngineConfig(options);
   const checkpoints = await createCheckpointService(workspace, options);
+  const turnReceipts = createTurnReceiptService(workspace);
+  const captureIntents = createCaptureIntentService(workspace, turnReceipts);
 
   return {
     workspace,
     checkpoints,
+    turnReceipts,
+    captureTurnDelta: captureIntents.captureTurnDelta,
+    recoverCaptureIntents: captureIntents.recoverCaptureIntents,
     async search(query, opts = {}) {
       if (typeof query !== 'string' || !query.trim()) return [];
       const hits = (await searchWithEngineFallback(workspace, engineConfig, query, opts)).hits;
@@ -246,8 +267,14 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     async organize(opts = {}) {
       return await organizeDraft(workspace, opts);
     },
+    async organize_tick(opts = {}) {
+      return await organizeReportTick(workspace, opts);
+    },
     async export_vault(fromDraft, opts = {}) {
       return await exportVaultFromDraft(workspace, fromDraft, opts);
+    },
+    async propose_memory(request) {
+      return await proposeMemoryV1(workspace, request);
     },
   };
 }

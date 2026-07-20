@@ -32,6 +32,102 @@ export type Workspace = {
   lockPath: string;
 };
 
+export type TurnReceiptDeltaStateV1 = 'explicit_none' | 'not_emitted' | 'extraction_failed' | 'emitted';
+
+export type TurnReceiptDeltaLinkageV1 = {
+  deltaId: string;
+  deltaHash: string;
+  proposalId: string;
+};
+
+export type TurnReceiptIdentityV1 = {
+  runtime: string;
+  projectId: string;
+  sessionHash: string;
+  turnId: string;
+  revision: number;
+};
+
+export type TurnReceiptV1 = TurnReceiptIdentityV1 & {
+  schemaVersion: 1;
+  state: 'OPEN' | 'COMMITTED';
+  inputSourceHash: string;
+  inputContentSha256: string;
+  openedAt: string;
+  finalSourceHash?: string;
+  finalContentSha256?: string;
+  committedAt?: string;
+  deltaState: TurnReceiptDeltaStateV1;
+  deltaLinkage?: TurnReceiptDeltaLinkageV1;
+};
+
+export type TurnReceiptOpenInputV1 = TurnReceiptIdentityV1 & {
+  schemaVersion: 1;
+  inputSourceHash: string;
+  inputContentSha256: string;
+  openedAt: string;
+};
+
+export type TurnReceiptCommitInputV1 = TurnReceiptIdentityV1 & {
+  schemaVersion: 1;
+  inputSourceHash: string;
+  inputContentSha256: string;
+  finalSourceHash: string;
+  finalContentSha256: string;
+  committedAt: string;
+  deltaState: TurnReceiptDeltaStateV1;
+  deltaLinkage?: TurnReceiptDeltaLinkageV1;
+};
+
+export type TurnReceiptProjectionBindingV1 = {
+  runtime: string;
+  projectId: string;
+  sessionHash: string;
+};
+
+export type TurnReceiptListOptions = {
+  offset?: number;
+  limit?: number;
+  currentOnly?: boolean;
+  runtime?: string;
+  projectId?: string;
+  sessionHash?: string;
+};
+
+export type TurnReceiptKnownClosedPreconditionV1 = {
+  schemaVersion: 1;
+  binding: TurnReceiptProjectionBindingV1;
+  requiredStatus: 'known_closed';
+  expectedSnapshotSha256: string;
+};
+
+export type TurnReceiptKnownCoverageV1 =
+  | {
+      status: 'unknown';
+      reasonCode: 'turn_receipt_no_known_receipts';
+      knownReceiptCount: 0;
+      gapCount: 0;
+    }
+  | {
+      status: 'partial';
+      reasonCode: 'turn_receipt_known_gaps';
+      knownReceiptCount: number;
+      gapCount: number;
+    }
+  | {
+      status: 'known_closed';
+      reasonCode: 'turn_receipt_all_known_receipts_closed';
+      knownReceiptCount: number;
+      gapCount: 0;
+      snapshotSha256: string;
+    };
+
+export type TurnReceiptPageV1 = {
+  items: TurnReceiptV1[];
+  total: number;
+  nextOffset: number | null;
+};
+
 export type Citation = {
   path: string;
   snippet: string;
@@ -67,6 +163,7 @@ export type RetrievalEngineStatus = {
   model: string | null;
   ready: boolean;
   cloud: boolean;
+  dimension?: number;
   lastError?: string;
 };
 

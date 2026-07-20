@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fuseRrf, isSemanticSourced, semanticRecallFloor } from '../src/engine/retrieval.ts';
+import { fuseRrf, isSemanticSourced, orderSupersededHits, semanticRecallFloor } from '../src/engine/retrieval.ts';
 import { openCore } from '../src/core.ts';
 
 const hit = (p, snippet = p) => ({ path: p, score: 1, snippet, citation: { path: p, snippet } });
@@ -93,6 +93,145 @@ test('fuseRrf preserves the semantic cosine as semanticScore — including on a 
 test('fuseRrf: a mislabeled vector-lane hit (source fts/unknown) stamps NO semanticScore (fail-closed)', () => {
   const fused = fuseRrf([], [{ ...hit('a'), score: 0.9, source: 'fts' }, { ...hit('b'), score: 0.9, source: 'weird' }], 10);
   assert.ok(fused.every((h) => h.semanticScore === undefined), 'only a semantic-sourced lane may stamp evidence');
+});
+
+test('fuseRrf weights only the recognized semantic lane at frozen 1.25: vector-only rank3 enters top5', () => {
+  const fts = ['f1', 'f2', 'f3', 'f4', 'f5'].map((p) => ({ ...hit(p), source: 'fts' }));
+  const vec = ['v1', 'v2', 'semantic-rank3'].map((p, i) => ({ ...hit(p), score: 0.9 - i * 0.01, source: 'vector-gguf' }));
+  assert.deepEqual(fuseRrf(fts, vec, 5).map((h) => h.path), ['v1', 'v2', 'semantic-rank3', 'f1', 'f2']);
+
+  const mislabeled = vec.map((h) => ({ ...h, source: 'unknown' }));
+  assert.deepEqual(fuseRrf(fts, mislabeled, 5).map((h) => h.path), ['f1', 'v1', 'f2', 'v2', 'f3']);
+  assert.ok(fuseRrf(fts, mislabeled, 10).every((h) => h.semanticScore === undefined));
+});
+
+async function writeDoc(spaceDir, rel, frontmatter, body = 'body') {
+  const abs = path.join(spaceDir, rel);
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  await fs.writeFile(abs, `---\n${frontmatter}\n---\n\n${body}`);
+}
+
+test('orderSupersededHits moves an existing current document immediately before its stale document, stably', async (t) => {
+  const spaceDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-supersession-')));
+  t.after(() => fs.rm(spaceDir, { recursive: true, force: true }));
+  await writeDoc(spaceDir, 'memory/stale.md', 'document_id: stale\nsuperseded_by: current');
+  await writeDoc(spaceDir, 'memory/current.md', 'document_id: current');
+  await writeDoc(spaceDir, 'memory/unrelated.md', 'document_id: unrelated');
+  const hits = [hit('memory/stale.md'), hit('memory/unrelated.md'), hit('memory/current.md')];
+  const ordered = await orderSupersededHits({ spaceDir }, hits, 3);
+  assert.deepEqual(ordered.map((h) => h.path), ['memory/current.md', 'memory/stale.md', 'memory/unrelated.md']);
+  assert.deepEqual(new Set(ordered), new Set(hits), 'no hit is introduced, removed, cloned, or mutated');
+});
+
+test('orderSupersededHits never demotes a current document that already ranks before stale', async (t) => {
+  const spaceDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-supersession-current-first-')));
+  t.after(() => fs.rm(spaceDir, { recursive: true, force: true }));
+  await writeDoc(spaceDir, 'memory/current.md', 'document_id: current');
+  await writeDoc(spaceDir, 'memory/stale.md', 'document_id: stale\nsuperseded_by: current');
+  for (let i = 0; i < 8; i++) await writeDoc(spaceDir, `memory/unrelated-${i}.md`, `document_id: unrelated-${i}`);
+
+  const current = hit('memory/current.md');
+  const stale = hit('memory/stale.md');
+  const unrelated = Array.from({ length: 8 }, (_, i) => hit(`memory/unrelated-${i}.md`));
+  for (const original of [
+    [current, unrelated[0], stale],
+    [current, ...unrelated, stale],
+    [current, stale, ...unrelated],
+  ]) {
+    const before = [...original];
+    const ordered = await orderSupersededHits({ spaceDir }, original, original.length);
+    assert.deepEqual(ordered, before, 'rank and object order must remain byte-for-byte/object-order identical');
+    assert.deepEqual(original, before, 'input order must not be mutated');
+  }
+});
+
+test('orderSupersededHits fails open on malformed/duplicate/self/cycle metadata and unsafe paths', async (t) => {
+  const spaceDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-supersession-bad-')));
+  t.after(() => fs.rm(spaceDir, { recursive: true, force: true }));
+  await writeDoc(spaceDir, 'memory/a.md', 'document_id: a\nsuperseded_by: b');
+  await writeDoc(spaceDir, 'memory/b.md', 'document_id: b\nsuperseded_by: a');
+  const cyclic = [hit('memory/a.md'), hit('memory/b.md')];
+  assert.deepEqual(await orderSupersededHits({ spaceDir }, cyclic, 2), cyclic);
+
+  await writeDoc(spaceDir, 'memory/dup1.md', 'document_id: duplicate');
+  await writeDoc(spaceDir, 'memory/dup2.md', 'document_id: duplicate');
+  const duplicate = [hit('memory/dup1.md'), hit('memory/dup2.md')];
+  assert.deepEqual(await orderSupersededHits({ spaceDir }, duplicate, 2), duplicate);
+
+  await writeDoc(spaceDir, 'memory/self.md', 'document_id: self\nsuperseded_by: self');
+  const self = [hit('memory/self.md')];
+  assert.deepEqual(await orderSupersededHits({ spaceDir }, self, 1), self);
+
+  const outside = path.join(spaceDir, '..', `ihow-supersession-outside-${path.basename(spaceDir)}.md`);
+  await fs.writeFile(outside, '---\ndocument_id: outside\n---\n');
+  t.after(() => fs.rm(outside, { force: true }));
+  await fs.mkdir(path.join(spaceDir, 'memory', 'links'), { recursive: true });
+  await fs.symlink(outside, path.join(spaceDir, 'memory', 'links', 'escape.md'));
+  const symlinkEscape = [hit('memory/links/escape.md')];
+  assert.deepEqual(await orderSupersededHits({ spaceDir }, symlinkEscape, 1), symlinkEscape);
+
+  await fs.mkdir(path.join(spaceDir, 'memory', 'oversized'), { recursive: true });
+  await fs.writeFile(
+    path.join(spaceDir, 'memory', 'oversized', 'open.md'),
+    `---\ndocument_id: oversized\n${'x'.repeat(17 * 1024)}`,
+  );
+  const oversized = [hit('memory/oversized/open.md')];
+  assert.deepEqual(await orderSupersededHits({ spaceDir }, oversized, 1), oversized);
+
+  const unsafe = [hit('../escape.md'), hit('/absolute.md'), hit('memory/missing.md')];
+  assert.deepEqual(await orderSupersededHits({ spaceDir }, unsafe, 3), unsafe);
+});
+
+test('orderSupersededHits accepts only an exact frontmatter closing delimiter line', async (t) => {
+  const spaceDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-supersession-delimiter-')));
+  t.after(() => fs.rm(spaceDir, { recursive: true, force: true }));
+  const current = hit('memory/current.md');
+  await writeDoc(spaceDir, current.path, 'document_id: current');
+
+  const malformedClosers = [
+    '---invalid\n',
+    '--- #comment\n',
+    '--- trailing-characters\n',
+    '---invalid\r\n',
+    '--- #comment\r\n',
+    '--- trailing-characters\r\n',
+  ];
+  for (const [index, closer] of malformedClosers.entries()) {
+    const stale = hit(`memory/stale-${index}.md`);
+    await fs.writeFile(
+      path.join(spaceDir, stale.path),
+      `---\r\ndocument_id: stale-${index}\r\nsuperseded_by: current\r\n${closer}\r\nbody`,
+    );
+    const original = [stale, current];
+    assert.deepEqual(
+      await orderSupersededHits({ spaceDir }, original, 2),
+      original,
+      `malformed closer ${JSON.stringify(closer)} must fail open`,
+    );
+  }
+
+  for (const [index, closer] of ['---\n', '---\r\n', '---', '---\r'].entries()) {
+    const stale = hit(`memory/valid-stale-${index}.md`);
+    await fs.writeFile(
+      path.join(spaceDir, stale.path),
+      `---\r\ndocument_id: valid-stale-${index}\r\nsuperseded_by: current\r\n${closer}`,
+    );
+    assert.deepEqual(
+      (await orderSupersededHits({ spaceDir }, [stale, current], 2)).map((item) => item.path),
+      [current.path, stale.path],
+      `exact closer ${JSON.stringify(closer)} must be accepted`,
+    );
+  }
+});
+
+test('default lexical search never reads supersession metadata', async (t) => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-supersession-lexical-')));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const core = await openCore({ root, space: 'lexical' });
+  await core.journal({ text: 'lexical-only relation metadata sentinel', sourceAgent: 'test' });
+  await fs.symlink('/definitely/outside/ihow-memory', path.join(core.workspace.memoryDir, 'broken-link.md'));
+  const hits = await core.search('relation metadata sentinel', { limit: 5 });
+  assert.ok(hits.length > 0, 'pure FTS path remains available despite unrelated unreadable metadata');
 });
 
 test('semanticRecallFloor: measured models only; env override wins; unmeasured models fail closed', () => {

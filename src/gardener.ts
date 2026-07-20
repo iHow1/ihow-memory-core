@@ -7,6 +7,7 @@ import type { JsonRecord, Workspace } from './types.ts';
 import { appendEvent } from './store/events.ts';
 import { atomicWriteFile, listMarkdownFiles, safeFileSlug } from './store/files.ts';
 import { containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
+import { withWorkspaceLock } from './store/lock.ts';
 import { relativeToSpace } from './workspace.ts';
 
 export type GardenerEvidence = {
@@ -70,6 +71,27 @@ export type OrganizeDraftOptions = {
   scope?: string;
   since?: string;
   actor?: string;
+};
+
+export type OrganizeReportTickOptions = OrganizeDraftOptions & {
+  ttlMs?: number;
+  nowMs?: number;
+};
+
+export type OrganizeReportTickResult = {
+  schema_version: 'alpha31.gardener-report-tick.v1';
+  status: 'created' | 'reused';
+  run_id: string;
+  draft_id: string;
+  draft_path: string;
+  source_manifest_sha256: string;
+  window_started_at: string;
+  expires_at: string;
+  safety: {
+    mode: 'report-only';
+    authority_writes: 0;
+    rollback_required: false;
+  };
 };
 
 export type ExportVaultBlockedItemsPolicy = 'fail-closed';
@@ -137,6 +159,14 @@ function draftDir(workspace: Workspace): string {
 
 function exportRoot(workspace: Workspace): string {
   return path.join(gardenerRoot(workspace), 'exports');
+}
+
+function runRoot(workspace: Workspace): string {
+  return path.join(gardenerRoot(workspace), 'runs');
+}
+
+function reportTickPath(workspace: Workspace, runId: string): string {
+  return path.join(runRoot(workspace), `${safeFileSlug(runId, 'run')}.json`);
 }
 
 export function gardenerDraftPath(workspace: Workspace, draftId: string): string {
@@ -357,7 +387,16 @@ function draftHashPayload(draft: Omit<GardenerDraft, 'draft_id' | 'created_at' |
   return stableStringify(draft);
 }
 
-export async function organizeDraft(workspace: Workspace, opts: OrganizeDraftOptions = {}): Promise<GardenerDraft> {
+function storedDraftBase(draft: GardenerDraft): Omit<GardenerDraft, 'draft_id' | 'created_at' | 'audit_event_id' | 'draft_path'> {
+  const { draft_id: _draftId, created_at: _createdAt, audit_event_id: _auditEventId, draft_path: _draftPath, ...base } = draft;
+  return base;
+}
+
+async function buildDraftBase(workspace: Workspace, opts: OrganizeDraftOptions): Promise<{
+  base: Omit<GardenerDraft, 'draft_id' | 'created_at' | 'audit_event_id' | 'draft_path'>;
+  draftId: string;
+  read: Awaited<ReturnType<typeof readSourceCandidates>>;
+}> {
   const scope = (opts.scope || 'project').trim().toLowerCase() || 'project';
   const read = await readSourceCandidates(workspace, { ...opts, scope });
   const { items, flags } = buildItemsAndFlags(read.candidates);
@@ -387,18 +426,26 @@ export async function organizeDraft(workspace: Workspace, opts: OrganizeDraftOpt
       out_of_scope_sources_excluded: read.outOfScopeExcluded,
     },
   };
-  const draftId = stableId('draft', draftHashPayload(base)).replace(/^draft_/, 'gdr_');
+  return { base, draftId: stableId('draft', draftHashPayload(base)).replace(/^draft_/, 'gdr_'), read };
+}
+
+async function persistDraft(
+  workspace: Workspace,
+  opts: OrganizeDraftOptions,
+  built: Awaited<ReturnType<typeof buildDraftBase>>,
+): Promise<GardenerDraft> {
+  const { base, draftId } = built;
   const event = await appendEvent(workspace, {
     type: 'memory.organized',
     actor: opts.actor || 'gardener',
     metadata: {
       draftId,
-      scope,
+      scope: base.scope_label,
       mode: 'review-first',
-      decisionsFacts: decisionsFacts.length,
-      nextActionsOpenQuestions: nextActions.length,
-      duplicateStaleFlags: flags.length,
-      outOfScopeSourcesExcluded: read.outOfScopeExcluded,
+      decisionsFacts: base.decisions_facts.length,
+      nextActionsOpenQuestions: base.next_actions_open_questions.length,
+      duplicateStaleFlags: base.duplicate_stale_flags.length,
+      outOfScopeSourcesExcluded: base.safety.out_of_scope_sources_excluded,
       curatedRewrite: false,
     },
   });
@@ -412,6 +459,90 @@ export async function organizeDraft(workspace: Workspace, opts: OrganizeDraftOpt
   };
   await atomicWriteFile(draftPathAbs, `${JSON.stringify(draft, null, 2)}\n`, workspace.spaceDir);
   return draft;
+}
+
+export async function organizeDraft(workspace: Workspace, opts: OrganizeDraftOptions = {}): Promise<GardenerDraft> {
+  return await persistDraft(workspace, opts, await buildDraftBase(workspace, opts));
+}
+
+export async function organizeReportTick(
+  workspace: Workspace,
+  opts: OrganizeReportTickOptions = {},
+): Promise<OrganizeReportTickResult> {
+  const rawTtlMs = Number.isFinite(opts.ttlMs) ? Math.trunc(opts.ttlMs as number) : 3_600_000;
+  const ttlMs = Math.max(1_000, Math.min(7 * 86_400_000, rawTtlMs));
+  const nowMs = Number.isFinite(opts.nowMs) ? Math.trunc(opts.nowMs as number) : Date.now();
+  const windowStartMs = Math.floor(nowMs / ttlMs) * ttlMs;
+  const built = await buildDraftBase(workspace, opts);
+  const sourceManifestSha256 = sha256(stableStringify(built.base.sources.map((source) => ({
+    source: source.source,
+    sha256: source.sha256,
+    lines: source.lines,
+    visibility: source.visibility,
+  }))));
+  const runId = stableId('run', stableStringify({
+    scope: built.base.scope_label,
+    since: built.base.source_window.since,
+    sourceManifestSha256,
+    draftId: built.draftId,
+    windowStartMs,
+    ttlMs,
+  }));
+  const receiptPath = reportTickPath(workspace, runId);
+
+  return await withWorkspaceLock(workspace, async () => {
+    try {
+      const existing = JSON.parse(await fs.readFile(receiptPath, 'utf8')) as OrganizeReportTickResult;
+      const canonicalDraftPath = relativeToSpace(workspace, gardenerDraftPath(workspace, built.draftId));
+      const valid = existing.schema_version === 'alpha31.gardener-report-tick.v1'
+        && existing.run_id === runId
+        && existing.source_manifest_sha256 === sourceManifestSha256
+        && existing.safety?.mode === 'report-only'
+        && existing.safety?.authority_writes === 0
+        && existing.safety?.rollback_required === false
+        && existing.draft_id === built.draftId
+        && existing.draft_path === canonicalDraftPath;
+      if (!valid) throw new Error('gardener_report_receipt_invalid');
+      try {
+        const draft = JSON.parse(await fs.readFile(gardenerDraftPath(workspace, built.draftId), 'utf8')) as GardenerDraft;
+        const computedDraftId = stableId('draft', draftHashPayload(storedDraftBase(draft))).replace(/^draft_/, 'gdr_');
+        if (draft.draft_id !== existing.draft_id || draft.mode !== 'review-first' || computedDraftId !== existing.draft_id) {
+          throw new Error('gardener_report_draft_invalid');
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('gardener_report_draft_missing');
+        throw error;
+      }
+      return {
+        schema_version: 'alpha31.gardener-report-tick.v1',
+        status: 'reused',
+        run_id: runId,
+        draft_id: built.draftId,
+        draft_path: canonicalDraftPath,
+        source_manifest_sha256: sourceManifestSha256,
+        window_started_at: new Date(windowStartMs).toISOString(),
+        expires_at: new Date(windowStartMs + ttlMs).toISOString(),
+        safety: { mode: 'report-only', authority_writes: 0, rollback_required: false },
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+
+    const draft = await persistDraft(workspace, opts, built);
+    const receipt: OrganizeReportTickResult = {
+      schema_version: 'alpha31.gardener-report-tick.v1',
+      status: 'created',
+      run_id: runId,
+      draft_id: draft.draft_id,
+      draft_path: draft.draft_path,
+      source_manifest_sha256: sourceManifestSha256,
+      window_started_at: new Date(windowStartMs).toISOString(),
+      expires_at: new Date(windowStartMs + ttlMs).toISOString(),
+      safety: { mode: 'report-only', authority_writes: 0, rollback_required: false },
+    };
+    await atomicWriteFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, workspace.spaceDir);
+    return receipt;
+  });
 }
 
 async function readDraft(workspace: Workspace, draftId: string): Promise<GardenerDraft> {

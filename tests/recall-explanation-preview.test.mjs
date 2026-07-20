@@ -103,7 +103,7 @@ test('alpha26 recall explanation includes reviewed relevant citation/tier/reason
   const env = { HOME: home, IHOW_MEMORY_HOME: home, IHOW_MEMORY_STATE_ROOT: stateRoot };
   reindex(memoryRoot, stateRoot, env);
 
-  const prompt = 'Explain ZXPREVIEWALPHA and also check ZXPREVIEWFLAGGED ZXPREVIEWPRIVATE ZXPREVIEWAUDIT';
+  const prompt = 'ZXPREVIEWALPHA decision orionwidget ZXPREVIEWFLAGGED ZXPREVIEWPRIVATE ZXPREVIEWAUDIT';
   const explanation = await explainPromptRecall({ memoryRoot, stateRoot }, prompt);
   assert.equal(explanation.version, 'alpha26-recall-explanation-v0');
   assert.equal(explanation.mode, 'lexical/FTS only');

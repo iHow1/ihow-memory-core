@@ -1,0 +1,877 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 iHow Memory
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
+import { openCore } from '../src/core.ts';
+
+const execFileAsync = promisify(execFile);
+const CORE_MODULE_URL = new URL('../src/core.ts', import.meta.url).href;
+
+function expectedSourceHash(rawSourceId) {
+  return `sha256:${crypto.createHash('sha256')
+    .update('turn-receipt-source-v1\0')
+    .update(rawSourceId)
+    .digest('hex')}`;
+}
+
+const INPUT_SOURCE_HASH = expectedSourceHash('host-inputs/turn-001');
+const FINAL_SOURCE_HASH = expectedSourceHash('host-transcript/turn-001/revision-1');
+const DELTA_LINKAGE = Object.freeze({
+  deltaId: `ci1_${'c'.repeat(64)}`,
+  deltaHash: 'd'.repeat(64),
+  proposalId: `mp1_${'e'.repeat(64)}`,
+});
+
+async function createTestCore(t) {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-turn-receipts-')));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  return await openCore({ root, cwd: root, space: 'turn-receipts-test' });
+}
+
+const BASE_IDENTITY = Object.freeze({
+  runtime: 'hermes',
+  projectId: '1'.repeat(64),
+  sessionHash: '2'.repeat(64),
+  turnId: 'turn-001',
+  revision: 1,
+});
+
+function openInput(identity = BASE_IDENTITY, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    ...identity,
+    inputSourceHash: INPUT_SOURCE_HASH,
+    inputContentSha256: 'a'.repeat(64),
+    openedAt: '2026-07-17T12:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function commitInput(identity = BASE_IDENTITY, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    ...identity,
+    inputSourceHash: INPUT_SOURCE_HASH,
+    inputContentSha256: 'a'.repeat(64),
+    finalSourceHash: FINAL_SOURCE_HASH,
+    finalContentSha256: 'b'.repeat(64),
+    committedAt: '2026-07-17T12:00:03.000Z',
+    deltaState: 'explicit_none',
+    ...overrides,
+  };
+}
+
+function receiptPaths(core) {
+  const directory = path.join(core.workspace.spaceDir, 'turn-receipts');
+  return { directory, file: path.join(directory, 'v1.json') };
+}
+
+function storedOpenReceipt(identity, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    state: 'OPEN',
+    ...identity,
+    inputSourceHash: expectedSourceHash(`input/${identity.turnId}/${identity.revision}`),
+    inputContentSha256: 'a'.repeat(64),
+    openedAt: '2026-07-17T12:00:00.000Z',
+    deltaState: 'not_emitted',
+    ...overrides,
+  };
+}
+
+function storedCommittedReceipt(identity, overrides = {}) {
+  return {
+    ...storedOpenReceipt(identity),
+    state: 'COMMITTED',
+    finalSourceHash: expectedSourceHash(`final/${identity.turnId}/${identity.revision}`),
+    finalContentSha256: 'b'.repeat(64),
+    committedAt: '2026-07-17T12:00:03.000Z',
+    deltaState: 'explicit_none',
+    ...overrides,
+  };
+}
+
+async function plantStore(core, receipts) {
+  const { directory, file } = receiptPaths(core);
+  await fs.mkdir(directory, { mode: 0o700 });
+  const bytes = Buffer.from(`${JSON.stringify({ schemaVersion: 1, receipts }, null, 2)}\n`);
+  await fs.writeFile(file, bytes, { mode: 0o600 });
+  return { directory, file, bytes };
+}
+
+function receiptKey(receipt) {
+  return [receipt.runtime, receipt.projectId, receipt.sessionHash, receipt.turnId, receipt.revision].join(':');
+}
+
+async function collectPages(fetchPage, options = {}, limit = 23) {
+  const items = [];
+  let offset = 0;
+  let expectedTotal;
+  for (;;) {
+    const page = await fetchPage({ ...options, offset, limit });
+    expectedTotal ??= page.total;
+    assert.equal(page.total, expectedTotal);
+    assert.ok(page.items.length <= limit);
+    items.push(...page.items);
+    if (page.nextOffset === null) break;
+    assert.equal(page.nextOffset, offset + page.items.length);
+    assert.ok(page.nextOffset > offset);
+    offset = page.nextOffset;
+  }
+  assert.equal(items.length, expectedTotal);
+  assert.equal(new Set(items.map(receiptKey)).size, items.length);
+  return items;
+}
+
+test('creates an OPEN receipt and reads/lists the durable receipt', async (t) => {
+  const core = await createTestCore(t);
+  const receipt = await core.turnReceipts.open({
+    schemaVersion: 1,
+    ...BASE_IDENTITY,
+    inputSourceHash: INPUT_SOURCE_HASH,
+    inputContentSha256: 'a'.repeat(64),
+    openedAt: '2026-07-17T12:00:00.000Z',
+  });
+
+  assert.deepEqual(receipt, {
+    schemaVersion: 1,
+    state: 'OPEN',
+    ...BASE_IDENTITY,
+    inputSourceHash: INPUT_SOURCE_HASH,
+    inputContentSha256: 'a'.repeat(64),
+    openedAt: '2026-07-17T12:00:00.000Z',
+    deltaState: 'not_emitted',
+  });
+  assert.deepEqual(await core.turnReceipts.read(BASE_IDENTITY), receipt);
+  assert.deepEqual(await core.turnReceipts.list(), {
+    items: [receipt],
+    total: 1,
+    nextOffset: null,
+  });
+  assert.equal(JSON.stringify(receipt).includes('sessionId'), false);
+});
+
+test('rejects COMMITTED when the identity/revision has no OPEN receipt', async (t) => {
+  const core = await createTestCore(t);
+  await assert.rejects(async () => await core.turnReceipts.commit(commitInput()), /turn_receipt_open_required/);
+});
+
+test('identical replays are idempotent, COMMITTED replaces OPEN, and OPEN cannot regress it', async (t) => {
+  const core = await createTestCore(t);
+  const opened = await core.turnReceipts.open(openInput());
+  assert.deepEqual(await core.turnReceipts.open(openInput()), opened);
+
+  const committed = await core.turnReceipts.commit(commitInput());
+  assert.deepEqual(committed, {
+    ...opened,
+    state: 'COMMITTED',
+    finalSourceHash: FINAL_SOURCE_HASH,
+    finalContentSha256: 'b'.repeat(64),
+    committedAt: '2026-07-17T12:00:03.000Z',
+    deltaState: 'explicit_none',
+  });
+  assert.deepEqual(await core.turnReceipts.commit(commitInput()), committed);
+  assert.deepEqual(await core.turnReceipts.open(openInput()), committed);
+  assert.deepEqual(await core.turnReceipts.read(BASE_IDENTITY), committed);
+  assert.deepEqual((await core.turnReceipts.list()).items, [committed]);
+});
+
+test('same identity/revision with conflicting source or content hashes fails closed', async (t) => {
+  const core = await createTestCore(t);
+  await core.turnReceipts.open(openInput());
+
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput(BASE_IDENTITY, {
+      inputSourceHash: expectedSourceHash('host-inputs/other'),
+    })),
+    /turn_receipt_conflict/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput(BASE_IDENTITY, { inputContentSha256: 'c'.repeat(64) })),
+    /turn_receipt_conflict/,
+  );
+
+  await core.turnReceipts.commit(commitInput());
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(BASE_IDENTITY, {
+      finalSourceHash: expectedSourceHash('host-transcript/other'),
+    })),
+    /turn_receipt_conflict/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(BASE_IDENTITY, { finalContentSha256: 'd'.repeat(64) })),
+    /turn_receipt_conflict/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(BASE_IDENTITY, { deltaState: 'extraction_failed' })),
+    /turn_receipt_conflict/,
+  );
+});
+
+test('supports all delta states and gaps exclude COMMITTED explicit_none and emitted', async (t) => {
+  const core = await createTestCore(t);
+  const identities = {
+    explicit: { ...BASE_IDENTITY, turnId: 'turn-explicit' },
+    notEmitted: { ...BASE_IDENTITY, turnId: 'turn-not-emitted' },
+    failed: { ...BASE_IDENTITY, turnId: 'turn-extraction' },
+    emitted: { ...BASE_IDENTITY, turnId: 'turn-emitted' },
+    open: { ...BASE_IDENTITY, turnId: 'turn-open' },
+  };
+
+  for (const identity of Object.values(identities)) await core.turnReceipts.open(openInput(identity));
+  await core.turnReceipts.commit(commitInput(identities.explicit, { deltaState: 'explicit_none' }));
+  await core.turnReceipts.commit(commitInput(identities.notEmitted, { deltaState: 'not_emitted' }));
+  await core.turnReceipts.commit(commitInput(identities.failed, { deltaState: 'extraction_failed' }));
+  await core.turnReceipts.commit(commitInput(identities.emitted, {
+    deltaState: 'emitted',
+    deltaLinkage: DELTA_LINKAGE,
+  }));
+
+  const allDeltaStates = (await core.turnReceipts.list()).items
+    .filter((receipt) => receipt.state === 'COMMITTED')
+    .map((receipt) => receipt.deltaState)
+    .sort();
+  assert.deepEqual(allDeltaStates, ['emitted', 'explicit_none', 'extraction_failed', 'not_emitted']);
+
+  const gaps = (await core.turnReceipts.gaps()).items;
+  assert.deepEqual(
+    gaps.map((receipt) => `${receipt.turnId}:${receipt.state}:${receipt.deltaState}`).sort(),
+    [
+      'turn-extraction:COMMITTED:extraction_failed',
+      'turn-not-emitted:COMMITTED:not_emitted',
+      'turn-open:OPEN:not_emitted',
+    ],
+  );
+});
+
+test('emitted linkage is exact, state-bound, and part of same-commit idempotency', async (t) => {
+  const core = await createTestCore(t);
+  const missing = { ...BASE_IDENTITY, turnId: 'turn-emitted-missing-linkage' };
+  const forbidden = { ...BASE_IDENTITY, turnId: 'turn-non-emitted-linkage' };
+  const emitted = { ...BASE_IDENTITY, turnId: 'turn-emitted-linkage' };
+  for (const identity of [missing, forbidden, emitted]) await core.turnReceipts.open(openInput(identity));
+
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(missing, { deltaState: 'emitted' })),
+    /turn_receipt_delta_linkage_required/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(forbidden, {
+      deltaState: 'explicit_none',
+      deltaLinkage: DELTA_LINKAGE,
+    })),
+    /turn_receipt_delta_linkage_forbidden/,
+  );
+
+  const committed = await core.turnReceipts.commit(commitInput(emitted, {
+    deltaState: 'emitted',
+    deltaLinkage: DELTA_LINKAGE,
+  }));
+  assert.deepEqual(committed.deltaLinkage, DELTA_LINKAGE);
+  assert.deepEqual(await core.turnReceipts.commit(commitInput(emitted, {
+    deltaState: 'emitted',
+    deltaLinkage: DELTA_LINKAGE,
+  })), committed);
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(emitted, {
+      deltaState: 'emitted',
+      deltaLinkage: { ...DELTA_LINKAGE, deltaHash: 'f'.repeat(64) },
+    })),
+    /turn_receipt_conflict/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(emitted, {
+      deltaState: 'emitted',
+      deltaLinkage: { ...DELTA_LINKAGE, deltaId: `ci1_${'f'.repeat(64)}` },
+    })),
+    /turn_receipt_conflict/,
+  );
+});
+
+test('emitted linkage requires exact three strictly formatted fields', async (t) => {
+  const invalidLinkages = [
+    { deltaHash: DELTA_LINKAGE.deltaHash, proposalId: DELTA_LINKAGE.proposalId },
+    { ...DELTA_LINKAGE, deltaId: `ci1_${'C'.repeat(64)}` },
+    { ...DELTA_LINKAGE, deltaHash: 'D'.repeat(64) },
+    { ...DELTA_LINKAGE, proposalId: `mp1_${'E'.repeat(64)}` },
+    { ...DELTA_LINKAGE, unexpected: true },
+  ];
+  for (const [index, deltaLinkage] of invalidLinkages.entries()) {
+    const core = await createTestCore(t);
+    const identity = { ...BASE_IDENTITY, turnId: `turn-invalid-linkage-${index}` };
+    await core.turnReceipts.open(openInput(identity));
+    await assert.rejects(
+      async () => await core.turnReceipts.commit(commitInput(identity, {
+        deltaState: 'emitted',
+        deltaLinkage,
+      })),
+      /turn_receipt_(?:delta_id|delta_hash|proposal_id|unknown_field)/,
+    );
+  }
+});
+
+test('unknown, missing, malformed, or state-invalid persisted linkage fails closed and preserves exact bytes', async (t) => {
+  const invalidLinkages = [
+    { deltaState: 'emitted', deltaLinkage: { deltaHash: DELTA_LINKAGE.deltaHash, proposalId: DELTA_LINKAGE.proposalId } },
+    { deltaState: 'emitted', deltaLinkage: { ...DELTA_LINKAGE, deltaId: `ci1_${'C'.repeat(64)}` } },
+    { deltaState: 'emitted', deltaLinkage: { ...DELTA_LINKAGE, unexpected: true } },
+    { deltaState: 'explicit_none', deltaLinkage: DELTA_LINKAGE },
+  ];
+  for (const [index, overrides] of invalidLinkages.entries()) {
+    const core = await createTestCore(t);
+    const malformed = storedCommittedReceipt(
+      { ...BASE_IDENTITY, turnId: `turn-persisted-malformed-linkage-${index}` },
+      overrides,
+    );
+    const { file, bytes: before } = await plantStore(core, [malformed]);
+
+    await assert.rejects(
+      async () => await core.turnReceipts.list(),
+      /turn_receipt_(?:store_invalid|delta_id_(?:required|invalid)|unknown_field)/,
+    );
+    const after = await fs.readFile(file);
+    assert.equal(Buffer.compare(after, before), 0);
+  }
+});
+
+test('preserves older revisions in numeric order while currentOnly lists the newest revision', async (t) => {
+  const core = await createTestCore(t);
+  const revision1 = { ...BASE_IDENTITY, turnId: 'turn-revised', revision: 1 };
+  const revision2 = { ...revision1, revision: 2 };
+  const revision10 = { ...revision1, revision: 10 };
+
+  const opened1 = await core.turnReceipts.open(openInput(revision1));
+  const committed1 = await core.turnReceipts.commit(commitInput(revision1));
+  const opened2 = await core.turnReceipts.open(openInput(revision2, {
+    inputSourceHash: expectedSourceHash('host-inputs/turn-revised/revision-2'),
+    inputContentSha256: 'c'.repeat(64),
+    openedAt: '2026-07-17T12:01:00.000Z',
+  }));
+  const opened10 = await core.turnReceipts.open(openInput(revision10, {
+    inputSourceHash: expectedSourceHash('host-inputs/turn-revised/revision-10'),
+    inputContentSha256: 'd'.repeat(64),
+    openedAt: '2026-07-17T12:02:00.000Z',
+  }));
+
+  assert.equal(opened1.revision, 1);
+  assert.equal(opened2.revision, 2);
+  assert.deepEqual(await core.turnReceipts.read(revision1), committed1);
+  assert.deepEqual((await core.turnReceipts.list()).items.map((receipt) => receipt.revision), [1, 2, 10]);
+  assert.deepEqual((await core.turnReceipts.list({ currentOnly: true })).items, [opened10]);
+});
+
+test('list and gaps project exactly one runtime/project/session binding before pagination and current revision selection', async (t) => {
+  const core = await createTestCore(t);
+  const targetBinding = {
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  };
+  const identities = [
+    { ...targetBinding, turnId: 'target-open', revision: 1 },
+    { ...targetBinding, turnId: 'target-revised', revision: 1 },
+    { ...targetBinding, turnId: 'target-revised', revision: 2 },
+    { ...targetBinding, projectId: '3'.repeat(64), turnId: 'other-project', revision: 1 },
+    { ...targetBinding, sessionHash: '4'.repeat(64), turnId: 'other-session', revision: 1 },
+    { ...targetBinding, runtime: 'codex', turnId: 'other-runtime', revision: 1 },
+  ];
+  for (const identity of identities) {
+    await core.turnReceipts.open(openInput(identity, {
+      inputSourceHash: expectedSourceHash(`projection/${identity.turnId}/${identity.revision}`),
+      openedAt: `2026-07-17T12:00:0${identity.revision}.000Z`,
+    }));
+  }
+  await core.turnReceipts.commit(commitInput(identities[1], {
+    inputSourceHash: expectedSourceHash('projection/target-revised/1'),
+    deltaState: 'not_emitted',
+  }));
+
+  const projected = await core.turnReceipts.list({
+    ...targetBinding,
+    currentOnly: true,
+    offset: 0,
+    limit: 1,
+  });
+  assert.equal(projected.total, 2, 'total is computed after exact binding and current-revision projection');
+  assert.equal(projected.items.length, 1);
+  assert.equal(projected.nextOffset, 1);
+  assert.ok(projected.items.every((receipt) => (
+    receipt.runtime === targetBinding.runtime
+    && receipt.projectId === targetBinding.projectId
+    && receipt.sessionHash === targetBinding.sessionHash
+  )));
+
+  const gaps = await core.turnReceipts.gaps({ ...targetBinding, currentOnly: true });
+  assert.deepEqual(
+    gaps.items.map((receipt) => `${receipt.turnId}:${receipt.revision}`).sort(),
+    ['target-open:1', 'target-revised:2'],
+  );
+  assert.equal(gaps.total, 2);
+  assert.equal(gaps.nextOffset, null);
+});
+
+test('receipt projection is all-or-none and rejects malformed or attacker-controlled binding fields', async (t) => {
+  const core = await createTestCore(t);
+  const exact = {
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  };
+  for (const options of [
+    { runtime: exact.runtime },
+    { projectId: exact.projectId },
+    { sessionHash: exact.sessionHash },
+    { runtime: exact.runtime, projectId: exact.projectId },
+    { ...exact, runtime: 'hermes\nattacker' },
+    { ...exact, projectId: '1'.repeat(63) },
+    { ...exact, sessionHash: 'A'.repeat(64) },
+    { ...exact, sessionId: 'raw-session' },
+  ]) {
+    await assert.rejects(
+      async () => await core.turnReceipts.list(options),
+      /turn_receipt_(?:projection_required|runtime_invalid|project_id_invalid|session_hash_invalid|unknown_field)/,
+    );
+    await assert.rejects(
+      async () => await core.turnReceipts.gaps(options),
+      /turn_receipt_(?:projection_required|runtime_invalid|project_id_invalid|session_hash_invalid|unknown_field)/,
+    );
+  }
+});
+
+test('known receipt coverage is unknown when an exact binding has no receipts', async (t) => {
+  const core = await createTestCore(t);
+  assert.deepEqual(await core.turnReceipts.knownCoverage({
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  }), {
+    status: 'unknown',
+    reasonCode: 'turn_receipt_no_known_receipts',
+    knownReceiptCount: 0,
+    gapCount: 0,
+  });
+});
+
+test('known receipt coverage is partial when any current revision remains open or un-emitted', async (t) => {
+  const core = await createTestCore(t);
+  const binding = {
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  };
+  const identities = [
+    { ...binding, turnId: 'open-gap', revision: 1 },
+    { ...binding, turnId: 'not-emitted-gap', revision: 1 },
+    { ...binding, turnId: 'extraction-gap', revision: 1 },
+    { ...binding, turnId: 'closed', revision: 1 },
+    { ...binding, turnId: 'revised-gap', revision: 1 },
+    { ...binding, turnId: 'revised-gap', revision: 2 },
+  ];
+  for (const identity of identities) {
+    await core.turnReceipts.open(openInput(identity, {
+      inputSourceHash: expectedSourceHash(`coverage/${identity.turnId}/${identity.revision}`),
+      openedAt: `2026-07-17T12:00:0${identity.revision}.000Z`,
+    }));
+  }
+  await core.turnReceipts.commit(commitInput(identities[1], {
+    inputSourceHash: expectedSourceHash('coverage/not-emitted-gap/1'),
+    deltaState: 'not_emitted',
+  }));
+  await core.turnReceipts.commit(commitInput(identities[2], {
+    inputSourceHash: expectedSourceHash('coverage/extraction-gap/1'),
+    deltaState: 'extraction_failed',
+  }));
+  await core.turnReceipts.commit(commitInput(identities[3], {
+    inputSourceHash: expectedSourceHash('coverage/closed/1'),
+    deltaState: 'explicit_none',
+  }));
+  await core.turnReceipts.commit(commitInput(identities[4], {
+    inputSourceHash: expectedSourceHash('coverage/revised-gap/1'),
+    deltaState: 'explicit_none',
+  }));
+
+  assert.deepEqual(await core.turnReceipts.knownCoverage(binding), {
+    status: 'partial',
+    reasonCode: 'turn_receipt_known_gaps',
+    knownReceiptCount: 5,
+    gapCount: 4,
+  });
+});
+
+test('known receipt coverage reports only that every known current receipt is closed', async (t) => {
+  const core = await createTestCore(t);
+  const binding = {
+    runtime: 'hermes',
+    projectId: '1'.repeat(64),
+    sessionHash: '2'.repeat(64),
+  };
+  const explicit = { ...binding, turnId: 'known-explicit-none', revision: 1 };
+  const emitted = { ...binding, turnId: 'known-emitted', revision: 1 };
+  for (const identity of [explicit, emitted]) {
+    await core.turnReceipts.open(openInput(identity, {
+      inputSourceHash: expectedSourceHash(`known-closed/${identity.turnId}`),
+    }));
+  }
+  await core.turnReceipts.commit(commitInput(explicit, {
+    inputSourceHash: expectedSourceHash('known-closed/known-explicit-none'),
+    deltaState: 'explicit_none',
+  }));
+  await core.turnReceipts.commit(commitInput(emitted, {
+    inputSourceHash: expectedSourceHash('known-closed/known-emitted'),
+    deltaState: 'emitted',
+    deltaLinkage: DELTA_LINKAGE,
+  }));
+
+  const coverage = await core.turnReceipts.knownCoverage(binding);
+  assert.equal(coverage.status, 'known_closed');
+  assert.deepEqual({ ...coverage, snapshotSha256: undefined }, {
+    status: 'known_closed',
+    reasonCode: 'turn_receipt_all_known_receipts_closed',
+    knownReceiptCount: 2,
+    gapCount: 0,
+    snapshotSha256: undefined,
+  });
+  assert.match(coverage.snapshotSha256, /^[a-f0-9]{64}$/);
+});
+
+test('rejects unknown, oversized, raw-content, raw-source, and unhashed identity fields', async (t) => {
+  const core = await createTestCore(t);
+
+  for (const rawSource of [
+    'password=hunter2',
+    '/private/var/tmp/ihow/source/transcript.json',
+    'https://private.example/session/123',
+    'data:text/plain,raw-prompt-body',
+    'plain source identity prose',
+    `sha256:${'A'.repeat(64)}`,
+  ]) {
+    await assert.rejects(
+      async () => await core.turnReceipts.open(openInput(BASE_IDENTITY, {
+        inputSourceHash: rawSource,
+      })),
+      /turn_receipt_input_source_hash_invalid/,
+    );
+  }
+  await assert.rejects(
+    async () => await core.turnReceipts.open({ ...openInput(), inputSource: 'password=hunter2' }),
+    /turn_receipt_unknown_field:inputSource/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.commit(commitInput(BASE_IDENTITY, {
+      finalSourceHash: '/private/var/tmp/ihow/source/transcript.json',
+    })),
+    /turn_receipt_final_source_hash_invalid/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.open({ ...openInput(), unexpected: true }),
+    /turn_receipt_unknown_field:unexpected/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.open({ ...openInput(), sessionId: 'raw-session-id' }),
+    /turn_receipt_unknown_field:sessionId/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput({ ...BASE_IDENTITY, turnId: 't'.repeat(129) })),
+    /turn_receipt_turn_id_too_large/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput(BASE_IDENTITY, {
+      inputSourceHash: `sha256:${'x'.repeat(64)}`,
+    })),
+    /turn_receipt_input_source_hash_invalid/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput({ ...BASE_IDENTITY, sessionHash: 'raw-session-id' })),
+    /turn_receipt_session_hash_invalid/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.list({ offset: -1 }),
+    /turn_receipt_list_offset_invalid/,
+  );
+  await assert.rejects(
+    async () => await core.turnReceipts.list({ limit: 101 }),
+    /turn_receipt_list_limit_invalid/,
+  );
+
+  for (const forbidden of [
+    { rawPrompt: 'secret' },
+    { assistantResponse: 'secret' },
+    { transcriptBody: 'secret' },
+    { conversationHistory: ['secret'] },
+    { toolOutput: 'secret' },
+  ]) {
+    await assert.rejects(
+      async () => await core.turnReceipts.open({ ...openInput(), ...forbidden }),
+      /turn_receipt_raw_content_forbidden/,
+    );
+  }
+  assert.deepEqual((await core.turnReceipts.list()).items, []);
+});
+
+test('hashes raw session/source identities deterministically and persists no raw canaries', async (t) => {
+  const core = await createTestCore(t);
+  const rawSessionId = 'private-session-2026-07-17';
+  const rawInputSourceId = 'password=hunter2';
+  const rawFinalSourceId = '/private/var/tmp/ihow/source/transcript.json';
+  const sessionHash = core.turnReceipts.hashSessionId(rawSessionId);
+  const inputSourceHash = core.turnReceipts.hashSourceId(rawInputSourceId);
+  const finalSourceHash = core.turnReceipts.hashSourceId(rawFinalSourceId);
+
+  assert.match(sessionHash, /^[a-f0-9]{64}$/);
+  assert.equal(core.turnReceipts.hashSessionId(rawSessionId), sessionHash);
+  assert.notEqual(core.turnReceipts.hashSessionId(`${rawSessionId}-other`), sessionHash);
+  assert.equal(inputSourceHash, expectedSourceHash(rawInputSourceId));
+  assert.match(inputSourceHash, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(core.turnReceipts.hashSourceId(rawInputSourceId), inputSourceHash);
+  assert.notEqual(core.turnReceipts.hashSourceId(`${rawInputSourceId}-other`), inputSourceHash);
+  assert.throws(() => core.turnReceipts.hashSourceId(''), /turn_receipt_source_id_invalid/);
+  assert.throws(() => core.turnReceipts.hashSourceId('a\u0000b'), /turn_receipt_source_id_invalid/);
+  assert.throws(() => core.turnReceipts.hashSourceId('x'.repeat(513)), /turn_receipt_source_id_too_large/);
+
+  await core.turnReceipts.open(openInput({ ...BASE_IDENTITY, sessionHash }, { inputSourceHash }));
+  await core.turnReceipts.commit(commitInput({ ...BASE_IDENTITY, sessionHash }, {
+    inputSourceHash,
+    finalSourceHash,
+  }));
+  const persisted = await fs.readFile(path.join(core.workspace.spaceDir, 'turn-receipts', 'v1.json'), 'utf8');
+  assert.equal(persisted.includes(rawSessionId), false);
+  assert.equal(persisted.includes(rawInputSourceId), false);
+  assert.equal(persisted.includes(rawFinalSourceId), false);
+  assert.equal(persisted.includes(sessionHash), true);
+  assert.equal(persisted.includes(inputSourceHash), true);
+  assert.equal(persisted.includes(finalSourceHash), true);
+});
+
+test('concurrent identical OPEN and COMMITTED writes converge to one receipt', async (t) => {
+  const first = await createTestCore(t);
+  const second = await openCore({
+    root: first.workspace.root,
+    cwd: first.workspace.root,
+    space: first.workspace.space,
+  });
+
+  const opens = await Promise.all(Array.from({ length: 32 }, (_, index) => (
+    (index % 2 === 0 ? first : second).turnReceipts.open(openInput())
+  )));
+  assert.equal(new Set(opens.map((receipt) => JSON.stringify(receipt))).size, 1);
+  assert.equal((await first.turnReceipts.list()).total, 1);
+
+  const commits = await Promise.all(Array.from({ length: 32 }, (_, index) => (
+    (index % 2 === 0 ? first : second).turnReceipts.commit(commitInput())
+  )));
+  assert.equal(new Set(commits.map((receipt) => JSON.stringify(receipt))).size, 1);
+  assert.equal((await second.turnReceipts.list()).total, 1);
+  assert.equal((await second.turnReceipts.read(BASE_IDENTITY)).state, 'COMMITTED');
+
+  const storeEntries = await fs.readdir(path.join(first.workspace.spaceDir, 'turn-receipts'));
+  assert.deepEqual(storeEntries, ['v1.json']);
+  await assert.rejects(fs.access(first.workspace.lockPath));
+});
+
+test('twelve separate Node processes converge to one committed receipt', async (t) => {
+  const core = await createTestCore(t);
+  const childScript = `
+    const { openCore } = await import(${JSON.stringify(CORE_MODULE_URL)});
+    const core = await openCore(${JSON.stringify({
+      root: core.workspace.root,
+      cwd: core.workspace.root,
+      space: core.workspace.space,
+    })});
+    const identity = ${JSON.stringify(BASE_IDENTITY)};
+    const inputSourceHash = core.turnReceipts.hashSourceId('cross-process-input');
+    const finalSourceHash = core.turnReceipts.hashSourceId('cross-process-final');
+    await core.turnReceipts.open({
+      schemaVersion: 1,
+      ...identity,
+      inputSourceHash,
+      inputContentSha256: '${'a'.repeat(64)}',
+      openedAt: '2026-07-17T12:00:00.000Z'
+    });
+    const receipt = await core.turnReceipts.commit({
+      schemaVersion: 1,
+      ...identity,
+      inputSourceHash,
+      inputContentSha256: '${'a'.repeat(64)}',
+      finalSourceHash,
+      finalContentSha256: '${'b'.repeat(64)}',
+      committedAt: '2026-07-17T12:00:03.000Z',
+      deltaState: 'explicit_none'
+    });
+    process.stdout.write(JSON.stringify({ state: receipt.state }));
+  `;
+
+  const results = await Promise.all(Array.from({ length: 12 }, async () => {
+    const { stdout } = await execFileAsync(process.execPath, [
+      '--experimental-strip-types',
+      '--input-type=module',
+      '-e',
+      childScript,
+    ], { cwd: process.cwd(), timeout: 20_000 });
+    return JSON.parse(stdout);
+  }));
+
+  assert.deepEqual(new Set(results.map((result) => result.state)), new Set(['COMMITTED']));
+  const page = await core.turnReceipts.list();
+  assert.equal(page.total, 1);
+  assert.equal(page.items[0].state, 'COMMITTED');
+  assert.equal(page.nextOffset, null);
+});
+
+test('list and gaps paginate every frozen receipt deterministically with currentOnly grouping', async (t) => {
+  const core = await createTestCore(t);
+  const uniqueGaps = Array.from({ length: 101 }, (_, index) => storedOpenReceipt({
+    ...BASE_IDENTITY,
+    turnId: `turn-gap-${String(index).padStart(3, '0')}`,
+  }));
+  const groupedIdentity = { ...BASE_IDENTITY, turnId: 'turn-revision-group' };
+  const grouped = [
+    storedOpenReceipt({ ...groupedIdentity, revision: 1 }),
+    storedCommittedReceipt({ ...groupedIdentity, revision: 2 }),
+    storedCommittedReceipt({ ...groupedIdentity, revision: 10 }, { deltaState: 'extraction_failed' }),
+  ];
+  await plantStore(core, [...grouped, ...uniqueGaps].reverse());
+
+  const all = await collectPages((options) => core.turnReceipts.list(options));
+  assert.equal(all.length, 104);
+  assert.deepEqual(
+    all.filter((receipt) => receipt.turnId === groupedIdentity.turnId).map((receipt) => receipt.revision),
+    [1, 2, 10],
+  );
+
+  const gaps = await collectPages((options) => core.turnReceipts.gaps(options));
+  assert.equal(gaps.length, 103);
+  assert.deepEqual(
+    gaps.filter((receipt) => receipt.turnId === groupedIdentity.turnId).map((receipt) => receipt.revision),
+    [1, 10],
+  );
+
+  const currentGaps = await collectPages(
+    (options) => core.turnReceipts.gaps(options),
+    { currentOnly: true },
+  );
+  assert.equal(currentGaps.length, 102);
+  assert.deepEqual(
+    currentGaps.filter((receipt) => receipt.turnId === groupedIdentity.turnId).map((receipt) => receipt.revision),
+    [10],
+  );
+});
+
+test('malformed planted store fails closed and preserves exact bytes', async (t) => {
+  const core = await createTestCore(t);
+  const { directory, file } = receiptPaths(core);
+  await fs.mkdir(directory, { mode: 0o700 });
+  const before = Buffer.from('{"schemaVersion":1,"receipts":[');
+  await fs.writeFile(file, before, { mode: 0o600 });
+
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput()),
+    /turn_receipt_store_invalid/,
+  );
+  const after = await fs.readFile(file);
+  assert.equal(Buffer.compare(after, before), 0);
+});
+
+test('oversized planted store fails closed and preserves exact bytes', async (t) => {
+  const core = await createTestCore(t);
+  const { directory, file } = receiptPaths(core);
+  await fs.mkdir(directory, { mode: 0o700 });
+  const before = Buffer.alloc((4 * 1024 * 1024) + 1, 0x78);
+  await fs.writeFile(file, before, { mode: 0o600 });
+
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput()),
+    /turn_receipt_store_too_large/,
+  );
+  const after = await fs.readFile(file);
+  assert.equal(Buffer.compare(after, before), 0);
+});
+
+test('receipt directory and atomic files are private with no success-path temp files', async (t) => {
+  const core = await createTestCore(t);
+  await core.turnReceipts.open(openInput());
+  await core.turnReceipts.commit(commitInput());
+  const { directory, file } = receiptPaths(core);
+  const [directoryStat, fileStat, entries] = await Promise.all([
+    fs.lstat(directory),
+    fs.lstat(file),
+    fs.readdir(directory),
+  ]);
+
+  assert.equal(directoryStat.isSymbolicLink(), false);
+  assert.equal(directoryStat.isDirectory(), true);
+  assert.equal(directoryStat.mode & 0o777, 0o700);
+  assert.equal(fileStat.isSymbolicLink(), false);
+  assert.equal(fileStat.isFile(), true);
+  assert.equal(fileStat.mode & 0o777, 0o600);
+  assert.deepEqual(entries, ['v1.json']);
+});
+
+test('the B1 full condition is explicit, preserves all 4096 receipts, and never evicts', async (t) => {
+  const core = await createTestCore(t);
+  const receipts = Array.from({ length: 4096 }, (_, index) => storedOpenReceipt({
+    ...BASE_IDENTITY,
+    turnId: `turn-full-${String(index).padStart(4, '0')}`,
+  }));
+  const { file, bytes: before } = await plantStore(core, receipts);
+  assert.ok(before.byteLength < 4 * 1024 * 1024);
+
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput({ ...BASE_IDENTITY, turnId: 'turn-over-cap' })),
+    /turn_receipt_store_full/,
+  );
+  const after = await fs.readFile(file);
+  assert.equal(Buffer.compare(after, before), 0);
+
+  const first = await core.turnReceipts.list({ limit: 100 });
+  const last = await core.turnReceipts.list({ offset: 4000, limit: 100 });
+  assert.equal(first.total, 4096);
+  assert.equal(first.nextOffset, 100);
+  assert.equal(last.total, 4096);
+  assert.equal(last.items.length, 96);
+  assert.equal(last.nextOffset, null);
+});
+
+test('store is path-contained, leaves no temp files, and temporary roots clean up', async (t) => {
+  const parent = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-turn-containment-')));
+  t.after(async () => { await fs.rm(parent, { recursive: true, force: true }); });
+  const root = path.join(parent, 'root');
+  const outside = path.join(parent, 'outside');
+  await fs.mkdir(root);
+  await fs.mkdir(outside);
+  const core = await openCore({ root, cwd: root, space: 'contained' });
+  const receiptDir = path.join(core.workspace.spaceDir, 'turn-receipts');
+  const outsideStore = path.join(outside, 'v1.json');
+  const outsideBefore = '{"schemaVersion":1,"receipts":[]}\n';
+  await fs.writeFile(outsideStore, outsideBefore, 'utf8');
+  await fs.symlink(outside, receiptDir, 'dir');
+
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput()),
+    /turn_receipt_path_outside_store/,
+  );
+  assert.equal(await fs.readFile(outsideStore, 'utf8'), outsideBefore);
+  assert.deepEqual(await fs.readdir(outside), ['v1.json']);
+
+  await fs.rm(receiptDir);
+  await fs.mkdir(receiptDir, { mode: 0o700 });
+  await fs.symlink(outsideStore, path.join(receiptDir, 'v1.json'), 'file');
+  await assert.rejects(
+    async () => await core.turnReceipts.open(openInput()),
+    /turn_receipt_path_outside_store/,
+  );
+  assert.equal(await fs.readFile(outsideStore, 'utf8'), outsideBefore);
+  await fs.rm(receiptDir, { recursive: true });
+
+  await core.turnReceipts.open(openInput());
+  assert.deepEqual(await fs.readdir(receiptDir), ['v1.json']);
+  await assert.rejects(fs.access(core.workspace.lockPath));
+
+  await fs.rm(parent, { recursive: true, force: true });
+  await assert.rejects(fs.access(parent));
+});

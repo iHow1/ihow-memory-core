@@ -24,6 +24,7 @@ export type ProviderManifest = {
       model: string | null;
       ready: boolean;
       cloud: boolean;
+      dimension?: number;
       lastError?: string;
       capabilities?: {
         lexical?: boolean;
