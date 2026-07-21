@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const repo = path.resolve(import.meta.dirname, '..');
-const releaseVersion = '0.1.0-alpha.31.1';
+const releaseVersion = '0.1.0-alpha.31.2';
 
 test('package and lock metadata expose the current Hermes bridge contract', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8'));

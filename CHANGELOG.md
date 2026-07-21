@@ -8,6 +8,29 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.31.2] — 2026-07-21
+
+### Fixed
+
+- **Upgrade-safe native hooks.** A successful frozen-runtime refresh now records the verified Claude Code/Codex activation generation without rewriting already-valid host hook files, preventing a package update from degrading `doctor` to `ACTIVATION_WIRING_GENERATION_UNCONFIRMED`. Absent hooks remain absent, and pre-existing broken or ambiguous hook config is not overwritten.
+- **Targeted stale-registration repair.** `upgrade --runtime <name>` now backs up and reconciles the selected runtime's existing MCP registration to the upgraded workspace. This gives OpenCode and other runtimes a bounded recovery path when a prior registration points at a deleted or moved workspace, without auto-connecting every detected application.
+- **Help-path configuration isolation.** The subcommand-help regression now protects a sentinel OpenCode configuration byte-for-byte in addition to proving no `help-probe` workspace is created.
+
+### Changed
+
+- **Stable native-hook bootstrap.** The hook-facing `dist/cli.js` / workspace `.runtime/cli.js` is now a byte-stable launcher, while release implementation bytes live in `cli-runtime.js`. Existing alpha.31.1 installations refresh activation evidence once during the first upgrade without rewriting correct hook files; later implementation-only upgrades keep both hook config and activation generation unchanged.
+- **Two-generation activation.** Runtime replacement continues to stage and integrity-check the new generation before the atomic `.runtime` / `.runtime.previous` swap. A failed MCP probe restores the exact previous self-verifying generation instead of leaving a partially activated bundle.
+
+### Added
+
+- **Out-of-band rescue command.** `npx ihow-memory@next rescue` force-installs and probes the workspace runtime through the newly downloaded npm package; `--runtime <name>` also backs up and repairs that selected host registration. This path does not depend on the already-frozen CLI being healthy.
+
+### Notes
+
+- npm `next` is the source of truth for package availability. Publication alone does not replace an already frozen runtime or prove live activation; existing installations must run `upgrade` and restart the affected host, while a damaged updater can use `rescue` from a fresh package invocation.
+- Automatic registration repair remains explicit and bounded to `--runtime <name>`; the release does not overwrite absent, broken, ambiguous, or user-managed Hook configuration and does not auto-connect every detected application.
+- Safe Memory Gardener remains review-first and report-only. This release does not add automatic authoritative-memory rewriting, production certification, or complete enterprise multi-tenant authentication/RBAC/administration.
+
 ## [0.1.0-alpha.31.1] — 2026-07-20
 
 ### Fixed

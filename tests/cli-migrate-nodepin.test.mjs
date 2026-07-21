@@ -58,9 +58,21 @@ test('subcommand --help exits before setup or upgrade can write', async (t) => {
   const cwd = path.join(sandbox, 'cwd');
   await fs.mkdir(home);
   await fs.mkdir(cwd);
+  const opencodeConfig = path.join(home, '.config', 'opencode', 'opencode.json');
+  const opencodeSentinel = `${JSON.stringify({
+    mcp: {
+      'ihow-memory': {
+        type: 'local',
+        command: ['/sentinel/node', '/sentinel/runtime/mcp/server.js'],
+        enabled: true,
+      },
+    },
+  }, null, 2)}\n`;
+  await fs.mkdir(path.dirname(opencodeConfig), { recursive: true });
+  await fs.writeFile(opencodeConfig, opencodeSentinel, 'utf8');
   t.after(async () => { await fs.rm(sandbox, { recursive: true, force: true }); });
 
-  for (const command of ['setup', 'upgrade']) {
+  for (const command of ['setup', 'upgrade', 'rescue']) {
     const root = path.join(sandbox, `${command}-root`);
     const out = execFileSync(process.execPath, [CLI, command, '--help', '--root', root, '--space', 'help-probe'], {
       cwd,
@@ -74,5 +86,10 @@ test('subcommand --help exits before setup or upgrade can write', async (t) => {
     });
     assert.match(out, /Start here|Full command reference/, `${command} --help prints help`);
     await assert.rejects(fs.access(root), `${command} --help must not materialize a workspace`);
+    assert.equal(
+      await fs.readFile(opencodeConfig, 'utf8'),
+      opencodeSentinel,
+      `${command} --help must not rewrite a real runtime config`,
+    );
   }
 });

@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const RELEASE_VERSION = '0.1.0-alpha.31.1';
+const RELEASE_VERSION = '0.1.0-alpha.31.2';
 
 function readRoot(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8');
@@ -29,7 +29,7 @@ function releaseSection(changelog, version) {
   return match[1];
 }
 
-test('alpha.31.1 prerelease metadata and docs stay truthful and aligned', () => {
+test('alpha.31.2 prerelease metadata and docs stay truthful and aligned', () => {
   const manifest = JSON.parse(readRoot('package.json'));
   const lock = JSON.parse(readRoot('package-lock.json'));
   assert.equal(manifest.version, RELEASE_VERSION);
@@ -39,7 +39,22 @@ test('alpha.31.1 prerelease metadata and docs stay truthful and aligned', () => 
   assert.deepEqual(lock.packages?.['']?.dependencies ?? {}, {}, 'lockfile preserves the zero-runtime-dependency contract');
 
   const changelog = readRoot('CHANGELOG.md');
-  const alpha311 = releaseSection(changelog, RELEASE_VERSION);
+  const alpha312 = releaseSection(changelog, RELEASE_VERSION);
+  assert.match(alpha312, /Upgrade-safe native hooks/i);
+  assert.match(alpha312, /without rewriting already-valid host hook files/i);
+  assert.match(alpha312, /Stable native-hook bootstrap/i);
+  assert.match(alpha312, /byte-stable launcher/i);
+  assert.match(alpha312, /Two-generation activation/i);
+  assert.match(alpha312, /MCP probe/i);
+  assert.match(alpha312, /exact previous self-verifying generation/i);
+  assert.match(alpha312, /upgrade --runtime <name>/i);
+  assert.match(alpha312, /OpenCode/i);
+  assert.match(alpha312, /rescue command/i);
+  assert.match(alpha312, /npm `?next`?[^\n]*(?:source of truth|availability)/i);
+  assert.match(alpha312, /(?:publication|published)[^\n]*(?:does not|doesn['’]t)[^\n]*(?:live activation|production certification|frozen runtime)/i);
+  assert.match(alpha312, /report-only/i);
+
+  const alpha311 = releaseSection(changelog, '0.1.0-alpha.31.1');
   assert.match(alpha311, /WorkBuddy/i);
   assert.match(alpha311, /\.workbuddy\/\.mcp\.json/);
   assert.match(alpha311, /Codex/i);
@@ -77,12 +92,12 @@ test('alpha.31.1 prerelease metadata and docs stay truthful and aligned', () => 
   assert.match(alpha31, /(?:no|not)[^\n]*(?:APPLIED|authoritative write)/i);
 
   const readmes = [
-    ['README.md', readRoot('README.md'), /Alpha\.31\.1 prerelease/i, /npm `?@?next`?[^\n]*(?:source of truth|availability)/i],
-    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.31\.1 预发布版/i, /npm `?@?next`?[^\n]*(?:真相源|可用)/i],
+    ['README.md', readRoot('README.md'), /Alpha\.31\.2 prerelease/i, /npm `?@?next`?[^\n]*(?:source of truth|availability)/i],
+    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.31\.2 预发布版/i, /npm `?@?next`?[^\n]*(?:真相源|可用)/i],
   ];
   for (const [name, readme, versionLabel, registryTruth] of readmes) {
-    assert.match(readme, /0\.1\.0-alpha\.31\.1/, `${name} states the prerelease version`);
-    assert.match(readme, versionLabel, `${name} identifies the alpha.31.1 surface`);
+    assert.match(readme, /0\.1\.0-alpha\.31\.2/, `${name} states the prerelease version`);
+    assert.match(readme, versionLabel, `${name} identifies the alpha.31.2 surface`);
     assert.match(readme, registryTruth, `${name} identifies npm next as availability truth`);
     assert.match(readme, /\.workbuddy\/\.mcp\.json/, `${name} states WorkBuddy's effective user-scope path`);
     assert.doesNotMatch(readme, /\.workbuddy\/mcp\.json/, `${name} does not advertise WorkBuddy's obsolete user-scope path`);
@@ -137,6 +152,7 @@ test('every relative import in a packed module is itself in the tarball (fresh i
     'dist/checkpoint-file-worker.js',
     'dist/checkpoint-schema.js',
     'dist/checkpoints.js',
+    'dist/cli-runtime.js',
     'dist/floor.js',
     'dist/grounded-media.js',
     'dist/handoff.js',
@@ -150,6 +166,11 @@ test('every relative import in a packed module is itself in the tarball (fresh i
   ]) {
     assert.ok(packed.has(required), `tarball must include ${required}`);
   }
+  assert.match(
+    readRoot('dist/cli.js'),
+    /import ['"]\.\/cli-runtime\.js['"]/,
+    'the public CLI entry is a stable bootstrap that delegates to the release implementation',
+  );
 
   const missing = [];
   for (const rel of jsFiles) {
@@ -164,7 +185,7 @@ test('every relative import in a packed module is itself in the tarball (fresh i
   assert.deepEqual(missing, [], `tarball is missing modules that packed code imports:\n  ${missing.join('\n  ')}`);
 });
 
-test('tracked-only clean tree rebuild packs a spawnable checkpoint worker', () => {
+test('tracked-only clean tree rebuild packs a spawnable checkpoint worker and rescue bootstrap', () => {
   const tracked = execFileSync('git', ['ls-files', '-z', '--cached'], { cwd: ROOT })
     .toString('utf8')
     .split('\0')
@@ -198,6 +219,19 @@ test('tracked-only clean tree rebuild packs a spawnable checkpoint worker', () =
       cwd: consumer,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+
+    const installedBin = path.join(consumer, 'node_modules', 'ihow-memory', 'bin', 'ihow-memory.mjs');
+    const rescueRoot = path.join(temporaryRoot, 'rescue-root');
+    const rescue = JSON.parse(execFileSync(process.execPath, [
+      installedBin, 'rescue', '--json', '--root', rescueRoot, '--space', 'packed-rescue',
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: path.join(temporaryRoot, 'home'), IHOW_HANDOFF_METRICS: '0' },
+    }));
+    assert.equal(rescue.ok, true, 'fresh packed install can run the out-of-band rescue entry');
+    assert.equal(rescue.mode, 'rescue');
+    assert.ok(fs.existsSync(path.join(rescueRoot, 'packed-rescue', '.runtime', 'cli.js')), 'rescue installs the stable bootstrap');
+    assert.ok(fs.existsSync(path.join(rescueRoot, 'packed-rescue', '.runtime', 'cli-runtime.js')), 'rescue installs the release CLI implementation');
 
     const smoke = String.raw`
       import fs from 'node:fs/promises';

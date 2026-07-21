@@ -311,6 +311,8 @@ test('setup --runtime workbuddy wires cross-thread resume into BOOTSTRAP.md (ide
   run(args, home);
   const bootstrap = await fs.readFile(path.join(wbDir, 'BOOTSTRAP.md'), 'utf8');
   assert.match(bootstrap, /resume across threads/, 'resume instruction injected');
+  assert.match(bootstrap, /deterministic update recovery/, 'deterministic update guidance injected');
+  assert.match(bootstrap, /ihow-memory@next rescue --json/, 'WorkBuddy is told to use the shared rescue entry');
   assert.match(bootstrap, /memory\.continue/, 'tells the agent to call memory.continue');
   assert.match(bootstrap, /be yourself\./, 'existing BOOTSTRAP content is preserved');
   const wbBaks = async () => (await fs.readdir(wbDir)).filter((f) => f.startsWith('BOOTSTRAP.md.ihow-bak-')).length;

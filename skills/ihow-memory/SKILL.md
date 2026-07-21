@@ -125,6 +125,20 @@ Before you finish a substantive task, propose a short handoff candidate covering
 
 That one candidate is what makes the next session continuous instead of starting cold.
 
+## Deterministic update recovery
+
+When the user explicitly asks you to update or repair iHow Memory, use the package's deterministic
+update path instead of manually editing MCP or native-hook configuration:
+
+1. Run `ihow-memory upgrade --json`.
+2. If the installed or workspace-frozen runtime cannot start, run
+   `npx ihow-memory@next rescue --json` from the target workspace.
+3. Add `--runtime <name>` only when the user selected that host registration for repair.
+4. Report `restartRequired`; after the host restarts, verify with `ihow-memory doctor --json`.
+
+Do not invent per-agent migration steps in the prompt. The CLI owns backup, integrity verification,
+runtime activation, selected registration repair, and last-known-good recovery.
+
 ## Don't over-do it
 
 This skill raises the odds memory is used well; it is not a mandate to search or write on
