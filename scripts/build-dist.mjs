@@ -7,6 +7,15 @@ import { stripTypeScriptTypes } from 'node:module';
 const packageDir = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const sourceDir = path.join(packageDir, 'src');
 const outputDir = path.join(packageDir, 'dist');
+const CLI_SOURCE = 'cli.ts';
+const CLI_RUNTIME = 'cli-runtime.js';
+const CLI_BOOTSTRAP = `#!/usr/bin/env node
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 iHow Memory
+// Stable hook-facing entrypoint. Release implementation bytes live in cli-runtime.js so ordinary
+// upgrades do not change native hook identity or require rewriting host configuration.
+import './cli-runtime.js';
+`;
 
 async function sourceFiles(dir) {
   const files = [];
@@ -22,7 +31,8 @@ await fs.rm(outputDir, { recursive: true, force: true });
 
 for (const sourcePath of await sourceFiles(sourceDir)) {
   const relative = path.relative(sourceDir, sourcePath);
-  const outputPath = path.join(outputDir, relative.replace(/\.ts$/, '.js'));
+  const outputRelative = relative === CLI_SOURCE ? CLI_RUNTIME : relative.replace(/\.ts$/, '.js');
+  const outputPath = path.join(outputDir, outputRelative);
   const source = await fs.readFile(sourcePath, 'utf8');
   const rawShebang = source.match(/^#!.*\n/)?.[0] || '';
   const withoutShebang = source.slice(rawShebang.length);
@@ -38,6 +48,12 @@ for (const sourcePath of await sourceFiles(sourceDir)) {
   await fs.writeFile(outputPath, `${shebang}${transformed}`, 'utf8');
   if (shebang) await fs.chmod(outputPath, 0o755);
 }
+
+// Keep dist/cli.js deliberately tiny and byte-stable. It is copied into every workspace as
+// <space>/.runtime/cli.js and is the exact path stored in Codex/Claude native hooks. The active
+// implementation remains inside the atomically-swapped runtime generation as cli-runtime.js.
+await fs.writeFile(path.join(outputDir, 'cli.js'), CLI_BOOTSTRAP, 'utf8');
+await fs.chmod(path.join(outputDir, 'cli.js'), 0o755);
 
 // The pinned TOML parser is vendored into src/ so frozen `.runtime` generations remain self-contained.
 // Preserve its BSD-3 license alongside the built vendor modules; runtime integrity covers this file too.

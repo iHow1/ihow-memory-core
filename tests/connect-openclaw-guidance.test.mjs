@@ -50,12 +50,30 @@ test('setup --runtime openclaw injects memory.continue guidance into AGENTS.md (
   let body = await fs.readFile(agents, 'utf8');
   assert.match(body, /iHow Memory — resume across threads/, 'resume marker injected into AGENTS.md');
   assert.match(body, /memory\.continue/, 'guidance mentions memory.continue');
+  assert.match(body, /deterministic update recovery/, 'guidance includes the managed update protocol');
+  assert.match(body, /ihow-memory@next rescue --json/, 'guidance uses the out-of-band rescue command');
   assert.match(body, /PRE-EXISTING-OPENCLAW-CONTENT/, 'pre-existing AGENTS.md content preserved');
 
   // idempotent: a second setup must not double-inject
   run(home, ['setup', '--runtime', 'openclaw']);
   body = await fs.readFile(agents, 'utf8');
   assert.equal(body.match(/iHow Memory — resume across threads/g).length, 1, 'guidance injected exactly once');
+  assert.equal(body.match(/iHow Memory — deterministic update recovery/g).length, 1, 'update guidance injected exactly once');
+});
+
+test('setup upgrades a legacy OpenClaw resume block with deterministic recovery guidance', async (t) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-home-'));
+  t.after(async () => { await fs.rm(home, { recursive: true, force: true }); });
+  await fs.mkdir(path.join(home, '.openclaw', 'workspace'), { recursive: true });
+  await fs.writeFile(path.join(home, '.openclaw', 'openclaw.json'), JSON.stringify({ mcp: { servers: {} } }), 'utf8');
+  const agents = path.join(home, '.openclaw', 'workspace', 'AGENTS.md');
+  await fs.writeFile(agents, '# AGENTS\n\n## iHow Memory — resume across threads\nCall memory.continue first.\n', 'utf8');
+
+  run(home, ['setup', '--runtime', 'openclaw']);
+  const body = await fs.readFile(agents, 'utf8');
+  assert.equal(body.match(/iHow Memory — resume across threads/g).length, 1, 'legacy resume block is preserved once');
+  assert.equal(body.match(/iHow Memory — deterministic update recovery/g).length, 1, 'new managed recovery block is appended once');
+  assert.match(body, /instead of\nmanually editing MCP or hook configuration/);
 });
 
 test('setup --runtime opencode injects instructions + creates the resume guide file', async (t) => {
@@ -71,6 +89,16 @@ test('setup --runtime opencode injects instructions + creates the resume guide f
   const exists = await fs.access(guide).then(() => true, () => false);
   assert.ok(exists, 'ihow-resume.md guide file created');
   assert.match(await fs.readFile(guide, 'utf8'), /memory\.continue/, 'guide tells the agent to call memory.continue');
+  assert.match(await fs.readFile(guide, 'utf8'), /ihow-memory@next rescue --json/, 'guide includes deterministic rescue');
+
+  await fs.writeFile(guide, '# iHow Memory legacy guide\n\nCall memory.continue.\n', 'utf8');
+  run(home, ['setup', '--runtime', 'opencode']);
+  assert.match(await fs.readFile(guide, 'utf8'), /ihow-memory@next rescue --json/, 'setup upgrades an already-referenced legacy guide');
+  assert.equal(
+    (await fs.readdir(path.dirname(guide))).filter((name) => name.startsWith('ihow-resume.md.ihow-bak-')).length,
+    1,
+    'legacy guide is backed up once before replacement',
+  );
 });
 
 test('setup --runtime codex installs hooks + proactive AGENTS loop (idempotent, content kept)', async (t) => {
@@ -94,6 +122,7 @@ test('setup --runtime codex installs hooks + proactive AGENTS loop (idempotent, 
   assert.match(body, /memory\.search/, 'loop tells Codex to search memory proactively');
   assert.match(body, /memory\.write_candidate/, 'loop tells Codex to write durable facts');
   assert.match(body, /memory\.forget/, 'loop tells Codex how to correct wrong memories');
+  assert.match(body, /ihow-memory@next rescue --json/, 'loop tells Codex to use deterministic rescue rather than manual config edits');
   assert.match(body, /KEEP-CODEX-CONTENT/, 'pre-existing AGENTS.md content preserved');
   let hooks = JSON.parse(await fs.readFile(path.join(home, '.codex', 'hooks.json'), 'utf8'));
   const startCmds = (hooks.hooks?.SessionStart ?? []).flatMap((g) => g.hooks ?? []).map((h) => h.command);
@@ -107,4 +136,24 @@ test('setup --runtime codex installs hooks + proactive AGENTS loop (idempotent, 
   hooks = JSON.parse(await fs.readFile(path.join(home, '.codex', 'hooks.json'), 'utf8'));
   assert.equal(JSON.stringify(hooks).match(/hook-session-start/g).length, 1, 'SessionStart hook injected exactly once');
   assert.equal(JSON.stringify(hooks).match(/hook-user-prompt-submit/g).length, 1, 'UserPromptSubmit hook injected exactly once');
+});
+
+test('setup upgrades an existing Codex memory loop with deterministic recovery guidance', async (t) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-home-'));
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-bin-'));
+  t.after(async () => {
+    await fs.rm(home, { recursive: true, force: true });
+    await fs.rm(bin, { recursive: true, force: true });
+  });
+  await makeCodexMcpShim(bin);
+  await fs.mkdir(path.join(home, '.codex'), { recursive: true });
+  const agents = path.join(home, '.codex', 'AGENTS.md');
+  await fs.writeFile(agents, '# Existing Codex Rules\n\n## iHow Memory — Codex proactive memory loop\n- Call memory.continue first.\n', 'utf8');
+
+  const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, IHOW_HANDOFF_METRICS: '0' };
+  execFileSync(process.execPath, [CLI, 'setup', '--runtime', 'codex'], { encoding: 'utf8', env });
+  const body = await fs.readFile(agents, 'utf8');
+  assert.equal(body.match(/iHow Memory — Codex proactive memory loop/g).length, 1, 'legacy Codex loop remains single');
+  assert.equal(body.match(/iHow Memory — deterministic update recovery/g).length, 1, 'recovery guidance is appended once');
+  assert.match(body, /ihow-memory@next rescue --json/);
 });

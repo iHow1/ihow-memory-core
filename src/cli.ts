@@ -1859,12 +1859,21 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
 // customer. Idempotent (marker-checked), backed up, reversible. Never CREATES the file (only augments an
 // existing WorkBuddy install). Returns the on-disk outcome.
 const WB_RESUME_MARKER = 'iHow Memory — resume across threads';
-const WB_RESUME_SECTION = `
+const UPDATE_RECOVERY_MARKER = 'iHow Memory — deterministic update recovery';
+const WB_RESUME_BASE_SECTION = `
 ## ${WB_RESUME_MARKER}
 At the START of a thread, call the \`memory.continue\` MCP tool to pick up where a prior thread left off
 (it returns candidate projects + a verify-first handoff packet for this machine). Treat the returned
 narrative as UNVERIFIED — run its verifyFirst git checks before acting. This is how your memory carries
 across threads and tools.
+`;
+const UPDATE_RECOVERY_SECTION = `
+## ${UPDATE_RECOVERY_MARKER}
+When the user explicitly asks you to update or repair iHow Memory, use the deterministic CLI instead of
+manually editing MCP or hook configuration: run \`ihow-memory upgrade --json\`; if the installed/frozen
+runtime cannot start, run \`npx ihow-memory@next rescue --json\`. Add \`--runtime <name>\` only when the
+user selected that host registration for repair. Report \`restartRequired\`, restart the host when asked,
+then verify with \`ihow-memory doctor --json\`.
 `;
 async function maybeInstallWorkbuddyResume(): Promise<'installed' | 'already' | 'skipped' | 'failed'> {
   const file = path.join(os.homedir(), '.workbuddy', 'BOOTSTRAP.md');
@@ -1874,14 +1883,18 @@ async function maybeInstallWorkbuddyResume(): Promise<'installed' | 'already' | 
   } catch {
     return 'skipped'; // no WorkBuddy BOOTSTRAP.md -> nothing to augment (never create it)
   }
-  if (existing.includes(WB_RESUME_MARKER)) {
+  const additions = [
+    !existing.includes(WB_RESUME_MARKER) ? WB_RESUME_BASE_SECTION : '',
+    !existing.includes(UPDATE_RECOVERY_MARKER) ? UPDATE_RECOVERY_SECTION : '',
+  ].filter(Boolean).join('');
+  if (!additions) {
     console.log(`✓ WorkBuddy resume instruction already present in ${file}`);
     return 'already';
   }
   try {
     const backup = `${file}.ihow-bak-${Date.now()}`;
     await fs.writeFile(backup, existing, 'utf8'); // back up before augmenting
-    await fs.writeFile(file, `${existing.trimEnd()}\n${WB_RESUME_SECTION}`, 'utf8');
+    await fs.writeFile(file, `${existing.trimEnd()}\n${additions}`, 'utf8');
     console.log(`✓ added WorkBuddy resume instruction → ${file} (backup: ${path.basename(backup)})`);
     return 'installed';
   } catch {
@@ -1897,11 +1910,15 @@ async function maybeInjectMarkdownResume(file: string, opts: { create?: boolean 
   let existing = '';
   let existed = true;
   try { existing = await fs.readFile(file, 'utf8'); } catch { existed = false; if (!opts.create) return 'skipped'; }
-  if (existing.includes(WB_RESUME_MARKER)) return 'already';
+  const additions = [
+    !existing.includes(WB_RESUME_MARKER) ? WB_RESUME_BASE_SECTION : '',
+    !existing.includes(UPDATE_RECOVERY_MARKER) ? UPDATE_RECOVERY_SECTION : '',
+  ].filter(Boolean).join('');
+  if (!additions) return 'already';
   try {
     if (existed) await fs.writeFile(`${file}.ihow-bak-${Date.now()}`, existing, 'utf8');
     await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.writeFile(file, existed ? `${existing.trimEnd()}\n${WB_RESUME_SECTION}` : `# iHow Memory${WB_RESUME_SECTION}`, 'utf8');
+    await fs.writeFile(file, existed ? `${existing.trimEnd()}\n${additions}` : `# iHow Memory${additions}`, 'utf8');
     return 'installed';
   } catch { return 'failed'; }
 }
@@ -1914,6 +1931,13 @@ const OPENCODE_RESUME_DOC = `# iHow Memory — resume across sessions
 When the user says "继续 / continue / resume", or you start fresh after a reset: FIRST call the
 \`memory.continue\` MCP tool to get a cross-tool verify-first handoff packet. Treat its narrative as
 UNVERIFIED — check the git anchors it gives before acting. If it returns nothing, continue normally.
+
+## ${UPDATE_RECOVERY_MARKER}
+When the user explicitly asks you to update or repair iHow Memory, run \`ihow-memory upgrade --json\`
+instead of manually editing MCP or hook configuration. If the installed/frozen runtime cannot start,
+run \`npx ihow-memory@next rescue --json\`. Add \`--runtime <name>\` only for the host registration the
+user selected. Report \`restartRequired\`, restart the host when asked, then run
+\`ihow-memory doctor --json\`.
 `;
 async function maybeInstallOpenCodeResume(): Promise<'installed' | 'already' | 'skipped' | 'failed'> {
   const dir = path.join(os.homedir(), '.config', 'opencode');
@@ -1925,15 +1949,24 @@ async function maybeInstallOpenCodeResume(): Promise<'installed' | 'already' | '
   catch { return 'failed'; } // refuse to clobber an unparseable config
   const guide = path.join(dir, 'ihow-resume.md');
   const ins = Array.isArray(config.instructions) ? (config.instructions as unknown[]).filter((x): x is string => typeof x === 'string') : [];
-  if (ins.includes(guide) && existsSync(guide)) return 'already';
+  let guideContent = '';
+  try { guideContent = await fs.readFile(guide, 'utf8'); } catch { /* created below */ }
+  const guideChanged = guideContent !== OPENCODE_RESUME_DOC;
+  const configChanged = !ins.includes(guide);
+  if (!guideChanged && !configChanged) return 'already';
   try {
-    await fs.writeFile(guide, OPENCODE_RESUME_DOC, 'utf8');
-    if (!ins.includes(guide)) ins.push(guide);
-    config.instructions = ins;
-    await fs.copyFile(cfgPath, `${cfgPath}.ihow-bak-${Date.now()}`);
-    const tmp = `${cfgPath}.ihow-tmp-${process.pid}`;
-    await fs.writeFile(tmp, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-    await fs.rename(tmp, cfgPath);
+    if (guideChanged) {
+      if (guideContent) await fs.writeFile(`${guide}.ihow-bak-${Date.now()}`, guideContent, 'utf8');
+      await fs.writeFile(guide, OPENCODE_RESUME_DOC, 'utf8');
+    }
+    if (configChanged) {
+      ins.push(guide);
+      config.instructions = ins;
+      await fs.copyFile(cfgPath, `${cfgPath}.ihow-bak-${Date.now()}`);
+      const tmp = `${cfgPath}.ihow-tmp-${process.pid}`;
+      await fs.writeFile(tmp, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+      await fs.rename(tmp, cfgPath);
+    }
     return 'installed';
   } catch { return 'failed'; }
 }
@@ -1962,11 +1995,17 @@ async function maybeInstallCodexMemoryLoop(): Promise<'installed' | 'already' | 
   } catch {
     existed = false;
   }
-  if (existing.includes(CODEX_MEMORY_MARKER)) return 'already';
+  const additions = [
+    !existing.includes(CODEX_MEMORY_MARKER) ? `${CODEX_MEMORY_SECTION}${UPDATE_RECOVERY_SECTION}` : '',
+    existing.includes(CODEX_MEMORY_MARKER) && !existing.includes(UPDATE_RECOVERY_MARKER)
+      ? UPDATE_RECOVERY_SECTION
+      : '',
+  ].filter(Boolean).join('');
+  if (!additions) return 'already';
   try {
     if (existed) await fs.writeFile(`${file}.ihow-bak-${Date.now()}`, existing, 'utf8');
     await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.writeFile(file, existed ? `${existing.trimEnd()}\n${CODEX_MEMORY_SECTION}` : `# Codex Instructions${CODEX_MEMORY_SECTION}`, 'utf8');
+    await fs.writeFile(file, existed ? `${existing.trimEnd()}\n${additions}` : `# Codex Instructions${additions}`, 'utf8');
     return 'installed';
   } catch {
     return 'failed';
@@ -1974,6 +2013,86 @@ async function maybeInstallCodexMemoryLoop(): Promise<'installed' | 'already' | 
 }
 
 type HookInstallOutcome = 'installed' | 'already' | 'skipped' | 'failed';
+
+type NativeHookUpgradeStatus = {
+  status: 'not-configured' | 'unchanged' | 'activation-refreshed' | 'skipped-runtime-rollback' | 'failed';
+  detail?: string;
+};
+
+type NativeHookUpgradeTargets = {
+  codex: boolean;
+  claudeCode: boolean;
+};
+
+async function nativeHookUpgradeTargets(
+  workspace: ReturnType<typeof resolveWorkspace>,
+  options: ParsedArgs['options'],
+): Promise<NativeHookUpgradeTargets> {
+  const isCurrent = async (runtime: 'codex' | 'claude-code'): Promise<boolean> => {
+    try {
+      return (await verifyRuntimeHookWiring(workspace, runtime, options)).state === 'current';
+    } catch {
+      return false;
+    }
+  };
+  const [codex, claudeCode] = await Promise.all([isCurrent('codex'), isCurrent('claude-code')]);
+  return { codex, claudeCode };
+}
+
+async function refreshNativeHooksAfterRuntimeUpgrade(
+  workspace: ReturnType<typeof resolveWorkspace>,
+  targets: NativeHookUpgradeTargets,
+  options: ParsedArgs['options'],
+): Promise<{ codex: NativeHookUpgradeStatus; claudeCode: NativeHookUpgradeStatus }> {
+  const result: { codex: NativeHookUpgradeStatus; claudeCode: NativeHookUpgradeStatus } = {
+    codex: { status: 'not-configured' },
+    claudeCode: { status: 'not-configured' },
+  };
+  const refresh = async (runtime: 'codex' | 'claude-code'): Promise<NativeHookUpgradeStatus> => {
+    try {
+      // The exact hook command stays on the stable .runtime/cli.js bootstrap. Upgrades therefore do
+      // not rewrite host config; the one-time legacy transition only records the new verified runtime
+      // identity in the activation ledger. A failed ledger refresh leaves the user's hook file intact.
+      const changed = await hookGenerationNeedsRepair(workspace, runtime, options);
+      const configured = await recordConfiguredActivation(workspace, runtime, 'install-hook', options, true);
+      return configured
+        ? { status: changed ? 'activation-refreshed' : 'unchanged' }
+        : { status: 'failed', detail: 'current hook generation could not be recorded' };
+    } catch (caught) {
+      return { status: 'failed', detail: caught instanceof Error ? caught.message : String(caught) };
+    }
+  };
+
+  if (targets.codex) result.codex = await refresh('codex');
+  if (targets.claudeCode) result.claudeCode = await refresh('claude-code');
+  return result;
+}
+
+async function repairSelectedRuntimeAfterUpgrade(
+  workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
+  options: ParsedArgs['options'],
+): Promise<{ runtime: string; status: 'unchanged' | 'repaired' | 'failed'; detail: string } | null> {
+  if (!options.runtime) return null;
+  try {
+    const connected = await connectRuntime(workspace, options.runtime, {});
+    const verification = await verifyConnection(mcpServerSpec(workspace), options.runtime);
+    if (!verification.reachable) {
+      return { runtime: options.runtime, status: 'failed', detail: verification.detail };
+    }
+    const changed = connected.changed === true || connected.replaced === true;
+    return {
+      runtime: options.runtime,
+      status: changed ? 'repaired' : 'unchanged',
+      detail: verification.detail,
+    };
+  } catch (caught) {
+    return {
+      runtime: options.runtime,
+      status: 'failed',
+      detail: caught instanceof Error ? caught.message : String(caught),
+    };
+  }
+}
 
 // Stage 3 candidate: current official Codex hooks support PreCompact in hooks.json (verified against
 // the shipped 0.144.1 schema as well as upstream generated schemas), so setup wires the bounded,
@@ -2546,7 +2665,8 @@ Usage:
   ihow-memory forget <text-or-path> [--yes] [--json]   # one-gesture correction: "forget that / I was wrong" — tombstones the matching memory so it stops surfacing in search AND recall everywhere (file untouched, fully reversible). Free text applies only on a single unambiguous match; multiple matches are listed to pick from. Forgetting a human-reviewed entry asks for --yes. Undo: ihow-memory remember
   ihow-memory forget --list [--json]                   # list everything currently forgotten (path + first line)
   ihow-memory remember <text-or-path> [--json]         # reverse a forget: the entry surfaces again in search/recall
-  ihow-memory upgrade [--space name] [--root path]   # re-stamp the connected server bundle after 'npm update' (then restart the runtime)
+  ihow-memory upgrade [--space name] [--root path] [--runtime name]   # atomically replace the active runtime; optionally repair one runtime registration; then restart
+  ihow-memory rescue [--space name] [--root path] [--runtime name]    # out-of-band repair entry for npx ihow-memory@next rescue; reinstalls, probes, and preserves the last good runtime on failure
   ihow-memory rollback-runtime [--space name] [--root path] [--apply] [--json]   # verify and preview the exact previous runtime bundle; --apply atomically swaps generations, probes the restored server, and requires a runtime restart
   ihow-memory migrate-local-day [--memory-root path] [--apply]   # one-time: re-bucket UTC-named journal/event files to local-day (dry-run unless --apply)
   ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
@@ -4746,10 +4866,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command === 'upgrade') {
-    // Re-stamp the frozen .runtime bundle from the freshly-installed dist so a connected runtime stops
-    // running the old MCP server. (npm update alone does not refresh .runtime — see runtimeBundleVersion.)
+  if (command === 'upgrade' || command === 'rescue') {
+    const mode = command;
+    // Replace the active frozen .runtime generation from the freshly-installed package so connected
+    // runtimes stop launching the old MCP server. The hook-facing cli.js bootstrap stays byte-stable;
+    // versioned implementation bytes live in cli-runtime.js. npm update alone does not refresh either.
     const workspace = await ensureWorkspace(resolveWorkspace(options));
+    // Snapshot only healthy, already-managed native hooks before replacing the runtime generation.
+    // The first legacy-cli → stable-bootstrap transition needs one re-stamp; later implementation-only
+    // upgrades keep the same generation. Never enable absent hooks or overwrite broken/ambiguous config.
+    const nativeHookTargets = await nativeHookUpgradeTargets(workspace, options);
     const before = await runtimeBundleVersion(workspace);
     await installRuntimeBundle(workspace, { force: true });
     const after = packageVersion();
@@ -4770,15 +4896,60 @@ async function main(): Promise<void> {
         rollbackDetail = error instanceof Error ? error.message : String(error);
       }
     }
+    let runtimeRepair: Awaited<ReturnType<typeof repairSelectedRuntimeAfterUpgrade>> = null;
+    let nativeHooks: Awaited<ReturnType<typeof refreshNativeHooksAfterRuntimeUpgrade>> = {
+      codex: { status: nativeHookTargets.codex ? 'skipped-runtime-rollback' : 'not-configured' },
+      claudeCode: { status: nativeHookTargets.claudeCode ? 'skipped-runtime-rollback' : 'not-configured' },
+    };
+    if (probe.ok) {
+      // `--runtime` is an explicit authorization to repair that runtime's MCP registration. This
+      // closes stale/deleted workspace paths (including old test-fixture contamination) without
+      // broad auto-connecting every installed application to a possibly different workspace.
+      runtimeRepair = await repairSelectedRuntimeAfterUpgrade(workspace, options);
+      nativeHooks = await refreshNativeHooksAfterRuntimeUpgrade(workspace, nativeHookTargets, options);
+    }
+    const nativeHooksOk = nativeHooks.codex.status !== 'failed' && nativeHooks.claudeCode.status !== 'failed';
+    const runtimeRepairOk = runtimeRepair?.status !== 'failed';
+    const ok = probe.ok && nativeHooksOk && runtimeRepairOk;
     if (options.json) {
-      printJson({ ok: probe.ok, from: before, to: after, runtimeDir: path.join(workspace.spaceDir, '.runtime'), serverReachable: probe.ok, detail: probe.detail, rolledBack, rollbackDetail });
+      printJson({
+        ok,
+        mode,
+        from: before,
+        to: after,
+        runtimeDir: path.join(workspace.spaceDir, '.runtime'),
+        serverReachable: probe.ok,
+        detail: probe.detail,
+        rolledBack,
+        rollbackDetail,
+        runtimeRepair,
+        nativeHooks,
+        activation: ok ? 'active' : rolledBack ? 'kept-previous' : 'repair-required',
+        restartRequired: ok,
+      });
     } else {
-      console.log(before && before !== after ? `upgraded runtime bundle: v${before} → v${after}` : `runtime bundle refreshed (v${after})`);
+      const verb = mode === 'rescue' ? 'rescued' : 'upgraded';
+      console.log(before && before !== after ? `${verb} runtime bundle: v${before} → v${after}` : `runtime bundle ${mode === 'rescue' ? 'rescued' : 'refreshed'} (v${after})`);
       console.log(probe.ok ? `✓ new server bundle round-trips (${probe.detail})` : `⚠ the re-stamped server did NOT round-trip — ${probe.detail}`);
       if (!probe.ok) console.log(rolledBack ? `✓ restored previous runtime bundle (${rollbackDetail})` : `✗ automatic runtime rollback failed — ${rollbackDetail || 'unknown error'}`);
-      console.log(probe.ok ? 'Restart your connected runtime(s) so they load the new server.' : rolledBack ? 'The previous runtime bundle is active on disk; restart only if you need to reload it.' : 'Do not restart connected runtimes until the runtime bundle is repaired.');
+      if (runtimeRepair) {
+        console.log(runtimeRepair.status === 'failed'
+          ? `⚠ ${runtimeLabel(options.runtime)} registration repair failed — ${runtimeRepair.detail}`
+          : `✓ ${runtimeLabel(options.runtime)} registration ${runtimeRepair.status}`);
+      }
+      for (const [label, status] of [['Codex', nativeHooks.codex], ['Claude Code', nativeHooks.claudeCode]] as const) {
+        if (status.status === 'activation-refreshed') console.log(`✓ ${label} native hook activation refreshed without rewriting host config`);
+        else if (status.status === 'failed') console.log(`⚠ ${label} native hook refresh failed — ${status.detail}`);
+      }
+      console.log(probe.ok
+        ? ok
+          ? 'Restart your connected runtime(s) so they load the new server; existing native hooks were verified.'
+          : 'The server bundle is healthy, but repair the reported runtime/hook configuration before restarting.'
+        : rolledBack
+          ? 'The previous runtime bundle is active on disk; restart only if you need to reload it.'
+          : 'Do not restart connected runtimes until the runtime bundle is repaired.');
     }
-    if (!probe.ok) process.exitCode = 1;
+    if (!ok) process.exitCode = 1;
     return;
   }
 
