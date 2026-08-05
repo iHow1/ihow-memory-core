@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Install dev deps (typescript for the typecheck gate)
+        run: npm install --no-audit --no-fund
+      - name: Build
+        run: npm run build
+      - name: Typecheck (catches used-but-not-imported / unresolved-identifier bugs the transform-only build can't)
+        run: npm run typecheck
+      - name: CLI smoke
+        run: node bin/ihow-memory.mjs --version
+      - name: Tests
+        run: |
+          if [ -d tests ]; then npm test; else echo "no tests/ yet"; fi
+      - name: Governed-loop proof
+        run: node scripts/proof.mjs
+      - name: Pack check
+        run: npm pack --dry-run --ignore-scripts
+
+  windows-test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Build
+        run: npm run build
+      - name: Version smoke (guards packageDir Windows path bug)
+        shell: pwsh
+        run: |
+          $v = node bin/ihow-memory.mjs --version
+          Write-Host "version: $v"
+          if ("$v" -match 'unknown' -or -not ("$v" -match '\d')) {
+            Write-Error "packageDir resolution broken on Windows: --version = $v"
+            exit 1
+          }
+      - name: Connect + verify smoke (packageDir -> installRuntimeBundle -> server round-trip)
+        shell: pwsh
+        run: |
+          $out = node bin/ihow-memory.mjs connect --runtime claude-code --json | ConvertFrom-Json
+          Write-Host "reachable: $($out.reachable)  verified: $($out.verified)"
+          if (-not $out.reachable) { Write-Error "configured MCP server did NOT round-trip on Windows"; exit 1 }
+      - name: Doctor runtime-reachability smoke (required check, B3)
+        run: node bin/ihow-memory.mjs doctor --runtime claude-code
+      - name: Windows smoke tests
+        # Keep Windows coverage focused on supported cross-platform behavior:
+        # package-dir resolution, governed-loop CLI flow, automation doctor, and
+        # receiver-runtime config writes. The full suite currently contains many
+        # POSIX/local-agent transcript assumptions and is exercised on Linux.
+        run: node --test tests/windows-packagedir.test.mjs tests/quickstart-governed-loop.test.mjs tests/automation-doctor.test.mjs tests/connect-receiver-runtimes.test.mjs
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan for credentials and private content
+        run: npm run secret-scan
+        env:
+          IHOW_PUBLIC_BOUNDARY_DENYLIST: ${{ secrets.IHOW_PUBLIC_BOUNDARY_DENYLIST }}
+      - name: Install pinned Gitleaks
+        run: |
+          curl --fail --location --silent --show-error \
+            --output /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz' | sha256sum --check --strict
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+      - name: Gitleaks working tree
+        run: /tmp/gitleaks dir . --no-banner --redact=100
+      - name: Gitleaks Git history
+        run: /tmp/gitleaks git . --no-banner --redact=100

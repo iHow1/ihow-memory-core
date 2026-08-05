@@ -1,0 +1,70 @@
+{
+  "name": "ihow-memory",
+  "version": "0.1.0-alpha.31.2",
+  "type": "module",
+  "description": "Local-first shared memory for AI agents with zero-dependency FTS, citations, governance, and MCP.",
+  "keywords": [
+    "ai",
+    "agent",
+    "memory",
+    "mcp",
+    "local-first",
+    "sqlite",
+    "fts",
+    "codex",
+    "claude-code",
+    "cursor"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iHow1/ihow-memory-core.git"
+  },
+  "homepage": "https://github.com/iHow1/ihow-memory-core#readme",
+  "bugs": {
+    "url": "https://github.com/iHow1/ihow-memory-core/issues"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "integrations/hermes/ihow-memory/",
+    "LICENSE",
+    "NOTICE",
+    "TRADEMARK.md",
+    "README.md",
+    "README.zh-CN.md",
+    "skills/",
+    "docs/enterprise-quality-gates.md",
+    "docs/harness-contract.md",
+    "docs/safe-memory-gardener.md"
+  ],
+  "bin": {
+    "ihow-memory": "bin/ihow-memory.mjs",
+    "ihow-memory-mcp": "dist/mcp/server.js",
+    "ihow-memory-hermes-bridge": "dist/hermes-bridge.js"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "node scripts/build-dist.mjs",
+    "precli": "npm run build",
+    "cli": "node bin/ihow-memory.mjs",
+    "mcp": "node --experimental-strip-types src/mcp/server.ts",
+    "preactivation-proof": "npm run build",
+    "activation-proof": "node scripts/activation-proof.mjs",
+    "proof": "node scripts/proof.mjs",
+    "test": "node scripts/run-tests.mjs",
+    "eval:smoke": "node --experimental-strip-types scripts/evaluation-bench.mjs smoke",
+    "eval:batch": "node --experimental-strip-types scripts/evaluation-bench.mjs batch",
+    "eval:full": "node --experimental-strip-types scripts/evaluation-bench.mjs full",
+    "eval:proposals": "node --experimental-strip-types scripts/proposal-evaluation.mjs",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build",
+    "secret-scan": "node scripts/secret-scan.mjs"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,17 @@
+dist/
+.state/
+node_modules/
+*.tgz
+.DS_Store
+# Downloaded benchmark corpora (LongMemEval oracle, ~15MB) — fetched + sha256-verified on demand, never committed.
+scripts/bench/.cache/
+tmp-floor-quality/
+*.ihow-bak-*
+.claude/settings.local.json
+# Internal, non-public strategy material — kept LOCAL only, never committed to this public repo.
+docs/external-validation-kit.md
+docs/verify-benchmark.md
+docs/release-runbook.md
+
+# Also ignore node_modules symlinks in staging worktrees
+node_modules
