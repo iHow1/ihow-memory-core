@@ -54,7 +54,7 @@ test('Hermes is ready after verified plugin installation but before live activit
   assert.equal(activation.reasonCode, 'ACTIVATION_CONFIGURED_AWAITING_LIVE_ACTIVITY');
 });
 
-test('Hermes becomes active only after completed native-hook evidence from the same installed generation', () => {
+test('Hermes completion without host attestation stays ready on the same installed generation', () => {
   const rows = [
     evidence({
       status: 'configured', source: 'install-hook', event: 'runtime-configured',
@@ -68,8 +68,8 @@ test('Hermes becomes active only after completed native-hook evidence from the s
   const activation = deriveRuntimeActivation('hermes', rows, {
     lifecycleWiring: { state: 'current', generationId: 'generation-1' },
   });
-  assert.equal(activation.status, 'ACTIVE');
-  assert.equal(activation.reasonCode, 'ACTIVATION_LIVE_COMPLETED_AFTER_INSTALL');
+  assert.equal(activation.status, 'READY — WAITING FOR FIRST ACTIVITY');
+  assert.equal(activation.reasonCode, 'ACTIVATION_COMPLETION_UNATTESTED');
 });
 
 test('Hermes rejects synthetic/context-probe evidence and stale plugin generations as activation proof', () => {

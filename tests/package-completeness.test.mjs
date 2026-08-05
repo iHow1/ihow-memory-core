@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const RELEASE_VERSION = '0.1.0-alpha.31.2';
+const RELEASE_VERSION = '0.1.0-alpha.31.4';
 
 function readRoot(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8');
@@ -29,7 +29,7 @@ function releaseSection(changelog, version) {
   return match[1];
 }
 
-test('alpha.31.2 prerelease metadata and docs stay truthful and aligned', () => {
+test('alpha.31.4 prerelease metadata and docs stay truthful and aligned', () => {
   const manifest = JSON.parse(readRoot('package.json'));
   const lock = JSON.parse(readRoot('package-lock.json'));
   assert.equal(manifest.version, RELEASE_VERSION);
@@ -39,7 +39,22 @@ test('alpha.31.2 prerelease metadata and docs stay truthful and aligned', () => 
   assert.deepEqual(lock.packages?.['']?.dependencies ?? {}, {}, 'lockfile preserves the zero-runtime-dependency contract');
 
   const changelog = readRoot('CHANGELOG.md');
-  const alpha312 = releaseSection(changelog, RELEASE_VERSION);
+  const alpha314 = releaseSection(changelog, RELEASE_VERSION);
+  assert.match(alpha314, /Hermes compaction installation closure/i);
+  assert.match(alpha314, /explicit-consent anonymous metrics/i);
+  assert.match(alpha314, /off by default/i);
+  assert.match(alpha314, /no built-in upload endpoint/i);
+  assert.match(alpha314, /manual `?telemetry flush`?/i);
+  assert.match(alpha314, /ACTIVATION_COMPLETION_UNATTESTED/i);
+  assert.match(alpha314, /Evidence-first GitHub launch surface/i);
+  assert.match(alpha314, /Telemetry opt-out and queue hardening/i);
+  assert.match(alpha314, /fails closed/i);
+  assert.match(alpha314, /local release-ready prerelease/i);
+  assert.match(alpha314, /npm `?next`?[^\n]*(?:source of truth|availability)/i);
+  assert.match(alpha314, /(?:publication|published)[^\n]*(?:does not|doesn['’]t)[^\n]*(?:activate|frozen local runtime)/i);
+  assert.match(alpha314, /report-only/i);
+
+  const alpha312 = releaseSection(changelog, '0.1.0-alpha.31.2');
   assert.match(alpha312, /Upgrade-safe native hooks/i);
   assert.match(alpha312, /without rewriting already-valid host hook files/i);
   assert.match(alpha312, /Stable native-hook bootstrap/i);
@@ -92,18 +107,20 @@ test('alpha.31.2 prerelease metadata and docs stay truthful and aligned', () => 
   assert.match(alpha31, /(?:no|not)[^\n]*(?:APPLIED|authoritative write)/i);
 
   const readmes = [
-    ['README.md', readRoot('README.md'), /Alpha\.31\.2 prerelease/i, /npm `?@?next`?[^\n]*(?:source of truth|availability)/i],
-    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.31\.2 预发布版/i, /npm `?@?next`?[^\n]*(?:真相源|可用)/i],
+    ['README.md', readRoot('README.md'), /Alpha\.31\.4 prerelease/i, /npm `?@?next`?[^\n]*(?:source of truth|availability)/i],
+    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.31\.4 预发布版/i, /npm `?@?next`?[^\n]*(?:真相源|可用)/i],
   ];
   for (const [name, readme, versionLabel, registryTruth] of readmes) {
-    assert.match(readme, /0\.1\.0-alpha\.31\.2/, `${name} states the prerelease version`);
-    assert.match(readme, versionLabel, `${name} identifies the alpha.31.2 surface`);
+    assert.match(readme, /0\.1\.0-alpha\.31\.4/, `${name} states the prerelease version`);
+    assert.match(readme, versionLabel, `${name} identifies the alpha.31.4 surface`);
     assert.match(readme, registryTruth, `${name} identifies npm next as availability truth`);
     assert.match(readme, /\.workbuddy\/\.mcp\.json/, `${name} states WorkBuddy's effective user-scope path`);
     assert.doesNotMatch(readme, /\.workbuddy\/mcp\.json/, `${name} does not advertise WorkBuddy's obsolete user-scope path`);
     assert.match(readme, /report-only/i, `${name} preserves report-only consolidation truth`);
     assert.match(readme, /EQUAL_UNTRUSTED/i, `${name} preserves grounded-media trust boundaries`);
     assert.match(readme, /COMMITTED/i, `${name} preserves activity-ledger verdict boundaries`);
+    assert.match(readme, /ACTIVATION_COMPLETION_UNATTESTED/i, `${name} preserves unattested activation truth`);
+    assert.match(readme, /telemetry flush/i, `${name} documents explicit manual metrics transport`);
   }
 
   const workbuddyGuide = readRoot('examples/connect-workbuddy.md');
@@ -183,6 +200,27 @@ test('every relative import in a packed module is itself in the tarball (fresh i
     }
   }
   assert.deepEqual(missing, [], `tarball is missing modules that packed code imports:\n  ${missing.join('\n  ')}`);
+});
+
+test('all packed Markdown links and advertised assets resolve inside the tarball', () => {
+  const out = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: ROOT, encoding: 'utf8' });
+  const report = JSON.parse(out);
+  const packed = new Set((report[0].files || []).map((file) => file.path.replace(/\\/g, '/')));
+  assert.ok(
+    packed.has('assets/ihow-memory-social-preview.svg'),
+    'the editable social-preview asset advertised by the packaged launch checklist must be in the tarball',
+  );
+  const packedMarkdown = [...packed].filter((file) => file.endsWith('.md'));
+  assert.ok(packedMarkdown.length > 10, 'the tarball must expose its packaged documentation surface');
+  for (const source of packedMarkdown) {
+    for (const match of readRoot(source).matchAll(/\]\(([^)]+)\)/g)) {
+      const href = match[1].replace(/^<|>$/g, '').split('#')[0];
+      if (!href || /^(?:https?:|mailto:)/.test(href)) continue;
+      const target = path.posix.normalize(path.posix.join(path.posix.dirname(source), href));
+      const targetIsPacked = packed.has(target) || [...packed].some((file) => file.startsWith(`${target.replace(/\/$/, '')}/`));
+      assert.ok(targetIsPacked, `${source} links to a path missing from the tarball: ${href}`);
+    }
+  }
 });
 
 test('tracked-only clean tree rebuild packs a spawnable checkpoint worker and rescue bootstrap', () => {

@@ -1,6 +1,10 @@
 # iHow Memory
 
-> Local shared-memory runtime for heterogeneous coding agents — one git-auditable Markdown memory they share and hand off through.
+> **Your AI can change. Your work should not reset.**
+
+iHow Memory gives coding agents one local, human-readable memory they can hand off across sessions and tools. On supported capture paths, when context is compressed, a runtime crashes, or you move from Claude Code to Codex, the next agent receives the prior state, evidence, blockers, and next step.
+
+It does not trust that narrative on sight. The receiving agent re-checks live git anchors first; a matching repo can earn **GREEN**, while drift forces **RED**. Memory stays Markdown on your machine, with citations and an audit trail.
 
 [![npm version](https://img.shields.io/npm/v/ihow-memory.svg)](https://www.npmjs.com/package/ihow-memory)
 [![CI](https://github.com/iHow1/ihow-memory-core/actions/workflows/ci.yml/badge.svg)](https://github.com/iHow1/ihow-memory-core/actions/workflows/ci.yml)
@@ -8,56 +12,43 @@
 
 [简体中文](./README.zh-CN.md)
 
-**Requires Node.js >= 22.12 · macOS / Linux (alpha; Windows via WSL, native Windows experimental).** No account, no API key, no third-party runtime dependencies. (Node >= 22.12 is a hard requirement — the engine uses `node:sqlite`.)
+## See it in 3 minutes
 
-**Who this is for:** best for git-using coding workflows, where the verify-first handoff gets the strongest anchors; usable beyond git too, with file-fingerprint anchors instead (see below).
+Requires Node.js >= 22.12 on macOS or Linux. WSL is supported; native Windows is experimental. No account or API key is required.
 
-iHow Memory is a local, shared-memory runtime for heterogeneous coding agents — one human-readable, git-auditable memory that Claude Code, Codex, Cursor and other MCP clients share and hand off through. Memory is plain Markdown on disk that you read, diff and roll back with git. A pre-write check rejects candidates that look like they contain secrets, every promote is an audited event, and agents leave a handoff candidate — current state, evidence, blockers, next step — that the next agent reads. Agents talk to it over a stdio MCP server; you use the same flow from the CLI.
-
-## Why it is different
-
-1. **Verify-first handoff — resume without re-briefing.** After `/clear`, or when a *different* tool picks up the work, run `memory.continue` (or `ihow-memory continue`). You get the prior session's handoff together with **live git anchors the receiver re-checks (GREEN / RED) before trusting the narrative** — so a fresh agent continues where you left off without you re-explaining, and without acting on a stale "done / shipped" claim. Other memory tools retrieve *facts*; this is a cross-tool resume with a built-in trust check. This is the point of iHow Memory. In a git repo you get the strongest verify-first anchors (branch / HEAD / dirty). In a non-git project, the handoff still works — you get the prior session's narrative plus file-fingerprint anchors (the receiver re-hashes the touched files to detect drift) — just without git's commit-level GREEN/RED.
-2. **Cross-vendor by design.** One memory that Claude Code, Codex, Cursor, Tencent WorkBuddy, Claude Desktop, OpenCode, Hermes and OpenClaw can share — across vendors, on your machine, one command each. The big platforms have every reason to keep memory inside their own ecosystem; iHow is the neutral local layer between them. In this alpha only Claude Code is dogfooded daily; the others are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they call the tools but cannot resume) — see [Runtime support](#runtime-support).
-3. **Safe writes + governance.** Multiple agents share one memory, with writes serialized by a workspace lock so they never clobber each other. A pre-write check rejects candidates that look like they hold secrets (tokens, keys, credentials), and every promote is an audited event.
-4. **Human-readable and yours.** Memory is plain Markdown you read, diff and roll back with git — no vendor lock-in, no black-box vector store, no account, no telemetry by default. Governance (candidate → review → promote) is available when your team needs it, not a forced step.
-
-**Alpha.31.2 prerelease (`0.1.0-alpha.31.2`; local release-ready):** makes package updates recoverable without turning user configuration into release state. Claude Code/Codex hooks keep a byte-stable `.runtime/cli.js` bootstrap while implementation bytes move to `cli-runtime.js`; a verified upgrade refreshes legacy activation evidence once without rewriting correct Hook files, then later implementation-only upgrades leave Hook config and activation generation unchanged. Runtime replacement uses two self-verifying generations and restores the exact previous generation if the new MCP server fails its probe. `upgrade --runtime <name>` provides bounded repair for a stale host registration, and the fresh-package `rescue` entry can recover a damaged frozen updater. Alpha.31.1's WorkBuddy effective-path, Codex least-privilege/transactional rollback, and zero-runtime-dependency fixes remain included. This proves the documented update and recovery contracts—it does not claim every host lifecycle is `ACTIVE`; `doctor` may still report `TOOLS ONLY`, `READY — WAITING FOR FIRST ACTIVITY`, or `NEEDS REPAIR` where lifecycle evidence is absent. npm `@next` is the source of truth for package availability; publication does not itself update a frozen runtime or imply production certification. The Alpha.31 review-first boundaries remain unchanged: continuous consolidation is report-only and never automatically rewrites authoritative memory; Grounded Media reports only `EQUAL_UNTRUSTED`; Activity Ledger `COMMITTED` does not imply task success.
-
-## Quickstart — first success in about 3 minutes
-
-### 1. Set up locally
+### Set up
 
 ```bash
 npx ihow-memory@next setup
 ```
 
-`setup` detects installed runtimes, connects the local MCP server, installs proactive memory behavior only where the runtime exposes a stable surface, and runs `doctor`. It is idempotent, backs up edited config, and ends with one result card: what connected, what is verified or pending, whether a restart is required, where local data lives, and the one next command.
+`setup` detects supported runtimes, backs up configuration before editing it, connects the local MCP server, and reports what is verified, pending, or needs a restart.
 
-Activation is evidence-based, not inferred from installation text. `doctor` reports **ACTIVE** only after a valid live Claude/Codex hook completes on the currently verified wiring generation; **READY — WAITING FOR FIRST ACTIVITY** means the native hooks are configured but have not yet produced qualifying live evidence; **TOOLS ONLY** means MCP/cooperative tools are available without a verified lifecycle hook; **NEEDS REPAIR** means previously configured managed wiring is missing, duplicated, malformed, dead, or bound to the wrong workspace. Synthetic probes and started-only events never become ACTIVE. The activation ledger stores only hashed bindings and bounded metadata—never prompts, transcripts, environment values, or error text.
-
-Want a zero-write preview first?
-
-```bash
-npx ihow-memory@next setup --dry-run
-```
-
-### 2. See the verify-first difference immediately
+### Run the proof
 
 ```bash
 npx ihow-memory@next proof
 ```
 
-The proof runs in a throwaway git repo and temporary memory workspace. It shows:
+The proof uses only synthetic data in a throwaway git repo and temporary memory workspace. It demonstrates an **UNVERIFIED** prior-agent narrative, matching live anchors earning **GREEN**, later repo drift forcing **RED**, and agent A's governed memory reaching agent B with a citation and audit event. It does not edit your project or runtime configuration.
 
-```text
-prior agent narrative: UNVERIFIED
-recorded anchors == live anchors  -> GREEN
-checkout changes after recording  -> RED
-```
+Want to inspect before running? Read the [30–45 second evidence storyboard](./docs/demo-storyboard.md) or run the [repo-local synthetic demo](./examples/verify-first-handoff-demo.sh).
 
-It also proves the governed local-memory path — candidate → promote → search/read with citation + audit — without touching your project or runtime configuration. The default retrieval lane is honest zero-dependency lexical FTS; optional semantic recall is separate and is not presented as state of the art.
+## What survives the interruption
 
-### 3. Resume real work
+| Interruption | Recovery path | Trust boundary |
+| --- | --- | --- |
+| Context compression | Supported hooks write a bounded pre-compact checkpoint. | Narrative remains unverified; checkpoint artifacts and anchors must validate. |
+| Crash or abandoned session | A later session can recover the latest valid checkpoint or capture floor where that runtime supports capture. | Missing, partial, or drifting evidence fails closed instead of becoming a completion claim. |
+| Tool switch | A receiving MCP client reads the shared handoff and local Markdown memory. | The receiver re-checks live repo or file-fingerprint anchors before continuing. |
+
+Git repos provide the strongest branch / HEAD / dirty anchors. Non-git workspaces still get file-fingerprint drift checks, but not commit-level GREEN/RED.
+
+**Alpha boundary:** Claude Code is the daily-dogfooded path. Other listed runtimes have narrower single-machine smoke coverage, and some are receive-only. Default retrieval is lexical FTS5, not semantic recall. Expect breaking alpha changes; check [Runtime support](#runtime-support) and [Limitations](#limitations) before production use.
+
+If agent resets have cost you real work, [star iHow Memory](https://github.com/iHow1/ihow-memory-core) so other developers can find the project—and tell us which handoff you need next.
+
+## Continue real work
 
 After `/clear`, a new session, or a switch to another supported runtime:
 
@@ -67,7 +58,7 @@ npx ihow-memory@next continue            # optional repo keyword: continue <name
 
 `continue` carries the previous narrative as **UNVERIFIED** and gives the receiver machine anchors to re-check before acting. GREEN is deliberately narrow; drift or conflict forces RED. If this is your first run and there is no captured session yet, the CLI says that plainly and points back to `proof` instead of printing an empty handoff envelope. In Claude Code you can simply say “continue” / “继续”.
 
-### 4. Correct a wrong memory
+### Correct a wrong memory
 
 ```bash
 npx ihow-memory@next forget "text or memory/path.md"
@@ -76,6 +67,13 @@ npx ihow-memory@next remember "text or memory/path.md"
 ```
 
 `forget` tombstones one unambiguous match so it stops surfacing in search and recall; the file is untouched and the action is reversible and audited.
+
+## Why the handoff is different
+
+1. **Verify before continuing.** The previous agent's status is narrative, not authority. Live git or file anchors decide whether the receiver sees GREEN or RED.
+2. **Cross-agent by design.** Claude Code, Codex, Cursor, WorkBuddy, Claude Desktop, OpenCode, Hermes, OpenClaw, VS Code, Gemini CLI, and Cline can participate according to the support table below.
+3. **Governed, inspectable writes.** Candidates can be reviewed and promoted; secret-like content is rejected; promoted memory has citations and audit events.
+4. **Local and human-readable.** The default core uses Markdown plus SQLite FTS5, with no account, required cloud, or telemetry by default.
 
 ### What `setup` connects
 
@@ -89,6 +87,8 @@ npx ihow-memory@next connect --runtime claude-code
 npx ihow-memory@next init --runtime claude-code       # print the MCP snippet only
 npx ihow-memory@next doctor --runtime claude-code
 ```
+
+Activation is evidence-based, not inferred from installation text. The workspace-frozen CLI and exact managed Claude/Codex wiring can produce bounded local completion evidence, but the same OS user can replay that command, so it does not authenticate the host: `doctor` keeps these runtimes at **READY — WAITING FOR FIRST ACTIVITY** with reason code `ACTIVATION_COMPLETION_UNATTESTED`. **TOOLS ONLY** means cooperative MCP tools are available without a verified lifecycle hook; **NEEDS REPAIR** means managed wiring is broken or stale. Synthetic probes and started-only events never become ACTIVE. The ledger stores hashed bindings and bounded metadata, never prompts, transcripts, environment values, or error text.
 
 ### The governed loop, explicitly
 
@@ -105,7 +105,7 @@ npx ihow-memory@next reset --space demo
 
 Without `--no-auto-promote`, a clean write can auto-promote into a durable yellow tier; secrets and falsified anchors are still blocked. Search/read results cite the exact Markdown source, and promote creates an audit event.
 
-### Updating
+### Updating and recovery
 
 `connect` freezes a runtime copy into the workspace. Runtime registrations keep using the stable `.runtime/mcp/server.js` path, while Claude Code and Codex hooks use a byte-stable `.runtime/cli.js` bootstrap; release CLI implementation bytes live in `.runtime/cli-runtime.js`. Because `npm update` does **not** refresh this frozen runtime by itself, run `npx ihow-memory@next upgrade` and then restart the runtime. The new generation is staged and integrity-checked before the atomic `.runtime` / `.runtime.previous` swap, then the MCP server is probed; probe failure restores the exact prior generation. Existing legacy installations refresh their activation evidence once when they first move to the stable bootstrap—without rewriting correct hook files—while later implementation-only upgrades leave both hook config and generation unchanged. If one runtime registration points at a deleted/moved workspace, pass it explicitly—for example `npx ihow-memory@next upgrade --runtime opencode`—to back up and repair only that registration. If the installed/frozen runtime is damaged, use the independent package entry `npx ihow-memory@next rescue` (optionally with `--runtime <name>`). `doctor` fails instead of silently accepting version skew or broken activation wiring.
 
@@ -118,7 +118,7 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 | Claude Code | ✓ (`claude mcp add-json`) | ✓ | real-app + ongoing dogfood; skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks |
 | Codex | ✓ (`codex mcp add`) | ✓ | native SessionStart / PreCompact / UserPromptSubmit hooks + proactive `~/.codex/AGENTS.md` memory loop; single-machine real-app smoke |
 | OpenClaw | ✓ (`~/.openclaw/openclaw.json`) | ✓ | single-machine real-app smoke (memory.continue + git preflight) |
-| Hermes | ✓ (`hermes mcp add`) | ✓ (JSON + `state.db`) | single-machine real-app smoke |
+| Hermes | ✓ (`hermes mcp add` + packaged adapters) | ✓ (JSON + `state.db`) | installs/enables the lifecycle plugin and selects the packaged compaction `MemoryProvider`; single-machine real-app smoke |
 | OpenCode | ✓ (`~/.config/opencode`) | ✓ (`opencode.db`) | single-machine real-app smoke |
 | WorkBuddy | ✓ (`~/.workbuddy/.mcp.json`) | ✓ | single-machine real-app smoke |
 | Cursor | ✓ (merges `~/.cursor/mcp.json`) | ✗ | receiver-only — Cursor keeps chats in a binary IndexedDB, not readable for resume |
@@ -127,7 +127,7 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 | Gemini CLI | ✓ (`~/.gemini/settings.json`) | ✓ (`~/.gemini/tmp/*/logs.json`) | passive reader of Gemini's on-disk **user-prompt log** (Gemini records no assistant turns) → session topic + git anchors; manual `GEMINI.md` nudge. Verified against real local data |
 | Cline (VS Code) | — (add via Cline's own MCP settings) | ✓ (`globalStorage` / `~/.cline/data`) | passive reader of `tasks/<id>/api_conversation_history.json`; cwd from `environment_details`. Fixture-tested, not yet real-app smoke |
 
-The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / PreCompact / UserPromptSubmit hooks. Codex uses native SessionStart / PreCompact / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the existing capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. The Alpha.27 PreCompact checkpoint path is bounded, transcript-free, and host-fail-open; its crash-floor and checkpoint-first continue path remain fail-closed on artifact or anchor uncertainty. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
+The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / PreCompact / UserPromptSubmit hooks. Codex uses native SessionStart / PreCompact / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the existing capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. For Hermes, `connect` / `setup` installs both packaged adapters under `$HERMES_HOME/plugins`, enables `ihow-memory`, selects `memory.provider=ihow-memory-compaction`, and binds both to the workspace's integrity-checked frozen bridge. It refuses to replace another configured external memory provider and rolls back partial adapter/config/MCP writes on failure. The pre-compress handoff is bounded and transcript-free, but stays explicitly `UNVERIFIED` until live anchors are checked; this is not an `ACTIVE` or host-authentication claim. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
 
 ### Runtimes wired without an auto-injected resume nudge (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
 
@@ -372,12 +372,12 @@ For no-hook runtimes, `session_end` means task completion or delivery, not proce
 
 ## Examples
 
-Runnable, self-contained walkthroughs live in [`examples/`](./examples/) (numbered 01–03). All examples use synthetic data only.
+Runnable, self-contained walkthroughs live in [`examples/`](./examples/), including the short [verify-first handoff demo](./examples/verify-first-handoff-demo.sh). All examples use synthetic data only.
 
 ## Privacy
 
 - The open-source core runs locally: no account, no required network calls, cloud and sync are disabled and report as such in `status` and `doctor`.
-- Telemetry is **off by default** and opt-in (`ihow-memory telemetry on`). When enabled it records only a fixed allow-list — event name, runtime, package version, error type, timestamp — never memory content, file names, queries, paths or prompts. In the current alpha, events are appended to a local file (`~/.ihow-memory/telemetry-events.jsonl`) and are not uploaded anywhere.
+- Metrics are **off by default** and require an explicit three-way consent choice or `ihow-memory telemetry on`. Noninteractive and `--json` setup never prompt or save a consent decision. When enabled, only versioned allowlisted event names, a random installation ID, timestamps, and allowlisted categorical runtime/error values can enter the bounded local queue; memory, prompts, queries, paths, git data, user/host names, and hardware identifiers cannot. No upload endpoint is built in. A network request requires both an explicitly configured credential-free HTTP(S) endpoint and the user's manual `ihow-memory telemetry flush`; `telemetry off` removes the queue and installation ID. See [the metrics and privacy contract](docs/telemetry-privacy.md).
 - Diagnostics are redacted by design; memory content is never included. `feedback` only prints a template — you decide whether to open the issue.
 
 ## Hosted runtime
@@ -386,7 +386,11 @@ A hosted runtime is not included in this npm package or this repository.
 
 ## Status
 
-Alpha prerelease candidate `0.1.0-alpha.27.1` (local release-ready only — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex now has native SessionStart/UserPromptSubmit hooks plus a proactive AGENTS memory loop; the other runtimes are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they can call the tools but cannot resume). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated daily on macOS and Linux; native Windows is **experimental** — the `packageDir` path bug is fixed and a `windows-latest` CI lane covers build + a connect/doctor reachability smoke + the full test suite, with WSL as the supported path. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
+Alpha.31.4 prerelease candidate `0.1.0-alpha.31.4` (local release-ready only — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex has native SessionStart / PreCompact / UserPromptSubmit hooks plus a proactive AGENTS memory loop; Hermes now has packaged lifecycle and compaction adapters; the other runtimes have the narrower evidence recorded in [Runtime support](#runtime-support). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated on macOS and Linux; native Windows is **experimental**, with WSL as the supported path. The npm tarball ships the compiled CLI, stdio MCP server, read-only local console, packaged Hermes adapters, privacy contract, and evidence-first launch assets. Expect breaking changes between alpha releases.
+
+**Alpha.31.4 engineering detail:** closes Hermes compaction installation as one transactional operation, adds explicit-consent bounded anonymous metrics with no built-in endpoint or automatic upload, and ships the evidence-first GitHub demo/contribution surface. Replayable managed-hook completion remains `ACTIVATION_COMPLETION_UNATTESTED` and cannot claim `ACTIVE`. npm `@next` remains the source of truth for package availability; publication does not itself update a frozen runtime or authenticate a host.
+
+**Alpha.31.2 engineering detail:** makes package updates recoverable without turning user configuration into release state. Claude Code/Codex hooks keep a byte-stable `.runtime/cli.js` bootstrap while implementation bytes move to `cli-runtime.js`; a verified upgrade refreshes legacy activation evidence once without rewriting correct Hook files, then later implementation-only upgrades leave Hook config and activation generation unchanged. Runtime replacement uses two self-verifying generations and restores the exact previous generation if the new MCP server fails its probe. `upgrade --runtime <name>` provides bounded repair for a stale host registration, and the fresh-package `rescue` entry can recover a damaged frozen updater. Alpha.31.1's WorkBuddy effective-path, Codex least-privilege/transactional rollback, and zero-runtime-dependency fixes remain included. This proves the documented update and recovery contracts—it does not claim every host lifecycle is `ACTIVE`; `doctor` may still report `TOOLS ONLY`, `READY — WAITING FOR FIRST ACTIVITY`, or `NEEDS REPAIR` where lifecycle evidence is absent. npm `@next` is the source of truth for package availability; publication does not itself update a frozen runtime or imply production certification. The Alpha.31 review-first boundaries remain unchanged: continuous consolidation is report-only and never automatically rewrites authoritative memory; Grounded Media reports only `EQUAL_UNTRUSTED`; Activity Ledger `COMMITTED` does not imply task success.
 
 **Which version has what (dist-tags).** Prereleases publish under the `next` dist-tag; `npm install ihow-memory` resolves `latest`.
 

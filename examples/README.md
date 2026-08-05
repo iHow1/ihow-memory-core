@@ -25,6 +25,7 @@ All examples are sandboxed by design:
 | [01-five-minute-memory.md](./01-five-minute-memory.md) | The full governed loop with the CLI alone: init a demo space, write a candidate, promote it, search with citations, read back, confirm local-only status, inspect the audit trail. | ~5 min |
 | [02-claude-code-mcp.md](./02-claude-code-mcp.md) | Wiring the stdio MCP server into Claude Code: `init` snippet, `connect --dry-run` preview, manual config alternative, in-session verification of the six `memory.*` tools, governance from the CLI, `doctor`, clean uninstall. | ~10 min |
 | [03-two-agents-shared-memory.sh](./03-two-agents-shared-memory.sh) | Executable proof that two agents share one governed memory: agent A writes a candidate over MCP stdio, governance promotes it via the CLI, agent B finds and reads it back with a citation. Prints `PASS`/`FAIL`. | ~15 s |
+| [verify-first-handoff-demo.sh](./verify-first-handoff-demo.sh) | One-command repository demo of the shipped verify-first proof: synthetic UNVERIFIED narrative, live git anchors GREEN then RED after drift, followed by cited and audited agent-to-agent memory. | ~10 s |
 
 ## Running the script example
 

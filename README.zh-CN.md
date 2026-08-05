@@ -1,6 +1,10 @@
 # iHow Memory
 
-> 给异构 AI coding agents 用的本地共享记忆运行时——一份 git 可审的 Markdown 记忆，供它们共享并安全交接。
+> **你的AI可以换，工作不能断。**
+
+iHow Memory 为 coding agent 提供一份本地、人可读的共享记忆，跨会话、跨工具交接。在支持捕获的路径上，上下文被压缩、runtime 崩溃，或你从 Claude Code 换到 Codex 时，下一位 agent 能接到此前的状态、证据、阻塞与下一步。
+
+它不会直接相信上一位 agent 的叙事。接收方先重新检查现场 git 锚点：仓库状态吻合才能得到 **GREEN**，发生漂移就强制 **RED**。记忆以 Markdown 留在你的机器上，带引用与审计轨迹。
 
 [![npm version](https://img.shields.io/npm/v/ihow-memory.svg)](https://www.npmjs.com/package/ihow-memory)
 [![CI](https://github.com/iHow1/ihow-memory-core/actions/workflows/ci.yml/badge.svg)](https://github.com/iHow1/ihow-memory-core/actions/workflows/ci.yml)
@@ -10,56 +14,43 @@
 
 > 本文是英文版 README 的翻译。单一信源为英文版；若中英文有出入，以 [英文版](./README.md) 为准。
 
-**要求：Node.js >= 22.12 · macOS / Linux（alpha）。** 无账号、无 API key、无第三方运行时依赖。（Node >= 22.12 是硬性要求——引擎使用 `node:sqlite`。）
+## 3 分钟看见证据
 
-**适合谁用：** 最适合用 git 的编码工作流——此时 verify-first 交接能拿到最强的锚点；不用 git 也能用，改用文件指纹锚点（见下文）。
+要求 Node.js >= 22.12，运行于 macOS 或 Linux；支持 WSL，原生 Windows 仍为实验性。无需账号或 API key。
 
-iHow Memory 是给异构 AI coding agents 用的本地共享记忆运行时——让 Claude Code、Codex、Cursor 以及其他 MCP 客户端共享同一份人可读、git 可审的长期记忆，并能安全交接。记忆本体是磁盘上的纯 Markdown，你可以用 git 阅读、diff、回滚；写入前有一道检查会拒绝看起来含密钥的候选，每次 promote 都是一个审计事件；交接（handoff）是下一个 agent 会读到的一份候选——当前状态、证据、阻塞、下一步。在 git 仓库里，你能拿到最强的 verify-first 锚点（branch / HEAD / dirty）；在非 git 项目里，交接照样能用——你会得到上一会话的叙述加上文件指纹锚点（接收方会对动过的文件重新哈希以发现漂移）——只是没有 git 那种 commit 级的 GREEN/RED。Agent 通过 stdio MCP server 接入；你在 CLI 里用的是同一套流程。
-
-## 为什么不同
-
-1. **Verify-first 交接——无需重新讲背景，也不盲信上一任。** `/clear` 后、开启新会话或换到另一个工具时，运行 `memory.continue`（或 `ihow-memory continue`）。接收方会拿到上一会话的交接叙事，同时用**现场 git 锚点重新核验（GREEN / RED），再决定是否信任叙事**。因此新 agent 可以从原处继续，又不会把过期的“已完成 / 已发布”当成事实。其他记忆工具主要检索事实；iHow 的核心差异是带信任检查的跨工具 resume。Git 仓库能提供最强的 branch / HEAD / dirty 锚点；非 git 项目则用文件指纹，由接收方重新哈希已修改文件来发现漂移。
-2. **天生跨厂商。** 同一份记忆，可供 Claude Code、Codex、Cursor、腾讯 WorkBuddy、Claude Desktop、OpenCode、Hermes 与 OpenClaw 共享——跨厂商，在你自己的机器上，每个一条命令接入。大平台都有理由把记忆锁在各自生态里；iHow 是它们之间那层中立的本地记忆。当前 alpha 阶段只有 Claude Code 在每日 dogfood，其余都是单机真机 smoke，而 Cursor 与 Claude Desktop 只能接收（能调用工具，但无法 resume）——详见 [Runtime 支持](#runtime-支持)。
-3. **安全写入 + 治理。** 多个 agent 共享同一份记忆，写入由 workspace 锁串行化，彼此不会互相覆盖。写入前有一道检查会拒绝看起来含密钥（token、key、凭据）的候选，每次 promote 都是一个审计事件。
-4. **人可读，且归你所有。** 记忆是纯 Markdown，你可以用 git 阅读、diff、回滚——不锁厂商、无向量黑盒、无账号、默认无遥测。治理流程（候选 → 审阅 → promote）在团队需要时随时可用，而不是被强制的步骤。
-
-**Alpha.31.2 预发布版（`0.1.0-alpha.31.2`；本地 release-ready）：** 让软件包更新具备可恢复性，同时不把用户配置当成版本状态。Claude Code/Codex Hook 固定使用字节稳定的 `.runtime/cli.js` 启动器，随版本变化的实现移到 `cli-runtime.js`；一次成功升级只为旧安装刷新一次激活证据，不改写正确的 Hook 文件，此后的普通实现更新不会再改变 Hook 配置或代际。runtime 替换保留两代自校验目录，新 MCP server 探活失败时恢复精确的上一代。`upgrade --runtime <name>` 可对单个过期宿主注册做有边界的修复；若冻结升级器本身已损坏，还可从新下载的软件包运行 `rescue`。Alpha.31.1 的 WorkBuddy 生效路径、Codex 最小权限/事务回滚与零运行时依赖修复继续保留。这里证明的是文档所述更新与救援合同，并不宣称所有宿主生命周期都已 `ACTIVE`；在缺少生命周期证据时，`doctor` 仍可能报告 `TOOLS ONLY`、`READY — WAITING FOR FIRST ACTIVITY` 或 `NEEDS REPAIR`。npm `@next` 是软件包可用性的真相源；发布本身不会更新已经冻结的 runtime，也不代表生产认证。Alpha.31 的 review-first 边界保持不变：持续整理仅 report-only，绝不会自动改写权威记忆；Grounded Media 只输出 `EQUAL_UNTRUSTED`；Activity Ledger 的 `COMMITTED` 不代表任务成功。
-
-## 快速开始——约 3 分钟看到第一次成功
-
-### 1. 本地接入
+### 接入
 
 ```bash
 npx ihow-memory@next setup
 ```
 
-`setup` 会检测已安装的 runtime、接入本地 MCP server，只在 runtime 有稳定入口时安装主动记忆行为，并运行 `doctor`。它可重复执行、改配置前会备份，最后只给一张结果卡：接上了什么、哪些已验证或待确认、是否需要重启、数据在本机哪里，以及唯一下一步。
+`setup` 会检测支持的 runtime，改配置前先备份，接入本地 MCP server，并报告哪些已验证、待确认或需要重启。
 
-激活状态来自真实证据，而不是安装成功文案。只有当前 Claude/Codex Hook 接线经现场核验，且该配置代际之后出现有效的真实 Hook 完成事件，`doctor` 才会显示 **ACTIVE**；**READY — WAITING FOR FIRST ACTIVITY** 表示原生 Hook 已配置但尚未观察到合格的真实活动；**TOOLS ONLY** 表示只有 MCP/协作式工具，没有可核验的生命周期 Hook；**NEEDS REPAIR** 表示此前配置过的托管 Hook 已缺失、重复、损坏、目标失效或绑定到了错误 workspace。synthetic probe 和 started-only 事件绝不会升级成 ACTIVE。Activation Ledger 只保存哈希化 binding 与有界元数据，不保存 prompt、transcript、环境变量或错误正文。
-
-想先零写入预览：
-
-```bash
-npx ihow-memory@next setup --dry-run
-```
-
-### 2. 立即看懂 verify-first 的差异
+### 运行证明
 
 ```bash
 npx ihow-memory@next proof
 ```
 
-`proof` 只在一次性 git 仓库和临时记忆 workspace 中运行，会直接展示：
+`proof` 只用合成数据，在一次性 git 仓库与临时记忆 workspace 中运行。它会证明：上一位 agent 的叙事保持 **UNVERIFIED**；现场锚点吻合后得到 **GREEN**；仓库发生漂移后强制 **RED**；agent A 的受治理记忆带着引用与审计事件到达 agent B。它不会修改你的项目或 runtime 配置。
 
-```text
-上一任 agent 的叙事：UNVERIFIED
-记录锚点 == 现场锚点  -> GREEN
-记录之后 checkout 漂移 -> RED
-```
+想先看清过程，可阅读 [30–45 秒证据分镜](./docs/demo-storyboard.md)，或运行[仓库内合成演示脚本](./examples/verify-first-handoff-demo.sh)。
 
-它同时证明治理闭环——candidate → promote → 带引用的 search/read + audit——不会修改你的项目或真实 runtime 配置。默认检索是诚实的零依赖词法 FTS；可选语义召回是另一条 opt-in 通道，不会被包装成行业最强语义能力。
+## 中断之后，什么能接回来
 
-### 3. 接回真实工作
+| 中断 | 恢复路径 | 信任边界 |
+| --- | --- | --- |
+| 上下文压缩 | 支持的 Hook 会在压缩前写入有界 checkpoint。 | 叙事仍未验证；checkpoint 工件与锚点都必须通过校验。 |
+| 崩溃或会话意外结束 | 在支持捕获的 runtime 上，后续会话可恢复最近的有效 checkpoint 或 capture floor。 | 证据缺失、不完整或漂移时 fail closed，不会变成“已完成”结论。 |
+| 切换工具 | 接收方 MCP 客户端读取共享 handoff 与本地 Markdown 记忆。 | 继续之前，接收方重新检查现场仓库或文件指纹锚点。 |
+
+Git 仓库能提供最强的 branch / HEAD / dirty 锚点。非 git workspace 仍可用文件指纹检查漂移，但没有 commit 级 GREEN/RED。
+
+**Alpha 边界：** Claude Code 是每日 dogfood 主路径；其他 runtime 只有下表所列的较窄单机 smoke 证据，部分只能接收。默认检索是词法 FTS5，不是语义召回。Alpha 版本可能破坏兼容；生产使用前请看 [Runtime 支持](#runtime-支持)与[局限](#局限limitations)。
+
+如果 agent 重置曾让你返工，欢迎 [Star iHow Memory](https://github.com/iHow1/ihow-memory-core)，让更多开发者找到它，也告诉我们你最需要哪一种交接。
+
+## 接回真实工作
 
 在 `/clear`、新会话或切换到另一个受支持 runtime 后：
 
@@ -69,7 +60,7 @@ npx ihow-memory@next continue            # 可选仓库关键词：continue <nam
 
 `continue` 会把上一会话叙事标成 **UNVERIFIED**，并交给接收方现场重验机器锚点。GREEN 的条件刻意很窄；一旦有漂移或冲突就强制 RED。首次使用还没有历史会话时，CLI 会直接说明，并引导运行 `proof`，不会再输出一个巨大的空交接包。在 Claude Code 里可直接说“继续”。
 
-### 4. 纠正错误记忆
+### 纠正错误记忆
 
 ```bash
 npx ihow-memory@next forget "文字或 memory/path.md"
@@ -78,6 +69,13 @@ npx ihow-memory@next remember "文字或 memory/path.md"
 ```
 
 `forget` 只对一个无歧义匹配做 tombstone，让它停止出现在 search 和 recall；原文件不删除，操作可逆且有审计。
+
+## 为什么这种交接不同
+
+1. **先核验，再继续。** 上一位 agent 的状态只是叙事，不是权威事实；现场 git 或文件锚点决定接收方看到 GREEN 还是 RED。
+2. **为跨 agent 而生。** Claude Code、Codex、Cursor、WorkBuddy、Claude Desktop、OpenCode、Hermes、OpenClaw、VS Code、Gemini CLI 与 Cline 按下表能力参与。
+3. **写入受治理、可检查。** 候选可审阅后 promote；疑似密钥内容会被拒绝；持久记忆带引用与审计事件。
+4. **本地且人可读。** 默认核心使用 Markdown + SQLite FTS5；无账号、无必需云服务，遥测默认关闭。
 
 ### `setup` 当前接入成熟度
 
@@ -91,6 +89,8 @@ npx ihow-memory@next connect --runtime claude-code
 npx ihow-memory@next init --runtime claude-code       # 只打印 MCP 片段
 npx ihow-memory@next doctor --runtime claude-code
 ```
+
+激活状态来自证据，而不是安装成功文案。当前候选中的冻结 CLI 与精确 Claude/Codex 托管接线可以形成有界的本地完成证据，但同一 OS 用户可重放该命令，因此它不是宿主认证。`doctor` 会把这类 runtime 封顶为 **READY — WAITING FOR FIRST ACTIVITY**，reason code 为 `ACTIVATION_COMPLETION_UNATTESTED`。**TOOLS ONLY** 表示只有协作式 MCP 工具，没有可核验的生命周期 Hook；**NEEDS REPAIR** 表示托管接线已经损坏或过期。synthetic probe 和 started-only 事件绝不会升级成 ACTIVE。Ledger 只保存哈希化 binding 与有界元数据，不保存 prompt、transcript、环境变量或错误正文。
 
 ### 显式治理闭环
 
@@ -107,7 +107,7 @@ npx ihow-memory@next reset --space demo
 
 不加 `--no-auto-promote` 时，干净写入可自动晋升到持久 yellow 子档；密钥和伪造锚点仍会被拦截。search/read 会引用确切 Markdown 来源，promote 会生成审计事件。
 
-### 更新
+### 更新与恢复
 
 `connect` 会把运行时副本冻结进 workspace。各 Agent 的 MCP 注册持续使用固定的 `.runtime/mcp/server.js` 路径；Claude Code/Codex Hook 使用字节稳定的 `.runtime/cli.js` 启动器，真正随版本变化的 CLI 实现在 `.runtime/cli-runtime.js`。因此 `npm update` **本身不会**刷新正在运行的 MCP server，更新包后仍需执行 `npx ihow-memory@next upgrade`，然后重启 runtime。新版会先在旁路构建并校验完整性，再原子交换 `.runtime` 与 `.runtime.previous` 两代目录，随后做 MCP 探活；探活失败会恢复精确的上一代。旧安装第一次迁移到稳定启动器时只刷新一次激活证据，不会改写本来正确的 Hook 文件；此后的普通实现更新不会再改变 Hook 配置或代际。如果某一个 runtime 的注册仍指向已删除/移动的 workspace，可执行例如 `npx ihow-memory@next upgrade --runtime opencode`，只备份并修复该 runtime。若本地冻结运行时已经损坏，可从目标 workspace 执行独立救援入口 `npx ihow-memory@next rescue`，必要时再加 `--runtime <name>`。版本偏移或激活接线损坏时，`doctor` 会失败而不是静默放行。
 
@@ -120,7 +120,7 @@ npx ihow-memory@next reset --space demo
 | Claude Code | ✓（`claude mcp add-json`） | ✓ | 真机 app smoke + 持续 dogfood；含 skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks |
 | Codex | ✓（`codex mcp add`） | ✓ | 原生 SessionStart / PreCompact / UserPromptSubmit hooks + `~/.codex/AGENTS.md` 主动记忆循环；单机真机 smoke |
 | OpenClaw | ✓（`~/.openclaw/openclaw.json`） | ✓ | 单机真机 smoke（memory.continue + git 预检） |
-| Hermes | ✓（`hermes mcp add`） | ✓（JSON + `state.db`） | 单机真机 smoke |
+| Hermes | ✓（`hermes mcp add` + 包内适配器） | ✓（JSON + `state.db`） | 自动安装并启用 lifecycle plugin，选择包内 compaction `MemoryProvider`；单机真机 smoke |
 | OpenCode | ✓（`~/.config/opencode`） | ✓（`opencode.db`） | 单机真机 smoke |
 | WorkBuddy | ✓（`~/.workbuddy/.mcp.json`） | ✓ | 单机真机 smoke |
 | Cursor | ✓（合并 `~/.cursor/mcp.json`） | ✗ | 只能接收——Cursor 把会话存在二进制 IndexedDB 里，无法读取用于 resume |
@@ -129,7 +129,7 @@ npx ihow-memory@next reset --space demo
 | Gemini CLI | ✓（`~/.gemini/settings.json`） | ✓（`~/.gemini/tmp/*/logs.json`） | 被动读取 Gemini 的磁盘**用户 prompt 日志**（Gemini 不在磁盘记录助手轮）→ 会话主题 + git 锚点；需手动在 `GEMINI.md` 加提示。已对真实本地数据验证 |
 | Cline (VS Code) | —（经 Cline 自己的 MCP 设置接入） | ✓（`globalStorage` / `~/.cline/data`） | 被动读取 `tasks/<id>/api_conversation_history.json`；cwd 取自 `environment_details`。已 fixture 测试，尚未真机 smoke |
 
-MCP 工具与治理闭环与 runtime 无关。Claude Code 使用 skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks；Codex 使用原生 SessionStart / PreCompact / UserPromptSubmit hooks，并由 `~/.codex/AGENTS.md` 提供主动记忆循环。Alpha.27 的 PreCompact checkpoint 路径有界、无 transcript 原文、对宿主 fail-open；其 crash-floor 与 checkpoint-first continue 会在 artifact 或 anchor 不确定时 fail closed。Resume 提示会自动注入到配置暴露了指令文件的 runtime（Claude Code、WorkBuddy、OpenClaw、Hermes、OpenCode）。
+MCP 工具与治理闭环与 runtime 无关。Claude Code 使用 skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks；Codex 使用原生 SessionStart / PreCompact / UserPromptSubmit hooks，并由 `~/.codex/AGENTS.md` 提供主动记忆循环。Hermes 的 `connect` / `setup` 会把两类包内适配器安装到 `$HERMES_HOME/plugins`，启用 `ihow-memory`，选择 `memory.provider=ihow-memory-compaction`，并把两者绑定到该 workspace 中经过完整性校验的冻结 bridge；若已配置其他外部 MemoryProvider，会在写入前拒绝覆盖，配置/插件/MCP 任一步失败则回滚本轮变更。预压缩交接保持有界且不含 transcript 原文，但在现场锚点核验前始终明确标为 `UNVERIFIED`，不等于 `ACTIVE` 或宿主认证。Resume 提示会自动注入到配置暴露了指令文件的 runtime（Claude Code、WorkBuddy、OpenClaw、Hermes、OpenCode）。
 
 ## 检索引擎
 
@@ -306,12 +306,12 @@ npx ihow-memory@next doctor --memory-root <memory-root> --state-root <state-root
 
 ## 示例
 
-可直接运行、自包含的演练在 [`examples/`](./examples/)（编号 01–03）。所有示例只用合成数据。
+可直接运行、自包含的演练在 [`examples/`](./examples/)，包括短版 [verify-first handoff 演示](./examples/verify-first-handoff-demo.sh)。所有示例只用合成数据。
 
 ## 隐私
 
 - 开源核心在本地运行：无账号、无必需网络调用，cloud 与 sync 处于禁用状态，并在 `status` 和 `doctor` 中如实报告。
-- 遥测**默认关闭**、需主动开启（`ihow-memory telemetry on`）。开启后只记录固定白名单——事件名、runtime、包版本、错误类型、时间戳——绝不记录记忆内容、文件名、查询、路径或 prompt。当前 alpha 阶段，事件只追加到本地文件（`~/.ihow-memory/telemetry-events.jsonl`），不向任何地方上传。
+- 指标收集**默认关闭**，仅在明确的三选一同意流程或执行 `ihow-memory telemetry on` 后开启。非交互式和 `--json` setup 不会提示，也不会保存同意状态。开启后，只有版本化白名单事件名、随机安装 ID、时间戳以及白名单中的 runtime/error 分类值能进入有界本地队列；记忆、prompt、查询、路径、git 数据、用户名/主机名和硬件标识都不会进入。产品不内置上传端点；只有显式配置无凭据的 HTTP(S) 端点且用户手动执行 `ihow-memory telemetry flush` 时才会发送网络请求。执行 `telemetry off` 会删除队列和安装 ID。详见[指标与隐私契约](docs/telemetry-privacy.md)。
 - 诊断输出按设计脱敏，绝不包含记忆内容。`feedback` 只打印模板——是否提交由你决定。
 
 ## Hosted runtime
@@ -320,7 +320,11 @@ Hosted runtime 不包含在本 npm 包与本仓库中。
 
 ## 状态
 
-Alpha 预发布候选 `0.1.0-alpha.27`（local release-ready only——上方 npm 徽章即最新发布版本；详见 [CHANGELOG.md](./CHANGELOG.md)）。成熟度为 **alpha + 单机真机 smoke**：只有 Claude Code 在每日 dogfood，其余 runtime 都是单机真机 smoke，而 Cursor 与 Claude Desktop 只能接收（能调用工具，但无法 resume）。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 上每日验证；原生 Windows 为**实验性**——`packageDir` 路径 bug 已修，并有 `windows-latest` CI lane 覆盖构建 + connect/doctor 可达性 smoke + 全量测试，受支持路径为 WSL。npm 包内含编译后的 CLI、stdio MCP server 与只读本地 console；TypeScript 源码就在本仓库。alpha 版本间可能有破坏性变更。
+Alpha.31.4 预发布版候选 `0.1.0-alpha.31.4`（local release-ready only——上方 npm 徽章即最新发布版本；详见 [CHANGELOG.md](./CHANGELOG.md)）。成熟度为 **alpha + 单机真机 smoke**：Claude Code 每日 dogfood，拥有最完整的原生 Hook 路径；Codex 有原生 SessionStart / PreCompact / UserPromptSubmit Hook 与主动 AGENTS 记忆循环；Hermes 现包含包内 lifecycle 与 compaction 适配器；其他 runtime 的较窄证据以 [Runtime 支持](#runtime-支持)为准。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 验证；原生 Windows 为**实验性**，受支持路径为 WSL。npm 包内含编译后的 CLI、stdio MCP server、只读本地 console、Hermes 包内适配器、隐私契约与 evidence-first 发布资产。Alpha 版本间可能有破坏性变更。
+
+**Alpha.31.4 工程细节：** 以一笔事务闭合 Hermes compaction 安装，加入需显式同意、有界、无内置端点且不会自动上传的匿名指标，并交付 evidence-first 的 GitHub 演示/贡献界面。可重放的 managed-hook 完成证据仍是 `ACTIVATION_COMPLETION_UNATTESTED`，不能宣称 `ACTIVE`。npm `@next` 继续作为软件包可用性的真相源；发布本身不会更新冻结 runtime，也不会认证宿主。
+
+**Alpha.31.2 工程细节：** 让软件包更新具备可恢复性，同时不把用户配置当成版本状态。Claude Code/Codex Hook 固定使用字节稳定的 `.runtime/cli.js` 启动器，随版本变化的实现在 `cli-runtime.js`；一次成功升级只为旧安装刷新一次激活证据，不改写正确的 Hook 文件，此后的普通实现更新不会再改变 Hook 配置或代际。runtime 替换保留两代自校验目录，新 MCP server 探活失败时恢复精确的上一代。`upgrade --runtime <name>` 可对单个过期宿主注册做有边界的修复；若冻结升级器本身已损坏，还可从新下载的软件包运行 `rescue`。Alpha.31.1 的 WorkBuddy 生效路径、Codex 最小权限/事务回滚与零运行时依赖修复继续保留。这里证明的是文档所述更新与救援合同，并不宣称所有宿主生命周期都已 `ACTIVE`；在缺少生命周期证据时，`doctor` 仍可能报告 `TOOLS ONLY`、`READY — WAITING FOR FIRST ACTIVITY` 或 `NEEDS REPAIR`。npm `@next` 是软件包可用性的真相源；发布本身不会更新已经冻结的 runtime，也不代表生产认证。Alpha.31 的 review-first 边界保持不变：持续整理仅 report-only，绝不会自动改写权威记忆；Grounded Media 只输出 `EQUAL_UNTRUSTED`；Activity Ledger 的 `COMMITTED` 不代表任务成功。
 
 **哪个版本有什么（dist-tag）。** 预发布版发布在 `next` dist-tag 下；`npm install ihow-memory` 解析到 `latest`。
 

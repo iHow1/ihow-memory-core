@@ -11,6 +11,12 @@ The project is in alpha. The most useful contributions right now:
 
 For anything larger than a small fix, please open an issue first so we can agree on the direction before you invest time.
 
+Looking for a bounded first contribution? Start with the eight [good first issue candidates](./docs/good-first-issues.md). They are proposals, not pre-created public issues; confirm availability with a maintainer before beginning.
+
+Maintainers preparing a public release can use the [GitHub launch asset checklist](./docs/launch-asset-checklist.md), which keeps repository assets separate from settings, uploads, issues, and posts that still require public action.
+
+Maintainers and automation agents must also follow the [engineering change and release governance](./docs/release-governance.md): use focused verification during development, risk-based per-PR CI, Merge Queue or a bounded integration branch for composition, one immutable integrated RC for release-wide testing, and promotion of the same verified artifact.
+
 ## Development setup
 
 Requirements: Node.js >= 22.12, macOS or Linux.
@@ -69,8 +75,8 @@ See [DCO.md](./DCO.md) for the full text. Unsigned commits will be asked to amen
 ## Pull request checklist
 
 - `npm run build` passes.
-- `node --test tests/` passes (when the test suite is present).
-- `npm pack --dry-run` shows the expected file list.
+- Affected tests and repository-required baseline CI pass; run the full suite only when the change risk or release-train stage requires it.
+- Package-surface changes verify the expected pack list; the integrated RC is packed once and the same artifact is used for fresh-install smoke and promotion.
 - Synthetic data only; no secrets, no customer data.
 - README / CHANGELOG updated if behavior changed.
 - Commits signed off (DCO).

@@ -58,13 +58,20 @@ export type CodexPreCompactTrigger = NativePreCompactCommon & {
   trigger: 'manual' | 'auto';
 };
 
-export type NativePreCompactTrigger = ClaudePreCompactTrigger | CodexPreCompactTrigger;
+export type HermesPreCompactTrigger = NativePreCompactCommon & {
+  runtime: 'hermes';
+  trigger: 'auto';
+};
+
+export type HostNativePreCompactTrigger = ClaudePreCompactTrigger | CodexPreCompactTrigger;
+export type NativePreCompactTrigger = HostNativePreCompactTrigger | HermesPreCompactTrigger;
 
 export type NativePreCompactResult = {
   status: 'completed';
   artifactId: string;
   deduplicated: boolean;
   draftPath: 'existing' | 'minimal-shadow';
+  coverageComplete: boolean;
 };
 
 export class NativePreCompactInputError extends Error {
@@ -131,7 +138,7 @@ export function normalizeNativePreCompactTrigger(
   runtime: 'claude-code' | 'codex',
   payload: unknown,
   at?: string,
-): NativePreCompactTrigger {
+): HostNativePreCompactTrigger {
   const input = record(payload);
   if (input.hook_event_name !== 'PreCompact') fail('native_precompact_event_invalid');
   const cwd = boundedString(input.cwd, 'native_precompact_cwd_invalid', CWD_MAX);
@@ -208,7 +215,7 @@ function isMinimalShadowDraft(draft: CheckpointDraftV1): boolean {
 async function matchingDraft(
   workspace: Awaited<ReturnType<typeof openCore>>['workspace'],
   project: Awaited<ReturnType<typeof resolveCheckpointProjectIdentity>>,
-  runtime: 'claude-code' | 'codex',
+  runtime: NativePreCompactTrigger['runtime'],
   sessionId: string,
 ): Promise<{ open?: CheckpointDraftV1; recentFinalized?: CheckpointDraftV1 }> {
   const match = await locateCheckpointDrafts(workspace, project, runtime, sessionId);
@@ -235,7 +242,11 @@ export async function runNativePreCompact(
       && receipt.artifactId === matched.recentFinalized.finalization.artifactId
     ) {
       const prior = await core.checkpoints.read(receipt.artifactId);
-      const expectedSource = contract.runtime === 'claude-code' ? 'ClaudeCode.PreCompact' : 'Codex.PreCompact';
+      const expectedSource = contract.runtime === 'claude-code'
+        ? 'ClaudeCode.PreCompact'
+        : contract.runtime === 'codex'
+          ? 'Codex.PreCompact'
+          : 'Hermes.MemoryProvider.on_pre_compress';
       const replayAgeMs = Date.parse(contract.observedAt) - Date.parse(receipt.completedAt);
       // Never dedupe from recency alone. The private receipt binds the exact normalized delivery key to
       // the still-latest finalized draft/artifact, and any newly opened cooperative draft bypasses this
@@ -256,6 +267,7 @@ export async function runNativePreCompact(
             artifactId: prior.id,
             deduplicated: true,
             draftPath: prior.trigger.signal === 'native' ? 'existing' : 'minimal-shadow',
+            coverageComplete: prior.coverage.complete,
           };
         }
       }
@@ -268,6 +280,22 @@ export async function runNativePreCompact(
   let draftPath: NativePreCompactResult['draftPath'] = draft && !isMinimalShadowDraft(draft)
     ? 'existing'
     : 'minimal-shadow';
+  // The MemoryProvider hook has no exact durable turn-receipt binding. It may preserve bounded
+  // cooperative claims, but it cannot promote their protection truth: an asserted complete draft is
+  // downgraded until the existing session-end path proves every known receipt closed.
+  if (contract.runtime === 'hermes' && draft?.coverage.complete) {
+    draft = await core.checkpoints.updateDraft(draft.draftId, {
+      claims: {
+        ...draft.claims,
+        evidence: draft.evidence,
+        coverage: {
+          complete: false,
+          ...(draft.coverage.fromCheckpointId ? { fromCheckpointId: draft.coverage.fromCheckpointId } : {}),
+          ...(draft.coverage.eventCount === undefined ? {} : { eventCount: draft.coverage.eventCount }),
+        },
+      },
+    });
+  }
   if (!draft) {
     draft = await core.checkpoints.createDraft({
       runtime: contract.runtime,
@@ -276,7 +304,11 @@ export async function runNativePreCompact(
     });
     draftPath = 'minimal-shadow';
   }
-  const sourceEvent = contract.runtime === 'claude-code' ? 'ClaudeCode.PreCompact' : 'Codex.PreCompact';
+  const sourceEvent = contract.runtime === 'claude-code'
+    ? 'ClaudeCode.PreCompact'
+    : contract.runtime === 'codex'
+      ? 'Codex.PreCompact'
+      : 'Hermes.MemoryProvider.on_pre_compress';
   const result = await core.checkpoints.finalizeDraft(draft.draftId, {
     trigger: {
       kind: 'pre_compact',
@@ -299,5 +331,6 @@ export async function runNativePreCompact(
     artifactId: result.artifact.id,
     deduplicated: result.deduplicated,
     draftPath,
+    coverageComplete: result.artifact.coverage.complete,
   };
 }

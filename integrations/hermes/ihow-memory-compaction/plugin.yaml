@@ -1,0 +1,4 @@
+name: ihow-memory-compaction
+version: "0.1.0"
+description: Explicit fail-open Hermes MemoryProvider for local iHow pre-compression checkpoints.
+kind: exclusive
