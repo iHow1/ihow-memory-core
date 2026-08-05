@@ -21,6 +21,7 @@ export type ActivationEvidenceSource =
   | 'setup'
   | 'connect'
   | 'install-hook'
+  | 'managed-hook'
   | 'native-hook'
   | 'context-probe'
   | 'synthetic-proof'
@@ -84,7 +85,7 @@ const KNOWN_EVENTS = new Set<ActivationEvidenceEvent>([
   'context-probe-tick', 'synthetic-check',
 ]);
 const KNOWN_SOURCES = new Set<ActivationEvidenceSource>([
-  'setup', 'connect', 'install-hook', 'native-hook', 'context-probe', 'synthetic-proof', 'test',
+  'setup', 'connect', 'install-hook', 'managed-hook', 'native-hook', 'context-probe', 'synthetic-proof', 'test',
 ]);
 const KNOWN_STATUSES = new Set<ActivationEvidenceStatus>([
   'configured', 'synthetic', 'observed-live-started', 'observed-live-completed', 'failed',
@@ -292,8 +293,8 @@ export async function appendActivationEvidence(
   });
 }
 
-// Activation telemetry must never become a host availability dependency. Hook/probe/setup callers use
-// this wrapper so a read-only disk, lock timeout, or malformed prior ledger cannot block the runtime.
+// Local activation evidence must never become a host availability dependency. Hook/probe/setup callers
+// use this wrapper so a read-only disk, lock timeout, or malformed prior ledger cannot block the runtime.
 export async function appendActivationEvidenceFailOpen(
   workspace: Workspace,
   input: AppendActivationEvidenceInput,

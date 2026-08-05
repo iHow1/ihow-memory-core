@@ -79,7 +79,10 @@ test('real Hermes lifecycle verifies host execution and checkpoints finalize wit
     dedupeKey: wiring.generationId, configurationKey: wiring.generationId,
   });
   const ready = await automationMatrix(f.core.workspace, { command: process.execPath }, { hermesHome: f.home });
-  assert.equal(ready.rows.find(row => row.runtime === 'Hermes')?.activationStatus, 'READY — WAITING FOR FIRST ACTIVITY');
+  const incomplete = ready.rows.find(row => row.runtime === 'Hermes');
+  assert.equal(incomplete?.activationStatus, 'NEEDS REPAIR');
+  assert.equal(incomplete?.activationReasonCode, 'ACTIVATION_WIRING_BROKEN');
+  assert.match(incomplete?.notes ?? '', /compaction-missing/);
 
   const run = invokeHost(f);
   assert.equal(run.status, 0, run.stderr);
@@ -87,7 +90,9 @@ test('real Hermes lifecycle verifies host execution and checkpoints finalize wit
   assert.equal(evidence.some(row => row.runtime === 'hermes' && row.source === 'native-hook'), false);
 
   const verified = await automationMatrix(f.core.workspace, { command: process.execPath }, { hermesHome: f.home });
-  assert.equal(verified.rows.find(row => row.runtime === 'Hermes')?.activationStatus, 'READY — WAITING FOR FIRST ACTIVITY');
+  const stillIncomplete = verified.rows.find(row => row.runtime === 'Hermes');
+  assert.equal(stillIncomplete?.activationStatus, 'NEEDS REPAIR');
+  assert.equal(stillIncomplete?.activationReasonCode, 'ACTIVATION_WIRING_BROKEN');
   const artifacts = await fs.readdir(path.join(f.memoryRoot, '_mcp', 'checkpoints', 'artifacts'));
   assert.ok(artifacts.some(name => /^cp_[a-f0-9]{64}\.json$/.test(name)));
 });

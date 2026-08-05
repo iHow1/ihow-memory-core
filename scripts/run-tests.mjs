@@ -3,7 +3,7 @@
 //
 // Keep the broad suite parallel, but run deadline-sensitive integration tests after it. The real
 // PreCompact hook tests execute a production 8s fail-open watchdog, the Hermes native lifecycle test
-// crosses a production 5s Python-to-Node bridge budget, and the vector timeout test deliberately
+// and B3 adapter tests cross a production Python-to-Node bridge budget, and the vector timeout test deliberately
 // contrasts a 200ms status preflight with the index phase's 4000ms ceiling. Running any of these
 // families while every CPU is saturated by unrelated workers tests scheduler contention rather than
 // the production checkpoint, bridge, or index-timeout contract that its assertions are meant to cover.
@@ -18,8 +18,10 @@ const testsRoot = path.join(repo, 'tests');
 const deadlineSensitive = new Set([
   'tests/activation-ledger.test.mjs',
   'tests/checkpoint-core.test.mjs',
+  'tests/hermes-b3-adapter-safety.test.mjs',
   'tests/hermes-b3-shared-contract.test.mjs',
   'tests/hermes-host-plugin-e2e.test.mjs',
+  'tests/hermes-memory-provider-compaction.test.mjs',
   'tests/hermes-native-lifecycle-e2e.test.mjs',
   'tests/hermes-ordinary-language-capture.test.mjs',
   'tests/native-precompact.test.mjs',
@@ -35,6 +37,7 @@ const dangerousAmbientRoutingKeys = [
   'HERMES_HOME',
   'IHOW_MEMORY_HERMES_BRIDGE',
   'IHOW_MEMORY_HERMES_NODE',
+  'IHOW_TELEMETRY_ENDPOINT',
   'CODEX_HOME',
 ];
 
@@ -99,6 +102,40 @@ function isCompetingTestCommand(command) {
     || script === 'scripts/run-tests.mjs';
 }
 
+export function parsePsDuration(value) {
+  const hms = /^(?:(\d+)-)?(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$/.exec(value);
+  if (hms) {
+    const days = Number(hms[1] ?? 0);
+    const hours = Number(hms[2]);
+    const minutes = Number(hms[3]);
+    const seconds = Number(hms[4]);
+    if (![days, hours, minutes, seconds].every(Number.isFinite) || minutes >= 60 || seconds >= 60) return Number.NaN;
+    return days * 24 * 60 * 60 + hours * 60 * 60 + minutes * 60 + seconds;
+  }
+  const ms = /^(?:(\d+)-)?(\d+):(\d{2}(?:\.\d+)?)$/.exec(value);
+  if (!ms) return Number.NaN;
+  const days = Number(ms[1] ?? 0);
+  const minutes = Number(ms[2]);
+  const seconds = Number(ms[3]);
+  if (![days, minutes, seconds].every(Number.isFinite) || seconds >= 60) return Number.NaN;
+  return days * 24 * 60 * 60 + minutes * 60 + seconds;
+}
+
+function isDormantLowCpu(entry) {
+  return (entry.state?.startsWith('S') || entry.state?.startsWith('I'))
+    && Number.isFinite(entry.elapsedSeconds)
+    && entry.elapsedSeconds >= 24 * 60 * 60
+    && Number.isFinite(entry.cpuSeconds)
+    && entry.cpuSeconds < 60;
+}
+
+function belongsToStaleDormantOrphanTree(entry, byPid) {
+  if (!isDormantLowCpu(entry)) return false;
+  let cursor = entry;
+  while (cursor?.ppid && cursor.ppid !== 1) cursor = byPid.get(cursor.ppid);
+  return cursor?.ppid === 1 && isDormantLowCpu(cursor);
+}
+
 export function findCompetingTestProcesses(processTable, currentPid = process.pid) {
   const byPid = new Map(processTable.map((entry) => [entry.pid, entry]));
   const ownLineage = new Set();
@@ -110,17 +147,25 @@ export function findCompetingTestProcesses(processTable, currentPid = process.pi
   return processTable.filter((entry) => (
     !ownLineage.has(entry.pid)
     && isCompetingTestCommand(entry.command)
+    && !belongsToStaleDormantOrphanTree(entry, byPid)
   ));
 }
 
 function defaultReadinessSample() {
   const load1 = os.loadavg()[0];
-  const output = execFileSync('ps', ['-axo', 'pid=,ppid=,command='], { encoding: 'utf8' });
+  const output = execFileSync('ps', ['-axo', 'pid=,ppid=,state=,etime=,time=,command='], { encoding: 'utf8' });
   const processTable = output
     .split('\n')
-    .map((line) => line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/))
+    .map((line) => line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$/))
     .filter(Boolean)
-    .map((match) => ({ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] }));
+    .map((match) => ({
+      pid: Number(match[1]),
+      ppid: Number(match[2]),
+      state: match[3],
+      elapsedSeconds: parsePsDuration(match[4]),
+      cpuSeconds: parsePsDuration(match[5]),
+      command: match[6],
+    }));
   const competitors = findCompetingTestProcesses(processTable);
   return { load1, competitors };
 }

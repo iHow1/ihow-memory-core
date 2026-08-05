@@ -222,21 +222,45 @@ const configPath = path.join(process.env.HERMES_HOME, 'config.yaml');
 const statePath = process.env.IHOW_OFFICIAL_CLI_STATE;
 const logPath = process.env.IHOW_OFFICIAL_CLI_LOG;
 const load = () => { try { return JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch { return null; } };
+const readConfig = () => { try { return fs.readFileSync(configPath, 'utf8'); } catch { return ''; } };
+const withoutTopLevelSections = (raw, names) => {
+  const kept = [];
+  let skip = false;
+  for (const line of raw.split(/\r?\n/)) {
+    const top = /^([^\s:#][^:]*):(?:\s.*)?$/.exec(line);
+    if (top) skip = names.has(top[1]);
+    if (!skip && line) kept.push(line);
+  }
+  return kept.length ? kept.join('\n') + '\n' : '';
+};
 const save = (spec) => {
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  const preserved = withoutTopLevelSections(readConfig(), new Set(['mcp_servers']));
   if (!spec) {
     try { fs.unlinkSync(statePath); } catch {}
-    fs.writeFileSync(configPath, 'mcp_servers: {}\n');
+    fs.writeFileSync(configPath, 'mcp_servers: {}\n' + preserved);
     return;
   }
   fs.writeFileSync(statePath, JSON.stringify(spec));
   const args = spec.args.map((arg) => '    - ' + JSON.stringify(arg)).join('\n');
   const env = Object.entries(spec.env).map(([key, value]) => '      ' + key + ': ' + JSON.stringify(value)).join('\n');
-  fs.writeFileSync(configPath, 'mcp_servers:\n  ihow-memory:\n    command: ' + JSON.stringify(spec.command) + '\n    args:\n' + args + '\n    env:\n' + env + '\n');
+  fs.writeFileSync(configPath, 'mcp_servers:\n  ihow-memory:\n    command: ' + JSON.stringify(spec.command) + '\n    args:\n' + args + '\n    env:\n' + env + '\n' + preserved);
 };
 const log = (op, spec) => fs.appendFileSync(logPath, JSON.stringify({ op, spec }) + '\n');
 if (argv[0] === 'gateway') process.exit(0);
+if (argv[0] === 'plugins' && argv[1] === 'enable' && argv[2] === 'ihow-memory') {
+  const raw = readConfig();
+  if (!/(^|\n)plugins:\s*\n[\s\S]*?\n\s*-\s*ihow-memory(?:\s|$)/.test(raw)) {
+    fs.writeFileSync(configPath, raw + 'plugins:\n  enabled:\n    - ihow-memory\n  disabled: []\n');
+  }
+  process.exit(0);
+}
+if (argv[0] === 'config' && argv[1] === 'set' && argv[2] === 'memory.provider') {
+  const preserved = withoutTopLevelSections(readConfig(), new Set(['memory']));
+  fs.writeFileSync(configPath, preserved + 'memory:\n  provider: ihow-memory-compaction\n');
+  process.exit(0);
+}
 if (argv[0] !== 'mcp') process.exit(0);
 const state = load();
 if (argv[1] === 'list') {
@@ -711,7 +735,11 @@ test('Hermes official CLI compares command/argv/env and replaces environment dri
 
   const common = {
     runtime: 'hermes', home, bin, statePath, logPath, root, command: 'connect',
-    extraEnv: { HERMES_HOME: hermesHome },
+    extraEnv: {
+      HERMES_HOME: hermesHome,
+      IHOW_MEMORY_HERMES_BRIDGE: '',
+      IHOW_MEMORY_HERMES_NODE: '',
+    },
   };
   const first = runJson(common);
   assert.equal(first.changed, true);
