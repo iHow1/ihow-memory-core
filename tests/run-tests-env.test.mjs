@@ -10,6 +10,7 @@ import test from 'node:test';
 import {
   awaitDeadlineReadiness,
   findCompetingTestProcesses,
+  parsePsDuration,
   partitionTestPhases,
   sanitizeTestEnv,
 } from '../scripts/run-tests.mjs';
@@ -24,6 +25,7 @@ const dangerousRoutingKeys = [
   'HERMES_HOME',
   'IHOW_MEMORY_HERMES_BRIDGE',
   'IHOW_MEMORY_HERMES_NODE',
+  'IHOW_TELEMETRY_ENDPOINT',
   'CODEX_HOME',
 ];
 
@@ -32,8 +34,10 @@ test('partitionTestPhases separates deadline-sensitive tests from the parallel c
     'tests/ordinary.test.mjs',
     'tests/activation-ledger.test.mjs',
     'tests/checkpoint-core.test.mjs',
+    'tests/hermes-b3-adapter-safety.test.mjs',
     'tests/hermes-b3-shared-contract.test.mjs',
     'tests/hermes-host-plugin-e2e.test.mjs',
+    'tests/hermes-memory-provider-compaction.test.mjs',
     'tests/hermes-native-lifecycle-e2e.test.mjs',
     'tests/hermes-ordinary-language-capture.test.mjs',
     'tests/ollama-index-concurrency.test.mjs',
@@ -47,8 +51,10 @@ test('partitionTestPhases separates deadline-sensitive tests from the parallel c
     deadlineTests: [
       'tests/activation-ledger.test.mjs',
       'tests/checkpoint-core.test.mjs',
+      'tests/hermes-b3-adapter-safety.test.mjs',
       'tests/hermes-b3-shared-contract.test.mjs',
       'tests/hermes-host-plugin-e2e.test.mjs',
+      'tests/hermes-memory-provider-compaction.test.mjs',
       'tests/hermes-native-lifecycle-e2e.test.mjs',
       'tests/hermes-ordinary-language-capture.test.mjs',
       'tests/ollama-index-concurrency.test.mjs',
@@ -104,6 +110,61 @@ test('findCompetingTestProcesses parses executable argv without matching prompt 
     processTable[6],
     processTable[7],
   ]);
+});
+
+test('findCompetingTestProcesses ignores only stale dormant orphan test processes', () => {
+  const processTable = [
+    {
+      pid: 400,
+      ppid: 1,
+      state: 'S',
+      elapsedSeconds: 2 * 24 * 60 * 60,
+      cpuSeconds: 1,
+      command: 'npm test',
+    },
+    {
+      pid: 401,
+      ppid: 400,
+      state: 'S',
+      elapsedSeconds: 2 * 24 * 60 * 60,
+      cpuSeconds: 1,
+      command: 'node --test test/stale.test.js',
+    },
+    {
+      pid: 402,
+      ppid: 1,
+      state: 'S',
+      elapsedSeconds: 10 * 60,
+      cpuSeconds: 1,
+      command: 'npm test',
+    },
+    {
+      pid: 403,
+      ppid: 1,
+      state: 'R',
+      elapsedSeconds: 2 * 24 * 60 * 60,
+      cpuSeconds: 1,
+      command: 'node --test test/active.test.js',
+    },
+    {
+      pid: 404,
+      ppid: 403,
+      state: 'S',
+      elapsedSeconds: 2 * 24 * 60 * 60,
+      cpuSeconds: 1,
+      command: 'node --test test/active-child.test.js',
+    },
+  ];
+
+  assert.deepEqual(findCompetingTestProcesses(processTable, 999), [processTable[2], processTable[3], processTable[4]]);
+});
+
+test('parsePsDuration preserves macOS ps minute, hour, and day formats', () => {
+  assert.equal(parsePsDuration('2:03.50'), 123.5);
+  assert.equal(parsePsDuration('01:02:03'), 3723);
+  assert.equal(parsePsDuration('01-02:03:04'), 93784);
+  assert.ok(Number.isNaN(parsePsDuration('02:99')));
+  assert.ok(Number.isNaN(parsePsDuration('not-a-duration')));
 });
 
 test('awaitDeadlineReadiness reports bounded exhaustion without launching the deadline phase', async () => {

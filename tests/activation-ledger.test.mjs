@@ -19,6 +19,27 @@ import { resolveWorkspace } from '../src/workspace.ts';
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
 const READY = 'READY — WAITING FOR FIRST ACTIVITY';
 
+function isolatedEnv(home, extraEnv = {}) {
+  return {
+    ...process.env,
+    HOME: home,
+    CODEX_HOME: path.join(home, '.codex'),
+    HERMES_HOME: path.join(home, '.hermes'),
+    XDG_CONFIG_HOME: path.join(home, '.config'),
+    XDG_DATA_HOME: path.join(home, '.local', 'share'),
+    XDG_STATE_HOME: path.join(home, '.local', 'state'),
+    XDG_CACHE_HOME: path.join(home, '.cache'),
+    IHOW_MEMORY_HOME: path.join(home, '.ihow-memory'),
+    IHOW_MEMORY_HERMES_BRIDGE: '',
+    IHOW_MEMORY_HERMES_NODE: '',
+    IHOW_TELEMETRY_ENDPOINT: '',
+    MEMORY_ROOT: '',
+    IHOW_MEMORY_ROOT: '',
+    IHOW_MEMORY_STATE_ROOT: '',
+    ...extraEnv,
+  };
+}
+
 async function fixture(t, slug, space = 't') {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), `ihow-activation-${slug}-`));
   const workspace = resolveWorkspace({ root, space });
@@ -62,13 +83,24 @@ test('started-only evidence never upgrades a runtime to ACTIVE', async (t) => {
   assert.equal(state.reasonCode, 'ACTIVATION_STARTED_ONLY');
 });
 
-test('only a live completion strictly after installation upgrades to ACTIVE', async (t) => {
+test('a replayable managed-hook completion after installation stays READY', async (t) => {
   const { workspace } = await fixture(t, 'completed-after');
+  await evidence(workspace, 'claude-code', 'configured', '2026-07-11T20:00:00.000Z', 'install-1');
+  await evidence(workspace, 'claude-code', 'observed-live-completed', '2026-07-11T20:00:01.000Z', 'event-1', {
+    source: 'managed-hook',
+  });
+  const state = deriveRuntimeActivation('claude-code', await readActivationEvidence(workspace), { now: Date.parse('2026-07-11T21:00:00Z') });
+  assert.equal(state.status, READY);
+  assert.equal(state.reasonCode, 'ACTIVATION_COMPLETION_UNATTESTED');
+});
+
+test('legacy native-hook labels without host attestation stay READY', async (t) => {
+  const { workspace } = await fixture(t, 'legacy-native-label');
   await evidence(workspace, 'claude-code', 'configured', '2026-07-11T20:00:00.000Z', 'install-1');
   await evidence(workspace, 'claude-code', 'observed-live-completed', '2026-07-11T20:00:01.000Z', 'event-1');
   const state = deriveRuntimeActivation('claude-code', await readActivationEvidence(workspace), { now: Date.parse('2026-07-11T21:00:00Z') });
-  assert.equal(state.status, 'ACTIVE');
-  assert.equal(state.reasonCode, 'ACTIVATION_LIVE_COMPLETED_AFTER_INSTALL');
+  assert.equal(state.status, READY);
+  assert.equal(state.reasonCode, 'ACTIVATION_COMPLETION_UNATTESTED');
 });
 
 test('a completion before installation does not upgrade to ACTIVE', async (t) => {
@@ -156,7 +188,7 @@ test('doctor JSON exposes verified-wiring activation status and stable reason co
     await fs.rm(home, { recursive: true, force: true });
     await fs.rm(cwd, { recursive: true, force: true });
   });
-  const env = { ...process.env, HOME: home, IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { IHOW_CAPTURE_FLOOR: '0' });
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd], {
     encoding: 'utf8',
     env,
@@ -172,15 +204,16 @@ test('doctor JSON exposes verified-wiring activation status and stable reason co
   assert.equal(doctor.automationMetrics.activationEvidenceCount, 1);
 });
 
-test('only the currently wired frozen CLI records generation-bound native hook completion', async (t) => {
+test('frozen managed-hook completion stays local and does not emit reserved activation telemetry', async (t) => {
   const { root, workspace } = await fixture(t, 'native-hook');
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-native-home-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-native-cwd-'));
   const transcript = path.join(root, 'transcript.jsonl');
   await fs.writeFile(transcript, ['a', 'b', 'c', 'd', 'e'].join('\n'), 'utf8');
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home };
+  const env = isolatedEnv(home);
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
+  execFileSync(process.execPath, [CLI, 'telemetry', 'on'], { encoding: 'utf8', env });
   const runtimeCli = path.join(root, 't', '.runtime', 'cli.js');
   const result = spawnSync(process.execPath, [
     runtimeCli, 'hook-stop', '--hook-owner', 'ihow-memory-v1', '--runtime', 'claude-code',
@@ -190,21 +223,37 @@ test('only the currently wired frozen CLI records generation-bound native hook c
     input: JSON.stringify({ session_id: 's1', hook_event_name: 'Stop', cwd, transcript_path: transcript }),
   });
   assert.equal(result.status, 0);
+  const replay = spawnSync(process.execPath, [
+    runtimeCli, 'hook-stop', '--hook-owner', 'ihow-memory-v1', '--runtime', 'claude-code',
+    '--root', root, '--space', 't', '--cwd', cwd,
+  ], {
+    encoding: 'utf8', env,
+    input: JSON.stringify({ session_id: 's1', hook_event_name: 'Stop', cwd, transcript_path: transcript }),
+  });
+  assert.equal(replay.status, 0);
   const rows = await readActivationEvidence(workspace);
   const configured = rows.find((row) => row.status === 'configured');
   const completed = rows.find((row) => row.event === 'hook-stop' && row.status === 'observed-live-completed');
   assert.ok(rows.some((row) => row.event === 'hook-stop' && row.status === 'observed-live-started'));
   assert.ok(completed?.configuration?.id);
+  assert.equal(completed.source, 'managed-hook', 'the replayable frozen CLI is not native host attestation');
   assert.equal(completed.configuration.id, configured.configuration.id, 'live evidence is bound to the verified wiring generation');
-  assert.equal(deriveRuntimeActivation('claude-code', rows).status, 'ACTIVE');
+  const activation = deriveRuntimeActivation('claude-code', rows);
+  assert.equal(activation.status, READY);
+  assert.equal(activation.reasonCode, 'ACTIVATION_COMPLETION_UNATTESTED');
+  await assert.rejects(
+    fs.readFile(path.join(home, '.ihow-memory', 'telemetry-queue.ndjson'), 'utf8'),
+    (error) => error?.code === 'ENOENT',
+    'managed-hook completion is local evidence only; no host-authenticated telemetry producer exists',
+  );
 });
 
-test('manual source-CLI invocation and recursion-guard payload cannot forge ACTIVE', async (t) => {
+test('source CLI invocation and recursion-guard payload create no managed-hook completion evidence', async (t) => {
   const { root, workspace } = await fixture(t, 'manual-forgery');
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-forgery-home-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-forgery-cwd-'));
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home };
+  const env = isolatedEnv(home);
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   const forged = spawnSync(process.execPath, [CLI, 'hook-stop', '--root', root, '--space', 't', '--cwd', cwd], {
     encoding: 'utf8', env,
@@ -317,7 +366,7 @@ test('setup --no-install-hook remains TOOLS ONLY and creates no configured autom
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-nohook-home-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-nohook-cwd-'));
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home, PATH: '/usr/bin:/bin', IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { PATH: '/usr/bin:/bin', IHOW_CAPTURE_FLOOR: '0' });
   execFileSync(process.execPath, [CLI, 'setup', '--runtime', 'claude-code', '--root', root, '--space', 't', '--cwd', cwd, '--no-install-hook', '--json'], { encoding: 'utf8', env });
   const doctor = JSON.parse(execFileSync(process.execPath, [CLI, 'doctor', '--root', root, '--space', 't', '--cwd', cwd, '--json'], { encoding: 'utf8', env }));
   const claude = doctor.automationMatrix.find((row) => row.runtime === 'Claude Code');
@@ -326,12 +375,12 @@ test('setup --no-install-hook remains TOOLS ONLY and creates no configured autom
   assert.equal(doctor.automationMetrics.activationEvidenceCount, 0);
 });
 
-test('deleting live Claude hooks degrades ACTIVE to NEEDS REPAIR and fails doctor', async (t) => {
+test('deleting completed-but-unattested Claude hooks degrades READY to NEEDS REPAIR and fails doctor', async (t) => {
   const { root } = await fixture(t, 'claude-deleted');
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-delete-home-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-delete-cwd-'));
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home, PATH: '/usr/bin:/bin', IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { PATH: '/usr/bin:/bin', IHOW_CAPTURE_FLOOR: '0' });
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   const runtimeCli = path.join(root, 't', '.runtime', 'cli.js');
   const transcript = path.join(root, 'delete-transcript.jsonl');
@@ -345,7 +394,9 @@ test('deleting live Claude hooks degrades ACTIVE to NEEDS REPAIR and fails docto
   });
   assert.equal(live.status, 0);
   const before = JSON.parse(execFileSync(process.execPath, [CLI, 'doctor', '--root', root, '--space', 't', '--cwd', cwd, '--json'], { encoding: 'utf8', env }));
-  assert.equal(before.automationMatrix.find((row) => row.runtime === 'Claude Code').activationStatus, 'ACTIVE');
+  const beforeClaude = before.automationMatrix.find((row) => row.runtime === 'Claude Code');
+  assert.equal(beforeClaude.activationStatus, READY);
+  assert.equal(beforeClaude.activationReasonCode, 'ACTIVATION_COMPLETION_UNATTESTED');
 
   await fs.rm(path.join(cwd, '.claude', 'settings.local.json'));
   const afterRun = spawnSync(process.execPath, [CLI, 'doctor', '--root', root, '--space', 't', '--cwd', cwd, '--json'], { encoding: 'utf8', env });
@@ -364,7 +415,7 @@ test('wrong Codex workspace binding becomes NEEDS REPAIR and fails doctor', asyn
   const codexHome = path.join(home, '.codex');
   await fs.mkdir(codexHome, { recursive: true });
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { CODEX_HOME: codexHome, IHOW_CAPTURE_FLOOR: '0' });
   execFileSync(process.execPath, [CLI, 'install-hook', '--runtime', 'codex', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   const configPath = path.join(codexHome, 'hooks.json');
   const config = JSON.parse(await fs.readFile(configPath, 'utf8'));
@@ -386,7 +437,7 @@ test('activation ledger lock contention fails open within a bounded hook budget'
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-lock-home-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-lock-cwd-'));
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home };
+  const env = isolatedEnv(home);
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   const before = await readActivationEvidence(workspace);
   const lock = `${activationLedgerPath(workspace)}.lock`;
@@ -410,7 +461,7 @@ test('duplicate current Claude hooks across local and user scopes are NEEDS REPA
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-dup-home-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-dup-cwd-'));
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home, IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { IHOW_CAPTURE_FLOOR: '0' });
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd, '--global-hook'], { encoding: 'utf8', env });
   const run = spawnSync(process.execPath, [CLI, 'doctor', '--root', root, '--space', 't', '--cwd', cwd, '--global-hook', '--json'], { encoding: 'utf8', env });
@@ -425,7 +476,7 @@ test('same-binding iHow-shaped hooks with a wrong owner are conflicts, not third
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-owner-home-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-owner-cwd-'));
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home, IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { IHOW_CAPTURE_FLOOR: '0' });
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   const configPath = path.join(cwd, '.claude', 'settings.local.json');
   const config = JSON.parse(await fs.readFile(configPath, 'utf8'));
@@ -451,7 +502,7 @@ test('touching unchanged hook config does not create a new wiring generation or 
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-touch-home-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-touch-cwd-'));
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home, IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { IHOW_CAPTURE_FLOOR: '0' });
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   const configPath = path.join(cwd, '.claude', 'settings.local.json');
   const beforeBytes = await fs.readFile(configPath);
@@ -490,7 +541,7 @@ test('tampered non-empty managed generation is BROKEN and installer replaces it 
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-tamper-home-'));
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-tamper-cwd-'));
   t.after(async () => { await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home, IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { IHOW_CAPTURE_FLOOR: '0' });
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   const configPath = path.join(cwd, '.claude', 'settings.local.json');
   const config = JSON.parse(await fs.readFile(configPath, 'utf8'));
@@ -546,7 +597,7 @@ test('valid foreign-workspace Codex hooks do not block the current workspace aud
   const codexHome = path.join(home, '.codex');
   await fs.mkdir(codexHome, { recursive: true });
   t.after(async () => { await fs.rm(rootB, { recursive: true, force: true }); await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { CODEX_HOME: codexHome, IHOW_CAPTURE_FLOOR: '0' });
   const install = (root) => execFileSync(process.execPath, [CLI, 'install-hook', '--runtime', 'codex', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   install(rootA);
   const configPath = path.join(codexHome, 'hooks.json');
@@ -572,7 +623,7 @@ test('current frozen CLI with a wrong-binding duplicate is BROKEN, not foreign-w
   const codexHome = path.join(home, '.codex');
   await fs.mkdir(codexHome, { recursive: true });
   t.after(async () => { await fs.rm(otherRoot, { recursive: true, force: true }); await fs.rm(home, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, IHOW_CAPTURE_FLOOR: '0' };
+  const env = isolatedEnv(home, { CODEX_HOME: codexHome, IHOW_CAPTURE_FLOOR: '0' });
   execFileSync(process.execPath, [CLI, 'install-hook', '--runtime', 'codex', '--root', root, '--space', 't', '--cwd', cwd], { encoding: 'utf8', env });
   const configPath = path.join(codexHome, 'hooks.json');
   const config = JSON.parse(await fs.readFile(configPath, 'utf8'));

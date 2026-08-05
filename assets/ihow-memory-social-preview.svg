@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">iHow Memory: Your AI can change. Your work should not reset.</title>
+  <desc id="desc">A verify-first handoff moves an unverified agent narrative through live anchor checks to a green match or red drift result.</desc>
+  <rect width="1280" height="640" fill="#f7f8f5"/>
+  <rect x="52" y="48" width="1176" height="544" rx="6" fill="#ffffff" stroke="#1f2933" stroke-width="2"/>
+
+  <text x="96" y="126" fill="#126149" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="27" font-weight="700">iHow Memory</text>
+  <text x="96" y="205" fill="#18212b" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="52" font-weight="700">Your AI can change.</text>
+  <text x="96" y="270" fill="#18212b" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="52" font-weight="700">Your work should not reset.</text>
+
+  <rect x="96" y="354" width="270" height="92" rx="6" fill="#f4f0df" stroke="#8a6d1d" stroke-width="2"/>
+  <text x="231" y="390" text-anchor="middle" fill="#5f4a12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" font-weight="700">PRIOR NARRATIVE</text>
+  <text x="231" y="420" text-anchor="middle" fill="#5f4a12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">UNVERIFIED</text>
+
+  <path d="M382 400H480" fill="none" stroke="#51606f" stroke-width="3"/>
+  <path d="M470 390L482 400L470 410" fill="none" stroke="#51606f" stroke-width="3"/>
+
+  <rect x="496" y="354" width="282" height="92" rx="6" fill="#eef2f4" stroke="#51606f" stroke-width="2"/>
+  <text x="637" y="390" text-anchor="middle" fill="#273746" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" font-weight="700">CHECK LIVE ANCHORS</text>
+  <text x="637" y="420" text-anchor="middle" fill="#51606f" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17">HEAD · BRANCH · DIRTY</text>
+
+  <path d="M794 382H894" fill="none" stroke="#126149" stroke-width="3"/>
+  <path d="M884 372L896 382L884 392" fill="none" stroke="#126149" stroke-width="3"/>
+  <path d="M794 420H894" fill="none" stroke="#a33a32" stroke-width="3"/>
+  <path d="M884 410L896 420L884 430" fill="none" stroke="#a33a32" stroke-width="3"/>
+
+  <rect x="912" y="340" width="220" height="52" rx="6" fill="#e5f4ed" stroke="#126149" stroke-width="2"/>
+  <text x="1022" y="374" text-anchor="middle" fill="#126149" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="700">MATCH → GREEN</text>
+  <rect x="912" y="408" width="220" height="52" rx="6" fill="#f9e9e7" stroke="#a33a32" stroke-width="2"/>
+  <text x="1022" y="442" text-anchor="middle" fill="#8f2f28" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="700">DRIFT → RED</text>
+
+  <text x="96" y="530" fill="#51606f" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">LOCAL  ·  MARKDOWN  ·  CITED  ·  AUDITED</text>
+</svg>

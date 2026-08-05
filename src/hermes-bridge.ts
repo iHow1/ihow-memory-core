@@ -10,6 +10,7 @@ import { contextProbe } from './context-probe.ts';
 import { containsSecretLikeContent, redactSecretLikeContent } from './governance.ts';
 import { checkpointDraftFinalizationPrecondition } from './checkpoints.ts';
 import { CheckpointValidationError, type CheckpointMachineAnchors } from './checkpoint-schema.ts';
+import { runNativePreCompact, type HermesPreCompactTrigger } from './native-precompact.ts';
 import { appendEvent } from './store/events.ts';
 import { validateMemoryDeltaV1, type MemoryDeltaV1 } from './capture-intents.ts';
 
@@ -41,6 +42,14 @@ type HermesBridgeEvent = RuntimeLifecycleEvent & {
   turnReceipt?: unknown;
   diagnostic?: unknown;
 };
+
+type HermesCompressionCheckpointRequest = Readonly<{
+  schemaVersion: 1;
+  operation: 'checkpoint.pre_compress';
+  runtime: 'hermes';
+  sessionHash: string;
+  compactionId: string;
+}>;
 
 type HermesDurableTranscriptRevisionEvent = Readonly<{
   schemaVersion: 1;
@@ -94,6 +103,20 @@ function parseDurableTranscriptRevisionEvent(value: unknown): HermesDurableTrans
     observedAt: value.observedAt,
     publication: value.publication,
   };
+}
+
+function parseCompressionCheckpointRequest(value: unknown): HermesCompressionCheckpointRequest | undefined {
+  if (!isRecord(value) || value.operation !== 'checkpoint.pre_compress') return undefined;
+  if (
+    !exactKeys(value, ['schemaVersion', 'operation', 'runtime', 'sessionHash', 'compactionId'])
+    || value.schemaVersion !== 1
+    || value.runtime !== 'hermes'
+    || typeof value.sessionHash !== 'string'
+    || !HASH_RE.test(value.sessionHash)
+    || typeof value.compactionId !== 'string'
+    || !HASH_RE.test(value.compactionId)
+  ) throw new Error('hermes_compression_checkpoint_request_invalid');
+  return value as HermesCompressionCheckpointRequest;
 }
 
 type ParsedReceiptAction =
@@ -368,6 +391,27 @@ async function main(): Promise<void> {
     parsed = JSON.parse(raw) as unknown;
   } catch {
     throw new Error('runtime_event_json_invalid');
+  }
+  const compressionCheckpoint = parseCompressionCheckpointRequest(parsed);
+  if (compressionCheckpoint) {
+    const contract: HermesPreCompactTrigger = {
+      runtime: 'hermes',
+      event: 'PreCompact',
+      project: { cwd: process.cwd() },
+      session: { id: compressionCheckpoint.sessionHash },
+      observedAt: new Date().toISOString(),
+      delivery: { mode: 'best_effort', dedupeKey: compressionCheckpoint.compactionId },
+      usage: { status: 'unknown' },
+      trigger: 'auto',
+    };
+    const result = await runNativePreCompact(contract, { cwd: process.cwd() });
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      checkpointId: result.artifactId,
+      deduplicated: result.deduplicated,
+      coverageStatus: result.coverageComplete ? 'known_closed' : 'partial',
+    })}\n`);
+    return;
   }
   const durableRevision = parseDurableTranscriptRevisionEvent(parsed);
   if (durableRevision) {

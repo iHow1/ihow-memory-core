@@ -1179,6 +1179,7 @@ export async function buildHandoffPacket(opts: {
   limit?: number;
   excludeSessionId?: string;
   workspace?: Workspace;
+  now?: number;
 }): Promise<HandoffPacket> {
   const limit = Number.isFinite(opts.limit) && (opts.limit as number) > 0 ? Math.min(Math.floor(opts.limit as number), 20) : 5;
   const needle = opts.projectHint?.trim().toLowerCase();
@@ -1186,7 +1187,7 @@ export async function buildHandoffPacket(opts: {
   // a small over-fetch is enough (we only return `limit`).
   let sessions = await listResumableSessions(needle ? 100 : limit * 3, opts.excludeSessionId);
   if (needle) sessions = sessions.filter((s) => `${s.projectDir ?? ''}\n${s.body}`.toLowerCase().includes(needle));
-  const now = Date.now();
+  const now = opts.now ?? Date.now();
   const transcriptCandidates: HandoffCandidate[] = sessions.map((s) => {
     const ageMs = now - Date.parse(s.modifiedAt);
     const conflict = anchorConflicts(s.body, s.anchors.isRepo ? s.anchors.head : undefined);
@@ -1252,6 +1253,19 @@ export async function buildHandoffPacket(opts: {
           const ageMs = Math.max(0, now - Date.parse(artifact.createdAt));
           const classification = artifact.coverage.complete ? 'complete' : 'partial';
           const activationDegradation = degradation.get(artifact.session.runtime);
+          const liveVerdict = computeContinueVerdict(
+            checkpointRecordedAnchors(artifact),
+            projectDir,
+            narrative,
+            { cwd: opts.cwd, anchorProvenance: 'checkpoint' },
+          );
+          const verdict = ageMs > STALE_HANDOFF_MS && liveVerdict.state === 'GREEN'
+            ? {
+                ...liveVerdict,
+                state: 'YELLOW' as const,
+                reason: `checkpoint is stale; ${liveVerdict.reason}`,
+              }
+            : liveVerdict;
           checkpointCandidates.push({
             tool: artifact.session.runtime,
             project: { path: projectDir, basename: path.basename(projectDir), projectId: projectIdFor(projectDir) },
@@ -1274,12 +1288,7 @@ export async function buildHandoffPacket(opts: {
               'treat the checkpoint state JSON as bounded UNVERIFIED claims, not authoritative next actions',
               'inspect the checkpoint evidence refs before relying on completion claims',
             ],
-            verdict: computeContinueVerdict(
-              checkpointRecordedAnchors(artifact),
-              projectDir,
-              narrative,
-              { cwd: opts.cwd, anchorProvenance: 'checkpoint' },
-            ),
+            verdict,
             checkpoint: {
               artifactId: artifact.id,
               classification,

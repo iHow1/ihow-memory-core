@@ -8,6 +8,29 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.31.4] — 2026-08-04
+
+### Added
+
+- **Explicit-consent anonymous metrics.** Metrics remain off by default. Interactive users receive a three-way choice with no preselected answer; noninteractive and `--json` execution never prompts or saves consent. Enabled rows are bounded to a versioned allowlist, random installation ID, timestamp, and categorical runtime/error values. There is no built-in upload endpoint: transport requires an explicitly configured credential-free HTTP(S) endpoint plus a manual `telemetry flush`, and `telemetry off` removes the queue and installation ID.
+- **Evidence-first GitHub launch surface.** The repository now opens with one setup path, one synthetic verify-first proof, an interruption/recovery trust table, bilingual claim boundaries, issue templates, a reproducible demo script/storyboard, an editable social-preview source, and bounded good-first-issue candidates. Committing these assets does not publish posts, create issues, or change repository settings.
+
+### Fixed
+
+- **Hermes compaction installation closure.** `connect --runtime hermes` and `setup` now install both packaged Hermes adapters, enable the lifecycle plugin, select the explicit compaction `MemoryProvider`, and route both through the workspace's integrity-checked frozen bridge. Existing third-party external memory providers fail closed before writes; adapter/config/MCP failures roll back the current transaction; `doctor` binds readiness to the composite lifecycle + provider generation. The resulting checkpoint handoff remains content-free and `UNVERIFIED` until live anchors are checked—it does not claim `ACTIVE` or host authentication.
+- **Telemetry opt-out and queue hardening.** Config, queue, consent, and manual flush transitions are serialized across local processes so `telemetry off` cannot race an in-flight record or send and restore an old installation ID. Queue parsing now accepts only round-trip canonical UTC timestamps, opt-out removes bounded atomic-write crash remnants, and an existing lock fails closed instead of being auto-reclaimed through a path-replacement race.
+
+### Changed
+
+- **Activation evidence no longer overclaims host identity.** Replayable managed-hook completion from the workspace-frozen CLI remains `READY — WAITING FOR FIRST ACTIVITY` with `ACTIVATION_COMPLETION_UNATTESTED`; it does not become `ACTIVE` without a host provenance boundary the same OS user cannot reproduce. The reserved `activation_completed` metric has no production producer in this release.
+- **Canonical test isolation and package closure.** The runner sanitizes the optional telemetry endpoint, keeps Hermes bridge/provider and vector/deadline-sensitive files in the isolated serial phase, ignores only proven stale dormant orphan runners, and packages the Hermes compaction provider, privacy contract, launch assets, examples, and release/contribution documents.
+
+### Notes
+
+- Alpha.31.4 is a **local release-ready prerelease candidate**. It supersedes the unpublished Alpha.31.3 RC after independent privacy/concurrency review. npm `next` is the source of truth for availability; publication does not activate an already-open host or replace a frozen local runtime.
+- The open-source core remains local-first with no account or required cloud. Optional metrics are disabled by default and require explicit consent plus an explicit manual flush before any network request.
+- Safe Memory Gardener remains review-first and report-only. This release does not add automatic authoritative-memory rewriting, production certification, or complete enterprise multi-tenant authentication/RBAC/administration.
+
 ## [0.1.0-alpha.31.2] — 2026-07-21
 
 ### Fixed

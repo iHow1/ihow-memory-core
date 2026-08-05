@@ -10,13 +10,14 @@ import {
   type ActivationEvidence,
 } from './activation-ledger.ts';
 import { verifyRuntimeHookWiring, type RuntimeHookWiring } from './hook-wiring.ts';
-import { inspectHermesLifecycleWiring, resolveHermesHome } from './hermes-wiring.ts';
+import { inspectHermesInstallationWiring, resolveHermesHome } from './hermes-wiring.ts';
 
 export type AutomationRuntime = 'claude-code' | 'codex' | 'openclaw' | 'hermes' | 'no-hook';
 export type AutomationStatus = 'OK' | 'WARN' | 'BROKEN';
 export type ActivationStatus = 'ACTIVE' | 'READY — WAITING FOR FIRST ACTIVITY' | 'TOOLS ONLY' | 'NEEDS REPAIR';
 export type ActivationReasonCode =
   | 'ACTIVATION_LIVE_COMPLETED_AFTER_INSTALL'
+  | 'ACTIVATION_COMPLETION_UNATTESTED'
   | 'ACTIVATION_CONFIGURED_AWAITING_LIVE_ACTIVITY'
   | 'ACTIVATION_STARTED_ONLY'
   | 'ACTIVATION_SYNTHETIC_ONLY'
@@ -285,7 +286,12 @@ export function deriveRuntimeActivation(
     return { status: 'NEEDS REPAIR', reasonCode: 'ACTIVATION_RECENT_FAILURE', configuredAt, lastObservedAt };
   }
   if (completedAfterInstall) {
-    return { status: 'ACTIVE', reasonCode: 'ACTIVATION_LIVE_COMPLETED_AFTER_INSTALL', configuredAt, lastObservedAt };
+    return {
+      status: 'READY — WAITING FOR FIRST ACTIVITY',
+      reasonCode: 'ACTIVATION_COMPLETION_UNATTESTED',
+      configuredAt,
+      lastObservedAt,
+    };
   }
   if (failureIsLatest) {
     return { status: 'READY — WAITING FOR FIRST ACTIVITY', reasonCode: 'ACTIVATION_STALE_FAILURE', configuredAt, lastObservedAt };
@@ -324,7 +330,7 @@ export async function automationMatrix(
     verifyRuntimeHookWiring(workspace, 'claude-code', options.hookOptions),
     verifyRuntimeHookWiring(workspace, 'codex', options.hookOptions),
     hermesHome
-      ? inspectHermesLifecycleWiring(hermesHome)
+      ? inspectHermesInstallationWiring(hermesHome)
       : Promise.resolve<LifecycleWiringEvidence & { reason?: string }>({ state: 'missing' }),
   ]);
   const wirings = new Map<string, RuntimeHookWiring>([
@@ -350,7 +356,7 @@ export async function automationMatrix(
     }
     if (activation.status === 'NEEDS REPAIR') {
       status = 'BROKEN';
-      if (key === 'hermes' && hermesWiring.reason) notes.push(`Hermes lifecycle wiring: ${hermesWiring.reason}`);
+      if (key === 'hermes' && hermesWiring.reason) notes.push(`Hermes lifecycle/compaction wiring: ${hermesWiring.reason}`);
       else notes.push(...(wiring?.notes.length ? wiring.notes : ['configured lifecycle wiring needs repair']));
     }
     if (key === 'no-hook' && probeCalls === 0) {
