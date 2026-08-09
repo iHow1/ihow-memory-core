@@ -386,16 +386,9 @@ A hosted runtime is not included in this npm package or this repository.
 
 ## Status
 
-Alpha prerelease candidate `0.1.0-alpha.27.1` (local release-ready only — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex now has native SessionStart/UserPromptSubmit hooks plus a proactive AGENTS memory loop; the other runtimes are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they can call the tools but cannot resume). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated daily on macOS and Linux; native Windows is **experimental** — the `packageDir` path bug is fixed and a `windows-latest` CI lane covers build + a connect/doctor reachability smoke + the full test suite, with WSL as the supported path. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
+Current published prerelease: `0.1.0-alpha.31.2`. npm `latest` and `next` both resolve to this version; the npm badge above remains the source of truth for package availability. Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex has native SessionStart/UserPromptSubmit hooks plus a proactive AGENTS memory loop; the other runtimes are single-machine real-app smoke, and Cursor and Claude Desktop are receive-only (they can call the tools but cannot resume). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated daily on macOS and Linux; native Windows is **experimental** — the `packageDir` path bug is fixed and a `windows-latest` CI lane covers build + a connect/doctor reachability smoke + the full test suite, with WSL as the supported path. The npm tarball ships the compiled CLI, the stdio MCP server and the read-only local console; the TypeScript sources live in this repository. Expect breaking changes between alpha releases.
 
-**Which version has what (dist-tags).** Prereleases publish under the `next` dist-tag; `npm install ihow-memory` resolves `latest`.
-
-| dist-tag | auto-capture |
-| --- | --- |
-| `latest` | cooperative Stop-hook nudge only (depends on the agent honoring it) |
-| `next` | adds the **deterministic SessionStart floor** backstop (single-cwd, low-weight, offline-validated), turns **recall on** (reviewed + guard-railed auto soft facts since alpha.19; status/bypass claims held back), and ships **one-gesture `forget`/`remember`** |
-
-To try the floor backstop: `npm install ihow-memory@next`. A plain `npm install ihow-memory` stays on the conservative `latest`.
+**Install and update.** Fresh installs use `npx ihow-memory@next setup`. A connected workspace keeps a frozen runtime bundle, so existing installations use `npx ihow-memory@next upgrade` and then restart the affected runtime; use `npx ihow-memory@next rescue` when the frozen updater is damaged. Publication alone does not replace an already-running frozen runtime.
 
 ## Limitations
 
