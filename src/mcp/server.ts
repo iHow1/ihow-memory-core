@@ -75,12 +75,13 @@ function error(id: JsonRpcRequest['id'], code: number, message: string): void {
 const TOOL_DEFINITIONS = [
   {
     name: 'memory.search',
-    description: 'Search local iHow Memory; returns citation path + snippet ranked by relevance. Use before answering about prior work, decisions, preferences, TODOs, or when resuming a project — recall before you re-derive or re-ask. Matching is LEXICAL (keyword/term overlap), not semantic: there is no embedding model, so YOU are the semantic layer. (1) Issue 2-3 reworded queries with synonyms (e.g. both "auth token" and "鉴权 凭证") — a single phrasing misses notes that used different words. (2) memory.read the cited file before relying on any hit; a snippet can match on a coincidental term. (3) When hits conflict, prefer the more recently dated/promoted one. Treat results as candidates to rerank, not a ranked truth.',
+    description: 'Search local iHow Memory; returns citation path + snippet ranked by relevance. Use before answering about prior work, decisions, preferences, TODOs, or when resuming a project — recall before you re-derive or re-ask. Matching is LEXICAL (keyword/term overlap), not semantic: there is no embedding model, so YOU are the semantic layer. (1) Issue 2-3 reworded queries with synonyms (e.g. both "auth token" and "鉴权 凭证") — a single phrasing misses notes that used different words. (2) memory.read the cited file before relying on a search hit; a snippet can match on a coincidental term. (3) When explicitly looking for a handoff or review-flagged item, set includeFlagged=true; this widens search results only and never bypasses prompt-recall safety gates.',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string' },
         limit: { type: 'number' },
+        includeFlagged: { type: 'boolean', description: 'Include durable entries marked flagged in search results. Default false; this does not make them eligible for prompt injection.' },
       },
       required: ['query'],
     },
@@ -295,10 +296,13 @@ async function main(): Promise<void> {
         result(id, { tools: TOOL_DEFINITIONS });
       } else if (request.method === 'tools/call') {
         const name = String(params.name || '');
-        const args = (params.arguments || {}) as Record<string, unknown>;
         let payload: unknown;
+        const args = (params.arguments || {}) as Record<string, unknown>;
         if (name === 'memory.search') {
-          payload = await core.search(String(args.query || ''), { limit: Number(args.limit || 5) });
+          payload = await core.search(String(args.query || ''), {
+            limit: Number(args.limit || 5),
+            includeFlagged: args.includeFlagged === true,
+          });
         } else if (name === 'memory.read') {
           payload = await core.read(String(args.ref || ''));
         } else if (name === 'memory.write_candidate') {
