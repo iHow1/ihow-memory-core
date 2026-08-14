@@ -7,7 +7,17 @@ import test from 'node:test';
 
 const root = path.resolve(import.meta.dirname, '..');
 
-test('release evidence rejects a dirty working tree by default', () => {
+function withDirtyFixture(run) {
+  const fixture = path.join(root, `.release-evidence-dirty-${process.pid}.txt`);
+  fs.writeFileSync(fixture, 'synthetic dirty-tree fixture\n');
+  try {
+    return run();
+  } finally {
+    fs.rmSync(fixture, { force: true });
+  }
+}
+
+test('release evidence rejects a dirty working tree by default', () => withDirtyFixture(() => {
   const result = spawnSync(process.execPath, ['scripts/release-evidence.mjs'], {
     cwd: root,
     encoding: 'utf8',
@@ -15,9 +25,9 @@ test('release evidence rejects a dirty working tree by default', () => {
   });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /working tree is dirty/);
-});
+}));
 
-test('development evidence verifies legal files but is not release eligible', () => {
+test('development evidence verifies legal files but is not release eligible', () => withDirtyFixture(() => {
   const output = fs.mkdtempSync(path.join(os.tmpdir(), 'ihow-release-evidence-test-'));
   try {
     const result = spawnSync(process.execPath, ['scripts/release-evidence.mjs', '--allow-dirty', '--output', output], {
@@ -48,4 +58,5 @@ test('development evidence verifies legal files but is not release eligible', ()
   } finally {
     fs.rmSync(output, { recursive: true, force: true });
   }
-});
+}));
+
