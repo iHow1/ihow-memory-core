@@ -59,4 +59,3 @@ test('development evidence verifies legal files but is not release eligible', ()
     fs.rmSync(output, { recursive: true, force: true });
   }
 }));
-
