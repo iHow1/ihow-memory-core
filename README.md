@@ -411,4 +411,6 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) (DCO sign-off required — [DCO.md](./D
 
 ## License
 
-Apache License 2.0 — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE). The iHow / iHow Memory names and logos are trademarks; see [TRADEMARK.md](./TRADEMARK.md).
+Apache License 2.0 — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE). You may use, modify, fork, and distribute the Core commercially under that license, provided you comply with its conditions, including retaining applicable license, copyright, and attribution notices and prominently marking modified files. The Apache license does not grant rights to the iHow / iHow Memory names or logos; see [TRADEMARK.md](./TRADEMARK.md).
+
+The separately distributed iHow Memory desktop application and related commercial services are proprietary products owned by iHow. They are not licensed under the Core's Apache-2.0 license; bundled open-source components retain their own licenses.

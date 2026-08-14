@@ -60,6 +60,8 @@
     "eval:proposals": "node --experimental-strip-types scripts/proposal-evaluation.mjs",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run build",
+    "release:evidence": "npm run build && node scripts/release-evidence.mjs --output release-evidence",
+    "release:evidence:check": "npm run build && node scripts/release-evidence.mjs",
     "secret-scan": "node scripts/secret-scan.mjs"
   },
   "license": "Apache-2.0",
