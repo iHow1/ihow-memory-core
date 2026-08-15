@@ -16,14 +16,17 @@ export type ProbeResult = { ok: boolean; detail: string };
 // (the transport src/mcp/server.ts speaks). Resolves reachable iff memory.status
 // returns ok within the timeout. Always tears the child process down.
 export function probeMcpServer(
-  spec: { command: string; args: string[] },
+  spec: { command: string; args: string[]; env?: Record<string, string> },
   opts: { timeoutMs?: number } = {},
 ): Promise<ProbeResult> {
   const timeoutMs = opts.timeoutMs ?? 12000;
   return new Promise<ProbeResult>((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(spec.command, spec.args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn(spec.command, spec.args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: spec.env ? { ...process.env, ...spec.env } : process.env,
+      });
     } catch (caught) {
       resolve({ ok: false, detail: `spawn failed: ${caught instanceof Error ? caught.message : String(caught)}` });
       return;
@@ -106,6 +109,13 @@ export function verifyRuntimeRegistration(runtime: string): { registered: boolea
 
 export type ConnectionStatus = 'verified' | 'reachable' | 'written' | 'pending';
 
+export type ConnectionVerification = {
+  status: ConnectionStatus;
+  reachable: boolean;
+  verified: boolean;
+  detail: string;
+};
+
 // Combine both checks into one honest verdict per runtime.
 //
 // `verified` vs `reachable` is the distinction that keeps us off our own trust-without-verify trap
@@ -116,10 +126,10 @@ export type ConnectionStatus = 'verified' | 'reachable' | 'written' | 'pending';
 // its config is written and the server is launchable, but the runtime must be started before we can claim
 // it really connected. Callers must not print "verified" for the latter.
 export async function verifyConnection(
-  spec: { command: string; args: string[] },
+  spec: { command: string; args: string[]; env?: Record<string, string> },
   runtime: string,
   opts: { timeoutMs?: number } = {},
-): Promise<{ status: ConnectionStatus; reachable: boolean; verified: boolean; detail: string }> {
+): Promise<ConnectionVerification> {
   const probe = await probeMcpServer(spec, opts);
   if (!probe.ok) {
     return { status: 'written', reachable: false, verified: false, detail: `configured server unreachable — ${probe.detail}` };

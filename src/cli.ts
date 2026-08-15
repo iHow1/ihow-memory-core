@@ -21,12 +21,12 @@ import { gitAnchors, fileAnchors, inferProjectDir, type GitAnchors } from './anc
 import { assembleEnvelope, formatAge } from './envelope.ts';
 import { recordHandoffMetric } from './handoff-metrics.ts';
 import { pickTranscriptHandoff, listResumableSessions, computeContinueVerdict, buildHandoffPacket, type ResumableSession } from './handoff.ts';
-import { probeMcpServer, verifyConnection } from './mcp/probe.ts';
+import { probeMcpServer, verifyConnection, type ConnectionVerification } from './mcp/probe.ts';
 import { migrateLocalDay } from './migrate.ts';
 import { planImport, applyImport, collectExistingImports, type ImportPlan } from './import.ts';
 import { runBenchmark } from './benchmark.ts';
 import { mcpLaneWorkspace } from './store/events.ts';
-import type { WorkspaceOptions } from './types.ts';
+import type { Workspace, WorkspaceOptions } from './types.ts';
 import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_OLLAMA_HOST,
@@ -111,6 +111,8 @@ type ParsedArgs = {
     auto?: boolean;
     write?: boolean;
     apply?: boolean;
+    managed?: boolean;
+    receipt?: string;
     update?: boolean;
     autoPromote?: boolean;
     hookOwner?: string;
@@ -453,6 +455,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--auto') options.auto = true;
     else if (arg === '--write') options.write = true;
     else if (arg === '--json') options.json = true;
+    else if (arg === '--managed') options.managed = true;
+    else if (arg === '--receipt') options.receipt = tail[++index];
     else if (arg === '--explain') options.explain = true;
     else if (arg === '--no-explain') options.explain = false;
     else if (arg === '--list') options.list = true;
@@ -843,9 +847,15 @@ function commandExists(bin: string): boolean {
 
 // Absolute entry path. codex mcp add has no cwd field, so the entry must not rely on cwd;
 // .runtime/package.json{type:module} sits on the file's directory chain and keeps ESM working regardless of cwd.
+type McpServerSpec = {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+};
+
 function mcpServerSpec(
   workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
-): { command: string; args: string[] } {
+): McpServerSpec {
   const serverEntry = path.join(workspace.spaceDir, '.runtime', 'mcp', 'server.js');
   const args = [serverEntry, '--memory-root', workspace.memoryDir, '--state-root', workspace.root];
   // Opt-in semantic: when this space has been turned on with `enable-semantic` (semantic.json present),
@@ -854,9 +864,11 @@ function mcpServerSpec(
   // (capabilities.semantic=false). The sidecar is a SPAWNED subprocess, never imported into the graph.
   args.push(...semanticEngineArgs(workspace));
   return {
-    // Pin process.execPath (the node that ran setup), not bare 'node' — see workspaceMcpConfigSnippet.
+    // Pin process.execPath (the Node that ran setup), not bare `node`. Electron embeds Node behind its
+    // application executable, so its child process needs this documented switch to execute the server.
     command: process.execPath,
     args,
+    ...(process.versions.electron ? { env: { ELECTRON_RUN_AS_NODE: '1' } } : {}),
   };
 }
 
@@ -896,10 +908,10 @@ function normalizeMcpSpec(value: unknown): NormalizedMcpSpec | null {
 }
 
 function desiredMcpSpec(
-  spec: { command: string; args: string[] },
+  spec: McpServerSpec,
   env: Record<string, string> = {},
 ): NormalizedMcpSpec {
-  return normalizeMcpSpec({ command: spec.command, args: spec.args, env, envVars: [] })!;
+  return normalizeMcpSpec({ command: spec.command, args: spec.args, env: { ...spec.env, ...env }, envVars: [] })!;
 }
 
 function claudeConfigPath(): string {
@@ -1241,18 +1253,18 @@ function readHermesMcpSpec(): NormalizedMcpSpec | null {
 async function writeJsonMcpConfig(
   targetPath: string,
   runtime: string,
-  spec: { command: string; args: string[] },
+  spec: McpServerSpec,
   options: { dryRun?: boolean },
   // Per-runtime config shape. Defaults to the standard `mcpServers` + stdio entry used by
   // claude/cursor/workbuddy/claude-desktop. OpenCode uses a different shape (`mcp` container,
   // array-form command, `type: "local"`, `enabled`), so it overrides these.
   shape: {
     containerKey?: string;
-    buildEntry?: (s: { command: string; args: string[] }) => Record<string, unknown>;
+    buildEntry?: (s: McpServerSpec) => Record<string, unknown>;
   } = {},
 ): Promise<Record<string, unknown>> {
   const containerPath = (shape.containerKey || 'mcpServers').split('.'); // supports nested, e.g. 'mcp.servers' (OpenClaw)
-  const buildEntry = shape.buildEntry || ((s) => ({ type: 'stdio', command: s.command, args: s.args }));
+  const buildEntry = shape.buildEntry || ((s) => ({ type: 'stdio', command: s.command, args: s.args, ...(s.env ? { env: s.env } : {}) }));
   let config: Record<string, unknown> = {};
   let existed = false;
   let raw: string | null = null;
@@ -1333,13 +1345,13 @@ class RuntimeConnectFailure extends Error {
   }
 }
 
-function claudeAddJsonArgs(spec: { command: string; args: string[]; env?: Record<string, string> }): string[] {
+function claudeAddJsonArgs(spec: McpServerSpec): string[] {
   return ['mcp', 'add-json', '--scope', 'user', 'ihow-memory', JSON.stringify({
     type: 'stdio', command: spec.command, args: spec.args, env: spec.env ?? {},
   })];
 }
 
-function codexAddArgs(spec: { command: string; args: string[]; env?: Record<string, string> }): string[] {
+function codexAddArgs(spec: McpServerSpec): string[] {
   const env = Object.entries(spec.env ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
   return ['mcp', 'add', 'ihow-memory', ...env, '--', spec.command, ...spec.args];
 }
@@ -1348,14 +1360,17 @@ function codexAddArgs(spec: { command: string; args: string[]; env?: Record<stri
 // supported, and avoids racing Claude Code's own writes to ~/.claude.json.
 // Returns null when the claude CLI is absent -> caller falls back to writeJsonMcpConfig.
 function connectViaClaudeCli(
-  spec: { command: string; args: string[] },
-  options: { dryRun?: boolean },
+  spec: McpServerSpec,
+  options: { dryRun?: boolean; refuseExisting?: boolean },
 ): Record<string, unknown> | null {
   if (!commandExists('claude')) return null;
   const desired = desiredMcpSpec(spec);
   const canonical = readClaudeUserMcpEntry();
   const existing = canonical.normalized;
   const canonicalUserEntry = canonical.present;
+  if (options.refuseExisting && canonicalUserEntry) {
+    throw new RuntimeConnectFailure('managed_connect_existing_user_entry_refusing_takeover', 'claude-code', false, true);
+  }
   // `claude mcp get` is human-readable only: argv is space-joined without boundary quoting, the
   // environment listing is not a completeness contract, and the selected scope cannot be proven
   // reliably. It may establish that a name exists, but canonical user-scope JSON is the sole source
@@ -1381,6 +1396,9 @@ function connectViaClaudeCli(
       throw new Error(`claude_mcp_get_failed: ${(get.stderr || get.stdout || `exit ${get.status ?? 'unknown'}`).slice(0, 300)}`);
     }
     visibleScope = exists ? parseClaudeVisibleScope(get.stdout || '') : 'unknown';
+  }
+  if (options.refuseExisting && exists) {
+    throw new RuntimeConnectFailure('managed_connect_existing_registration_refusing_takeover', 'claude-code', false, true);
   }
   // Destructive replacement is allowed only with a complete, reversible canonical user snapshot.
   // Project/local-only visibility is safe to leave untouched while adding user scope. A visible
@@ -1438,12 +1456,361 @@ function connectViaClaudeCli(
   };
 }
 
+const MANAGED_RUNTIME_RECEIPT_KIND = 'ihow-memory-managed-runtime-connection';
+
+type ManagedRuntimeReceipt = {
+  schemaVersion: 1;
+  kind: typeof MANAGED_RUNTIME_RECEIPT_KIND;
+  status: 'connected' | 'disconnected';
+  receiptId: string;
+  runtime: 'claude-code';
+  method: 'official-cli:claude';
+  createdAt: string;
+  disconnectedAt?: string;
+  workspaceBinding: string;
+  configurationId: string;
+};
+
+function managedWorkspaceBinding(workspace: Workspace): string {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    root: path.resolve(workspace.root),
+    space: workspace.space,
+    memoryDir: path.resolve(workspace.memoryDir),
+  })).digest('hex');
+}
+
+function managedConfigurationId(spec: NormalizedMcpSpec): string {
+  return crypto.createHash('sha256').update(JSON.stringify(spec)).digest('hex');
+}
+
+function managedReceiptPath(options: ParsedArgs['options']): string {
+  if (!options.receipt?.trim()) throw new Error('managed_runtime_receipt_required');
+  if (!path.isAbsolute(options.receipt)) throw new Error('managed_runtime_receipt_must_be_absolute');
+  return path.resolve(options.receipt);
+}
+
+function assertClaudeRegistrationAbsent(): void {
+  const get = spawnSync('claude', ['mcp', 'get', 'ihow-memory'], { encoding: 'utf8' });
+  if (get.status === 0) throw new Error('managed_runtime_registration_still_present');
+  if (!claudeMcpGetMissing(get)) {
+    throw new Error(`managed_runtime_registration_check_failed: ${(get.stderr || get.stdout || `exit ${get.status ?? 'unknown'}`).slice(0, 300)}`);
+  }
+  const list = spawnSync('claude', ['mcp', 'list'], { encoding: 'utf8' });
+  if (list.status !== 0) {
+    throw new Error(`managed_runtime_list_failed: ${(list.stderr || list.stdout || `exit ${list.status ?? 'unknown'}`).slice(0, 300)}`);
+  }
+  if (`${list.stdout || ''}\n${list.stderr || ''}`.toLowerCase().includes('ihow-memory')) {
+    throw new Error('managed_runtime_registration_still_visible');
+  }
+}
+
+async function assertManagedConnectPrecondition(
+  workspace: Workspace,
+  runtime: string,
+  options: ParsedArgs['options'],
+): Promise<void> {
+  if (!options.managed) return;
+  if (runtime !== 'claude-code') throw new Error('managed_runtime_only_supports_claude_code');
+  if (process.platform === 'win32' || !commandExists('claude')) {
+    throw new Error('managed_runtime_requires_claude_cli');
+  }
+  managedReceiptPath(options);
+  if (readClaudeUserMcpEntry().present) {
+    throw new Error('managed_connect_existing_user_entry_refusing_takeover');
+  }
+  try {
+    assertClaudeRegistrationAbsent();
+  } catch (error) {
+    if ((error as Error).message === 'managed_runtime_registration_still_present'
+      || (error as Error).message === 'managed_runtime_registration_still_visible') {
+      throw new Error('managed_connect_existing_registration_refusing_takeover');
+    }
+    throw error;
+  }
+  try {
+    const prior = await readManagedReceipt(managedReceiptPath(options));
+    const expected = expectedManagedClaudeSpec(workspace);
+    if (prior.status !== 'disconnected'
+      || prior.workspaceBinding !== managedWorkspaceBinding(workspace)
+      || prior.configurationId !== managedConfigurationId(expected)) {
+      throw new Error('managed_runtime_receipt_already_exists');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  // Bind the preflight to the workspace before any host mutation. The same binding is checked again
+  // during disconnect, so a receipt from one local store cannot authorize removal for another.
+  managedWorkspaceBinding(workspace);
+}
+
+async function writeNewManagedReceipt(file: string, receipt: ManagedRuntimeReceipt): Promise<void> {
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  const handle = await fs.open(file, 'wx', 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
+  } finally {
+    await handle.close();
+  }
+  await fs.chmod(file, 0o600).catch(() => {});
+}
+
+async function readManagedReceipt(file: string): Promise<ManagedRuntimeReceipt> {
+  const stat = await fs.lstat(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16_384) {
+    throw new Error('managed_runtime_receipt_invalid_file');
+  }
+  const parsed = JSON.parse(await fs.readFile(file, 'utf8')) as Partial<ManagedRuntimeReceipt>;
+  const keys = Object.keys(parsed).sort();
+  const expectedKeys = parsed.status === 'disconnected'
+    ? ['configurationId', 'createdAt', 'disconnectedAt', 'kind', 'method', 'receiptId', 'runtime', 'schemaVersion', 'status', 'workspaceBinding']
+    : ['configurationId', 'createdAt', 'kind', 'method', 'receiptId', 'runtime', 'schemaVersion', 'status', 'workspaceBinding'];
+  const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const valid = isDeepStrictEqual(keys, expectedKeys)
+    && parsed.schemaVersion === 1
+    && parsed.kind === MANAGED_RUNTIME_RECEIPT_KIND
+    && (parsed.status === 'connected' || parsed.status === 'disconnected')
+    && typeof parsed.receiptId === 'string' && uuidV4.test(parsed.receiptId)
+    && parsed.runtime === 'claude-code'
+    && parsed.method === 'official-cli:claude'
+    && typeof parsed.createdAt === 'string' && Number.isFinite(Date.parse(parsed.createdAt))
+    && typeof parsed.workspaceBinding === 'string' && /^[0-9a-f]{64}$/.test(parsed.workspaceBinding)
+    && typeof parsed.configurationId === 'string' && /^[0-9a-f]{64}$/.test(parsed.configurationId)
+    && (parsed.status === 'connected'
+      ? parsed.disconnectedAt === undefined
+      : typeof parsed.disconnectedAt === 'string' && Number.isFinite(Date.parse(parsed.disconnectedAt)));
+  if (!valid) throw new Error('managed_runtime_receipt_invalid');
+  return parsed as ManagedRuntimeReceipt;
+}
+
+async function updateManagedReceipt(file: string, receipt: ManagedRuntimeReceipt): Promise<void> {
+  const tmp = `${file}.ihow-tmp-${process.pid}-${crypto.randomUUID()}`;
+  try {
+    await fs.writeFile(tmp, `${JSON.stringify(receipt, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    await fs.rename(tmp, file);
+    await fs.chmod(file, 0o600).catch(() => {});
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+function expectedManagedClaudeSpec(workspace: Workspace): NormalizedMcpSpec {
+  return desiredMcpSpec(mcpServerSpec(workspace));
+}
+
+function verifyManagedClaudeEntry(expected: NormalizedMcpSpec): void {
+  const current = readClaudeUserMcpEntry();
+  if (!current.present || !current.exactlyRestorable || !current.normalized || !isDeepStrictEqual(current.normalized, expected)) {
+    throw new Error('managed_runtime_current_configuration_mismatch');
+  }
+}
+
+function removeManagedClaudeEntry(expected: NormalizedMcpSpec): void {
+  verifyManagedClaudeEntry(expected);
+  const remove = spawnSync('claude', ['mcp', 'remove', 'ihow-memory', '--scope', 'user'], { encoding: 'utf8' });
+  if (remove.status !== 0) {
+    throw new Error(`managed_runtime_remove_failed: ${(remove.stderr || remove.stdout || '').slice(0, 300)}`);
+  }
+  assertClaudeRegistrationAbsent();
+}
+
+async function finalizeManagedConnect(
+  workspace: Workspace,
+  runtime: string,
+  options: ParsedArgs['options'],
+  result: Record<string, unknown>,
+  verification: ConnectionVerification | null,
+): Promise<{ path: string; receipt: ManagedRuntimeReceipt } | null> {
+  if (!options.managed) return null;
+  if (runtime !== 'claude-code') throw new Error('managed_runtime_only_supports_claude_code');
+  const expected = expectedManagedClaudeSpec(workspace);
+  const rollback = (failure: string): never => {
+    try {
+      removeManagedClaudeEntry(expected);
+    } catch (rollbackError) {
+      throw new Error(`${failure}_rollback_failed: ${(rollbackError as Error).message}`);
+    }
+    throw new Error(`${failure}_rolled_back`);
+  };
+  if (!verification?.verified) rollback('managed_runtime_verification_failed');
+  if (result.changed !== true || result.alreadyExists === true || result.replaced === true) {
+    rollback('managed_runtime_connection_not_exclusively_owned');
+  }
+  try {
+    verifyManagedClaudeEntry(expected);
+  } catch {
+    rollback('managed_runtime_post_connect_configuration_mismatch');
+  }
+  const receipt: ManagedRuntimeReceipt = {
+    schemaVersion: 1,
+    kind: MANAGED_RUNTIME_RECEIPT_KIND,
+    status: 'connected',
+    receiptId: crypto.randomUUID(),
+    runtime: 'claude-code',
+    method: 'official-cli:claude',
+    createdAt: new Date().toISOString(),
+    workspaceBinding: managedWorkspaceBinding(workspace),
+    configurationId: managedConfigurationId(expected),
+  };
+  const file = managedReceiptPath(options);
+  try {
+    try {
+      const prior = await readManagedReceipt(file);
+      if (prior.status !== 'disconnected'
+        || prior.workspaceBinding !== receipt.workspaceBinding
+        || prior.configurationId !== receipt.configurationId) {
+        throw new Error('managed_runtime_receipt_already_exists');
+      }
+      await updateManagedReceipt(file, receipt);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      await writeNewManagedReceipt(file, receipt);
+    }
+  } catch (error) {
+    rollback(`managed_runtime_receipt_write_failed:${(error as Error).message}`);
+  }
+  return { path: file, receipt };
+}
+
+async function disconnectManagedRuntime(options: ParsedArgs['options']): Promise<Record<string, unknown>> {
+  if (!options.managed) throw new Error('disconnect_requires_managed_receipt');
+  if (options.runtime !== 'claude-code') throw new Error('managed_runtime_only_supports_claude_code');
+  const file = managedReceiptPath(options);
+  const receipt = await readManagedReceipt(file);
+  const workspace = resolveWorkspace(options);
+  const expected = expectedManagedClaudeSpec(workspace);
+  if (receipt.workspaceBinding !== managedWorkspaceBinding(workspace)
+    || receipt.configurationId !== managedConfigurationId(expected)) {
+    throw new Error('managed_runtime_receipt_binding_mismatch');
+  }
+  const current = readClaudeUserMcpEntry();
+  if (receipt.status === 'disconnected') {
+    if (current.present) throw new Error('managed_runtime_receipt_already_consumed_refusing_remove');
+    return {
+      ok: true, runtime: receipt.runtime, status: 'disconnected', changed: false, verified: true,
+      restartRequired: false, receipt: { path: file, receiptId: receipt.receiptId, status: receipt.status },
+    };
+  }
+  if (!current.present) assertClaudeRegistrationAbsent();
+  if (!current.present) {
+    const updated = { ...receipt, status: 'disconnected' as const, disconnectedAt: new Date().toISOString() };
+    await updateManagedReceipt(file, updated);
+    return {
+      ok: true, runtime: receipt.runtime, status: 'disconnected', changed: false, verified: true,
+      restartRequired: false, receipt: { path: file, receiptId: receipt.receiptId, status: updated.status },
+    };
+  }
+  if (process.platform === 'win32' || !commandExists('claude')) throw new Error('managed_runtime_requires_claude_cli');
+  removeManagedClaudeEntry(expected);
+  const updated = { ...receipt, status: 'disconnected' as const, disconnectedAt: new Date().toISOString() };
+  await updateManagedReceipt(file, updated);
+  return {
+    ok: true, runtime: receipt.runtime, status: 'disconnected', changed: true, verified: true,
+    restartRequired: true, receipt: { path: file, receiptId: receipt.receiptId, status: updated.status },
+  };
+}
+
+function managedClaudeRegistrationIsAbsent(): boolean {
+  try {
+    assertClaudeRegistrationAbsent();
+    return true;
+  } catch (error) {
+    const message = (error as Error).message;
+    if (message === 'managed_runtime_registration_still_present' || message === 'managed_runtime_registration_still_visible') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function managedRuntimeConnectionStatus(options: ParsedArgs['options']): Promise<Record<string, unknown>> {
+  if (!options.managed) throw new Error('connection_status_requires_managed_receipt');
+  if (options.runtime !== 'claude-code') throw new Error('managed_runtime_only_supports_claude_code');
+  const file = managedReceiptPath(options);
+  const workspace = resolveWorkspace(options);
+  let receipt: ManagedRuntimeReceipt;
+  try {
+    receipt = await readManagedReceipt(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    if (process.platform === 'win32' || !commandExists('claude')) {
+      return {
+        ok: true, runtime: 'claude-code', managed: true, status: 'unavailable',
+        verified: false, canConnect: false, canDisconnect: false,
+        detail: 'Claude Code command is not available.',
+      };
+    }
+    const absent = managedClaudeRegistrationIsAbsent();
+    return {
+      ok: true, runtime: 'claude-code', managed: true,
+      status: absent ? 'available' : 'blocked-existing',
+      verified: false, canConnect: absent, canDisconnect: false,
+      detail: absent
+        ? 'Claude Code is available and no existing iHow Memory registration will be replaced.'
+        : 'Claude Code already has an iHow Memory registration that this product does not own.',
+    };
+  }
+
+  const expected = expectedManagedClaudeSpec(workspace);
+  const receiptSummary = { path: file, receiptId: receipt.receiptId, status: receipt.status };
+  if (receipt.workspaceBinding !== managedWorkspaceBinding(workspace)
+    || receipt.configurationId !== managedConfigurationId(expected)) {
+    return {
+      ok: true, runtime: receipt.runtime, managed: true, status: 'conflict',
+      verified: false, canConnect: false, canDisconnect: false,
+      detail: 'The managed receipt belongs to a different local workspace or configuration.',
+      receipt: receiptSummary,
+    };
+  }
+  const current = readClaudeUserMcpEntry();
+  if (receipt.status === 'disconnected') {
+    const absent = !current.present && managedClaudeRegistrationIsAbsent();
+    return {
+      ok: true, runtime: receipt.runtime, managed: true,
+      status: absent ? 'disconnected' : 'conflict',
+      verified: absent, canConnect: absent, canDisconnect: false,
+      detail: absent
+        ? 'The product-managed registration is absent and can be connected again.'
+        : 'A registration is present after this receipt was consumed; it is not owned by this receipt.',
+      receipt: receiptSummary,
+    };
+  }
+  if (!current.present) {
+    const absent = managedClaudeRegistrationIsAbsent();
+    return {
+      ok: true, runtime: receipt.runtime, managed: true,
+      status: absent ? 'removed' : 'conflict',
+      verified: false, canConnect: false, canDisconnect: absent,
+      detail: absent
+        ? 'The product-managed registration was removed outside iHow Memory; disconnect can close the receipt.'
+        : 'Claude Code reports a registration that cannot be matched to the managed receipt.',
+      receipt: receiptSummary,
+    };
+  }
+  if (!current.exactlyRestorable || !current.normalized || !isDeepStrictEqual(current.normalized, expected)) {
+    return {
+      ok: true, runtime: receipt.runtime, managed: true, status: 'conflict',
+      verified: false, canConnect: false, canDisconnect: false,
+      detail: 'The current Claude Code registration differs from the configuration owned by this receipt.',
+      receipt: receiptSummary,
+    };
+  }
+  const verification = await verifyConnection(mcpServerSpec(workspace), receipt.runtime);
+  return {
+    ok: true, runtime: receipt.runtime, managed: true,
+    status: verification.verified ? 'verified' : 'unreachable',
+    verified: verification.verified, canConnect: false, canDisconnect: true,
+    reachable: verification.reachable, detail: verification.detail,
+    receipt: receiptSummary,
+  };
+}
+
 // codex uses the official CLI (codex mcp add). It has no cwd field -> rely on the absolute entry path.
 // `mcp get --json` gives an exact command/argv/env comparison; only a differing entry is removed/re-added.
 // After registration, add narrowly scoped approval_mode="approve" entries for iHow's read-only tools so
 // Codex non-interactive calls work without granting server-wide or write/governance-tool approval.
 async function connectViaCodexCli(
-  spec: { command: string; args: string[] },
+  spec: McpServerSpec,
   options: { dryRun?: boolean },
 ): Promise<Record<string, unknown>> {
   if (!commandExists('codex')) {
@@ -1593,7 +1960,7 @@ async function connectViaCodexCli(
 // timeout guards against any interactive hang.
 function connectViaHermesCli(
   workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
-  spec: { command: string; args: string[] },
+  spec: McpServerSpec,
   options: { dryRun?: boolean },
 ): Record<string, unknown> {
   if (!commandExists('hermes')) {
@@ -1653,7 +2020,7 @@ function connectViaHermesCli(
 async function connectRuntime(
   workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
   runtime: string,
-  options: { dryRun?: boolean },
+  options: { dryRun?: boolean; refuseExisting?: boolean },
 ): Promise<Record<string, unknown>> {
   const home = os.homedir();
   const spec = mcpServerSpec(workspace);
@@ -2673,6 +3040,9 @@ Usage:
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
   ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the runtime's proactive memory layer, no prompts
+  ihow-memory connect --runtime claude-code --managed --receipt <absolute-path> [--json]   # product-managed fresh registration only; refuses takeover of any existing ihow-memory entry and writes a bound disconnect receipt after verification
+  ihow-memory connection-status --runtime claude-code --managed --receipt <absolute-path> [--json]   # read-only product state: available, blocked-existing, verified, disconnected, removed, unreachable, or conflict
+  ihow-memory disconnect --runtime claude-code --managed --receipt <absolute-path> [--json]   # remove only the exact fresh registration owned by that receipt; refuses drift or receipt/workspace mismatch
   ihow-memory connect --auto [--write] [--json]   # detect installed runtimes; default reports only, --write connects them all to one shared workspace
   ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
   ihow-memory hook-stop                   # Stop-hook handler (Claude Code session-end nudge; reads hook JSON on stdin)
@@ -3662,7 +4032,15 @@ async function runStopHook(options: ParsedArgs['options'], payload?: Record<stri
     state = undefined;
   }
 
-  if (state) {
+  // IHOW_STOP_PROMPT=0 = quiet mode: keep persisting the marker, drop the nudge. The marker is the
+  // MECHANISM — the SessionStart floor sweep and memory.continue's transcript fallback are its only
+  // producers/consumers pair — while the decision:block emission is pure UX. The two were coupled:
+  // every early return below is a *prompt* decision, yet each one also skips the marker write. So a
+  // host that merely wanted the nudge gone had to unhook the whole thing, silently starving floor
+  // capture and degrading resume. Quiet mode bypasses the prompt gates and falls through to the write.
+  const promptEnabled = process.env.IHOW_STOP_PROMPT !== '0';
+
+  if (promptEnabled && state) {
     try {
       // Auto-capture via the MCP memory.journal tool lands in the _mcp lane while this hook resolves
       // the managed-space main lane; readEventsAllLanes checks BOTH so we detect a journal that landed
@@ -3695,7 +4073,9 @@ async function runStopHook(options: ParsedArgs['options'], payload?: Record<stri
     hookLastAt: nowIso,
     markerCreatedAt: state?.markerCreatedAt ?? markerStartedAt(state) ?? nowIso,
     transcriptMtime: transcriptPath ? await transcriptMtimeIso(transcriptPath) : null,
-    prompts: (state?.prompts ?? 0) + 1,
+    // Honest counter — it records prompts, so quiet mode must not spend budget it never used;
+    // otherwise re-enabling the nudge later would start already exhausted against MAX_PROMPTS.
+    prompts: (state?.prompts ?? 0) + (promptEnabled ? 1 : 0),
     lastEntries: entries,
     processed: state?.processed ?? false,
   };
@@ -3707,6 +4087,13 @@ async function runStopHook(options: ParsedArgs['options'], payload?: Record<stri
     // contract is to NEVER throw or disrupt the session, so swallow it and still emit the nudge below.
     // Worst case the dedup marker is missing and we may re-nudge next turn — recoverable; crashing the
     // host session (the old unguarded fs.writeFile reaching main().catch with exit 1) is not.
+  }
+  if (!promptEnabled) {
+    // Marker persisted above, so floor capture and the continue-fallback stay intact; only the nudge
+    // is gone. Trade-off the operator is accepting: nothing prompts the agent to write a structured
+    // handoff, so deterministic floor capture becomes the sole path (a backstop, not an equal).
+    hookLog(`stop: quiet (IHOW_STOP_PROMPT=0) session=${sessionId} entries=${entries} marker=persisted`);
+    return;
   }
   // T5: surface the human-review backlog alongside the handoff nudge — a session never ends silently
   // sitting on un-reviewed flagged 🟡 memory. Piggybacks the existing re-prompt (no extra emission / spam).
@@ -4137,6 +4524,37 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'connection-status') {
+    if (!options.runtime) {
+      console.error('connection-status requires --runtime claude-code --managed --receipt <absolute-path>');
+      process.exitCode = 1;
+      return;
+    }
+    const result = await managedRuntimeConnectionStatus(options);
+    if (options.json) printJson(result);
+    else {
+      console.log(`${runtimeLabel(options.runtime)}: ${String(result.status)}`);
+      console.log(String(result.detail));
+    }
+    return;
+  }
+
+  if (command === 'disconnect') {
+    if (!options.runtime) {
+      console.error('disconnect requires --runtime claude-code --managed --receipt <absolute-path>');
+      process.exitCode = 1;
+      return;
+    }
+    const result = await disconnectManagedRuntime(options);
+    if (options.json) printJson(result);
+    else {
+      console.log(`✓ disconnected ${runtimeLabel(options.runtime)} from iHow Memory`);
+      console.log(`verified: ${result.verified === true ? 'registration absent' : 'no'}`);
+      console.log(`restart required: ${result.restartRequired === true ? 'yes' : 'no'}`);
+    }
+    return;
+  }
+
   if (command === 'connect') {
     if (options.auto) {
       await connectAuto(options);
@@ -4161,13 +4579,17 @@ async function main(): Promise<void> {
       if (options.installHook === undefined) options.installHook = true;
     }
     const workspace = await ensureWorkspace(resolveWorkspace(options));
+    await assertManagedConnectPrecondition(workspace, options.runtime, options);
     if (!options.dryRun) await installRuntimeBundle(workspace); // dry-run: don't materialize the bundle
-    const result = await connectRuntime(workspace, options.runtime, { dryRun: options.dryRun });
+    const result = await connectRuntime(workspace, options.runtime, { dryRun: options.dryRun, refuseExisting: options.managed });
     // Verify-after-connect on the single-runtime path too — README's "1. Connect a single runtime" points
     // here, so a bare "✓ connected" on write-success alone is the false-green this product exists to kill
     // (go/no-go #1). Round-trip the configured server (and, for CLI runtimes, confirm registration) and
     // report honestly: verified / reachable-pending / not-reachable. Same contract as setup + connect --auto.
     const verification = result.dryRun ? null : await verifyConnection(mcpServerSpec(workspace), options.runtime);
+    const managedConnection = result.dryRun
+      ? null
+      : await finalizeManagedConnect(workspace, options.runtime, options, result, verification);
     // Non-zero exit when the configured server isn't reachable — the same contract the text path honors,
     // and what CHANGELOG promises to --json callers (who are exactly the scripts that check exit codes).
     if (verification && !verification.reachable) process.exitCode = 1;
@@ -4197,7 +4619,22 @@ async function main(): Promise<void> {
     }
     if (options.json) {
       printJson(verification
-        ? { ...result, reachable: verification.reachable, verified: verification.verified, detail: verification.detail, codexHooks, codexGuidance }
+        ? {
+            ...result,
+            reachable: verification.reachable,
+            verified: verification.verified,
+            detail: verification.detail,
+            codexHooks,
+            codexGuidance,
+            ...(managedConnection ? {
+              managed: true,
+              receipt: {
+                path: managedConnection.path,
+                receiptId: managedConnection.receipt.receiptId,
+                status: managedConnection.receipt.status,
+              },
+            } : {}),
+          }
         : result);
     } else {
       console.log('cloud: disabled / local only');
