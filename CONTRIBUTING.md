@@ -72,19 +72,17 @@ git commit -s -m "your message"
 
 See [DCO.md](./DCO.md) for the full text. Unsigned commits will be asked to amend before merge.
 
+**Before accepting the first contribution from someone outside iHow, maintainers must confirm that the contributor is using their own work or has permission to submit it, and must decide whether the existing DCO is sufficient for the planned use. Do not merge external code into a private product or relicense it outside the Apache-2.0 Core without a separate written review.**
+
 ## Pull request checklist
 
-- `npm run build` passes.
-- Affected tests and repository-required baseline CI pass; run the full suite only when the change risk or release-train stage requires it.
-- Package-surface changes verify the expected pack list; the integrated RC is packed once and the same artifact is used for fresh-install smoke and promotion.
-- Synthetic data only; no secrets, no customer data.
-- README / CHANGELOG updated if behavior changed.
-- Commits signed off (DCO).
-
-## Security issues
-
-Do not open public issues for vulnerabilities. See [SECURITY.md](./SECURITY.md) for the private reporting channel.
-
-## License
-
-By contributing you agree that your contributions are licensed under the [Apache License 2.0](./LICENSE). The iHow / iHow Memory names and logos are trademarks — see [TRADEMARK.md](./TRADEMARK.md).
+- [ ] The contributor has added a DCO sign-off to every commit.
+- [ ] This is iHow-owned work or the contributor has the right to submit it.
+- [ ] No private product code, customer data, credentials, or internal strategy is included.
+- [ ] `npm run build` passes.
+- [ ] Affected tests and repository-required baseline CI pass; run the full suite only when the change risk or release-train stage requires it.
+- [ ] Package-surface changes verify the expected pack list; the integrated RC is packed once and the same artifact is used for fresh-install smoke and promotion.
+- [ ] Synthetic data only; no secrets, no customer data.
+- [ ] README / CHANGELOG updated if behavior changed.
+- [ ] The change does not alter the Core license or trademark boundary.
+- [ ] Commits signed off (DCO).

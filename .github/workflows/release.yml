@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -31,8 +33,10 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match package.json ($PKG)"; exit 1
           fi
           echo "version tag OK: $GITHUB_REF_NAME"
-      - name: Build
-        run: npm run build
+      - name: Install dev dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build and typecheck
+        run: npm run build && npm run typecheck
       - name: CLI smoke
         run: node bin/ihow-memory.mjs --version
       - name: Tests
@@ -44,7 +48,15 @@ jobs:
         run: npm run secret-scan
         env:
           IHOW_PUBLIC_BOUNDARY_DENYLIST: ${{ secrets.IHOW_PUBLIC_BOUNDARY_DENYLIST }}
-      - name: Publish to npm
+      - name: Build exact release artifact and evidence
+        run: npm run release:evidence
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-release-${{ github.ref_name }}
+          path: release-evidence/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Publish exact artifact to npm
         # Prereleases (-alpha/-beta/-rc) publish under the `next` dist-tag so `npm install ihow-memory`
         # keeps resolving the last stable/`latest`; stable tags publish to `latest`.
         run: |
@@ -52,7 +64,9 @@ jobs:
           case "$GITHUB_REF_NAME" in
             *-alpha*|*-beta*|*-rc*) TAG=next ;;
           esac
+          PACKAGE="release-evidence/ihow-memory-${GITHUB_REF_NAME#v}.tgz"
           echo "publishing $GITHUB_REF_NAME with dist-tag: $TAG"
-          npm publish --tag "$TAG" --provenance
+          sha256sum --check --ignore-missing release-evidence/checksums.txt
+          npm publish "$PACKAGE" --tag "$TAG" --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

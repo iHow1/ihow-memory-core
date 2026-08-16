@@ -386,20 +386,13 @@ A hosted runtime is not included in this npm package or this repository.
 
 ## Status
 
-Alpha.31.4 prerelease candidate `0.1.0-alpha.31.4` (local release-ready only — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex has native SessionStart / PreCompact / UserPromptSubmit hooks plus a proactive AGENTS memory loop; Hermes now has packaged lifecycle and compaction adapters; the other runtimes have the narrower evidence recorded in [Runtime support](#runtime-support). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated on macOS and Linux; native Windows is **experimental**, with WSL as the supported path. The npm tarball ships the compiled CLI, stdio MCP server, read-only local console, packaged Hermes adapters, privacy contract, and evidence-first launch assets. Expect breaking changes between alpha releases.
+Alpha.31.4 prerelease candidate `0.1.0-alpha.31.4` (local release-ready only — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). The current published prerelease remains `0.1.0-alpha.31.2` until this candidate is separately reviewed and published. Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex has native SessionStart / PreCompact / UserPromptSubmit hooks plus a proactive AGENTS memory loop; Hermes now has packaged lifecycle and compaction adapters; the other runtimes have the narrower evidence recorded in [Runtime support](#runtime-support). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated on macOS and Linux; native Windows is **experimental**, with WSL as the supported path. The npm tarball ships the compiled CLI, stdio MCP server, read-only local console, packaged Hermes adapters, privacy contract, and evidence-first launch assets. Expect breaking changes between alpha releases.
 
 **Alpha.31.4 engineering detail:** closes Hermes compaction installation as one transactional operation, adds explicit-consent bounded anonymous metrics with no built-in endpoint or automatic upload, and ships the evidence-first GitHub demo/contribution surface. Replayable managed-hook completion remains `ACTIVATION_COMPLETION_UNATTESTED` and cannot claim `ACTIVE`. npm `@next` remains the source of truth for package availability; publication does not itself update a frozen runtime or authenticate a host.
 
 **Alpha.31.2 engineering detail:** makes package updates recoverable without turning user configuration into release state. Claude Code/Codex hooks keep a byte-stable `.runtime/cli.js` bootstrap while implementation bytes move to `cli-runtime.js`; a verified upgrade refreshes legacy activation evidence once without rewriting correct Hook files, then later implementation-only upgrades leave Hook config and activation generation unchanged. Runtime replacement uses two self-verifying generations and restores the exact previous generation if the new MCP server fails its probe. `upgrade --runtime <name>` provides bounded repair for a stale host registration, and the fresh-package `rescue` entry can recover a damaged frozen updater. Alpha.31.1's WorkBuddy effective-path, Codex least-privilege/transactional rollback, and zero-runtime-dependency fixes remain included. This proves the documented update and recovery contracts—it does not claim every host lifecycle is `ACTIVE`; `doctor` may still report `TOOLS ONLY`, `READY — WAITING FOR FIRST ACTIVITY`, or `NEEDS REPAIR` where lifecycle evidence is absent. npm `@next` is the source of truth for package availability; publication does not itself update a frozen runtime or imply production certification. The Alpha.31 review-first boundaries remain unchanged: continuous consolidation is report-only and never automatically rewrites authoritative memory; Grounded Media reports only `EQUAL_UNTRUSTED`; Activity Ledger `COMMITTED` does not imply task success.
 
-**Which version has what (dist-tags).** Prereleases publish under the `next` dist-tag; `npm install ihow-memory` resolves `latest`.
-
-| dist-tag | auto-capture |
-| --- | --- |
-| `latest` | cooperative Stop-hook nudge only (depends on the agent honoring it) |
-| `next` | adds the **deterministic SessionStart floor** backstop (single-cwd, low-weight, offline-validated), turns **recall on** (reviewed + guard-railed auto soft facts since alpha.19; status/bypass claims held back), and ships **one-gesture `forget`/`remember`** |
-
-To try the floor backstop: `npm install ihow-memory@next`. A plain `npm install ihow-memory` stays on the conservative `latest`.
+**Install and update.** Fresh installs use `npx ihow-memory@next setup`. A connected workspace keeps a frozen runtime bundle, so existing installations use `npx ihow-memory@next upgrade` and then restart the affected runtime; use `npx ihow-memory@next rescue` when the frozen updater is damaged. Publication alone does not replace an already-running frozen runtime.
 
 ## Limitations
 
@@ -422,4 +415,6 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) (DCO sign-off required — [DCO.md](./D
 
 ## License
 
-Apache License 2.0 — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE). The iHow / iHow Memory names and logos are trademarks; see [TRADEMARK.md](./TRADEMARK.md).
+Apache License 2.0 — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE). You may use, modify, fork, and distribute the Core commercially under that license, provided you comply with its conditions, including retaining applicable license, copyright, and attribution notices and prominently marking modified files. The Apache license does not grant rights to the iHow / iHow Memory names or logos; see [TRADEMARK.md](./TRADEMARK.md).
+
+The separately distributed iHow Memory desktop application and related commercial services are proprietary products owned by iHow. They are not licensed under the Core's Apache-2.0 license; bundled open-source components retain their own licenses.

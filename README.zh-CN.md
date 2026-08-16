@@ -356,4 +356,6 @@ Alpha.31.4 预发布版候选 `0.1.0-alpha.31.4`（local release-ready only—�
 
 ## 许可证
 
-Apache License 2.0——见 [LICENSE](./LICENSE) 与 [NOTICE](./NOTICE)。iHow / iHow Memory 名称与 logo 为商标，见 [TRADEMARK.md](./TRADEMARK.md)。
+iHow Memory Core 采用 Apache License 2.0——见 [LICENSE](./LICENSE) 与 [NOTICE](./NOTICE)。任何人均可依照该许可证使用、修改、Fork 和商业分发 Core，但必须遵守其条件，包括保留适用的许可证、版权和归属声明，并对修改文件作出显著说明。Apache 许可证不授予 iHow / iHow Memory 名称与 Logo 的使用权，相关边界见 [TRADEMARK.md](./TRADEMARK.md)。
+
+独立分发的 iHow Memory 桌面应用及相关商业服务属于 iHow 的专有产品，不适用 Core 的 Apache-2.0 许可；其中包含的开源组件继续适用各自许可证。
