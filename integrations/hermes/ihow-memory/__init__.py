@@ -647,6 +647,26 @@ def _safe_argv(value: str) -> str:
     return value
 
 
+def _installed_bridge_settings() -> Optional[dict[str, str]]:
+    target = Path(__file__).with_name("bridge.json")
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    expected = {"schemaVersion", "node", "bridge", "memoryRoot", "stateRoot"}
+    if not isinstance(payload, dict) or set(payload) != expected or payload.get("schemaVersion") != 1:
+        return None
+    for key in ("node", "bridge", "memoryRoot", "stateRoot"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value or any(ch in value for ch in ("\x00", "\r", "\n")):
+            return None
+        if not Path(value).is_absolute():
+            return None
+    if not Path(payload["node"]).is_file() or not Path(payload["bridge"]).is_file():
+        return None
+    return payload
+
+
 def _bridge_command() -> list[str]:
     configured = os.environ.get("IHOW_MEMORY_HERMES_BRIDGE", "").strip()
     if configured:
@@ -657,10 +677,22 @@ def _bridge_command() -> list[str]:
             argv.append("--experimental-strip-types")
         argv.append(_safe_argv(str(bridge)))
         return argv
+    installed = _installed_bridge_settings()
+    if installed:
+        return [_safe_argv(installed["node"]), _safe_argv(installed["bridge"])]
     packaged = shutil.which("ihow-memory-hermes-bridge")
     if not packaged:
         raise RuntimeError("ihow_memory_hermes_bridge_not_found")
     return [_safe_argv(packaged)]
+
+
+def _bridge_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    installed = _installed_bridge_settings()
+    if installed:
+        environment["MEMORY_ROOT"] = installed["memoryRoot"]
+        environment["IHOW_MEMORY_STATE_ROOT"] = installed["stateRoot"]
+    return environment
 
 
 def _dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -679,6 +711,7 @@ def _dispatch(event: dict[str, Any]) -> Optional[dict[str, Any]]:
         text=True,
         timeout=5,
         check=False,
+        env=_bridge_environment(),
     )
     if completed.returncode != 0:
         raise RuntimeError("ihow_memory_hermes_bridge_failed")

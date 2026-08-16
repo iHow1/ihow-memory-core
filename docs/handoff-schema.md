@@ -9,7 +9,7 @@ This is the contract for the packet that `memory.continue` (MCP) and `ihow-memor
 return when an agent resumes after a context boundary (`/clear`, a new thread, a switched tool or
 model). It is the same packet for every runtime — Claude Code, Codex, Cursor, VS Code Copilot,
 Gemini CLI, and the rest — assembled by one runtime-neutral path
-([`src/handoff.ts`](../src/handoff.ts) `buildHandoffPacket`).
+([`src/handoff.ts`](https://github.com/iHow1/ihow-memory-core/blob/main/src/handoff.ts) `buildHandoffPacket`).
 
 The packet exists to transfer state **without making the receiver confidently wrong**. Its whole design
 is one rule:
@@ -111,7 +111,7 @@ two. Anchors never travel as a trusted snapshot the receiver is asked to believe
 ## 4. The GREEN / YELLOW / RED verdict
 
 `verdict` is **code-computed by re-reading the project's live git state** and comparing it to the
-recorded anchors ([`computeContinueVerdict`](../src/handoff.ts)). It is not prose for the agent to maybe
+recorded anchors ([`computeContinueVerdict`](https://github.com/iHow1/ihow-memory-core/blob/main/src/handoff.ts)). It is not prose for the agent to maybe
 run — it is the assembler's own honest read of whether the workspace drifted.
 
 ```jsonc
@@ -142,7 +142,7 @@ more dangerous than prose, so every uncertainty degrades to YELLOW and every gen
 
 ## 5. The receiver protocol (verbatim, not LLM-generated)
 
-`packet.receiverProtocol` is a **fixed string** ([`RECEIVER_INSTRUCTION`](../src/envelope.ts)), not
+`packet.receiverProtocol` is a **fixed string** ([`RECEIVER_INSTRUCTION`](https://github.com/iHow1/ihow-memory-core/blob/main/src/envelope.ts)), not
 generated per session. It tells the receiver, in order: (1) **preflight** in the project dir (which may
 differ from the receiver's cwd) by comparing live `git` to the machine anchors and checking that named
 files exist; (2) **pick a lane** (GREEN / YELLOW / RED) from what preflight shows; (3) obey two

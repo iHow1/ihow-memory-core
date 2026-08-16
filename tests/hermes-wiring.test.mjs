@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { openCore } from '../src/core.ts';
 import {
+  inspectHermesInstallationWiring,
   inspectHermesLifecycleWiring,
   hermesLifecycleConfigurationKey,
 } from '../src/hermes-wiring.ts';
@@ -15,6 +16,7 @@ import { appendActivationEvidence } from '../src/activation-ledger.ts';
 
 const repo = path.resolve(import.meta.dirname, '..');
 const pluginSource = path.join(repo, 'integrations', 'hermes', 'ihow-memory');
+const compactionSource = path.join(repo, 'integrations', 'hermes', 'ihow-memory-compaction');
 const bridgeSource = path.join(repo, 'dist', 'hermes-bridge.js');
 
 async function fixture() {
@@ -46,6 +48,16 @@ async function installFixture(home, enabled = true) {
     : 'plugins:\n  enabled: []\n', 'utf8');
 }
 
+async function installCompositeFixture(home) {
+  await installFixture(home);
+  await fs.cp(compactionSource, path.join(home, 'plugins', 'ihow-memory-compaction'), { recursive: true });
+  await fs.writeFile(
+    path.join(home, 'config.yaml'),
+    'plugins:\n  enabled:\n    - ihow-memory\nmemory:\n  provider: ihow-memory-compaction\n',
+    'utf8',
+  );
+}
+
 test('Hermes wiring is missing until the packaged plugin is installed and enabled', async () => withBridgeOverride(async () => {
   const { home } = await fixture();
   assert.deepEqual(await inspectHermesLifecycleWiring(home), { state: 'missing' });
@@ -71,8 +83,8 @@ test('Hermes wiring generation is content-bound and detects plugin tampering', a
 
 test('automationMatrix receives real Hermes wiring and refuses READY without matching configured evidence', async () => withBridgeOverride(async () => {
   const { home, core } = await fixture();
-  await installFixture(home);
-  const wiring = await inspectHermesLifecycleWiring(home);
+  await installCompositeFixture(home);
+  const wiring = await inspectHermesInstallationWiring(home);
   assert.equal(wiring.state, 'current');
 
   const unconfigured = await automationMatrix(core.workspace, { command: process.execPath }, {

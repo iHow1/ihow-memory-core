@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const repo = path.resolve(import.meta.dirname, '..');
-const releaseVersion = '0.1.0-alpha.31.2';
+const releaseVersion = '0.1.0-alpha.31.4';
 
 test('package and lock metadata expose the current Hermes bridge contract', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8'));
@@ -20,6 +20,7 @@ test('package and lock metadata expose the current Hermes bridge contract', () =
   assert.equal(manifest.bin?.['ihow-memory-hermes-bridge'], bridge);
   assert.equal(lock.packages?.['']?.bin?.['ihow-memory-hermes-bridge'], bridge);
   assert.ok(manifest.files?.includes('integrations/hermes/ihow-memory/'));
+  assert.ok(manifest.files?.includes('integrations/hermes/ihow-memory-compaction/'));
 });
 
 test('npm package includes the Hermes plugin and its Node bridge', () => {
@@ -32,6 +33,9 @@ test('npm package includes the Hermes plugin and its Node bridge', () => {
   assert.ok(files.has('dist/hermes-bridge.js'));
   assert.ok(files.has('integrations/hermes/ihow-memory/plugin.yaml'));
   assert.ok(files.has('integrations/hermes/ihow-memory/__init__.py'));
+  assert.ok(files.has('integrations/hermes/ihow-memory-compaction/plugin.yaml'));
+  assert.ok(files.has('integrations/hermes/ihow-memory-compaction/__init__.py'));
+  assert.ok(files.has('integrations/hermes/ihow-memory-compaction/provider.py'));
   assert.ok(files.has('NOTICE'));
   assert.ok(files.has('TRADEMARK.md'));
 });

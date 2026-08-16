@@ -69,9 +69,17 @@ import {
   NATIVE_PRECOMPACT_INPUT_MAX_BYTES,
   normalizeNativePreCompactTrigger,
   runNativePreCompact,
-  type NativePreCompactTrigger,
+  type HostNativePreCompactTrigger,
 } from './native-precompact.ts';
 import { explainPromptRecall, recallExplanationFromSelection } from './recall-explanation.ts';
+import {
+  inspectHermesCompactionWiring,
+  inspectHermesInstallationWiring,
+  inspectHermesLifecycleWiring,
+  readHermesMemoryProvider,
+  resolveHermesHome,
+  type HermesBridgeConfiguration,
+} from './hermes-wiring.ts';
 import {
   PROMPT_RECALL_INCLUDE_LIMIT,
   PROMPT_RECALL_MAX_CHARS,
@@ -151,8 +159,10 @@ async function recordConfiguredActivation(
   options: ParsedArgs['options'],
   allowGenerationChange = false,
 ): Promise<boolean> {
-  if (runtime !== 'claude-code' && runtime !== 'codex') return false;
-  const wiring = await verifyRuntimeHookWiring(workspace, runtime, options);
+  if (runtime !== 'claude-code' && runtime !== 'codex' && runtime !== 'hermes') return false;
+  const wiring = runtime === 'hermes'
+    ? await inspectHermesInstallationWiring(resolveHermesHome() || path.join(os.homedir(), '.hermes'))
+    : await verifyRuntimeHookWiring(workspace, runtime, options);
   if (wiring.state !== 'current' || !wiring.generationId) return false;
   const configurationId = activationConfigurationId(wiring.generationId);
   let priorConfigured: Awaited<ReturnType<typeof readActivationEvidence>>;
@@ -286,7 +296,7 @@ async function runHookWithActivation(
   await appendActivationEvidenceFailOpen(workspace, {
     runtime,
     event,
-    source: 'native-hook',
+    source: 'managed-hook',
     status: 'observed-live-started',
     dedupeKey: invocationKey,
     configurationKey: wiring.generationId,
@@ -296,7 +306,7 @@ async function runHookWithActivation(
     await appendActivationEvidenceFailOpen(workspace, {
       runtime,
       event,
-      source: 'native-hook',
+      source: 'managed-hook',
       status: 'observed-live-completed',
       dedupeKey: invocationKey,
       configurationKey: wiring.generationId,
@@ -305,7 +315,7 @@ async function runHookWithActivation(
     await appendActivationEvidenceFailOpen(workspace, {
       runtime,
       event,
-      source: 'native-hook',
+      source: 'managed-hook',
       status: 'failed',
       dedupeKey: invocationKey,
       configurationKey: wiring.generationId,
@@ -323,7 +333,7 @@ function preCompactBudgetMs(): number {
 async function verifiedPreCompactGeneration(
   options: ParsedArgs['options'],
   workspace: ReturnType<typeof resolveWorkspace>,
-  contract: NativePreCompactTrigger,
+  contract: HostNativePreCompactTrigger,
 ): Promise<string | undefined> {
   if (options.synthetic || options.hookOwner !== IHOW_HOOK_OWNER) return undefined;
   const expectedCli = path.join(workspace.spaceDir, '.runtime', 'cli.js');
@@ -353,7 +363,7 @@ async function runPreCompactHookCommand(options: ParsedArgs['options']): Promise
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch { return; }
     const runtime = options.runtime === 'codex' ? 'codex' : 'claude-code';
-    let contract: NativePreCompactTrigger;
+    let contract: HostNativePreCompactTrigger;
     try { contract = normalizeNativePreCompactTrigger(runtime, payload); } catch { return; }
 
     let workspace: Awaited<ReturnType<typeof ensureWorkspace>>;
@@ -367,7 +377,7 @@ async function runPreCompactHookCommand(options: ParsedArgs['options']): Promise
       await appendActivationEvidenceFailOpen(workspace, {
         runtime: contract.runtime,
         event: 'hook-pre-compact',
-        source: 'native-hook',
+        source: 'managed-hook',
         status: 'observed-live-started',
         observedAt: contract.observedAt,
         dedupeKey: contract.delivery.dedupeKey,
@@ -389,7 +399,7 @@ async function runPreCompactHookCommand(options: ParsedArgs['options']): Promise
         await appendActivationEvidenceFailOpen(workspace, {
           runtime: contract.runtime,
           event: 'hook-pre-compact',
-          source: 'native-hook',
+          source: 'managed-hook',
           status: 'observed-live-completed',
           dedupeKey: contract.delivery.dedupeKey,
           configurationKey: generation,
@@ -400,7 +410,7 @@ async function runPreCompactHookCommand(options: ParsedArgs['options']): Promise
         await appendActivationEvidenceFailOpen(workspace, {
           runtime: contract.runtime,
           event: 'hook-pre-compact',
-          source: 'native-hook',
+          source: 'managed-hook',
           status: 'failed',
           dedupeKey: contract.delivery.dedupeKey,
           configurationKey: generation,
@@ -1591,13 +1601,175 @@ async function connectViaCodexCli(
 // MEMORY_ROOT / IHOW_MEMORY_STATE_ROOT) and let --args carry only the server entry path. No `mcp get`;
 // use `mcp list` for registration and parse the existing config.yaml spec before deciding to replace it.
 // timeout guards against any interactive hang.
-function connectViaHermesCli(
+type HermesConfigSnapshot = {
+  existed: boolean;
+  content?: Buffer;
+  mode?: number;
+};
+
+async function snapshotHermesConfig(home: string): Promise<HermesConfigSnapshot> {
+  const target = path.join(home, 'config.yaml');
+  try {
+    const stat = await fs.lstat(target);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('hermes_config_must_be_regular_file');
+    return { existed: true, content: await fs.readFile(target), mode: stat.mode & 0o777 };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { existed: false };
+    throw error;
+  }
+}
+
+async function restoreHermesConfig(home: string, snapshot: HermesConfigSnapshot): Promise<void> {
+  const target = path.join(home, 'config.yaml');
+  if (!snapshot.existed) {
+    try {
+      const stat = await fs.lstat(target);
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('hermes_config_rollback_target_invalid');
+      await fs.rm(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    return;
+  }
+  if (!snapshot.content) throw new Error('hermes_config_snapshot_invalid');
+  await fs.mkdir(home, { recursive: true });
+  const staged = path.join(home, `.config.yaml.ihow-rollback-${process.pid}-${crypto.randomUUID()}`);
+  try {
+    await fs.writeFile(staged, snapshot.content, { mode: snapshot.mode ?? 0o600 });
+    await fs.rename(staged, target);
+  } finally {
+    await fs.rm(staged, { force: true }).catch(() => {});
+  }
+}
+
+async function installHermesAdapters(
+  workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
+  options: { dryRun?: boolean },
+): Promise<{ changed: boolean; lifecycleGeneration?: string; compactionGeneration?: string }> {
+  const home = resolveHermesHome() || path.join(os.homedir(), '.hermes');
+  const selectedProvider = await readHermesMemoryProvider(home);
+  if (selectedProvider && selectedProvider !== 'ihow-memory-compaction') {
+    throw new Error(`hermes_memory_provider_conflict:${selectedProvider}`);
+  }
+  const lifecycleBefore = await inspectHermesLifecycleWiring(home);
+  const compactionBefore = await inspectHermesCompactionWiring(home);
+  if (options.dryRun) {
+    return {
+      changed: lifecycleBefore.state !== 'current' || compactionBefore.state !== 'current',
+      lifecycleGeneration: lifecycleBefore.generationId,
+      compactionGeneration: compactionBefore.generationId,
+    };
+  }
+
+  const runtimeDir = path.join(workspace.spaceDir, '.runtime');
+  const bridgeConfig: HermesBridgeConfiguration = {
+    schemaVersion: 1,
+    node: process.execPath,
+    bridge: path.join(runtimeDir, 'hermes-bridge.js'),
+    memoryRoot: workspace.memoryDir,
+    stateRoot: workspace.root,
+  };
+  if (!await runtimeBundleHealthy(workspace)) throw new Error('hermes_runtime_bundle_not_current');
+
+  const pluginRoot = path.join(home, 'plugins');
+  const configBefore = await snapshotHermesConfig(home);
+  await fs.mkdir(pluginRoot, { recursive: true });
+  const nonce = `${process.pid}-${crypto.randomUUID()}`;
+  const definitions = [
+    { name: 'ihow-memory', required: ['plugin.yaml', '__init__.py'] },
+    { name: 'ihow-memory-compaction', required: ['plugin.yaml', '__init__.py', 'provider.py'] },
+  ] as const;
+  const installed: Array<{ target: string; backup: string | null }> = [];
+  try {
+    for (const definition of definitions) {
+      const source = path.join(packageDir(), 'integrations', 'hermes', definition.name);
+      const target = path.join(pluginRoot, definition.name);
+      const staged = path.join(pluginRoot, `.${definition.name}.ihow-tmp-${nonce}`);
+      const backup = path.join(pluginRoot, `.${definition.name}.ihow-bak-${nonce}`);
+      await fs.rm(staged, { recursive: true, force: true });
+      await fs.cp(source, staged, { recursive: true });
+      for (const file of definition.required) {
+        const stat = await fs.lstat(path.join(staged, file));
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size === 0) {
+          throw new Error(`hermes_adapter_source_invalid:${definition.name}/${file}`);
+        }
+      }
+      await fs.writeFile(path.join(staged, 'bridge.json'), `${JSON.stringify(bridgeConfig, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      });
+      let backupPath: string | null = null;
+      try {
+        const stat = await fs.lstat(target);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`hermes_adapter_target_not_directory:${definition.name}`);
+        await fs.rename(target, backup);
+        backupPath = backup;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      try {
+        await fs.rename(staged, target);
+      } catch (error) {
+        if (backupPath) await fs.rename(backupPath, target).catch(() => {});
+        throw error;
+      }
+      installed.push({ target, backup: backupPath });
+    }
+
+    const SP = { encoding: 'utf8' as const, timeout: 20000 };
+    const enable = spawnSync('hermes', ['plugins', 'enable', 'ihow-memory', '--no-allow-tool-override'], SP);
+    if (enable.status !== 0) throw new Error(`hermes_lifecycle_enable_failed: ${(enable.stderr || enable.stdout || '').slice(0, 300)}`);
+    const select = spawnSync('hermes', ['config', 'set', 'memory.provider', 'ihow-memory-compaction', '--force'], SP);
+    if (select.status !== 0) throw new Error(`hermes_compaction_select_failed: ${(select.stderr || select.stdout || '').slice(0, 300)}`);
+
+    const [lifecycle, compaction] = await Promise.all([
+      inspectHermesLifecycleWiring(home),
+      inspectHermesCompactionWiring(home),
+    ]);
+    if (lifecycle.state !== 'current') throw new Error(`hermes_lifecycle_install_unverified:${lifecycle.reason || lifecycle.state}`);
+    if (compaction.state !== 'current') throw new Error(`hermes_compaction_install_unverified:${compaction.reason || compaction.state}`);
+    for (const entry of installed) if (entry.backup) await fs.rm(entry.backup, { recursive: true, force: true });
+    return {
+      changed: lifecycleBefore.generationId !== lifecycle.generationId || compactionBefore.generationId !== compaction.generationId,
+      lifecycleGeneration: lifecycle.generationId,
+      compactionGeneration: compaction.generationId,
+    };
+  } catch (error) {
+    let rollbackFailure: unknown;
+    try {
+      await restoreHermesConfig(home, configBefore);
+    } catch (caught) {
+      rollbackFailure = caught;
+    }
+    for (const entry of installed.reverse()) {
+      await fs.rm(entry.target, { recursive: true, force: true }).catch(() => {});
+      if (entry.backup) await fs.rename(entry.backup, entry.target).catch(() => {});
+    }
+    if (rollbackFailure) {
+      const original = error instanceof Error ? error.message : String(error);
+      const rollback = rollbackFailure instanceof Error ? rollbackFailure.message : String(rollbackFailure);
+      throw new Error(`${original}; hermes_adapter_rollback_failed:${rollback}`);
+    }
+    throw error;
+  } finally {
+    for (const definition of definitions) {
+      await fs.rm(path.join(pluginRoot, `.${definition.name}.ihow-tmp-${nonce}`), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+async function connectViaHermesCli(
   workspace: Awaited<ReturnType<typeof ensureWorkspace>>,
   spec: { command: string; args: string[] },
   options: { dryRun?: boolean },
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   if (!commandExists('hermes')) {
     throw new Error('hermes_cli_not_found: install the Hermes Agent CLI to connect hermes (or run init for a manual ~/.hermes/config.yaml entry).');
+  }
+  const hermesHome = resolveHermesHome() || path.join(os.homedir(), '.hermes');
+  const selectedProvider = await readHermesMemoryProvider(hermesHome);
+  if (selectedProvider && selectedProvider !== 'ihow-memory-compaction') {
+    throw new Error(`hermes_memory_provider_conflict:${selectedProvider}`);
   }
   const SP = { encoding: 'utf8' as const, timeout: 20000 };
   const exists = /\bihow-memory\b/.test(spawnSync('hermes', ['mcp', 'list'], SP).stdout || '');
@@ -1609,33 +1781,61 @@ function connectViaHermesCli(
   const existing = exists ? readHermesMcpSpec() : null;
   const unchanged = existing !== null && isDeepStrictEqual(existing, desired);
   if (options.dryRun) {
+    const adapters = await installHermesAdapters(workspace, options);
     return {
       ok: true, runtime: 'hermes', method: 'official-cli:hermes',
-      alreadyExists: exists, unchanged, changed: !unchanged, dryRun: true,
+      alreadyExists: exists, unchanged: unchanged && !adapters.changed,
+      changed: !unchanged || adapters.changed, dryRun: true,
     };
   }
-  if (unchanged) {
-    return {
-      ok: true, runtime: 'hermes', method: 'official-cli:hermes',
-      target: `${hermesConfigPath()} (hermes mcp add + gateway start)`,
-      alreadyExists: true, unchanged: true, changed: false, replaced: false,
-    };
-  }
-  if (exists) {
-    const remove = spawnSync('hermes', ['mcp', 'remove', 'ihow-memory'], SP);
-    if (remove.status !== 0) {
-      throw new Error(`hermes_mcp_remove_failed: ${(remove.stderr || remove.stdout || '').slice(0, 300)}`);
+  const configBefore = await snapshotHermesConfig(hermesHome);
+  let mcpMutated = false;
+  let adapters: Awaited<ReturnType<typeof installHermesAdapters>>;
+  try {
+    if (!unchanged && exists) {
+      const remove = spawnSync('hermes', ['mcp', 'remove', 'ihow-memory'], SP);
+      if (remove.status !== 0) {
+        throw new Error(`hermes_mcp_remove_failed: ${(remove.stderr || remove.stdout || '').slice(0, 300)}`);
+      }
+      mcpMutated = true;
     }
-  }
-  // argparse declares --args as REMAINDER, so --env must come first and --args must be last.
-  const add = spawnSync('hermes', [
-    'mcp', 'add', 'ihow-memory',
-    '--command', spec.command,
-    '--env', `MEMORY_ROOT=${workspace.memoryDir}`, `IHOW_MEMORY_STATE_ROOT=${workspace.root}`,
-    '--args', serverEntry,
-  ], SP);
-  if (add.status !== 0) {
-    throw new Error(`hermes_mcp_add_failed: ${(add.stderr || add.stdout || '').slice(0, 300)}`);
+    // argparse declares --args as REMAINDER, so --env must come first and --args must be last.
+    if (!unchanged) {
+      const add = spawnSync('hermes', [
+        'mcp', 'add', 'ihow-memory',
+        '--command', spec.command,
+        '--env', `MEMORY_ROOT=${workspace.memoryDir}`, `IHOW_MEMORY_STATE_ROOT=${workspace.root}`,
+        '--args', serverEntry,
+      ], SP);
+      if (add.status !== 0) {
+        throw new Error(`hermes_mcp_add_failed: ${(add.stderr || add.stdout || '').slice(0, 300)}`);
+      }
+      mcpMutated = true;
+    }
+    adapters = await installHermesAdapters(workspace, options);
+    await recordConfiguredActivation(
+      workspace,
+      'hermes',
+      'connect',
+      {},
+      true,
+    );
+  } catch (error) {
+    const rollbackErrors: string[] = [];
+    if (mcpMutated) {
+      const remove = spawnSync('hermes', ['mcp', 'remove', 'ihow-memory'], SP);
+      if (remove.status !== 0) rollbackErrors.push(`mcp-remove:${(remove.stderr || remove.stdout || '').slice(0, 200)}`);
+    }
+    try {
+      await restoreHermesConfig(hermesHome, configBefore);
+    } catch (caught) {
+      rollbackErrors.push(`config:${caught instanceof Error ? caught.message : String(caught)}`);
+    }
+    if (rollbackErrors.length) {
+      const original = error instanceof Error ? error.message : String(error);
+      throw new Error(`${original}; hermes_connect_rollback_failed:${rollbackErrors.join('|')}`);
+    }
+    throw error;
   }
   // Refresh the gateway so the add takes effect on the LIVE gateway. First-user incident:
   // `hermes mcp add` succeeded but `hermes mcp list` stayed empty until `hermes gateway start`
@@ -1646,7 +1846,11 @@ function connectViaHermesCli(
   return {
     ok: true, runtime: 'hermes', method: 'official-cli:hermes',
     target: `${hermesConfigPath()} (hermes mcp add + gateway start)`,
-    alreadyExists: exists, unchanged: false, changed: true, replaced: exists,
+    alreadyExists: exists,
+    unchanged: unchanged && !adapters.changed,
+    changed: !unchanged || adapters.changed,
+    replaced: !unchanged && exists,
+    hermesAdapters: adapters,
   };
 }
 
@@ -1676,7 +1880,7 @@ async function connectRuntime(
     if (process.platform === 'win32') {
       throw new Error('hermes_connect_windows_unsupported: on Windows, run `ihow-memory init` and add the printed entry to ~/.hermes/config.yaml (hermes CLI auto-config is not yet wired for Windows).');
     }
-    return connectViaHermesCli(workspace, spec, options);
+    return await connectViaHermesCli(workspace, spec, options);
   }
   if (runtime === 'cursor') {
     return writeJsonMcpConfig(path.join(home, '.cursor', 'mcp.json'), runtime, spec, options); // no official CLI
@@ -1844,13 +2048,15 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
       console.log(`  · skipped ${d.runtime}: ${error}`);
     }
   }
-  if (connected.length) await telemetry.track('connect', { runtime: `auto:${connected.length}` });
   // Non-zero exit when something we tried to connect isn't reachable (a written-but-unreachable runtime),
   // or when nothing reached at all — so a script can't read a green exit over a failed auto-connect.
   if (unverified.length > 0 || (present.length > 0 && connected.length === 0)) process.exitCode = 1;
   if (options.json) printJson({ connected, unverified, skipped });
   const verifiedN = connected.filter((c) => c.verified).length;
   console.log(`\nconnected ${connected.length} (${verifiedN} verified, ${connected.length - verifiedN} pending first-launch), unverified ${unverified.length}, skipped ${skipped.length}. Restart each runtime to load the memory tools.`);
+  if (connected.length > 0 && unverified.length === 0 && process.exitCode !== 1 && !options.json) {
+    await maybeAskTelemetry();
+  }
 }
 
 // WorkBuddy resume wiring (the analog of Claude's skill/hook): WorkBuddy has no lifecycle hook, but it
@@ -2478,17 +2684,18 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     }
   }
 
-  if (!dryRun && connected.length) {
-    await telemetry.track('setup', { runtime: `auto:${connected.length}` });
-    if (!json) await maybeAskTelemetry(); // the consent nudge is human-only — never pollute --json
-  }
-
   const allFailed = connected.length === 0; // nothing reachable-verified (direct-write + server round-trip counts)
   const doctorRed = !!doctorResult && doctorResult.ok === false;
   const installFailed = skill === 'failed' || hook === 'failed' || workbuddyResume === 'failed' || codexHooks === 'failed'; // a helper no-op'd / threw despite being asked
   if (!dryRun && (allFailed || doctorRed || installFailed)) process.exitCode = 1;
   // ok must never contradict a non-zero exit a sub-step already set (e.g. unparseable settings)
   const ok = dryRun ? skipped.length === 0 : !allFailed && !doctorRed && !installFailed && process.exitCode !== 1;
+  if (ok && !dryRun) {
+    // Record only consent that existed before this setup. A choice made by the prompt below is not
+    // retroactive, and JSON/noninteractive execution never presents or persists a consent decision.
+    await telemetry.track('setup_completed');
+    if (!json) await maybeAskTelemetry();
+  }
   const applied = !dryRun && changedRuntimes.size > 0;
   const restartRuntimes = [...changedRuntimes];
   const restart = dryRun
@@ -2674,7 +2881,7 @@ Usage:
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
   ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the runtime's proactive memory layer, no prompts
   ihow-memory connect --auto [--write] [--json]   # detect installed runtimes; default reports only, --write connects them all to one shared workspace
-  ihow-memory telemetry [on|off|status]   # anonymous usage telemetry — OFF by default; only event/runtime/version, never memory content
+  ihow-memory telemetry [on|off|status|flush]   # optional anonymous metrics — OFF by default; only schema/event/category fields, never memory content; flush sends only after explicit endpoint configuration
   ihow-memory hook-stop                   # Stop-hook handler (Claude Code session-end nudge; reads hook JSON on stdin)
   ihow-memory hook-session-start          # SessionStart-hook handler (Claude Code marker floor; Codex resume hint + Codex capture floor trigger)
   ihow-memory hook-pre-compact            # Claude/Codex native PreCompact checkpoint adapter; bounded, transcript-free, fail-open
@@ -3266,29 +3473,26 @@ async function runProof(options: WorkspaceOptions & { json?: boolean }): Promise
   }
 }
 
-// First-run opt-in prompt. Interactive: ask [y/N] (default N). Non-interactive (agent/CI):
-// stay OFF, print one non-blocking hint. Asked once, then never again.
+// First-run consent is a single explicit three-way choice. Agent, CI, and JSON paths stay silent and
+// leave no consent state behind; there is deliberately no default answer.
 async function maybeAskTelemetry(): Promise<void> {
   if (await telemetry.hasAsked()) return;
-  if (!process.stdout.isTTY || !process.stdin.isTTY) {
-    // Non-interactive: emit the one-time notice on STDERR, never stdout — stdout may be a `--json`
-    // payload a script (or our own Windows CI `connect --json | ConvertFrom-Json`) is parsing.
-    console.error('(Want to help anonymously? Run `ihow-memory telemetry on` — usage only, never memory content.)');
-    await telemetry.markAsked();
-    return;
-  }
+  if (!process.stdout.isTTY || !process.stdin.isTTY) return;
   const readline = await import('node:readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await new Promise<string>((resolve) => {
-    rl.question(
-      '\nHelp us improve? (optional)\n  ✓ Reports only: when used · which runtime · version · error type\n  ✗ Never reports: your memory / files / projects — nothing\n  Turn off anytime: ihow-memory telemetry off\n  Share anonymous usage? [y/N] › ',
-      (a) => resolve(a),
-    );
-  });
-  rl.close();
-  const yes = /^y(es)?$/i.test(answer.trim());
-  await telemetry.setEnabled(yes);
-  console.log(yes ? '✓ Enabled, thank you! (turn off anytime: `ihow-memory telemetry off`)' : 'Skipped — telemetry stays off.');
+  try {
+    const choice = await telemetry.promptForTelemetryConsent({
+      interactive: true,
+      ask: (question) => new Promise<string>((resolve) => rl.question(question, resolve)),
+    });
+    if (!choice) return;
+    await telemetry.applyConsent(choice);
+    if (choice === 'opt-in') console.log('Anonymous metrics enabled. Turn off anytime with `ihow-memory telemetry off`.');
+    else if (choice === 'no-send') console.log('Anonymous metrics remain off.');
+    else console.log('No choice saved; anonymous metrics remain off.');
+  } finally {
+    rl.close();
+  }
 }
 
 // Optionally copy the bundled Claude Code skill into ~/.claude/skills/ihow-memory/. Consent-gated
@@ -4246,8 +4450,7 @@ async function main(): Promise<void> {
         options,
         claudeHooks === 'installed' || codexHooks === 'installed',
       );
-      await telemetry.track('connect', { runtime: options.runtime });
-      if (!options.json) await maybeAskTelemetry();
+      if (verification?.reachable && process.exitCode !== 1 && !options.json) await maybeAskTelemetry();
     }
     return;
   }
@@ -4730,8 +4933,16 @@ async function main(): Promise<void> {
 
   if (command === 'telemetry') {
     const sub = process.argv[3];
-    if (sub === 'on') { await telemetry.setEnabled(true); console.log('✓ Anonymous telemetry enabled (records usage events locally only; not uploaded in this version; never includes memory content).'); return; }
-    if (sub === 'off') { await telemetry.setEnabled(false); console.log('✓ Anonymous telemetry disabled.'); return; }
+    if (sub === 'on') { await telemetry.setEnabled(true); console.log('Anonymous metrics enabled. Events stay queued locally unless an explicit HTTP(S) endpoint is configured; memory content is never included.'); return; }
+    if (sub === 'off') { await telemetry.setEnabled(false); console.log('Anonymous metrics disabled; queued events and the installation ID were removed.'); return; }
+    if (sub === 'flush') {
+      const sent = await telemetry.flush();
+      console.log(sent
+        ? 'Anonymous metrics batch sent after explicit flush.'
+        : 'No anonymous metrics were sent. Check consent, the configured HTTP(S) endpoint, queued events, or retry backoff.');
+      if (!sent) process.exitCode = 1;
+      return;
+    }
     const st = await telemetry.status();
     if (options.json) printJson(st);
     else {

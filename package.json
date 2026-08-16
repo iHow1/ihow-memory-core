@@ -1,6 +1,6 @@
 {
   "name": "ihow-memory",
-  "version": "0.1.0-alpha.31.2",
+  "version": "0.1.0-alpha.31.4",
   "type": "module",
   "description": "Local-first shared memory for AI agents with zero-dependency FTS, citations, governance, and MCP.",
   "keywords": [
@@ -30,11 +30,24 @@
     "LICENSE",
     "NOTICE",
     "TRADEMARK.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "DCO.md",
+    "SECURITY.md",
     "README.md",
     "README.zh-CN.md",
     "skills/",
+    "assets/ihow-memory-social-preview.svg",
+    "examples/",
+    "integrations/hermes/ihow-memory-compaction/",
+    "docs/demo-storyboard.md",
     "docs/enterprise-quality-gates.md",
+    "docs/good-first-issues.md",
     "docs/harness-contract.md",
+    "docs/handoff-schema.md",
+    "docs/launch-asset-checklist.md",
+    "docs/release-governance.md",
+    "docs/telemetry-privacy.md",
     "docs/safe-memory-gardener.md"
   ],
   "bin": {

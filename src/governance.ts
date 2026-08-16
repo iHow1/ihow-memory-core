@@ -906,33 +906,40 @@ export type DurableWritePolicy = {
   flags: DurableWritePolicyFlag[];
 };
 
-// Standing-rule / policy / access / identity / destructive markers — content that must stay
-// human-gated even when it reads "low risk". A denylist can be evaded, so this is one of THREE
-// gates (secret-clean + not-governance + has-provenance) and the safe failure is "stays a
-// candidate". Kept off the noisiest factual verbs (a fact that mentions "deploy"/"disabled X"
-// is fine) but covers the clear high-signal directives.
-const GOVERNANCE_MARKERS: RegExp[] = [
-  // Standing rules / preferences / policy / imperatives — a durable directive, not a fact.
+// Standing-rule / policy / access / identity / destructive markers. High-risk markers always remain
+// flagged, including on an explicitly labelled handoff. Ordinary operational guidance is kept separate
+// so a handoff can remain discoverable without creating a bypass for credentials or destructive actions.
+const OPERATIONAL_GOVERNANCE_MARKERS: RegExp[] = [
   /\b(always|never|from now on|going forward|by default|as a rule|policy|standing rule|guideline|convention|preference|make sure to|remember to|prefer\b.{0,24}\bover\b|auto[-\s]?approve)\b/i,
-  // ZH: DIRECTIVE-TONE anchored (knob-②, Commander 2026-07-01). The old noun/topic keyword classes
-  // (偏好/默认/策略/权限/授权/管理员/回滚/删除…) flagged 11% of real ZH writebacks — measured 64% of those
-  // flags were plain FACTS ("API 授权失败", "默认端口 8788", "回滚点：…"), silently killing the default-auto
-  // surface for Chinese soft facts (CJK has no word boundaries and 偏好 doubles as the everyday verb
-  // "prefers"). This exact regex was evaluated against 300 dual-judged real entries: only PRESCRIPTIVE
-  // tone flags now; factual mentions of the same topics flow to the normal unverified/verified tiers,
-  // where the C1 recall gate still keeps status/bypass claims out of the default surface. System-level
-  // (write flag ∪ C1): dangerous-content recall 87%→65% with soft-fact survival 33%→~68% — the knob-②
-  // trade Commander chose. Red-team gated like every recall-surface change.
   /(以后|从现在起|今后|一律|务必|永远不|绝不|不要|勿|禁止|不得|不准|必须|请?记住|统一(?:用|按|走)|只(?:用|走|发|放|做|改)|仅(?:用|放|发|限)|默认(?:改|用|走|按)|从此|规定|要求所有|标准流程|红线)/,
-  // Access / security / identity / credentials (EN kept as-is — the eval corpus was ZH-dominant; EN
-  // markers are already directive-leaning. Revisit with an EN-labeled sample before touching).
+];
+
+const HIGH_RISK_GOVERNANCE_MARKERS: RegExp[] = [
   /\b(permission|access control|credential|api[\s_-]?key|password|\bsecret\b|\btoken\b|grant|revoke|sudo|chmod|chown|\broot\b|identity|impersonate|whitelist|allowlist|2fa|mfa|bypass\s+(?:auth|review|checks?)|skip\s+(?:review|code\s*review|checks?))\b/i,
-  // Destructive / high-blast-radius actions (EN kept as-is, same rationale).
   /\b(delete|drop\s+(?:table|database)|destroy|wipe|rm\s+-rf|truncate|force[\s-]?push|reset\s+--hard|terraform\s+destroy|kubectl\s+delete)\b/i,
 ];
 
-function looksLikeGovernanceStatement(text: string): boolean {
-  return GOVERNANCE_MARKERS.some((re) => re.test(text));
+function isHandoffMarker(value: unknown): boolean {
+  if (typeof value === 'string') return /^(?:handoff|resume|continuation|交接|续接)$/iu.test(value.trim());
+  if (Array.isArray(value)) return value.some((item) => isHandoffMarker(item));
+  return false;
+}
+
+// Handoff intent must be explicit in metadata or the title. Body text alone is not enough: otherwise a
+// malicious directive could self-label itself as a safe handoff and evade the governance floor.
+function isExplicitHandoffPayload(payload: WriteCandidatePayload): boolean {
+  const metadata = payload.metadata;
+  if (metadata && typeof metadata === 'object') {
+    for (const key of ['memoryType', 'memory_type', 'kind', 'category', 'type', 'tags', 'labels']) {
+      if (isHandoffMarker((metadata as Record<string, unknown>)[key])) return true;
+    }
+  }
+  return /handoff|resume|continuation|交接|续接/iu.test(String(payload.title || ''));
+}
+
+function looksLikeGovernanceStatement(text: string, options: { handoff?: boolean } = {}): boolean {
+  if (HIGH_RISK_GOVERNANCE_MARKERS.some((re) => re.test(text))) return true;
+  return !options.handoff && OPERATIONAL_GOVERNANCE_MARKERS.some((re) => re.test(text));
 }
 
 // Everything that will land on disk if promoted — body text + title + metadata values — so the
@@ -1052,7 +1059,7 @@ export function evaluateAutoPromote(payload: WriteCandidatePayload, opts: { cwd?
   if (prov.conflict) {
     return { allow: false, reason: prov.reason ?? 'claimed anchor conflicts with live state', category: 'conflict' };
   }
-  if (looksLikeGovernanceStatement(governanceScanText(payload))) {
+  if (looksLikeGovernanceStatement(governanceScanText(payload), { handoff: isExplicitHandoffPayload(payload) })) {
     return {
       allow: true,
       tier: 'flagged',

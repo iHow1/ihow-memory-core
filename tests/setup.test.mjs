@@ -20,10 +20,31 @@ import { makeCodexMcpShim } from './helpers/codex-mcp-shim.mjs';
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts');
 const HERMETIC_PATH = '/usr/bin:/bin';
 
+function isolatedEnv(home, extraEnv = {}) {
+  return {
+    ...process.env,
+    HOME: home,
+    CODEX_HOME: path.join(home, '.codex'),
+    HERMES_HOME: path.join(home, '.hermes'),
+    XDG_CONFIG_HOME: path.join(home, '.config'),
+    XDG_DATA_HOME: path.join(home, '.local', 'share'),
+    XDG_STATE_HOME: path.join(home, '.local', 'state'),
+    XDG_CACHE_HOME: path.join(home, '.cache'),
+    IHOW_MEMORY_HOME: path.join(home, '.ihow-memory'),
+    IHOW_MEMORY_HERMES_BRIDGE: '',
+    IHOW_MEMORY_HERMES_NODE: '',
+    IHOW_TELEMETRY_ENDPOINT: '',
+    MEMORY_ROOT: '',
+    IHOW_MEMORY_ROOT: '',
+    IHOW_MEMORY_STATE_ROOT: '',
+    ...extraEnv,
+  };
+}
+
 function run(args, home, extraEnv = {}) {
   return execFileSync(process.execPath, [CLI, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: home, PATH: HERMETIC_PATH, ...extraEnv },
+    env: isolatedEnv(home, { PATH: HERMETIC_PATH, ...extraEnv }),
   });
 }
 async function dirs(t) {
@@ -75,6 +96,15 @@ test('setup --runtime claude-code: writes MCP + skill + hook and reports success
   assert.match(settings, /hook-stop/, 'Stop hook wired into the project settings');
   assert.match(settings, /hook-session-start/, 'SessionStart hook wired into the project settings');
   assert.match(await fs.readFile(path.join(home, '.claude.json'), 'utf8'), /ihow-memory/, 'MCP entry written (direct-json fallback)');
+  assert.equal(await exists(path.join(home, '.ihow-memory', 'telemetry.json')), false, 'noninteractive setup neither prompts nor creates telemetry consent state');
+});
+
+test('successful setup records setup_completed only for a prior explicit opt-in', async (t) => {
+  const { home, root, proj } = await dirs(t);
+  run(['telemetry', 'on'], home);
+  run(['setup', '--runtime', 'claude-code', '--root', root, '--space', 't', '--cwd', proj], home);
+  const queue = await fs.readFile(path.join(home, '.ihow-memory', 'telemetry-queue.ndjson'), 'utf8');
+  assert.deepEqual(queue.trim().split('\n').map((line) => JSON.parse(line).event), ['setup_completed']);
 });
 
 test('setup is idempotent — re-running changes nothing and adds no new backups', async (t) => {
@@ -283,6 +313,8 @@ test('setup --json emits clean parseable output (install prints suppressed)', as
   assert.equal(j.applied, true, 'first run reports that setup configuration changed');
   assert.equal(j.restart.required, true, 'first run requests restart after applying setup configuration');
   assert.deepEqual(j.restart.runtimes, ['claude-code']);
+  assert.equal(await exists(path.join(home, '.ihow-memory', 'telemetry.json')), false, '--json does not persist a consent decision');
+  assert.equal(await exists(path.join(home, '.ihow-memory', 'telemetry-queue.ndjson')), false, '--json stays default-off without creating a queue');
 });
 
 test('setup --json is honest when the hook fails to wire (unparseable settings → ok:false, hook:failed)', async (t) => {

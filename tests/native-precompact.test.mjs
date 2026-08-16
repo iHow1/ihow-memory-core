@@ -13,6 +13,7 @@ import { locateCheckpointDrafts, resolveCheckpointProjectIdentity } from '../src
 import { normalizeNativePreCompactTrigger } from '../src/native-precompact.ts';
 import { openCore } from '../src/core.ts';
 import { readActivationEvidence } from '../src/activation-ledger.ts';
+import { deriveRuntimeActivation } from '../src/automation-doctor.ts';
 import {
   CHECKPOINT_OPEN_DRAFT_MAX,
   checkpointPrivateIndexPaths,
@@ -691,9 +692,12 @@ test('oversized/malformed payload and persistence failure stay silent and exit 0
   assert.ok(Date.now() - started < 3_500, 'failure is bounded below the host timeout envelope');
 });
 
-test('real installed Claude PreCompact path records started/completed evidence only after durable completion', async (t) => {
+test('real installed Claude PreCompact keeps completion local and emits no reserved activation telemetry', async (t) => {
   const f = await fixture(t, 'activation');
   execFileSync(process.execPath, [CLI, 'install-hook', '--root', f.root, '--space', f.space, '--cwd', f.project], {
+    encoding: 'utf8', env: { ...process.env, HOME: f.home },
+  });
+  execFileSync(process.execPath, [CLI, 'telemetry', 'on'], {
     encoding: 'utf8', env: { ...process.env, HOME: f.home },
   });
   const settings = JSON.parse(await fs.readFile(path.join(f.project, '.claude', 'settings.local.json'), 'utf8'));
@@ -717,8 +721,17 @@ test('real installed Claude PreCompact path records started/completed evidence o
   assert.equal(precompact.some((row) => row.status === 'failed'), false);
   const configured = rows.find((row) => row.status === 'configured');
   const completed = precompact.find((row) => row.status === 'observed-live-completed');
+  assert.equal(completed.source, 'managed-hook', 'the replayable frozen CLI is not native host attestation');
   assert.equal(completed.configuration.id, configured.configuration.id);
+  const activation = deriveRuntimeActivation('claude-code', rows);
+  assert.equal(activation.status, 'READY — WAITING FOR FIRST ACTIVITY');
+  assert.equal(activation.reasonCode, 'ACTIVATION_COMPLETION_UNATTESTED');
   assert.equal((await artifactFiles(f.root)).length, 1, 'completed evidence follows a durable artifact');
+  await assert.rejects(
+    fs.readFile(path.join(f.home, '.ihow-memory', 'telemetry-queue.ndjson'), 'utf8'),
+    (error) => error?.code === 'ENOENT',
+    'PreCompact completion is local evidence only; no host-authenticated telemetry producer exists',
+  );
 });
 
 test('strict PreCompact deadline exits 0, records failed not completed, and persists no partial artifact', async (t) => {
