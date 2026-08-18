@@ -64,7 +64,7 @@ jobs:
           case "$GITHUB_REF_NAME" in
             *-alpha*|*-beta*|*-rc*) TAG=next ;;
           esac
-          PACKAGE="release-evidence/ihow-memory-${GITHUB_REF_NAME#v}.tgz"
+          PACKAGE="./release-evidence/ihow-memory-${GITHUB_REF_NAME#v}.tgz"
           echo "publishing $GITHUB_REF_NAME with dist-tag: $TAG"
           sha256sum --check --ignore-missing release-evidence/checksums.txt
           npm publish "$PACKAGE" --tag "$TAG" --provenance
