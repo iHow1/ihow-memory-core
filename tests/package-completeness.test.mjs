@@ -49,7 +49,7 @@ test('alpha.31.4 prerelease metadata and docs stay truthful and aligned', () => 
   assert.match(alpha314, /Evidence-first GitHub launch surface/i);
   assert.match(alpha314, /Telemetry opt-out and queue hardening/i);
   assert.match(alpha314, /fails closed/i);
-  assert.match(alpha314, /local release-ready prerelease/i);
+  assert.match(alpha314, /public alpha prerelease/i);
   assert.match(alpha314, /npm `?next`?[^\n]*(?:source of truth|availability)/i);
   assert.match(alpha314, /(?:publication|published)[^\n]*(?:does not|doesn['’]t)[^\n]*(?:activate|frozen local runtime)/i);
   assert.match(alpha314, /report-only/i);
