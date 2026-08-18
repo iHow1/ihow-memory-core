@@ -8,7 +8,7 @@ with pre-release tags.
 
 ## [Unreleased]
 
-## [0.1.0-alpha.31.4] — 2026-08-04
+## [0.1.0-alpha.31.4] — 2026-08-18
 
 ### Added
 
@@ -27,7 +27,7 @@ with pre-release tags.
 
 ### Notes
 
-- Alpha.31.4 is a **local release-ready prerelease candidate**. It supersedes the unpublished Alpha.31.3 RC after independent privacy/concurrency review. npm `next` is the source of truth for availability; publication does not activate an already-open host or replace a frozen local runtime.
+- Alpha.31.4 is a **public alpha prerelease**. It supersedes the unpublished Alpha.31.3 RC after independent privacy/concurrency review. npm `next` is the source of truth for availability; publication does not activate an already-open host or replace a frozen local runtime.
 - The open-source core remains local-first with no account or required cloud. Optional metrics are disabled by default and require explicit consent plus an explicit manual flush before any network request.
 - Safe Memory Gardener remains review-first and report-only. This release does not add automatic authoritative-memory rewriting, production certification, or complete enterprise multi-tenant authentication/RBAC/administration.
 
