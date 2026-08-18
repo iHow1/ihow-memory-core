@@ -184,8 +184,7 @@ stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）
 
 | 工具 | 作用 |
 | --- | --- |
-| `memory.search` | 用 FTS 检索本地记忆，返回引用路径与片段。 |
-| `memory.read` | 按路径读取记忆 Markdown 文件，返回原文与引用。 |
+| `memory.read` | 按路径读取记忆 Markdown；默认返回有界预览（8,000 字符），同时返回 `truncated`、`originalChars` 和 `next` 提示。只有确实需要完整原文时才传 `mode: "full"`。 |
 | `memory.write_candidate` | 记一条记忆。引擎会把带 provenance（证据/锚点）的低风险内容自动晋升为持久记忆；高风险或无证据的内容保留为 candidate。 |
 | `memory.promote` | 显式手动把 candidate 升级到受治理的 staging，并记审计事件。 |
 | `memory.durable_promote` | 受治理的持久写入，必须显式传 `dryRun: true` 或 `realWrite: true`。 |

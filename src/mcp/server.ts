@@ -88,11 +88,13 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory.read',
-    description: 'Read a memory markdown file by path; returns exact content plus citation. Use to open the full source behind a search snippet before relying on it.',
+    description: 'Read a memory markdown file with a bounded preview by default. Use mode=full when the complete source is required; truncated responses include originalChars and a next hint.',
     inputSchema: {
       type: 'object',
       properties: {
         ref: { type: 'string' },
+        mode: { type: 'string', enum: ['preview', 'full'], description: 'Default preview is capped at 8,000 characters; full returns exact stored content.' },
+        maxChars: { type: 'number', description: 'Preview ceiling, clamped to 256..100000. Ignored in full mode.' },
       },
       required: ['ref'],
     },
@@ -304,7 +306,10 @@ async function main(): Promise<void> {
             includeFlagged: args.includeFlagged === true,
           });
         } else if (name === 'memory.read') {
-          payload = await core.read(String(args.ref || ''));
+          payload = await core.read(String(args.ref || ''), {
+            mode: args.mode === 'full' ? 'full' : 'preview',
+            maxChars: Number.isFinite(args.maxChars as number) ? Number(args.maxChars) : undefined,
+          });
         } else if (name === 'memory.write_candidate') {
           payload = await core.write_candidate(args);
         } else if (name === 'memory.promote') {

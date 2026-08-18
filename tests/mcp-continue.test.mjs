@@ -91,3 +91,25 @@ test('memory.search: includeFlagged exposes review-flagged matches without chang
   assert.equal(hidden.length, 0, 'MCP default keeps flagged entries hidden');
   assert.ok(visible.some((hit) => hit.path === written.path), 'MCP includeFlagged returns the durable match');
 });
+
+test('memory.read: defaults to a bounded preview and supports explicit full content', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-root-read-'));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const core = await (await import('../src/core.ts')).openCore({ root, space: 't' });
+  const marker = 'ZREADBUDGETMARKER';
+  const written = await core.write_candidate({
+    text: `${marker}\n${'x'.repeat(9_000)}`,
+    sourceAgent: 'test',
+    autoPromote: false,
+  });
+  const preview = await core.read(written.path);
+  assert.equal(preview.contentMode, 'preview');
+  assert.equal(preview.truncated, true);
+  assert.equal(preview.originalChars > preview.content.length, true);
+  assert.match(preview.next, /mode=full/);
+  const full = await core.read(written.path, { mode: 'full' });
+  assert.equal(full.contentMode, 'full');
+  assert.equal(full.truncated, false);
+  assert.match(full.content, new RegExp(marker));
+  assert.equal(full.content.length, full.originalChars);
+});

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 with pre-release tags.
 
 ## [Unreleased]
+### Changed
+
+- **Bounded memory reads.** `memory.read` now returns an 8,000-character preview by default, reports truncation metadata, and requires explicit `mode: "full"` for complete content. This preserves exact reads while preventing accidental context explosions from large Markdown sources.
 
 ## [0.1.0-alpha.31.4] — 2026-08-18
 

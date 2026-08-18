@@ -201,8 +201,7 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 
 | Tool | What it does |
 | --- | --- |
-| `memory.search` | Search local memory with FTS. Returns citation path and snippet. |
-| `memory.read` | Read a memory Markdown file by path. Returns exact content plus citation. |
+| `memory.read` | Read a memory Markdown file with a bounded preview by default (8,000 characters). Returns `truncated`, `originalChars`, and a `next` hint; pass `mode: "full"` only when the exact complete source is required. |
 | `memory.write_candidate` | Record a memory. Clean content auto-promotes into durable yellow tiers: verified, unverified, or flagged. Secrets and falsified anchors are rejected. |
 | `memory.promote` | Explicit manual promote of a candidate into governed staging, with an audit event. |
 | `memory.durable_promote` | Governed durable promote. Requires explicit `dryRun: true` or `realWrite: true`. |

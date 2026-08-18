@@ -9,6 +9,8 @@ import type {
   JournalResult,
   PromoteResult,
   PromoteTarget,
+  ReadMode,
+  ReadOptions,
   ReadResult,
   SearchResult,
   Workspace,
@@ -44,7 +46,7 @@ import {
 export type MemoryCore = {
   workspace: Workspace;
   search(query: string, opts?: SearchOptions): Promise<SearchResult[]>;
-  read(ref: string): Promise<ReadResult>;
+  read(ref: string, opts?: ReadOptions): Promise<ReadResult>;
   write_candidate(payload: WriteCandidatePayload): Promise<WriteCandidateResult>;
   journal(payload: JournalPayload): Promise<JournalResult>;
   promote(candidate: string, target?: PromoteTarget): Promise<PromoteResult>;
@@ -74,6 +76,12 @@ function excerpt(content: string, max = 300): string {
   const compact = content.replace(/\s+/g, ' ').trim();
   return compact.length > max ? `${compact.slice(0, max - 3)}...` : compact;
 }
+function boundedContent(content: string, mode: ReadMode, maxChars: number | undefined): { content: string; truncated: boolean; maxChars: number | null } {
+  if (mode === 'full') return { content, truncated: false, maxChars: null };
+  const cap = Number.isFinite(maxChars) ? Math.max(256, Math.min(Math.floor(maxChars as number), 100_000)) : 8_000;
+  if (content.length <= cap) return { content, truncated: false, maxChars: cap };
+  return { content: `${content.slice(0, cap)}\n\n[truncated: request mode=full or a larger maxChars]`, truncated: true, maxChars: cap };
+}
 
 export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCore> {
   const workspace = await ensureWorkspace(resolveWorkspace(options));
@@ -97,24 +105,26 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
       if (opts.includeForgotten === true) return hits;
       return await filterForgotten(workspace, hits);
     },
-    async read(ref) {
+    async read(ref, opts = {}) {
       const result = await readMemoryFile(workspace, ref);
-      // snippet is a PREVIEW — skip frontmatter and the engine's "# Candidate <uuid>" heading so it
-      // opens on content, not metadata (content itself stays raw: it IS the file)
+      const mode = opts.mode ?? 'preview';
+      const bounded = boundedContent(result.content, mode, opts.maxChars);
       const snippet = excerpt(
-        result.content
+        bounded.content
           .replace(/^﻿?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')
           .replace(/^\s*#\s*Candidate\s+[0-9a-f][0-9a-f-]{6,}\s*\r?\n/gim, ''),
       );
       return {
         path: result.path,
-        content: result.content,
+        content: bounded.content,
         snippet,
         source: 'markdown',
-        citation: {
-          path: result.path,
-          snippet,
-        },
+        citation: { path: result.path, snippet },
+        contentMode: mode,
+        truncated: bounded.truncated,
+        originalChars: result.content.length,
+        maxChars: bounded.maxChars,
+        ...(bounded.truncated ? { next: 'memory.read with mode=full or a larger maxChars' } : {}),
       };
     },
     async write_candidate(payload) {
