@@ -201,6 +201,7 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 
 | Tool | What it does |
 | --- | --- |
+| `memory.search` | Search local memory with FTS. Returns citation path and snippet. |
 | `memory.read` | Read a memory Markdown file with a bounded preview by default (8,000 characters). Returns `truncated`, `originalChars`, and a `next` hint; pass `mode: "full"` only when the exact complete source is required. |
 | `memory.write_candidate` | Record a memory. Clean content auto-promotes into durable yellow tiers: verified, unverified, or flagged. Secrets and falsified anchors are rejected. |
 | `memory.promote` | Explicit manual promote of a candidate into governed staging, with an audit event. |
@@ -211,6 +212,8 @@ The stdio MCP server (registered by `connect`, or manually via the `init` snippe
 | `memory.status` | Report workspace, retrieval provider, index and sync status. |
 | `memory.continue` | Return a verify-first handoff packet with live anchors and an UNVERIFIED prior narrative. |
 | `memory.context_probe` | Automation trigger probe for no-hook runtimes. It can return verify-first handoff text or `action: "journal"`; it does not auto-write for WorkBuddy/OpenCode/Gemini/unknown. |
+| `memory.organize` | Create a review-first Safe Memory Gardener draft without rewriting curated memory. |
+| `memory.export_vault` | Export a gardener draft as an Obsidian-compatible Markdown view with evidence links. |
 
 ## CLI reference
 
@@ -225,7 +228,7 @@ ihow-memory doctor           environment + setup checks [--share-diagnostics for
 ihow-memory verify           reproducible self-proof receipt: local store + each runtime's reachability + this checkout's resume verdict, every line re-runnable [--runtime name] [--json]
 ihow-memory status           workspace, engine, index and sync state [--json]
 ihow-memory search <query>   citation-bearing local search [--limit n]
-ihow-memory read <path>      read one memory file with citation
+ihow-memory read <path>      bounded 8,000-character preview by default [--max-chars n] [--full; ignores max-chars]
 ihow-memory write-candidate  propose a memory candidate (sandbox inbox)
 ihow-memory promote          promote a candidate (explicit, audited)
 ihow-memory durable-promote  durable write — requires --dry-run or --real-write

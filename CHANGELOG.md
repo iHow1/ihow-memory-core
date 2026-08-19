@@ -9,7 +9,7 @@ with pre-release tags.
 ## [Unreleased]
 ### Changed
 
-- **Bounded memory reads.** `memory.read` now returns an 8,000-character preview by default, reports truncation metadata, and requires explicit `mode: "full"` for complete content. This preserves exact reads while preventing accidental context explosions from large Markdown sources.
+- **Bounded memory reads.** Core, CLI, and MCP `memory.read` now return a strict 8,000-character preview by default, report truncation metadata, and require explicit `mode: "full"` / `--full` for complete content. The existing inline truncation marker is preserved inside the declared character budget, and callers can request a bounded custom preview without accidental context expansion.
 
 ## [0.1.0-alpha.31.4] — 2026-08-18
 

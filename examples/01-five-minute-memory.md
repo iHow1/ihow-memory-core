@@ -7,7 +7,7 @@ init a demo space
 -> write a candidate (sandbox inbox)
 -> promote it (governance + audit event)
 -> search hits it (with citation)
--> read it back (exact content + citation)
+-> read it back (bounded preview + citation; request full only when needed)
 -> status confirms local-only
 ```
 

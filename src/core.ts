@@ -80,7 +80,8 @@ function boundedContent(content: string, mode: ReadMode, maxChars: number | unde
   if (mode === 'full') return { content, truncated: false, maxChars: null };
   const cap = Number.isFinite(maxChars) ? Math.max(256, Math.min(Math.floor(maxChars as number), 100_000)) : 8_000;
   if (content.length <= cap) return { content, truncated: false, maxChars: cap };
-  return { content: `${content.slice(0, cap)}\n\n[truncated: request mode=full or a larger maxChars]`, truncated: true, maxChars: cap };
+  const marker = '\n\n[truncated: request mode=full or a larger maxChars]';
+  return { content: `${content.slice(0, cap - marker.length)}${marker}`, truncated: true, maxChars: cap };
 }
 
 export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCore> {
@@ -107,10 +108,10 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     },
     async read(ref, opts = {}) {
       const result = await readMemoryFile(workspace, ref);
-      const mode = opts.mode ?? 'preview';
+      const mode: ReadMode = opts.mode === 'full' ? 'full' : 'preview';
       const bounded = boundedContent(result.content, mode, opts.maxChars);
       const snippet = excerpt(
-        bounded.content
+        result.content
           .replace(/^﻿?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')
           .replace(/^\s*#\s*Candidate\s+[0-9a-f][0-9a-f-]{6,}\s*\r?\n/gim, ''),
       );

@@ -124,7 +124,7 @@ export async function createConsoleServer(options: ConsoleOptions = {}): Promise
       if (route === '/api/read') {
         const ref = url.searchParams.get('ref') || '';
         assertSafeRef(ref);
-        return json(res, 200, await core.read(ref));
+        return json(res, 200, await core.read(ref, { mode: 'full' }));
       }
       if (route === '/api/audit') {
         const limit = Math.min(Number(url.searchParams.get('limit') || 25), 100);
