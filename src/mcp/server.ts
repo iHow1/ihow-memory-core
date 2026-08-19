@@ -306,9 +306,15 @@ async function main(): Promise<void> {
             includeFlagged: args.includeFlagged === true,
           });
         } else if (name === 'memory.read') {
+          if (args.mode !== undefined && args.mode !== 'preview' && args.mode !== 'full') {
+            throw new Error('memory_read_invalid_mode');
+          }
+          if (args.maxChars !== undefined && (typeof args.maxChars !== 'number' || !Number.isFinite(args.maxChars) || args.maxChars <= 0)) {
+            throw new Error('memory_read_invalid_max_chars');
+          }
           payload = await core.read(String(args.ref || ''), {
             mode: args.mode === 'full' ? 'full' : 'preview',
-            maxChars: Number.isFinite(args.maxChars as number) ? Number(args.maxChars) : undefined,
+            maxChars: args.maxChars as number | undefined,
           });
         } else if (name === 'memory.write_candidate') {
           payload = await core.write_candidate(args);
