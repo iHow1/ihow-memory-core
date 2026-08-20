@@ -39,6 +39,22 @@ test('CLI read exposes bounded preview and explicit full modes', async (t) => {
   assert.equal(full.truncated, false);
 });
 
+test('CLI full mode ignores max-char values in either option order', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-cli-read-full-precedence-'));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const written = run(['write-candidate', `ZCLIFULLPRECEDENCE\n${'q'.repeat(9_000)}`, '--root', root, '--space', 't', '--no-auto-promote']);
+  for (const args of [
+    ['--full', '--max-chars', 'nope'],
+    ['--max-chars', 'nope', '--full'],
+    ['--max-chars', '--full'],
+  ]) {
+    const full = run(['read', written.path, '--root', root, '--space', 't', ...args]);
+    assert.equal(full.contentMode, 'full');
+    assert.equal(full.content.length, full.originalChars);
+    assert.equal(full.maxChars, null);
+  }
+});
+
 test('CLI read rejects invalid max-char budgets with actionable guidance', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-cli-read-invalid-'));
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });

@@ -111,9 +111,7 @@ test('memory.read: defaults to a bounded preview and supports explicit full cont
   const small = await core.read(written.path, { maxChars: 512 });
   assert.equal(small.content.length, 512);
   assert.equal(small.maxChars, 512);
-  const clamped = await core.read(written.path, { maxChars: Number.NaN });
-  assert.equal(clamped.maxChars, 8_000);
-  assert.equal(clamped.content.length, 8_000);
+  await assert.rejects(core.read(written.path, { maxChars: Number.NaN }), /memory_read_invalid_max_chars/);
   const minimum = await core.read(written.path, { maxChars: 1 });
   assert.equal(minimum.maxChars, 256);
   assert.equal(minimum.content.length, 256);
@@ -123,6 +121,15 @@ test('memory.read: defaults to a bounded preview and supports explicit full cont
   assert.equal(full.maxChars, null, 'full mode ignores maxChars');
   assert.match(full.content, new RegExp(marker));
   assert.equal(full.content.length, full.originalChars);
+  const truncationMarker = '\n\n[truncated: request mode=full or a larger maxChars]';
+  const splitAt = 256 - truncationMarker.length;
+  const emojiDir = path.join(core.workspace.memoryDir, 'scopes', 'test');
+  await fs.mkdir(emojiDir, { recursive: true });
+  await fs.writeFile(path.join(emojiDir, 'emoji-boundary.md'), `${'a'.repeat(splitAt - 1)}😀${'b'.repeat(9_000)}`, 'utf8');
+  const emojiPreview = await core.read('memory/scopes/test/emoji-boundary.md', { maxChars: 256 });
+  assert.equal(emojiPreview.content.length, 255, 'dropping a split surrogate stays within the declared ceiling');
+  assert.equal(emojiPreview.content.endsWith(truncationMarker), true);
+  assert.doesNotMatch(emojiPreview.content, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
 });
 
 test('memory.read: MCP schema and calls preserve the preview/full contract', async (t) => {
@@ -142,6 +149,8 @@ test('memory.read: MCP schema and calls preserve the preview/full contract', asy
     JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, mode: 'full' } } }),
     JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, mode: 'partial' } } }),
     JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, maxChars: -1 } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, mode: 'full', maxChars: -1 } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, maxChars: 1.5 } } }),
   ].join('\n') + '\n';
   const out = execFileSync(process.execPath, [SERVER, '--root', root, '--space', 't'], {
     encoding: 'utf8',
@@ -152,6 +161,8 @@ test('memory.read: MCP schema and calls preserve the preview/full contract', asy
   const messages = out.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const definition = messages.find((message) => message.id === 2).result.tools.find((tool) => tool.name === 'memory.read');
   assert.deepEqual(definition.inputSchema.properties.mode.enum, ['preview', 'full']);
+  assert.equal(definition.inputSchema.properties.maxChars.type, 'integer');
+  assert.equal(definition.inputSchema.properties.maxChars.minimum, 1);
   const defaultPreview = messages.find((message) => message.id === 3).result.structuredContent;
   assert.equal(defaultPreview.contentMode, 'preview');
   assert.equal(defaultPreview.content.length, 8_000);
@@ -166,4 +177,8 @@ test('memory.read: MCP schema and calls preserve the preview/full contract', asy
   assert.equal(full.truncated, false);
   assert.match(messages.find((message) => message.id === 6).error.message, /memory_read_invalid_mode/);
   assert.match(messages.find((message) => message.id === 7).error.message, /memory_read_invalid_max_chars/);
+  const fullWithIgnoredBudget = messages.find((message) => message.id === 8).result.structuredContent;
+  assert.equal(fullWithIgnoredBudget.contentMode, 'full');
+  assert.equal(fullWithIgnoredBudget.content.length, fullWithIgnoredBudget.originalChars);
+  assert.match(messages.find((message) => message.id === 9).error.message, /memory_read_invalid_max_chars/);
 });

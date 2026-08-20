@@ -76,12 +76,26 @@ function excerpt(content: string, max = 300): string {
   const compact = content.replace(/\s+/g, ' ').trim();
   return compact.length > max ? `${compact.slice(0, max - 3)}...` : compact;
 }
+function previewCap(maxChars: number | undefined): number {
+  if (maxChars === undefined) return 8_000;
+  if (!Number.isInteger(maxChars) || maxChars <= 0) throw new Error('memory_read_invalid_max_chars');
+  return Math.max(256, Math.min(maxChars, 100_000));
+}
+
+function safeUtf16Prefix(content: string, end: number): string {
+  // Keep the code-unit budget exact without emitting a lone surrogate at the truncation boundary.
+  const before = content.charCodeAt(end - 1);
+  const after = content.charCodeAt(end);
+  const splitsPair = end > 0 && before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+  return content.slice(0, splitsPair ? end - 1 : end);
+}
+
 function boundedContent(content: string, mode: ReadMode, maxChars: number | undefined): { content: string; truncated: boolean; maxChars: number | null } {
   if (mode === 'full') return { content, truncated: false, maxChars: null };
-  const cap = Number.isFinite(maxChars) ? Math.max(256, Math.min(Math.floor(maxChars as number), 100_000)) : 8_000;
+  const cap = previewCap(maxChars);
   if (content.length <= cap) return { content, truncated: false, maxChars: cap };
   const marker = '\n\n[truncated: request mode=full or a larger maxChars]';
-  return { content: `${content.slice(0, cap - marker.length)}${marker}`, truncated: true, maxChars: cap };
+  return { content: `${safeUtf16Prefix(content, cap - marker.length)}${marker}`, truncated: true, maxChars: cap };
 }
 
 export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCore> {

@@ -431,6 +431,9 @@ async function runPreCompactHookCommand(options: ParsedArgs['options']): Promise
 function parseArgs(argv: string[]): ParsedArgs {
   const [command = 'help', ...tail] = argv;
   const options: ParsedArgs['options'] = {};
+  if (command === 'read' && tail.includes('--full')) options.readMode = 'full';
+  let readMaxCharsSeen = false;
+  let readMaxCharsRaw: string | undefined;
   const rest: string[] = [];
   for (let index = 0; index < tail.length; index += 1) {
     const arg = tail[index];
@@ -472,12 +475,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--include-flagged') options.includeFlagged = true;
     else if (arg === '--full' && command === 'read') options.readMode = 'full';
     else if (arg === '--max-chars' && command === 'read') {
-      const raw = tail[++index];
-      const value = Number(raw);
-      if (!raw || !Number.isInteger(value) || value <= 0) {
-        throw new Error(`read --max-chars requires a positive integer; received ${JSON.stringify(raw ?? '')}`);
-      }
-      options.readMaxChars = value;
+      readMaxCharsSeen = true;
+      readMaxCharsRaw = tail[++index];
     }
     else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--real-write') options.realWrite = true;
@@ -522,6 +521,13 @@ function parseArgs(argv: string[]): ParsedArgs {
       if (src === 'claude-code' || src === 'markdown') options.importSource = src;
     }
     else rest.push(arg);
+  }
+  if (command === 'read' && options.readMode !== 'full' && readMaxCharsSeen) {
+    const value = Number(readMaxCharsRaw);
+    if (!readMaxCharsRaw || !Number.isInteger(value) || value <= 0) {
+      throw new Error(`read --max-chars requires a positive integer; received ${JSON.stringify(readMaxCharsRaw ?? '')}`);
+    }
+    options.readMaxChars = value;
   }
   return { command, options, rest };
 }

@@ -94,7 +94,7 @@ const TOOL_DEFINITIONS = [
       properties: {
         ref: { type: 'string' },
         mode: { type: 'string', enum: ['preview', 'full'], description: 'Default preview is capped at 8,000 characters; full returns exact stored content.' },
-        maxChars: { type: 'number', description: 'Preview ceiling, clamped to 256..100000. Ignored in full mode.' },
+        maxChars: { type: 'integer', minimum: 1, description: 'Positive-integer preview ceiling, clamped to 256..100000. Ignored in full mode.' },
       },
       required: ['ref'],
     },
@@ -309,12 +309,13 @@ async function main(): Promise<void> {
           if (args.mode !== undefined && args.mode !== 'preview' && args.mode !== 'full') {
             throw new Error('memory_read_invalid_mode');
           }
-          if (args.maxChars !== undefined && (typeof args.maxChars !== 'number' || !Number.isFinite(args.maxChars) || args.maxChars <= 0)) {
+          const full = args.mode === 'full';
+          if (!full && args.maxChars !== undefined && (typeof args.maxChars !== 'number' || !Number.isInteger(args.maxChars) || args.maxChars <= 0)) {
             throw new Error('memory_read_invalid_max_chars');
           }
           payload = await core.read(String(args.ref || ''), {
-            mode: args.mode === 'full' ? 'full' : 'preview',
-            maxChars: args.maxChars as number | undefined,
+            mode: full ? 'full' : 'preview',
+            maxChars: full ? undefined : args.maxChars as number | undefined,
           });
         } else if (name === 'memory.write_candidate') {
           payload = await core.write_candidate(args);
