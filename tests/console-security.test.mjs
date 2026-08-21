@@ -62,6 +62,23 @@ test('console: loopback Host allowed; foreign Host (DNS-rebind) and cross-site O
   assert.match(xorigin.body, /bad_origin/);
 });
 
+test('console: read endpoint explicitly returns complete memory content', async (t) => {
+  const root = await mkdtempReal('ihow-console-read-');
+  const server = await createConsoleServer({ root, space: 'c' });
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const marker = `CONSOLE-FULL-READ\n${'x'.repeat(9_000)}`;
+  const memoryDir = path.join(root, 'c', 'memory', 'scopes', 'test');
+  await fs.mkdir(memoryDir, { recursive: true });
+  await fs.writeFile(path.join(memoryDir, 'large.md'), marker, 'utf8');
+
+  const response = await request(server, '/api/read?ref=memory%2Fscopes%2Ftest%2Flarge.md', { Host: '127.0.0.1:8788' });
+  assert.equal(response.status, 200);
+  const payload = JSON.parse(response.body);
+  assert.equal(payload.contentMode, 'full');
+  assert.equal(payload.truncated, false);
+  assert.equal(payload.content, marker);
+});
+
 test('assertLoopbackBindHost refuses non-loopback bind hosts', () => {
   for (const ok of ['127.0.0.1', 'localhost', '::1', '[::1]', '127.0.0.1:8788']) {
     assert.doesNotThrow(() => assertLoopbackBindHost(ok), `${ok} should be allowed`);

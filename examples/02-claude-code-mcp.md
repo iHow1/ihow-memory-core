@@ -237,7 +237,7 @@ Expected output (trimmed):
 }
 ```
 
-Back in Claude Code, "read memory/scopes/decisions/20260611T085743Z-feature-flags.md from ihow memory" returns the exact content plus a citation — the loop is closed: agent proposed, you governed, agents can now cite it.
+Back in Claude Code, "read memory/scopes/decisions/20260611T085743Z-feature-flags.md from ihow memory" returns a bounded preview plus a citation. Ask for `mode: "full"` only when the exact complete source is required — the loop is closed: agent proposed, you governed, agents can now cite it.
 
 ## Step 6 — Doctor
 

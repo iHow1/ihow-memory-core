@@ -180,17 +180,23 @@ Evidence manifest：[LongMemEval_S 检索阶段运行记录，2026-05-11](https:
 
 ## MCP 工具
 
-stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）提供七个工具：
+stdio MCP server（由 `connect` 注册，或通过 `init` 片段手工配置）提供以下工具：
 
 | 工具 | 作用 |
 | --- | --- |
 | `memory.search` | 用 FTS 检索本地记忆，返回引用路径与片段。 |
-| `memory.read` | 按路径读取记忆 Markdown 文件，返回原文与引用。 |
+| `memory.read` | 按路径读取记忆 Markdown；默认返回有界预览（8,000 字符），同时返回 `truncated`、`originalChars` 和 `next` 提示。只有确实需要完整原文时才传 `mode: "full"`。 |
 | `memory.write_candidate` | 记一条记忆。引擎会把带 provenance（证据/锚点）的低风险内容自动晋升为持久记忆；高风险或无证据的内容保留为 candidate。 |
 | `memory.promote` | 显式手动把 candidate 升级到受治理的 staging，并记审计事件。 |
 | `memory.durable_promote` | 受治理的持久写入，必须显式传 `dryRun: true` 或 `realWrite: true`。 |
 | `memory.journal` | 向每日 journal 追加一条低权重、只追加（append-only）的条目（自动捕获通道）；可检索，但排序始终低于受治理记忆。 |
+| `memory.forget` | 可逆地隐藏匹配记忆，使其不再参与检索和召回；歧义时不猜测。 |
+| `memory.remember` | 撤销 `memory.forget`，恢复记忆的检索与召回资格。 |
 | `memory.status` | 报告 workspace、检索 provider、索引与 sync 状态。 |
+| `memory.continue` | 返回带实时锚点和 `UNVERIFIED` 既有叙述的 verify-first 接班包。 |
+| `memory.organize` | 创建 review-first Safe Memory Gardener 草稿，不改写受治理记忆。 |
+| `memory.export_vault` | 将 gardener 草稿导出为带证据链接的 Obsidian 兼容 Markdown 视图。 |
+| `memory.context_probe` | 为无原生 hooks 的 Runtime 返回自动化触发探针与协作指引。 |
 
 ## CLI 速查
 
@@ -205,7 +211,7 @@ ihow-memory doctor           环境与配置检查 [--share-diagnostics 输出�
 ihow-memory verify           可复现自证回执:本地存储 + 各 runtime 可达性 + 本 checkout 的接班裁决,每行可自己重跑 [--runtime name] [--json]
 ihow-memory status           workspace、引擎、索引与 sync 状态 [--json]
 ihow-memory search <query>   带引用的本地检索 [--limit n]
-ihow-memory read <path>      读取单个记忆文件（带引用）
+ihow-memory read <path>      默认返回 8,000 字符有界预览；`--max-chars n` 调整预览；`--full` 忽略预览上限并返回逐字完整内容
 ihow-memory write-candidate  提出记忆 candidate（进入沙箱 inbox）
 ihow-memory promote          升级 candidate（显式、留审计）
 ihow-memory durable-promote  持久写入——必须传 --dry-run 或 --real-write

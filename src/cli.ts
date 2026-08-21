@@ -26,7 +26,7 @@ import { migrateLocalDay } from './migrate.ts';
 import { planImport, applyImport, collectExistingImports, type ImportPlan } from './import.ts';
 import { runBenchmark } from './benchmark.ts';
 import { mcpLaneWorkspace } from './store/events.ts';
-import type { WorkspaceOptions } from './types.ts';
+import type { ReadMode, WorkspaceOptions } from './types.ts';
 import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_OLLAMA_HOST,
@@ -105,6 +105,8 @@ type ParsedArgs = {
     explain?: boolean;
     limit?: number;
     includeFlagged?: boolean;
+    readMode?: ReadMode;
+    readMaxChars?: number;
     list?: boolean;
     dryRun?: boolean;
     realWrite?: boolean;
@@ -429,6 +431,9 @@ async function runPreCompactHookCommand(options: ParsedArgs['options']): Promise
 function parseArgs(argv: string[]): ParsedArgs {
   const [command = 'help', ...tail] = argv;
   const options: ParsedArgs['options'] = {};
+  if (command === 'read' && tail.includes('--full')) options.readMode = 'full';
+  let readMaxCharsSeen = false;
+  let readMaxCharsRaw: string | undefined;
   const rest: string[] = [];
   for (let index = 0; index < tail.length; index += 1) {
     const arg = tail[index];
@@ -468,6 +473,11 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--list') options.list = true;
     else if (arg === '--limit') options.limit = Number(tail[++index]);
     else if (arg === '--include-flagged') options.includeFlagged = true;
+    else if (arg === '--full' && command === 'read') options.readMode = 'full';
+    else if (arg === '--max-chars' && command === 'read') {
+      readMaxCharsSeen = true;
+      readMaxCharsRaw = tail[++index];
+    }
     else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--real-write') options.realWrite = true;
     else if (arg === '--actor') options.actor = tail[++index];
@@ -511,6 +521,13 @@ function parseArgs(argv: string[]): ParsedArgs {
       if (src === 'claude-code' || src === 'markdown') options.importSource = src;
     }
     else rest.push(arg);
+  }
+  if (command === 'read' && options.readMode !== 'full' && readMaxCharsSeen) {
+    const value = Number(readMaxCharsRaw);
+    if (!readMaxCharsRaw || !Number.isInteger(value) || value <= 0) {
+      throw new Error(`read --max-chars requires a positive integer; received ${JSON.stringify(readMaxCharsRaw ?? '')}`);
+    }
+    options.readMaxChars = value;
   }
   return { command, options, rest };
 }
@@ -2861,7 +2878,7 @@ Usage:
   ihow-memory disable-semantic [--space name] [--json]   # reverse enable-semantic: remove the opt-in marker and return to the default FTS5 engine (re-run setup/connect + restart to apply)
   ihow-memory search <query> [--limit n] [--include-flagged]
   ihow-memory recall-preview <prompt> [--limit n] [--json]   # alpha.26 local diagnostic: explain why default prompt recall would include/exclude candidates (counts only for excluded/private content; no telemetry/upload)
-  ihow-memory read <memory/path.md>
+  ihow-memory read <memory/path.md> [--max-chars n] [--full]   # defaults to an 8,000-character preview; --full returns exact stored content and ignores --max-chars
   ihow-memory write-candidate <text> [--space name] [--no-auto-promote]
   ihow-memory journal <text> [--title t] [--actor name] [--space name]   # append a low-weight auto-capture entry (searchable but ranked below curated memory)
   ihow-memory import [--from path] [--source claude-code|markdown] [--apply] [--update] [--json]   # import EXISTING memory you wrote elsewhere (Claude Code native MEMORY.md = biggest stock source, ai-memory markdown, any folder of .md notes) into the searchable journal lane. Dry-run unless --apply; auto-detects Claude Code memory when --from is omitted; reversible per item; proves the import by searching one item back out. Re-import is idempotent (unchanged items skipped); an EDITED fact is reported as changed and refreshed only with --update (replaces the stale copy).
@@ -5476,7 +5493,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    printJson(await core.read(ref));
+    printJson(await core.read(ref, { mode: options.readMode, maxChars: options.readMaxChars }));
     return;
   }
   if (command === 'write-candidate') {

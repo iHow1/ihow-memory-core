@@ -178,12 +178,24 @@ export type RetrievalEngine = {
   status(workspace: Workspace): Promise<RetrievalEngineStatus>;
 };
 
+export type ReadMode = 'preview' | 'full';
+
+export type ReadOptions = {
+  mode?: ReadMode;
+  maxChars?: number;
+};
+
 export type ReadResult = {
   path: string;
   content: string;
   snippet: string;
   source: 'markdown';
   citation: Citation;
+  contentMode: ReadMode;
+  truncated: boolean;
+  originalChars: number;
+  maxChars: number | null;
+  next?: string;
 };
 
 export type WriteCandidatePayload = {

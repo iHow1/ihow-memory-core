@@ -9,6 +9,8 @@ import type {
   JournalResult,
   PromoteResult,
   PromoteTarget,
+  ReadMode,
+  ReadOptions,
   ReadResult,
   SearchResult,
   Workspace,
@@ -44,7 +46,7 @@ import {
 export type MemoryCore = {
   workspace: Workspace;
   search(query: string, opts?: SearchOptions): Promise<SearchResult[]>;
-  read(ref: string): Promise<ReadResult>;
+  read(ref: string, opts?: ReadOptions): Promise<ReadResult>;
   write_candidate(payload: WriteCandidatePayload): Promise<WriteCandidateResult>;
   journal(payload: JournalPayload): Promise<JournalResult>;
   promote(candidate: string, target?: PromoteTarget): Promise<PromoteResult>;
@@ -74,6 +76,27 @@ function excerpt(content: string, max = 300): string {
   const compact = content.replace(/\s+/g, ' ').trim();
   return compact.length > max ? `${compact.slice(0, max - 3)}...` : compact;
 }
+function previewCap(maxChars: number | undefined): number {
+  if (maxChars === undefined) return 8_000;
+  if (!Number.isInteger(maxChars) || maxChars <= 0) throw new Error('memory_read_invalid_max_chars');
+  return Math.max(256, Math.min(maxChars, 100_000));
+}
+
+function safeUtf16Prefix(content: string, end: number): string {
+  // Keep the code-unit budget exact without emitting a lone surrogate at the truncation boundary.
+  const before = content.charCodeAt(end - 1);
+  const after = content.charCodeAt(end);
+  const splitsPair = end > 0 && before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+  return content.slice(0, splitsPair ? end - 1 : end);
+}
+
+function boundedContent(content: string, mode: ReadMode, maxChars: number | undefined): { content: string; truncated: boolean; maxChars: number | null } {
+  if (mode === 'full') return { content, truncated: false, maxChars: null };
+  const cap = previewCap(maxChars);
+  if (content.length <= cap) return { content, truncated: false, maxChars: cap };
+  const marker = '\n\n[truncated: request mode=full or a larger maxChars]';
+  return { content: `${safeUtf16Prefix(content, cap - marker.length)}${marker}`, truncated: true, maxChars: cap };
+}
 
 export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCore> {
   const workspace = await ensureWorkspace(resolveWorkspace(options));
@@ -97,10 +120,10 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
       if (opts.includeForgotten === true) return hits;
       return await filterForgotten(workspace, hits);
     },
-    async read(ref) {
+    async read(ref, opts = {}) {
       const result = await readMemoryFile(workspace, ref);
-      // snippet is a PREVIEW — skip frontmatter and the engine's "# Candidate <uuid>" heading so it
-      // opens on content, not metadata (content itself stays raw: it IS the file)
+      const mode: ReadMode = opts.mode === 'full' ? 'full' : 'preview';
+      const bounded = boundedContent(result.content, mode, opts.maxChars);
       const snippet = excerpt(
         result.content
           .replace(/^﻿?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')
@@ -108,13 +131,15 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
       );
       return {
         path: result.path,
-        content: result.content,
+        content: bounded.content,
         snippet,
         source: 'markdown',
-        citation: {
-          path: result.path,
-          snippet,
-        },
+        citation: { path: result.path, snippet },
+        contentMode: mode,
+        truncated: bounded.truncated,
+        originalChars: result.content.length,
+        maxChars: bounded.maxChars,
+        ...(bounded.truncated ? { next: 'memory.read with mode=full or a larger maxChars' } : {}),
       };
     },
     async write_candidate(payload) {

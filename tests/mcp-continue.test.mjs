@@ -91,3 +91,94 @@ test('memory.search: includeFlagged exposes review-flagged matches without chang
   assert.equal(hidden.length, 0, 'MCP default keeps flagged entries hidden');
   assert.ok(visible.some((hit) => hit.path === written.path), 'MCP includeFlagged returns the durable match');
 });
+
+test('memory.read: defaults to a bounded preview and supports explicit full content', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-root-read-'));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const core = await (await import('../src/core.ts')).openCore({ root, space: 't' });
+  const marker = 'ZREADBUDGETMARKER';
+  const written = await core.write_candidate({
+    text: `${marker}\n${'x'.repeat(9_000)}`,
+    sourceAgent: 'test',
+    autoPromote: false,
+  });
+  const preview = await core.read(written.path);
+  assert.equal(preview.contentMode, 'preview');
+  assert.equal(preview.truncated, true);
+  assert.equal(preview.content.length, preview.maxChars, 'preview content never exceeds its declared budget');
+  assert.equal(preview.originalChars > preview.content.length, true);
+  assert.match(preview.next, /mode=full/);
+  const small = await core.read(written.path, { maxChars: 512 });
+  assert.equal(small.content.length, 512);
+  assert.equal(small.maxChars, 512);
+  await assert.rejects(core.read(written.path, { maxChars: Number.NaN }), /memory_read_invalid_max_chars/);
+  const minimum = await core.read(written.path, { maxChars: 1 });
+  assert.equal(minimum.maxChars, 256);
+  assert.equal(minimum.content.length, 256);
+  const full = await core.read(written.path, { mode: 'full', maxChars: 256 });
+  assert.equal(full.contentMode, 'full');
+  assert.equal(full.truncated, false);
+  assert.equal(full.maxChars, null, 'full mode ignores maxChars');
+  assert.match(full.content, new RegExp(marker));
+  assert.equal(full.content.length, full.originalChars);
+  const truncationMarker = '\n\n[truncated: request mode=full or a larger maxChars]';
+  const splitAt = 256 - truncationMarker.length;
+  const emojiDir = path.join(core.workspace.memoryDir, 'scopes', 'test');
+  await fs.mkdir(emojiDir, { recursive: true });
+  await fs.writeFile(path.join(emojiDir, 'emoji-boundary.md'), `${'a'.repeat(splitAt - 1)}😀${'b'.repeat(9_000)}`, 'utf8');
+  const emojiPreview = await core.read('memory/scopes/test/emoji-boundary.md', { maxChars: 256 });
+  assert.equal(emojiPreview.content.length, 255, 'dropping a split surrogate stays within the declared ceiling');
+  assert.equal(emojiPreview.content.endsWith(truncationMarker), true);
+  assert.doesNotMatch(emojiPreview.content, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+});
+
+test('memory.read: MCP schema and calls preserve the preview/full contract', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-root-read-mcp-'));
+  t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
+  const core = await (await import('../src/core.ts')).openCore({ root, space: 't' });
+  const written = await core.write_candidate({
+    text: `ZMCPREADBUDGET\n${'y'.repeat(9_000)}`,
+    sourceAgent: 'test',
+    autoPromote: false,
+  });
+  const lines = [
+    JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+    JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+    JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, maxChars: 512 } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, mode: 'full' } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, mode: 'partial' } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, maxChars: -1 } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, mode: 'full', maxChars: -1 } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'memory.read', arguments: { ref: written.path, maxChars: 1.5 } } }),
+  ].join('\n') + '\n';
+  const out = execFileSync(process.execPath, [SERVER, '--root', root, '--space', 't'], {
+    encoding: 'utf8',
+    input: lines,
+    env: { ...process.env, IHOW_CAPTURE_FLOOR: '0' },
+    timeout: 20_000,
+  });
+  const messages = out.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const definition = messages.find((message) => message.id === 2).result.tools.find((tool) => tool.name === 'memory.read');
+  assert.deepEqual(definition.inputSchema.properties.mode.enum, ['preview', 'full']);
+  assert.equal(definition.inputSchema.properties.maxChars.type, 'integer');
+  assert.equal(definition.inputSchema.properties.maxChars.minimum, 1);
+  const defaultPreview = messages.find((message) => message.id === 3).result.structuredContent;
+  assert.equal(defaultPreview.contentMode, 'preview');
+  assert.equal(defaultPreview.content.length, 8_000);
+  assert.equal(defaultPreview.truncated, true);
+  const preview = messages.find((message) => message.id === 4).result.structuredContent;
+  assert.equal(preview.contentMode, 'preview');
+  assert.equal(preview.content.length, 512);
+  assert.equal(preview.truncated, true);
+  const full = messages.find((message) => message.id === 5).result.structuredContent;
+  assert.equal(full.contentMode, 'full');
+  assert.equal(full.content.length, full.originalChars);
+  assert.equal(full.truncated, false);
+  assert.match(messages.find((message) => message.id === 6).error.message, /memory_read_invalid_mode/);
+  assert.match(messages.find((message) => message.id === 7).error.message, /memory_read_invalid_max_chars/);
+  const fullWithIgnoredBudget = messages.find((message) => message.id === 8).result.structuredContent;
+  assert.equal(fullWithIgnoredBudget.contentMode, 'full');
+  assert.equal(fullWithIgnoredBudget.content.length, fullWithIgnoredBudget.originalChars);
+  assert.match(messages.find((message) => message.id === 9).error.message, /memory_read_invalid_max_chars/);
+});
