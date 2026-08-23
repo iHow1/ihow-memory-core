@@ -101,6 +101,13 @@ export function verifyRuntimeRegistration(runtime: string): { registered: boolea
       ? { registered: true, detail: 'claude mcp list: present' }
       : { registered: false, detail: 'claude mcp list: ihow-memory missing' };
   }
+  if (runtime === 'omp') {
+    const out = run('omp', ['plugin', 'list']);
+    if (out == null) return { registered: 'n/a', detail: 'omp CLI not runnable' };
+    // OMP user extensions are auto-discovered outside its plugin registry. Exact extension wiring is
+    // verified separately by automation doctor; this check only establishes that the receiver is runnable.
+    return { registered: 'n/a', detail: 'omp CLI runnable; managed extension verification is separate' };
+  }
   return { registered: 'n/a', detail: 'no official CLI — written directly, verify on first launch' };
 }
 

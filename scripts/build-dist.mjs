@@ -31,7 +31,11 @@ await fs.rm(outputDir, { recursive: true, force: true });
 
 for (const sourcePath of await sourceFiles(sourceDir)) {
   const relative = path.relative(sourceDir, sourcePath);
-  const outputRelative = relative === CLI_SOURCE ? CLI_RUNTIME : relative.replace(/\.ts$/, '.js');
+  const outputRelative = relative === CLI_SOURCE
+    ? CLI_RUNTIME
+    : relative === 'omp-extension.ts'
+      ? 'omp-extension.js'
+      : relative.replace(/\.ts$/, '.js');
   const outputPath = path.join(outputDir, outputRelative);
   const source = await fs.readFile(sourcePath, 'utf8');
   const rawShebang = source.match(/^#!.*\n/)?.[0] || '';
@@ -54,6 +58,9 @@ for (const sourcePath of await sourceFiles(sourceDir)) {
 // implementation remains inside the atomically-swapped runtime generation as cli-runtime.js.
 await fs.writeFile(path.join(outputDir, 'cli.js'), CLI_BOOTSTRAP, 'utf8');
 await fs.chmod(path.join(outputDir, 'cli.js'), 0o755);
+// OMP loads this extension outside the package. Its frozen copy is self-contained and imports only
+// Node built-ins; setup installs this exact byte stream into OMP's user extension directory.
+await fs.chmod(path.join(outputDir, 'omp-extension.js'), 0o644);
 
 // The pinned TOML parser is vendored into src/ so frozen `.runtime` generations remain self-contained.
 // Preserve its BSD-3 license alongside the built vendor modules; runtime integrity covers this file too.

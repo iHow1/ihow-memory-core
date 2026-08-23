@@ -11,6 +11,7 @@ import {
   activationLedgerPath,
   appendActivationEvidence,
   readActivationEvidence,
+  readActivationEvidenceForRuntime,
 } from '../src/activation-ledger.ts';
 import { deriveRuntimeActivation } from '../src/automation-doctor.ts';
 import { contextProbe } from '../src/context-probe.ts';
@@ -46,6 +47,35 @@ async function fixture(t, slug, space = 't') {
   t.after(async () => { await fs.rm(root, { recursive: true, force: true }); });
   return { root, workspace };
 }
+
+test('OMP activation reads equivalent managed and explicit memory-root bindings from one ledger', async (t) => {
+  const { root, workspace } = await fixture(t, 'omp-equivalent');
+  const explicit = resolveWorkspace({ memoryRoot: workspace.memoryDir, stateRoot: root, space: 't' });
+  await evidence(workspace, 'omp', 'configured', '2026-08-20T20:00:00.000Z', 'configured', { configurationKey: 'generation' });
+  await evidence(explicit, 'omp', 'observed-live-completed', '2026-08-20T20:00:01.000Z', 'live', { configurationKey: 'generation' });
+
+  assert.equal((await readActivationEvidence(workspace)).length, 1);
+  const combined = await readActivationEvidenceForRuntime(workspace, 'omp');
+  assert.equal(combined.length, 2);
+  assert.deepEqual(deriveRuntimeActivation('omp', combined), {
+    status: READY,
+    reasonCode: 'ACTIVATION_COMPLETION_UNATTESTED',
+    configuredAt: '2026-08-20T20:00:00.000Z',
+    lastObservedAt: '2026-08-20T20:00:01.000Z',
+  });
+});
+
+test('OMP runtime evidence ignores rows from unrelated workspace bindings', async (t) => {
+  const first = await fixture(t, 'omp-binding-a', 'omp-shared');
+  const foreignState = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-activation-omp-foreign-state-'));
+  t.after(async () => { await fs.rm(foreignState, { recursive: true, force: true }); });
+  const foreign = resolveWorkspace({ memoryRoot: first.workspace.memoryDir, stateRoot: foreignState, space: 'omp-shared' });
+  await evidence(first.workspace, 'omp', 'configured', '2026-07-11T20:00:00.000Z', 'generation-a', { configurationKey: 'generation-a' });
+  await evidence(foreign, 'omp', 'observed-live-completed', '2026-07-11T20:00:01.000Z', 'foreign', { configurationKey: 'foreign' });
+
+  assert.equal((await readActivationEvidenceForRuntime(first.workspace, 'omp')).length, 1);
+  assert.equal((await readActivationEvidenceForRuntime(foreign, 'omp')).length, 1);
+});
 
 async function evidence(workspace, runtime, status, observedAt, dedupeKey, extra = {}) {
   const eventByStatus = {

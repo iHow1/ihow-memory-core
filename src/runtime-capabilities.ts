@@ -45,12 +45,28 @@ const HERMES_LIFECYCLE: RuntimeLifecycleCapabilities = Object.freeze({
   preCompact: 'none',
 });
 
+const OMP_LIFECYCLE: RuntimeLifecycleCapabilities = Object.freeze({
+  sessionStart: true,
+  sessionReset: true,
+  beforePrompt: true,
+  afterTurn: false,
+  sessionFinalize: true,
+  sessionEnd: true,
+  preCompact: 'native',
+});
+
 const KNOWN: Readonly<Record<string, RuntimeCapabilityManifest>> = Object.freeze({
   hermes: Object.freeze({
     runtime: 'hermes',
     mcpTools: true,
     readableTranscript: true,
     lifecycle: HERMES_LIFECYCLE,
+  }),
+  omp: Object.freeze({
+    runtime: 'omp',
+    mcpTools: true,
+    readableTranscript: true,
+    lifecycle: OMP_LIFECYCLE,
   }),
   workbuddy: Object.freeze({
     runtime: 'workbuddy',

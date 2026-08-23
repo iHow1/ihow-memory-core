@@ -58,12 +58,17 @@ export type CodexPreCompactTrigger = NativePreCompactCommon & {
   trigger: 'manual' | 'auto';
 };
 
+export type OmpPreCompactTrigger = NativePreCompactCommon & {
+  runtime: 'omp';
+  trigger: 'manual' | 'auto';
+};
+
 export type HermesPreCompactTrigger = NativePreCompactCommon & {
   runtime: 'hermes';
   trigger: 'auto';
 };
 
-export type HostNativePreCompactTrigger = ClaudePreCompactTrigger | CodexPreCompactTrigger;
+export type HostNativePreCompactTrigger = ClaudePreCompactTrigger | CodexPreCompactTrigger | OmpPreCompactTrigger;
 export type NativePreCompactTrigger = HostNativePreCompactTrigger | HermesPreCompactTrigger;
 
 export type NativePreCompactResult = {
@@ -135,7 +140,7 @@ function dedupeKey(value: unknown): string {
 // exact closed shape, so prompts, raw transcript/custom instructions, secrets, PII, and future unknown
 // fields cannot leak into checkpoint or activation persistence.
 export function normalizeNativePreCompactTrigger(
-  runtime: 'claude-code' | 'codex',
+  runtime: 'claude-code' | 'codex' | 'omp',
   payload: unknown,
   at?: string,
 ): HostNativePreCompactTrigger {
@@ -169,6 +174,23 @@ export function normalizeNativePreCompactTrigger(
       ...(transcriptRef ? { transcriptRef } : {}),
       trigger: compactTrigger,
       ...(customInstructionsRef ? { customInstructionsRef } : {}),
+    };
+  }
+  if (runtime === 'omp') {
+    const key = dedupeKey({
+      runtime, event: 'PreCompact', cwd, sessionId, trigger: compactTrigger,
+      transcript: transcriptRef?.sha256 ?? null,
+    });
+    return {
+      runtime,
+      event: 'PreCompact',
+      project: { cwd },
+      session: { id: sessionId },
+      observedAt: seenAt,
+      delivery: { mode: 'best_effort', dedupeKey: key },
+      usage: { status: 'unknown' },
+      ...(transcriptRef ? { transcriptRef } : {}),
+      trigger: compactTrigger,
     };
   }
 
@@ -246,7 +268,9 @@ export async function runNativePreCompact(
         ? 'ClaudeCode.PreCompact'
         : contract.runtime === 'codex'
           ? 'Codex.PreCompact'
-          : 'Hermes.MemoryProvider.on_pre_compress';
+          : contract.runtime === 'omp'
+            ? 'OMP.PreCompact'
+            : 'Hermes.MemoryProvider.on_pre_compress';
       const replayAgeMs = Date.parse(contract.observedAt) - Date.parse(receipt.completedAt);
       // Never dedupe from recency alone. The private receipt binds the exact normalized delivery key to
       // the still-latest finalized draft/artifact, and any newly opened cooperative draft bypasses this
@@ -308,7 +332,9 @@ export async function runNativePreCompact(
     ? 'ClaudeCode.PreCompact'
     : contract.runtime === 'codex'
       ? 'Codex.PreCompact'
-      : 'Hermes.MemoryProvider.on_pre_compress';
+      : contract.runtime === 'omp'
+        ? 'OMP.PreCompact'
+        : 'Hermes.MemoryProvider.on_pre_compress';
   const result = await core.checkpoints.finalizeDraft(draft.draftId, {
     trigger: {
       kind: 'pre_compact',

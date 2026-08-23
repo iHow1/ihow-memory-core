@@ -30,6 +30,7 @@ export type ActivationEvidenceSource =
 export type ActivationEvidenceEvent =
   | 'runtime-configured'
   | 'hook-stop'
+  | 'hook-session-end'
   | 'hook-session-start'
   | 'hook-pre-compact'
   | 'hook-user-prompt-submit'
@@ -76,11 +77,11 @@ export type AppendActivationEvidenceInput = {
 export const ACTIVATION_LEDGER_FILE = 'activation-ledger.ndjson';
 
 const KNOWN_RUNTIMES = new Set([
-  'claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw',
+  'claude-code', 'codex', 'omp', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw',
   'vscode', 'gemini', 'no-hook', 'unknown',
 ]);
 const KNOWN_EVENTS = new Set<ActivationEvidenceEvent>([
-  'runtime-configured', 'hook-stop', 'hook-session-start', 'hook-pre-compact', 'hook-user-prompt-submit',
+  'runtime-configured', 'hook-stop', 'hook-session-end', 'hook-session-start', 'hook-pre-compact', 'hook-user-prompt-submit',
   'context-probe-session-start', 'context-probe-prompt', 'context-probe-session-end',
   'context-probe-tick', 'synthetic-check',
 ]);
@@ -119,6 +120,26 @@ export function activationWorkspaceBinding(workspace: Workspace): ActivationEvid
       memoryDir: path.resolve(workspace.memoryDir),
     })),
   };
+}
+
+export async function readActivationEvidenceForRuntime(
+  workspace: Workspace,
+  runtime: string,
+): Promise<ActivationEvidence[]> {
+  const normalized = normalizeActivationRuntime(runtime);
+  const rows = await readLedgerFile(activationLedgerPath(workspace));
+  const bindings = new Set([activationWorkspaceBinding(workspace).id]);
+  if (normalized === 'omp' && workspace.mode === 'managed-space') {
+    // The installer records the managed-space binding, while the external OMP extension invokes the
+    // same frozen workspace through explicit memory/state roots. Accept only those two local identities.
+    bindings.add(activationWorkspaceBinding({
+      ...workspace,
+      mode: 'existing-memory-root',
+    }).id);
+  }
+  return rows
+    .filter((row) => row.runtime === normalized && bindings.has(row.workspaceBinding.id))
+    .sort((a, b) => a.observedAt.localeCompare(b.observedAt) || a.id.localeCompare(b.id));
 }
 
 function validObservedAt(value: string | undefined): string {

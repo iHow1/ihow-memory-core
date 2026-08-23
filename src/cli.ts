@@ -87,6 +87,14 @@ import {
   renderPromptRecall,
   selectPromptRecall,
 } from './prompt-recall.ts';
+import {
+  installOmpExtensionWiring,
+  ompExtensionConfigPath,
+  ompExtensionsDir,
+  ompMcpConfigPath,
+  verifyOmpExtensionWiring,
+  type OmpInstallOutcome,
+} from './omp-wiring.ts';
 
 // Suppress only Node's node:sqlite ExperimentalWarning (Node >= 22.12 is our supported runtime); all other warnings pass through unchanged.
 const _emitWarning = process.emitWarning.bind(process);
@@ -111,7 +119,7 @@ type ParsedArgs = {
     dryRun?: boolean;
     realWrite?: boolean;
     actor?: string;
-    runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini';
+    runtime?: 'claude-code' | 'codex' | 'omp' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini';
     shareDiagnostics?: boolean;
     installSkill?: boolean;
     installHook?: boolean;
@@ -161,10 +169,12 @@ async function recordConfiguredActivation(
   options: ParsedArgs['options'],
   allowGenerationChange = false,
 ): Promise<boolean> {
-  if (runtime !== 'claude-code' && runtime !== 'codex' && runtime !== 'hermes') return false;
+  if (runtime !== 'claude-code' && runtime !== 'codex' && runtime !== 'omp' && runtime !== 'hermes') return false;
   const wiring = runtime === 'hermes'
     ? await inspectHermesInstallationWiring(resolveHermesHome() || path.join(os.homedir(), '.hermes'))
-    : await verifyRuntimeHookWiring(workspace, runtime, options);
+    : runtime === 'omp'
+      ? await verifyOmpExtensionWiring(workspace)
+      : await verifyRuntimeHookWiring(workspace, runtime, options);
   if (wiring.state !== 'current' || !wiring.generationId) return false;
   const configurationId = activationConfigurationId(wiring.generationId);
   let priorConfigured: Awaited<ReturnType<typeof readActivationEvidence>>;
@@ -193,11 +203,13 @@ async function recordConfiguredActivation(
 
 async function hookGenerationNeedsRepair(
   workspace: ReturnType<typeof resolveWorkspace>,
-  runtime: 'claude-code' | 'codex',
+  runtime: 'claude-code' | 'codex' | 'omp',
   options: ParsedArgs['options'],
 ): Promise<boolean> {
   try {
-    const wiring = await verifyRuntimeHookWiring(workspace, runtime, options);
+    const wiring = runtime === 'omp'
+      ? await verifyOmpExtensionWiring(workspace)
+      : await verifyRuntimeHookWiring(workspace, runtime, options);
     if (wiring.state !== 'current' || !wiring.generationId) return false;
     const configured = (await readActivationEvidence(workspace))
       .filter((row) => row.runtime === runtime && row.status === 'configured');
@@ -211,7 +223,7 @@ async function hookGenerationNeedsRepair(
 
 async function runHookWithActivation(
   options: ParsedArgs['options'],
-  event: Extract<ActivationEvidenceEvent, 'hook-stop' | 'hook-session-start' | 'hook-user-prompt-submit'>,
+  event: Extract<ActivationEvidenceEvent, 'hook-stop' | 'hook-session-end' | 'hook-session-start' | 'hook-user-prompt-submit'>,
   handler: (payload: Record<string, unknown> | undefined) => Promise<void>,
 ): Promise<void> {
   let payload: Record<string, unknown> | undefined;
@@ -228,9 +240,11 @@ async function runHookWithActivation(
 
   const expectedEvent = event === 'hook-stop'
     ? 'Stop'
-    : event === 'hook-session-start'
-      ? 'SessionStart'
-      : 'UserPromptSubmit';
+    : event === 'hook-session-end'
+      ? 'SessionEnd'
+      : event === 'hook-session-start'
+        ? 'SessionStart'
+        : 'UserPromptSubmit';
   const sessionId = typeof payload?.session_id === 'string' ? payload.session_id.trim() : '';
   const eventName = typeof payload?.hook_event_name === 'string' ? payload.hook_event_name : '';
   const cwd = typeof payload?.cwd === 'string' && payload.cwd.trim() ? payload.cwd : options.cwd;
@@ -249,7 +263,7 @@ async function runHookWithActivation(
     return;
   }
 
-  const runtime = options.runtime === 'codex' ? 'codex' : 'claude-code';
+  const runtime = options.runtime === 'codex' ? 'codex' : options.runtime === 'omp' ? 'omp' : 'claude-code';
   const invocationKey = JSON.stringify({
     event,
     sessionId,
@@ -271,7 +285,7 @@ async function runHookWithActivation(
   const prompt = ['prompt', 'user_prompt', 'userPrompt', 'message', 'input']
     .map((key) => payload?.[key])
     .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
-  const handlerWouldAct = event === 'hook-stop'
+  const handlerWouldAct = event === 'hook-stop' || event === 'hook-session-end'
     ? payload?.stop_hook_active !== true
     : event === 'hook-user-prompt-submit'
       ? !process.env.IHOW_RECALL_OFF && !!prompt
@@ -285,7 +299,9 @@ async function runHookWithActivation(
     invokedFromCurrentBundle = false;
   }
   const wiring = options.hookOwner === IHOW_HOOK_OWNER && invokedFromCurrentBundle && handlerWouldAct
-    ? await verifyRuntimeHookWiring(workspace, runtime, options).catch(() => undefined)
+    ? runtime === 'omp'
+      ? await verifyOmpExtensionWiring(workspace).catch(() => undefined)
+      : await verifyRuntimeHookWiring(workspace, runtime, options).catch(() => undefined)
     : undefined;
   // A shell command that merely resembles a host event is not activation evidence. Live rows require
   // the explicit managed owner, the workspace-frozen CLI, current exact wiring, and a handler path that
@@ -348,7 +364,9 @@ async function verifiedPreCompactGeneration(
   } catch {
     return undefined;
   }
-  const wiring = await verifyRuntimeHookWiring(workspace, contract.runtime, { ...options, cwd: contract.project.cwd }).catch(() => undefined);
+  const wiring = contract.runtime === 'omp'
+    ? await verifyOmpExtensionWiring(workspace).catch(() => undefined)
+    : await verifyRuntimeHookWiring(workspace, contract.runtime, { ...options, cwd: contract.project.cwd }).catch(() => undefined);
   return wiring?.state === 'current' ? wiring.generationId : undefined;
 }
 
@@ -364,7 +382,7 @@ async function runPreCompactHookCommand(options: ParsedArgs['options']): Promise
     if (!raw.trim()) return;
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch { return; }
-    const runtime = options.runtime === 'codex' ? 'codex' : 'claude-code';
+    const runtime = options.runtime === 'codex' ? 'codex' : options.runtime === 'omp' ? 'omp' : 'claude-code';
     let contract: HostNativePreCompactTrigger;
     try { contract = normalizeNativePreCompactTrigger(runtime, payload); } catch { return; }
 
@@ -448,7 +466,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--vector-timeout-ms') options.vectorTimeoutMs = Number(tail[++index]);
     else if (arg === '--runtime') {
       const runtime = tail[++index];
-      if (['claude-code', 'codex', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw', 'vscode', 'gemini'].includes(runtime)) options.runtime = runtime as ParsedArgs['options']['runtime'];
+      if (['claude-code', 'codex', 'omp', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw', 'vscode', 'gemini'].includes(runtime)) options.runtime = runtime as ParsedArgs['options']['runtime'];
       else throw new Error(`unsupported_runtime: "${runtime || ''}". Copy-paste one of: ihow-memory setup --runtime claude-code  OR  ihow-memory setup --runtime codex`);
     }
     else if (arg === '--share-diagnostics') options.shareDiagnostics = true;
@@ -575,6 +593,7 @@ function packageVersion(): string {
 function runtimeLabel(runtime?: string): string {
   if (runtime === 'claude-code') return 'Claude Code';
   if (runtime === 'codex') return 'Codex';
+  if (runtime === 'omp') return 'OMP';
   if (runtime === 'cursor') return 'Cursor';
   if (runtime === 'workbuddy') return 'WorkBuddy';
   if (runtime === 'claude-desktop') return 'Claude Desktop';
@@ -624,6 +643,7 @@ function printRuntimeSnippet(snippet: unknown, runtime?: string): void {
 function initBackupGuidance(runtime?: string): string {
   if (runtime === 'codex') return 'Before editing Codex config, copy the existing config file or commit it first.';
   if (runtime === 'claude-code') return 'Before editing Claude Code MCP settings, make a copy of the current settings file.';
+  if (runtime === 'omp') return `Before editing OMP config, copy ${ompMcpConfigPath()} and ${ompExtensionConfigPath()}.`;
   if (runtime === 'cursor') return 'Before editing Cursor MCP settings, copy the current MCP/settings JSON.';
   if (runtime === 'workbuddy') return 'Before connect writes ~/.workbuddy/.mcp.json, it backs the file up; you can also copy it yourself first.';
   if (runtime === 'claude-desktop') return 'Before editing Claude Desktop config, copy claude_desktop_config.json; connect also backs it up.';
@@ -1887,6 +1907,12 @@ async function connectRuntime(
     }
     return writeJsonMcpConfig(path.join(home, '.claude.json'), runtime, spec, options); // fallback / Windows path: safe direct-write
   }
+  if (runtime === 'omp') {
+    const ompSpec = { command: process.execPath, args: spec.args };
+    return writeJsonMcpConfig(ompMcpConfigPath(), runtime, ompSpec, options, {
+      buildEntry: (server) => ({ type: 'stdio', command: server.command, args: server.args }),
+    });
+  }
   if (runtime === 'codex') {
     if (process.platform === 'win32') {
       throw new Error('codex_connect_windows_unsupported: on Windows, run `ihow-memory init --runtime codex` and paste the printed snippet into ~/.codex/config.toml (codex CLI auto-config is not yet wired for Windows).');
@@ -1986,6 +2012,7 @@ function runtimeDetectors(home: string): Array<{ runtime: string; cli?: string; 
   return [
     { runtime: 'claude-code', cli: 'claude', paths: [path.join(home, '.claude.json'), path.join(home, '.claude')] },
     { runtime: 'codex', cli: 'codex', paths: [path.join(home, '.codex')] },
+    { runtime: 'omp', cli: 'omp', paths: [path.join(home, '.omp', 'agent')] },
     { runtime: 'hermes', cli: 'hermes', paths: [path.join(home, '.hermes')] },
     { runtime: 'cursor', paths: [path.join(home, '.cursor')] },
     { runtime: 'workbuddy', paths: [path.join(home, '.workbuddy')] },
@@ -2063,6 +2090,21 @@ async function connectAuto(options: ParsedArgs['options']): Promise<void> {
       const error = caught instanceof Error ? caught.message : String(caught);
       skipped.push({ runtime: d.runtime, error });
       console.log(`  · skipped ${d.runtime}: ${error}`);
+    }
+  }
+  if (connected.some((row) => row.runtime === 'omp') && options.installHook !== false) {
+    try {
+      const outcome = await maybeInstallOmpLifecycle({ ...options, runtime: 'omp' });
+      if (outcome === 'installed' || outcome === 'already') {
+        await recordConfiguredActivation(workspace, 'omp', 'connect', options, outcome === 'installed');
+        console.log(outcome === 'installed'
+          ? '  ✓ omp lifecycle extension installed'
+          : '  · omp lifecycle extension already current');
+      } else {
+        unverified.push({ runtime: 'omp-lifecycle', detail: 'managed extension installation failed' });
+      }
+    } catch (caught) {
+      unverified.push({ runtime: 'omp-lifecycle', detail: caught instanceof Error ? caught.message : String(caught) });
     }
   }
   // Non-zero exit when something we tried to connect isn't reachable (a written-but-unreachable runtime),
@@ -2245,38 +2287,47 @@ type NativeHookUpgradeStatus = {
 type NativeHookUpgradeTargets = {
   codex: boolean;
   claudeCode: boolean;
+  omp: boolean;
 };
 
 async function nativeHookUpgradeTargets(
   workspace: ReturnType<typeof resolveWorkspace>,
   options: ParsedArgs['options'],
 ): Promise<NativeHookUpgradeTargets> {
-  const isCurrent = async (runtime: 'codex' | 'claude-code'): Promise<boolean> => {
+  const isCurrent = async (runtime: 'codex' | 'claude-code' | 'omp'): Promise<boolean> => {
     try {
-      return (await verifyRuntimeHookWiring(workspace, runtime, options)).state === 'current';
+      const wiring = runtime === 'omp'
+        ? await verifyOmpExtensionWiring(workspace)
+        : await verifyRuntimeHookWiring(workspace, runtime, options);
+      return wiring.state === 'current';
     } catch {
       return false;
     }
   };
-  const [codex, claudeCode] = await Promise.all([isCurrent('codex'), isCurrent('claude-code')]);
-  return { codex, claudeCode };
+  const [codex, claudeCode, omp] = await Promise.all([isCurrent('codex'), isCurrent('claude-code'), isCurrent('omp')]);
+  return { codex, claudeCode, omp };
 }
 
 async function refreshNativeHooksAfterRuntimeUpgrade(
   workspace: ReturnType<typeof resolveWorkspace>,
   targets: NativeHookUpgradeTargets,
   options: ParsedArgs['options'],
-): Promise<{ codex: NativeHookUpgradeStatus; claudeCode: NativeHookUpgradeStatus }> {
-  const result: { codex: NativeHookUpgradeStatus; claudeCode: NativeHookUpgradeStatus } = {
-    codex: { status: 'not-configured' },
-    claudeCode: { status: 'not-configured' },
+): Promise<{ codex: NativeHookUpgradeStatus; claudeCode: NativeHookUpgradeStatus; omp: NativeHookUpgradeStatus }> {
+  const result = {
+    codex: { status: 'not-configured' } as NativeHookUpgradeStatus,
+    claudeCode: { status: 'not-configured' } as NativeHookUpgradeStatus,
+    omp: { status: 'not-configured' } as NativeHookUpgradeStatus,
   };
-  const refresh = async (runtime: 'codex' | 'claude-code'): Promise<NativeHookUpgradeStatus> => {
+  const refresh = async (runtime: 'codex' | 'claude-code' | 'omp'): Promise<NativeHookUpgradeStatus> => {
     try {
       // The exact hook command stays on the stable .runtime/cli.js bootstrap. Upgrades therefore do
       // not rewrite host config; the one-time legacy transition only records the new verified runtime
       // identity in the activation ledger. A failed ledger refresh leaves the user's hook file intact.
       const changed = await hookGenerationNeedsRepair(workspace, runtime, options);
+      if (runtime === 'omp') {
+        const installed = await installOmpExtensionWiring(workspace);
+        if (installed === 'failed') return { status: 'failed', detail: 'managed OMP extension refresh failed' };
+      }
       const configured = await recordConfiguredActivation(workspace, runtime, 'install-hook', options, true);
       return configured
         ? { status: changed ? 'activation-refreshed' : 'unchanged' }
@@ -2288,6 +2339,7 @@ async function refreshNativeHooksAfterRuntimeUpgrade(
 
   if (targets.codex) result.codex = await refresh('codex');
   if (targets.claudeCode) result.claudeCode = await refresh('claude-code');
+  if (targets.omp) result.omp = await refresh('omp');
   return result;
 }
 
@@ -2390,11 +2442,16 @@ async function maybeInstallCodexHooks(options: ParsedArgs['options']): Promise<H
   }
 }
 
-// Proactive-resume guidance for the runtimes NOT covered by Claude(skill/hook) / WorkBuddy(BOOTSTRAP).
-// Cursor has no global rules file we can safely auto-write (User Rules are app-managed) -> not-applicable.
+async function maybeInstallOmpLifecycle(options: ParsedArgs['options']): Promise<OmpInstallOutcome | 'skipped'> {
+  if (options.installHook === false) return 'skipped';
+  return installOmpExtensionWiring(resolveWorkspace(options));
+}
+
+// Proactive-resume guidance for runtimes not covered by a native lifecycle integration.
 async function injectResumeGuidance(runtime: string): Promise<'installed' | 'already' | 'skipped' | 'failed' | 'not-applicable'> {
   const home = os.homedir();
   if (runtime === 'codex') return maybeInstallCodexMemoryLoop();
+  if (runtime === 'omp') return 'not-applicable';
   if (runtime === 'openclaw') return maybeInjectMarkdownResume(path.join(home, '.openclaw', 'workspace', 'AGENTS.md'), { create: false });
   if (runtime === 'hermes') return maybeInjectMarkdownResume(path.join(home, '.hermes', 'SOUL.md'), { create: true });
   if (runtime === 'opencode') return maybeInstallOpenCodeResume();
@@ -2658,6 +2715,28 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     }
   }
 
+  const hasOmp = present.some((entry) => entry.runtime === 'omp');
+  let ompLifecycle = 'not-applicable';
+  if (hasOmp) {
+    if (dryRun) {
+      line('       · would install OMP session_start, before_agent_start, PreCompact, and session-end lifecycle extension');
+      ompLifecycle = 'dry-run';
+    } else if (options.installHook === false) {
+      ompLifecycle = 'skipped';
+    } else {
+      try { ompLifecycle = await maybeInstallOmpLifecycle({ ...options, runtime: 'omp' }); } catch { ompLifecycle = 'failed'; }
+      if (ompLifecycle === 'installed') changedRuntimes.add('omp');
+      if (ompLifecycle === 'installed' || ompLifecycle === 'already') {
+        await recordConfiguredActivation(workspace, 'omp', 'setup', options, ompLifecycle === 'installed' || bundleChanged);
+        line(ompLifecycle === 'installed'
+          ? '       ✓ installed OMP lifecycle extension (automatic recall, PreCompact, and session-end capture)'
+          : '       · OMP lifecycle extension already current');
+      } else if (ompLifecycle === 'failed') {
+        line('       ⚠ OMP lifecycle extension failed to install');
+      }
+    }
+  }
+
   // 3/4 (cont.) proactive resume guidance for the markdown/config runtimes (OpenClaw AGENTS.md,
   // Hermes SOUL.md, OpenCode instructions). Same intent as the Claude hook / WorkBuddy BOOTSTRAP: make the
   // agent call memory.continue at a context boundary. Non-fatal, idempotent, backed up.
@@ -2703,7 +2782,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
 
   const allFailed = connected.length === 0; // nothing reachable-verified (direct-write + server round-trip counts)
   const doctorRed = !!doctorResult && doctorResult.ok === false;
-  const installFailed = skill === 'failed' || hook === 'failed' || workbuddyResume === 'failed' || codexHooks === 'failed'; // a helper no-op'd / threw despite being asked
+  const installFailed = skill === 'failed' || hook === 'failed' || workbuddyResume === 'failed' || codexHooks === 'failed' || ompLifecycle === 'failed'; // a helper no-op'd / threw despite being asked
   if (!dryRun && (allFailed || doctorRed || installFailed)) process.exitCode = 1;
   // ok must never contradict a non-zero exit a sub-step already set (e.g. unparseable settings)
   const ok = dryRun ? skipped.length === 0 : !allFailed && !doctorRed && !installFailed && process.exitCode !== 1;
@@ -2741,6 +2820,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
       hookScope: hasClaude ? (options.globalHook ? 'global' : 'project') : null,
       workbuddyResume: hasWorkbuddy ? workbuddyResume : null,
       codexHooks: hasCodex ? codexHooks : null,
+      ompLifecycle: hasOmp ? ompLifecycle : null,
       codexGuidance: hasCodex ? resumeGuidance.codex ?? null : null,
       doctor: doctorResult ? { ok: doctorResult.ok, checks: doctorResult.checks } : null,
       localData,
@@ -2778,6 +2858,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     if (skill === 'failed') probs.push('memory skill — install did not land (see the message above)');
     if (hook === 'failed') probs.push('auto-capture hook — not wired (see the message above)');
     if (codexHooks === 'failed') probs.push('Codex hooks — not wired (see the message above)');
+    if (ompLifecycle === 'failed') probs.push('OMP lifecycle extension — not wired (see the message above)');
     for (const entry of unverified) probs.push(`${entry.runtime} — config was written but the local server was not reachable (${entry.detail})`);
     for (const entry of skipped) probs.push(`${entry.runtime} — connection was skipped (${entry.error})`);
     if (doctorResult) for (const c of doctorResult.checks.filter((c) => !c.ok && c.required !== false)) probs.push(`${c.name} — ${c.detail}${c.hint ? `\n    → ${c.hint}` : ''}`);
@@ -2799,6 +2880,7 @@ async function runSetup(options: ParsedArgs['options']): Promise<void> {
     hasClaude ? 'Claude Code' : null,
     hasWorkbuddy && ['installed', 'already'].includes(workbuddyResume) ? 'WorkBuddy' : null,
     hasCodex && codexHooks !== 'failed' && resumeGuidance.codex && !['failed', 'skipped'].includes(resumeGuidance.codex) ? 'Codex' : null,
+    hasOmp && ['installed', 'already'].includes(ompLifecycle) ? 'OMP' : null,
   ].filter(Boolean);
   const verifiedRt = connected.filter((c) => c.verified).map((c) => c.runtime);
   const pendingRt = connected.filter((c) => !c.verified).map((c) => c.runtime);
@@ -2862,11 +2944,11 @@ Complete command reference (new here? start with: ihow-memory setup → ihow-mem
 
 Usage:
   ihow-memory setup [--runtime name] [--global-hook] [--dry-run] [--json]   # zero-config: detect your AI runtimes → wire MCP + memory skill + auto-capture hook → verify. No prompts, idempotent (safe to re-run), local only.
-  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
+  ihow-memory init [--space name] [--root path] [--runtime claude-code|codex|omp|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
   ihow-memory status [--space name] [--root path] [--memory-root path] [--state-root path] [--json]
   ihow-memory continue [project-keyword] [--cwd path] [--json]   # resume after a context boundary (/clear, new session, out of context): prints a verify-first handoff for the project you were working on — auto-detected from the files you EDITED, with that project's git anchors + the prior session quoted UNVERIFIED — so a fresh agent picks up without re-briefing. Pass a keyword to choose which project; works even if you launch every session from one dir. (alias: handoff)
   ihow-memory continue --list [--limit n] [--json]   # list the most recent resumable sessions across all recorded projects (inferred project, git branch+HEAD, last activity, summary snippet; newest first); resume one by its number with: ihow-memory continue <N>
-  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini] [--share-diagnostics] [--json]
+  ihow-memory doctor [--space name] [--root path] [--memory-root path] [--state-root path] [--runtime claude-code|codex|omp|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini] [--share-diagnostics] [--json]
   ihow-memory verify [--runtime name] [--cwd path] [--json]   # print a REPRODUCIBLE self-proof receipt: local store + each runtime's MCP reachability + this checkout's GREEN/YELLOW/RED resume verdict, each line with the exact command to re-run yourself (no trust required, local-only). Exit non-zero if anything fails to round-trip.
   ihow-memory proof [--root existing-dir] [--space name] [--engine fts|vector-gguf]   # --root selects a parent for a proof-owned temporary workspace; only that child is removed
   ihow-memory benchmark [--json]   # deterministic LOCAL proof of the verify-first guarantees: the three-color resume verdict discriminates (GREEN narrow · drift→RED · uncertainty→YELLOW) and the no-false-green floor isolates unverified/standing-rule content while blocking secret/fabricated-anchor content. Re-run for the same result; exit non-zero if any guarantee fails.
@@ -2893,18 +2975,19 @@ Usage:
   ihow-memory rescue [--space name] [--root path] [--runtime name]    # out-of-band repair entry for npx ihow-memory@next rescue; reinstalls, probes, and preserves the last good runtime on failure
   ihow-memory rollback-runtime [--space name] [--root path] [--apply] [--json]   # verify and preview the exact previous runtime bundle; --apply atomically swaps generations, probes the restored server, and requires a runtime restart
   ihow-memory migrate-local-day [--memory-root path] [--apply]   # one-time: re-bucket UTC-named journal/event files to local-day (dry-run unless --apply)
-  ihow-memory feedback [--runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
+  ihow-memory feedback [--runtime claude-code|codex|omp|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini]
   ihow-memory reset --space name [--root path]
   ihow-memory console [--port 8788] [--host 127.0.0.1] [--memory-root path]   # read-only local web UI
-  ihow-memory connect --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the runtime's proactive memory layer, no prompts
+  ihow-memory connect --runtime claude-code|codex|omp|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini [--easy] [--dry-run] [--json]   # auto-config MCP; --easy (alias --yes) also installs the runtime's proactive memory layer, no prompts
   ihow-memory connect --auto [--write] [--json]   # detect installed runtimes; default reports only, --write connects them all to one shared workspace
   ihow-memory telemetry [on|off|status|flush]   # optional anonymous metrics — OFF by default; only schema/event/category fields, never memory content; flush sends only after explicit endpoint configuration
   ihow-memory hook-stop                   # Stop-hook handler (Claude Code session-end nudge; reads hook JSON on stdin)
-  ihow-memory hook-session-start          # SessionStart-hook handler (Claude Code marker floor; Codex resume hint + Codex capture floor trigger)
-  ihow-memory hook-pre-compact            # Claude/Codex native PreCompact checkpoint adapter; bounded, transcript-free, fail-open
+  ihow-memory hook-session-start          # SessionStart-hook handler (Claude Code marker floor; Codex/OMP resume hint + crash-floor trigger)
+  ihow-memory hook-session-end            # OMP session switch/shutdown capture; exact runtime/session target; fail-open
+  ihow-memory hook-pre-compact            # Claude/Codex/OMP native PreCompact checkpoint adapter; bounded, transcript-free, fail-open
   ihow-memory hook-user-prompt-submit     # UserPromptSubmit recall — reviewed-first + guarded auto soft facts; relevant-only, bounded, seamless fenced reference. Off: IHOW_RECALL_OFF=1; reviewed-only: IHOW_RECALL_AUTO_DEFAULT=0
   ihow-memory install-skill [--no-install-skill]   # copy the proactive-memory skill into ~/.claude/skills/ihow-memory/ (Claude Code)
-  ihow-memory install-hook [--runtime claude-code|codex] [--global-hook] [--no-recall] [--no-install-hook]   # Claude Code: Stop + SessionStart + PreCompact + UserPromptSubmit hooks (project-local by default; --global-hook for ~/.claude/settings.json). Codex: SessionStart + PreCompact + UserPromptSubmit hooks in ~/.codex/hooks.json. Recall is ON by default; --no-recall skips it.
+  ihow-memory install-hook [--runtime claude-code|codex|omp] [--global-hook] [--no-recall] [--no-install-hook]   # Claude Code/Codex install native hooks; OMP installs its managed lifecycle extension. Recall is ON by default for managed prompt hooks.
 
 Defaults:
   root: ${defaultRoot()}
@@ -3033,7 +3116,7 @@ function nodeVersionAtLeast(actual: string, expected: string): boolean {
 }
 
 async function doctor(
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' },
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'omp' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' },
 ): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
   const workspace = resolveWorkspace(options);
@@ -3109,6 +3192,7 @@ async function doctor(
   const selectedRuntimeLabels: Partial<Record<NonNullable<typeof options.runtime>, string>> = {
     'claude-code': 'Claude Code',
     codex: 'Codex',
+    omp: 'OMP',
     openclaw: 'OpenClaw',
     hermes: 'Hermes',
     cursor: 'WorkBuddy/OpenCode/Gemini',
@@ -3302,7 +3386,7 @@ async function packageInfo(): Promise<{ name: string; version: string }> {
 
 async function diagnosticReport(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'omp' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' } = {},
 ): Promise<Record<string, unknown>> {
   const sanitized = sanitizeDoctorResult(result, options);
   const info = await packageInfo();
@@ -3350,7 +3434,7 @@ function githubIssueUrl(body: string): string {
 
 async function feedbackTemplate(
   result: DoctorResult,
-  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' } = {},
+  options: WorkspaceOptions & { runtime?: 'claude-code' | 'codex' | 'omp' | 'cursor' | 'workbuddy' | 'claude-desktop' | 'opencode' | 'hermes' | 'openclaw' | 'vscode' | 'gemini' } = {},
 ): Promise<{ body: string; url: string }> {
   const report = await diagnosticReport(result, options);
   const body = `## What happened
@@ -3943,6 +4027,34 @@ async function runStopHook(options: ParsedArgs['options'], payload?: Record<stri
   process.stdout.write(`${JSON.stringify({ decision: 'block', reason })}\n`);
 }
 
+async function runOmpSessionEnd(options: ParsedArgs['options'], payload?: Record<string, unknown>): Promise<void> {
+  if (!payload) return;
+  const sessionId = typeof payload.session_id === 'string' ? payload.session_id.trim() : '';
+  const cwd = typeof payload.cwd === 'string' && payload.cwd.trim() ? payload.cwd : options.cwd;
+  if (!sessionId || !cwd) return;
+  let workspace;
+  try {
+    workspace = await ensureWorkspace(resolveWorkspace({ ...options, cwd }));
+  } catch {
+    return;
+  }
+  try {
+    const effective = applySemanticEngine(resolveWorkspace({ ...options, cwd }), { ...options, cwd });
+    const engineConfig = resolveEngineConfig(effective);
+    await runCaptureFloorSweep(workspace, {
+      now: Date.now(),
+      idleMs: 0,
+      checkpointStaleMs: 0,
+      maxPerSweep: 1,
+      runtimes: new Set(['omp']),
+      includeSession: { runtime: 'omp', sessionId },
+      reindex: () => indexWithEngineFallback(workspace, engineConfig),
+    });
+  } catch {
+    // OMP shutdown/switch capture is host-fail-open.
+  }
+}
+
 // Floor-capture tuning. The floor is a BACKSTOP, not the primary path: it only fires for a prior
 // session that did NOT cooperatively journal, it is low-weight + rollbackable, and it is bounded so a
 // backlog can never make a SessionStart slow or spammy.
@@ -4000,25 +4112,25 @@ async function runSessionStartHook(options: ParsedArgs['options'], payload?: Rec
     }
   }
 
-  // Codex SessionStart hook: run the cross-runtime deterministic floor sweep at Codex thread boundaries.
-  // The MCP server still runs the same floor on startup, but a lifecycle hook is a better trigger cadence.
+  // Codex/OMP SessionStart hooks run the cross-runtime deterministic floor at lifecycle boundaries.
+  // OMP additionally has true shutdown/switch capture; this startup sweep is its crash backstop.
   // Keep the normal idle gate: another Codex thread can still be active, so lowering it to zero would floor
   // a paused-but-live session. If Codex gives us the current session id, exclude only that live session.
-  if (options.runtime === 'codex' && process.env.IHOW_CAPTURE_FLOOR !== '0') {
+  if ((options.runtime === 'codex' || options.runtime === 'omp') && process.env.IHOW_CAPTURE_FLOOR !== '0') {
     try {
       const effective = applySemanticEngine(resolveWorkspace({ ...options, cwd }), { ...options, cwd });
       const engineConfig = resolveEngineConfig(effective);
       await runCaptureFloorSweep(workspace, {
         now: Date.now(),
-        excludeSessionId: currentSessionId || undefined,
-        runtimes: new Set(['codex']),
+        ...(currentSessionId ? { excludeSession: { runtime: options.runtime, sessionId: currentSessionId } } : {}),
+        runtimes: new Set([options.runtime]),
         reindex: () => indexWithEngineFallback(workspace, engineConfig),
       });
     } catch {
-      // Codex hook must never disrupt thread start.
+      // Host SessionStart must never fail because memory capture did.
     }
   }
-  if (options.runtime === 'codex') return;
+  if (options.runtime === 'codex' || options.runtime === 'omp') return;
 
   const markerDir = path.join(workspace.spaceDir, '.hooks');
   let files: string[];
@@ -4275,6 +4387,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'hook-session-end') {
+    await runHookWithActivation(options, 'hook-session-end', (payload) => runOmpSessionEnd(options, payload));
+    return;
+  }
+
   if (command === 'hook-user-prompt-submit') {
     await runHookWithActivation(options, 'hook-user-prompt-submit', (payload) => runRecallHook(options, payload));
     return;
@@ -4296,7 +4413,22 @@ async function main(): Promise<void> {
     // reconcile hook config (upgrade remains the explicit version-refresh path).
     const workspace = resolveWorkspace(options);
     if (options.installHook !== false) await installRuntimeBundle(await ensureWorkspace(workspace));
-    if (options.runtime === 'codex') {
+    if (options.runtime === 'omp') {
+      const outcome = await maybeInstallOmpLifecycle({ ...options, installHook: options.installHook !== false });
+      if (outcome === 'installed' || outcome === 'already') {
+        await recordConfiguredActivation(workspace, 'omp', 'install-hook', options, outcome === 'installed');
+      }
+      if (outcome === 'installed') {
+        console.log(`✓ installed OMP lifecycle extension → ${ompExtensionsDir()} + ${ompExtensionConfigPath()}`);
+      } else if (outcome === 'already') {
+        console.log(`✓ OMP lifecycle extension already current in ${ompExtensionsDir()}`);
+      } else if (outcome === 'skipped') {
+        console.log('Skipped OMP lifecycle extension. (Add it later with install-hook --runtime omp.)');
+      } else {
+        console.error(`refusing to modify OMP lifecycle wiring — fix ${ompExtensionConfigPath()} or ${ompExtensionsDir()}, then re-run install-hook --runtime omp.`);
+        process.exitCode = 1;
+      }
+    } else if (options.runtime === 'codex') {
       const outcome = await maybeInstallCodexHooks({ ...options, installHook: options.installHook !== false });
       if (outcome === 'installed' || outcome === 'already') {
         await recordConfiguredActivation(workspace, 'codex', 'install-hook', options, outcome === 'installed');
@@ -4364,7 +4496,7 @@ async function main(): Promise<void> {
       return;
     }
     if (!options.runtime) {
-      console.error('connect requires --runtime claude-code|codex|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini (or --auto to detect installed runtimes)');
+      console.error('connect requires --runtime claude-code|codex|omp|cursor|workbuddy|claude-desktop|opencode|hermes|openclaw|vscode|gemini (or --auto to detect installed runtimes)');
       process.exitCode = 1;
       return;
     }
@@ -4377,6 +4509,8 @@ async function main(): Promise<void> {
         console.log('easy setup: MCP + skill + a project-local auto-capture hook (no prompts; --global-hook for user-wide)');
       } else if (options.runtime === 'codex' && !options.dryRun && !options.json) {
         console.log('easy setup: MCP + Codex hooks + AGENTS.md proactive memory loop (no prompts)');
+      } else if (options.runtime === 'omp' && !options.dryRun && !options.json) {
+        console.log('easy setup: MCP + OMP lifecycle extension for recall, PreCompact, and session-end capture (no prompts)');
       }
       if (options.installSkill === undefined) options.installSkill = true;
       if (options.installHook === undefined) options.installHook = true;
@@ -4416,9 +4550,19 @@ async function main(): Promise<void> {
       codexGuidance = await maybeInstallCodexMemoryLoop();
       if (codexHooks === 'failed' || codexGuidance === 'failed') process.exitCode = 1;
     }
+    let ompLifecycle: OmpInstallOutcome | null = null;
+    if (!result.dryRun && options.runtime === 'omp' && options.installHook !== false) {
+      try {
+        const outcome = await maybeInstallOmpLifecycle(options);
+        ompLifecycle = outcome === 'skipped' ? null : outcome;
+      } catch {
+        ompLifecycle = 'failed';
+      }
+      if (ompLifecycle === 'failed') process.exitCode = 1;
+    }
     if (options.json) {
       printJson(verification
-        ? { ...result, reachable: verification.reachable, verified: verification.verified, detail: verification.detail, codexHooks, codexGuidance }
+        ? { ...result, reachable: verification.reachable, verified: verification.verified, detail: verification.detail, codexHooks, codexGuidance, ompLifecycle }
         : result);
     } else {
       console.log('cloud: disabled / local only');
@@ -4456,6 +4600,10 @@ async function main(): Promise<void> {
             console.log(`⚠ Codex proactive memory loop failed to install → ${codexConfigLabel('AGENTS.md')}`);
             process.exitCode = 1;
           }
+        } else if (options.runtime === 'omp') {
+          if (ompLifecycle === 'installed') console.log('✓ installed OMP lifecycle extension (automatic recall, PreCompact, and session-end capture)');
+          else if (ompLifecycle === 'already') console.log('· OMP lifecycle extension already current');
+          else if (ompLifecycle === 'failed') console.log('⚠ OMP lifecycle extension failed to install');
         }
       }
     }
@@ -4465,7 +4613,7 @@ async function main(): Promise<void> {
         options.runtime,
         'connect',
         options,
-        claudeHooks === 'installed' || codexHooks === 'installed',
+        claudeHooks === 'installed' || codexHooks === 'installed' || ompLifecycle === 'installed',
       );
       if (verification?.reachable && process.exitCode !== 1 && !options.json) await maybeAskTelemetry();
     }
@@ -5128,6 +5276,7 @@ async function main(): Promise<void> {
     let nativeHooks: Awaited<ReturnType<typeof refreshNativeHooksAfterRuntimeUpgrade>> = {
       codex: { status: nativeHookTargets.codex ? 'skipped-runtime-rollback' : 'not-configured' },
       claudeCode: { status: nativeHookTargets.claudeCode ? 'skipped-runtime-rollback' : 'not-configured' },
+      omp: { status: nativeHookTargets.omp ? 'skipped-runtime-rollback' : 'not-configured' },
     };
     if (probe.ok) {
       // `--runtime` is an explicit authorization to repair that runtime's MCP registration. This
@@ -5136,7 +5285,9 @@ async function main(): Promise<void> {
       runtimeRepair = await repairSelectedRuntimeAfterUpgrade(workspace, options);
       nativeHooks = await refreshNativeHooksAfterRuntimeUpgrade(workspace, nativeHookTargets, options);
     }
-    const nativeHooksOk = nativeHooks.codex.status !== 'failed' && nativeHooks.claudeCode.status !== 'failed';
+    const nativeHooksOk = nativeHooks.codex.status !== 'failed'
+      && nativeHooks.claudeCode.status !== 'failed'
+      && nativeHooks.omp.status !== 'failed';
     const runtimeRepairOk = runtimeRepair?.status !== 'failed';
     const ok = probe.ok && nativeHooksOk && runtimeRepairOk;
     if (options.json) {
@@ -5165,14 +5316,14 @@ async function main(): Promise<void> {
           ? `⚠ ${runtimeLabel(options.runtime)} registration repair failed — ${runtimeRepair.detail}`
           : `✓ ${runtimeLabel(options.runtime)} registration ${runtimeRepair.status}`);
       }
-      for (const [label, status] of [['Codex', nativeHooks.codex], ['Claude Code', nativeHooks.claudeCode]] as const) {
-        if (status.status === 'activation-refreshed') console.log(`✓ ${label} native hook activation refreshed without rewriting host config`);
-        else if (status.status === 'failed') console.log(`⚠ ${label} native hook refresh failed — ${status.detail}`);
+      for (const [label, status] of [['Codex', nativeHooks.codex], ['Claude Code', nativeHooks.claudeCode], ['OMP', nativeHooks.omp]] as const) {
+        if (status.status === 'activation-refreshed') console.log(`✓ ${label} native lifecycle activation refreshed`);
+        else if (status.status === 'failed') console.log(`⚠ ${label} native lifecycle refresh failed — ${status.detail}`);
       }
       console.log(probe.ok
         ? ok
-          ? 'Restart your connected runtime(s) so they load the new server; existing native hooks were verified.'
-          : 'The server bundle is healthy, but repair the reported runtime/hook configuration before restarting.'
+          ? 'Restart your connected runtime(s) so they load the new server; existing native lifecycle wiring was verified.'
+          : 'The server bundle is healthy, but repair the reported runtime/lifecycle configuration before restarting.'
         : rolledBack
           ? 'The previous runtime bundle is active on disk; restart only if you need to reload it.'
           : 'Do not restart connected runtimes until the runtime bundle is repaired.');
@@ -5561,14 +5712,13 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  // Belt-and-suspenders for the never-crash-the-host contract: a hook command (Stop / SessionStart /
-  // UserPromptSubmit) must NEVER exit non-zero or write to stderr — Claude Code surfaces that as a hook
-  // failure on every turn end. If anything at all escapes a hook command, swallow it and exit 0 silently,
-  // so no current or future code path inside a hook can disrupt the host session.
+  // Belt-and-suspenders for the never-crash-the-host contract: lifecycle hook commands must NEVER exit
+  // non-zero or write to stderr. If anything escapes one, swallow it and exit 0 silently so memory cannot
+  // disrupt the host session.
   // Match the COMMAND word only (argv[2] = the subcommand for `ihow-memory <cmd> …`), never any argv
   // token — otherwise `ihow-memory search hook-stop` or a candidate body mentioning a hook name would
   // wrongly swallow a real failure.
-  const HOOK_COMMANDS = new Set(['hook-stop', 'hook-session-start', 'hook-pre-compact', 'hook-user-prompt-submit']);
+  const HOOK_COMMANDS = new Set(['hook-stop', 'hook-session-start', 'hook-session-end', 'hook-pre-compact', 'hook-user-prompt-submit']);
   if (HOOK_COMMANDS.has(process.argv[2])) {
     process.exitCode = 0;
     return;

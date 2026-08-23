@@ -77,7 +77,7 @@ npx ihow-memory@next remember "text or memory/path.md"
 
 ### What `setup` connects
 
-Claude Code is the daily-dogfooded path. Codex, OpenClaw, Hermes, OpenCode and WorkBuddy have single-machine real-app smoke. Cursor, Claude Desktop and VS Code are receiver-only because they do not expose a resumable local session store. See [Runtime support](#runtime-support) before making production assumptions.
+Claude Code is the daily-dogfooded path. Codex, OMP, OpenClaw, Hermes, OpenCode and WorkBuddy have single-machine real-app smoke. Cursor, Claude Desktop and VS Code are receiver-only because they do not expose a resumable local session store. See [Runtime support](#runtime-support) before making production assumptions.
 
 To connect only one runtime, or to inspect the exact config instead of applying it:
 
@@ -88,7 +88,7 @@ npx ihow-memory@next init --runtime claude-code       # print the MCP snippet on
 npx ihow-memory@next doctor --runtime claude-code
 ```
 
-Activation is evidence-based, not inferred from installation text. The workspace-frozen CLI and exact managed Claude/Codex wiring can produce bounded local completion evidence, but the same OS user can replay that command, so it does not authenticate the host: `doctor` keeps these runtimes at **READY — WAITING FOR FIRST ACTIVITY** with reason code `ACTIVATION_COMPLETION_UNATTESTED`. **TOOLS ONLY** means cooperative MCP tools are available without a verified lifecycle hook; **NEEDS REPAIR** means managed wiring is broken or stale. Synthetic probes and started-only events never become ACTIVE. The ledger stores hashed bindings and bounded metadata, never prompts, transcripts, environment values, or error text.
+Activation is evidence-based, not inferred from installation text. The workspace-frozen CLI and exact managed Claude/Codex hook or OMP extension wiring can produce bounded local completion evidence, but the same OS user can replay that command, so it does not authenticate the host: `doctor` keeps these runtimes at **READY — WAITING FOR FIRST ACTIVITY** with reason code `ACTIVATION_COMPLETION_UNATTESTED`. **TOOLS ONLY** means cooperative MCP tools are available without a verified lifecycle hook; **NEEDS REPAIR** means managed wiring is broken or stale. Synthetic probes and started-only events never become ACTIVE. The ledger stores hashed bindings and bounded metadata, never prompts, transcripts, environment values, or error text.
 
 ### The governed loop, explicitly
 
@@ -111,12 +111,13 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 
 ## Runtime support
 
-`connect` registers the MCP server for ten runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted — this is alpha.
+`connect` registers the MCP server for eleven runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted — this is alpha.
 
 | Runtime | connect | resume reader | Notes |
 | --- | --- | --- | --- |
 | Claude Code | ✓ (`claude mcp add-json`) | ✓ | real-app + ongoing dogfood; skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks |
 | Codex | ✓ (`codex mcp add`) | ✓ | native SessionStart / PreCompact / UserPromptSubmit hooks + proactive `~/.codex/AGENTS.md` memory loop; single-machine real-app smoke |
+| OMP (Oh My Pi) | ✓ (`~/.omp/agent/mcp.json`) | ✓ (`~/.omp/agent/sessions`) | managed extension: startup/prompt recall, native PreCompact, switch/shutdown capture; real-app smoke |
 | OpenClaw | ✓ (`~/.openclaw/openclaw.json`) | ✓ | single-machine real-app smoke (memory.continue + git preflight) |
 | Hermes | ✓ (`hermes mcp add` + packaged adapters) | ✓ (JSON + `state.db`) | installs/enables the lifecycle plugin and selects the packaged compaction `MemoryProvider`; single-machine real-app smoke |
 | OpenCode | ✓ (`~/.config/opencode`) | ✓ (`opencode.db`) | single-machine real-app smoke |
@@ -127,7 +128,7 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 | Gemini CLI | ✓ (`~/.gemini/settings.json`) | ✓ (`~/.gemini/tmp/*/logs.json`) | passive reader of Gemini's on-disk **user-prompt log** (Gemini records no assistant turns) → session topic + git anchors; manual `GEMINI.md` nudge. Verified against real local data |
 | Cline (VS Code) | — (add via Cline's own MCP settings) | ✓ (`globalStorage` / `~/.cline/data`) | passive reader of `tasks/<id>/api_conversation_history.json`; cwd from `environment_details`. Fixture-tested, not yet real-app smoke |
 
-The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / PreCompact / UserPromptSubmit hooks. Codex uses native SessionStart / PreCompact / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the existing capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. For Hermes, `connect` / `setup` installs both packaged adapters under `$HERMES_HOME/plugins`, enables `ihow-memory`, selects `memory.provider=ihow-memory-compaction`, and binds both to the workspace's integrity-checked frozen bridge. It refuses to replace another configured external memory provider and rolls back partial adapter/config/MCP writes on failure. The pre-compress handoff is bounded and transcript-free, but stays explicitly `UNVERIFIED` until live anchors are checked; this is not an `ACTIVE` or host-authentication claim. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
+The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / PreCompact / UserPromptSubmit hooks. Codex uses native SessionStart / PreCompact / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the existing capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. OMP uses a managed extension for `session_start`, `before_agent_start`, native PreCompact, and session switch/shutdown capture; its readable JSONL transcript also feeds `memory.continue` and the crash-floor sweep. For Hermes, `connect` / `setup` installs both packaged adapters under `$HERMES_HOME/plugins`, enables `ihow-memory`, selects `memory.provider=ihow-memory-compaction`, and binds both to the workspace's integrity-checked frozen bridge. It refuses to replace another configured external memory provider and rolls back partial adapter/config/MCP writes on failure. The pre-compress handoff is bounded and transcript-free, but stays explicitly `UNVERIFIED` until live anchors are checked; this is not an `ACTIVE` or host-authentication claim. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
 
 ### Runtimes wired without an auto-injected resume nudge (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
 

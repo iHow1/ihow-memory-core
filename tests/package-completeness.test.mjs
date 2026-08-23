@@ -176,6 +176,8 @@ test('every relative import in a packed module is itself in the tarball (fresh i
     'dist/live-activity-ledger.js',
     'dist/mcp/server.js',
     'dist/native-precompact.js',
+    'dist/omp-extension.js',
+    'dist/omp-wiring.js',
     'dist/proposal-review-state.js',
     'dist/store/checkpoints.js',
     'dist/vendor/smol-toml/parse.js',
@@ -223,13 +225,15 @@ test('all packed Markdown links and advertised assets resolve inside the tarball
   }
 });
 
-test('tracked-only clean tree rebuild packs a spawnable checkpoint worker and rescue bootstrap', () => {
+test('tracked-only clean tree rebuild packs OMP lifecycle, checkpoint workers, and rescue bootstrap', () => {
   const tracked = execFileSync('git', ['ls-files', '-z', '--cached'], { cwd: ROOT })
     .toString('utf8')
     .split('\0')
     .filter(Boolean);
   assert.ok(tracked.includes('src/checkpoint-claim-worker.ts'), 'checkpoint claim worker source must be tracked in the delivery index');
   assert.ok(tracked.includes('src/checkpoint-file-worker.ts'), 'checkpoint file worker source must be tracked in the delivery index');
+  assert.ok(tracked.includes('src/omp-extension.ts'), 'OMP lifecycle extension source must be tracked in the delivery index');
+  assert.ok(tracked.includes('src/omp-wiring.ts'), 'OMP lifecycle wiring source must be tracked in the delivery index');
 
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ihow-package-clean-tree-'));
   const cleanTree = path.join(temporaryRoot, 'repo');
