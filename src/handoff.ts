@@ -230,6 +230,79 @@ async function parseCodexRollout(file: string): Promise<CaptureUnit | undefined>
   return { sessionId, body, editedList: [...edited], projectDir: cwd };
 }
 
+// OMP: ~/.omp/agent/sessions/<encoded-cwd>/*.jsonl (or PI_CODING_AGENT_DIR). A session header carries
+// the exact cwd; message text and write-like tool calls are normalized into the shared capture contract.
+const ompSource: SessionSource = {
+  tool: 'omp',
+  list: async () => {
+    const agentDir = process.env.PI_CODING_AGENT_DIR?.trim()
+      ? path.resolve(process.env.PI_CODING_AGENT_DIR)
+      : path.join(os.homedir(), '.omp', 'agent');
+    const root = path.join(agentDir, 'sessions');
+    const out: Array<{ file: string; mtimeMs: number }> = [];
+    const walk = async (dir: string, depth: number): Promise<void> => {
+      if (depth > 3) return;
+      let entries;
+      try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) await walk(full, depth + 1);
+        else if (entry.name.endsWith('.jsonl')) {
+          try { out.push({ file: full, mtimeMs: (await fs.stat(full)).mtimeMs }); } catch { /* skip */ }
+        }
+      }
+    };
+    await walk(root, 0);
+    return out;
+  },
+  read: async (file) => parseOmpSession(file),
+};
+
+async function parseOmpSession(file: string): Promise<CaptureUnit | undefined> {
+  const raw = await readSessionFile(file);
+  if (raw === undefined) return undefined;
+  let sessionId = '';
+  let cwd: string | undefined;
+  const records: TranscriptRecord[] = [];
+  const edited = new Set<string>();
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let item: unknown;
+    try { item = JSON.parse(line); } catch { continue; }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    if (record.type === 'session') {
+      sessionId = typeof record.id === 'string' ? record.id : sessionId;
+      cwd = typeof record.cwd === 'string' ? record.cwd : cwd;
+      continue;
+    }
+    if (record.type !== 'message' || !record.message || typeof record.message !== 'object' || Array.isArray(record.message)) continue;
+    const message = record.message as Record<string, unknown>;
+    if (message.role !== 'user' && message.role !== 'assistant') continue;
+    const blocks = Array.isArray(message.content)
+      ? message.content.filter((block): block is Record<string, unknown> => !!block && typeof block === 'object' && !Array.isArray(block))
+      : [];
+    const text = blocks
+      .filter((block) => block.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text as string)
+      .join('\n');
+    if (text) records.push({ type: message.role, message: { content: [{ type: 'text', text }] } });
+    if (message.role !== 'assistant') continue;
+    for (const block of blocks) {
+      if (block.type !== 'toolCall' || typeof block.name !== 'string' || !block.arguments || typeof block.arguments !== 'object' || Array.isArray(block.arguments)) continue;
+      const args = block.arguments as Record<string, unknown>;
+      if (!['edit', 'write', 'notebook'].includes(block.name)) continue;
+      const candidate = [args.path, args.file_path]
+        .find((value): value is string => typeof value === 'string' && value.length > 0);
+      if (candidate) edited.add(cwd && !path.isAbsolute(candidate) ? path.join(cwd, candidate) : candidate);
+    }
+  }
+  if (!sessionId || records.length < 2) return undefined;
+  const body = summarizeTranscript(records).body;
+  if (!body) return undefined;
+  return { sessionId, body, editedList: [...edited], projectDir: cwd };
+}
+
 // WorkBuddy (Tencent): ~/.workbuddy/projects/<encoded-cwd>/<sessionId>.jsonl, one session per file.
 // Records are {id,timestamp,type,role,content,cwd,sessionId,...}; messages have type "message", a `role`
 // and a TOP-LEVEL `content` list (NOT message.content), with cwd inline (exact project map). agent-*.jsonl
@@ -796,7 +869,7 @@ async function parseClineTask(file: string): Promise<CaptureUnit | undefined> {
   return { sessionId, body, editedList: [], projectDir };
 }
 
-const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, workbuddySource, openclawSource, hermesSource, hermesStateDbSource, opencodeSource, geminiSource, clineSource];
+const SESSION_SOURCES: SessionSource[] = [claudeSource, codexSource, ompSource, workbuddySource, openclawSource, hermesSource, hermesStateDbSource, opencodeSource, geminiSource, clineSource];
 
 // Enumerate the most recent RESUMABLE sessions across EVERY recorded runtime (Claude, Codex, ...),
 // newest activity first. Each source contributes a reader; project inference, anchors and redaction are

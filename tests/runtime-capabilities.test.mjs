@@ -25,6 +25,23 @@ test('Hermes manifest exposes lifecycle surfaces without claiming native pre-com
   assert.equal(runtimeAutomationCeiling(manifest), 'lifecycle-capable');
 });
 
+test('OMP manifest exposes the managed extension lifecycle', () => {
+  const manifest = runtimeCapabilityManifest('omp');
+
+  assert.equal(manifest.mcpTools, true);
+  assert.equal(manifest.readableTranscript, true);
+  assert.deepEqual(manifest.lifecycle, {
+    sessionStart: true,
+    sessionReset: true,
+    beforePrompt: true,
+    afterTurn: false,
+    sessionFinalize: true,
+    sessionEnd: true,
+    preCompact: 'native',
+  });
+  assert.equal(runtimeAutomationCeiling(manifest), 'lifecycle-capable');
+});
+
 test('capability ceilings describe host potential, never live activation', () => {
   assert.equal(runtimeAutomationCeiling(runtimeCapabilityManifest('hermes')), 'lifecycle-capable');
   assert.equal(runtimeAutomationCeiling(runtimeCapabilityManifest('workbuddy')), 'tools-only');

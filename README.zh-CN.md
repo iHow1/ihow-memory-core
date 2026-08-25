@@ -79,7 +79,7 @@ npx ihow-memory@next remember "文字或 memory/path.md"
 
 ### `setup` 当前接入成熟度
 
-Claude Code 是每日 dogfood 主路径；Codex、OpenClaw、Hermes、OpenCode、WorkBuddy 完成了单机真机 smoke；Cursor、Claude Desktop、VS Code 因没有可读取的本地会话存储而属于 receiver-only。进入生产假设前请看 [Runtime 支持](#runtime-支持)。
+Claude Code 是每日 dogfood 主路径；Codex、OMP、OpenClaw、Hermes、OpenCode、WorkBuddy 完成了单机真机 smoke；Cursor、Claude Desktop、VS Code 因没有可读取的本地会话存储而属于 receiver-only。进入生产假设前请看 [Runtime 支持](#runtime-支持)。
 
 只接一个 runtime，或先查看配置而不直接写入：
 
@@ -90,7 +90,7 @@ npx ihow-memory@next init --runtime claude-code       # 只打印 MCP 片段
 npx ihow-memory@next doctor --runtime claude-code
 ```
 
-激活状态来自证据，而不是安装成功文案。当前候选中的冻结 CLI 与精确 Claude/Codex 托管接线可以形成有界的本地完成证据，但同一 OS 用户可重放该命令，因此它不是宿主认证。`doctor` 会把这类 runtime 封顶为 **READY — WAITING FOR FIRST ACTIVITY**，reason code 为 `ACTIVATION_COMPLETION_UNATTESTED`。**TOOLS ONLY** 表示只有协作式 MCP 工具，没有可核验的生命周期 Hook；**NEEDS REPAIR** 表示托管接线已经损坏或过期。synthetic probe 和 started-only 事件绝不会升级成 ACTIVE。Ledger 只保存哈希化 binding 与有界元数据，不保存 prompt、transcript、环境变量或错误正文。
+激活状态来自证据，而不是安装成功文案。当前候选中的冻结 CLI 与精确 Claude/Codex Hook 或 OMP 扩展托管接线可以形成有界的本地完成证据，但同一 OS 用户可重放该命令，因此它不是宿主认证。`doctor` 会把这类 runtime 封顶为 **READY — WAITING FOR FIRST ACTIVITY**，reason code 为 `ACTIVATION_COMPLETION_UNATTESTED`。**TOOLS ONLY** 表示只有协作式 MCP 工具，没有可核验的生命周期 Hook；**NEEDS REPAIR** 表示托管接线已经损坏或过期。synthetic probe 和 started-only 事件绝不会升级成 ACTIVE。Ledger 只保存哈希化 binding 与有界元数据，不保存 prompt、transcript、环境变量或错误正文。
 
 ### 显式治理闭环
 
@@ -113,12 +113,13 @@ npx ihow-memory@next reset --space demo
 
 ## Runtime 支持
 
-`connect` 为十个 runtime 生成 MCP 注册配置；`setup` 一条命令接好每个检测到的 runtime，并在 runtime 有指令文件时注入一句「resume 时调用 `memory.continue`」的提示。两个维度要分清：**connect**（runtime 能调用记忆工具）和 **resume reader**（该 runtime 自己过去的会话能被 `memory.continue` 接上）。下表除特别说明外均为单机真机 smoke——这是 alpha。
+`connect` 为十一个 runtime 生成 MCP 注册配置；`setup` 一条命令接好每个检测到的 runtime，并在 runtime 有指令文件时注入一句「resume 时调用 `memory.continue`」的提示。两个维度要分清：**connect**（runtime 能调用记忆工具）和 **resume reader**（该 runtime 自己过去的会话能被 `memory.continue` 接上）。下表除特别说明外均为单机真机 smoke——这是 alpha。
 
 | Runtime | connect | resume reader | 备注 |
 | --- | --- | --- | --- |
 | Claude Code | ✓（`claude mcp add-json`） | ✓ | 真机 app smoke + 持续 dogfood；含 skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks |
 | Codex | ✓（`codex mcp add`） | ✓ | 原生 SessionStart / PreCompact / UserPromptSubmit hooks + `~/.codex/AGENTS.md` 主动记忆循环；单机真机 smoke |
+| OMP (Oh My Pi) | ✓（`~/.omp/agent/mcp.json`） | ✓（`~/.omp/agent/sessions`） | 托管扩展：启动/提示召回、原生 PreCompact、切换/退出捕获；真机 smoke |
 | OpenClaw | ✓（`~/.openclaw/openclaw.json`） | ✓ | 单机真机 smoke（memory.continue + git 预检） |
 | Hermes | ✓（`hermes mcp add` + 包内适配器） | ✓（JSON + `state.db`） | 自动安装并启用 lifecycle plugin，选择包内 compaction `MemoryProvider`；单机真机 smoke |
 | OpenCode | ✓（`~/.config/opencode`） | ✓（`opencode.db`） | 单机真机 smoke |
@@ -129,7 +130,7 @@ npx ihow-memory@next reset --space demo
 | Gemini CLI | ✓（`~/.gemini/settings.json`） | ✓（`~/.gemini/tmp/*/logs.json`） | 被动读取 Gemini 的磁盘**用户 prompt 日志**（Gemini 不在磁盘记录助手轮）→ 会话主题 + git 锚点；需手动在 `GEMINI.md` 加提示。已对真实本地数据验证 |
 | Cline (VS Code) | —（经 Cline 自己的 MCP 设置接入） | ✓（`globalStorage` / `~/.cline/data`） | 被动读取 `tasks/<id>/api_conversation_history.json`；cwd 取自 `environment_details`。已 fixture 测试，尚未真机 smoke |
 
-MCP 工具与治理闭环与 runtime 无关。Claude Code 使用 skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks；Codex 使用原生 SessionStart / PreCompact / UserPromptSubmit hooks，并由 `~/.codex/AGENTS.md` 提供主动记忆循环。Hermes 的 `connect` / `setup` 会把两类包内适配器安装到 `$HERMES_HOME/plugins`，启用 `ihow-memory`，选择 `memory.provider=ihow-memory-compaction`，并把两者绑定到该 workspace 中经过完整性校验的冻结 bridge；若已配置其他外部 MemoryProvider，会在写入前拒绝覆盖，配置/插件/MCP 任一步失败则回滚本轮变更。预压缩交接保持有界且不含 transcript 原文，但在现场锚点核验前始终明确标为 `UNVERIFIED`，不等于 `ACTIVE` 或宿主认证。Resume 提示会自动注入到配置暴露了指令文件的 runtime（Claude Code、WorkBuddy、OpenClaw、Hermes、OpenCode）。
+MCP 工具与治理闭环与 runtime 无关。Claude Code 使用 skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks；Codex 使用原生 SessionStart / PreCompact / UserPromptSubmit hooks，并由 `~/.codex/AGENTS.md` 提供主动记忆循环。OMP 使用托管扩展接入 `session_start`、`before_agent_start`、原生 PreCompact 与会话切换/退出捕获；其可读 JSONL 会话同时供 `memory.continue` 和 crash-floor sweep 使用。Hermes 的 `connect` / `setup` 会把两类包内适配器安装到 `$HERMES_HOME/plugins`，启用 `ihow-memory`，选择 `memory.provider=ihow-memory-compaction`，并把两者绑定到该 workspace 中经过完整性校验的冻结 bridge；若已配置其他外部 MemoryProvider，会在写入前拒绝覆盖，配置/插件/MCP 任一步失败则回滚本轮变更。预压缩交接保持有界且不含 transcript 原文，但在现场锚点核验前始终明确标为 `UNVERIFIED`，不等于 `ACTIVE` 或宿主认证。Resume 提示会自动注入到配置暴露了指令文件的 runtime（Claude Code、WorkBuddy、OpenClaw、Hermes、OpenCode）。
 
 ## 检索引擎
 

@@ -230,6 +230,30 @@ test('dedup-2: same sessionId on different runtimes floors independently (compos
   assert.deepEqual(runtimes, ['codex', 'workbuddy']);
 });
 
+test('exact include/exclude filters use the composite runtime and session id key', async (t) => {
+  const { core, home, setHome } = await setup(t);
+  const now = Date.now();
+  await plantCodexSession(home, { id: 'shared-target', mtimeMs: now - IDLE_OLD });
+  await plantWorkbuddySession(home, { id: 'shared-target', mtimeMs: now - IDLE_OLD });
+  setHome();
+
+  const included = await runCaptureFloorSweep(core.workspace, {
+    now,
+    runtimes: new Set(['codex', 'workbuddy']),
+    includeSession: { runtime: 'workbuddy', sessionId: 'shared-target' },
+  });
+  assert.equal(included.journaled, 1);
+  assert.deepEqual((await floorEvents(core)).map((event) => event.metadata.floorRuntime), ['workbuddy']);
+
+  const excluded = await runCaptureFloorSweep(core.workspace, {
+    now,
+    runtimes: new Set(['codex', 'workbuddy']),
+    excludeSession: { runtime: 'workbuddy', sessionId: 'shared-target' },
+  });
+  assert.equal(excluded.journaled, 1, 'same id on Codex remains eligible when only WorkBuddy is excluded');
+  assert.deepEqual((await floorEvents(core)).map((event) => event.metadata.floorRuntime).sort(), ['codex', 'workbuddy']);
+});
+
 test('dedup-5: a session with no usable sessionId is skipped (not re-floored every sweep)', async (t) => {
   const { core, home, setHome } = await setup(t);
   const now = Date.now();

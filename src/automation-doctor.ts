@@ -7,12 +7,14 @@ import { probeMetrics, type ProbeMetrics } from './context-probe.ts';
 import {
   activationConfigurationId,
   readActivationEvidence,
+  readActivationEvidenceForRuntime,
   type ActivationEvidence,
 } from './activation-ledger.ts';
 import { verifyRuntimeHookWiring, type RuntimeHookWiring } from './hook-wiring.ts';
 import { inspectHermesInstallationWiring, resolveHermesHome } from './hermes-wiring.ts';
+import { verifyOmpExtensionWiring, type OmpWiring } from './omp-wiring.ts';
 
-export type AutomationRuntime = 'claude-code' | 'codex' | 'openclaw' | 'hermes' | 'no-hook';
+export type AutomationRuntime = 'claude-code' | 'codex' | 'omp' | 'openclaw' | 'hermes' | 'no-hook';
 export type AutomationStatus = 'OK' | 'WARN' | 'BROKEN';
 export type ActivationStatus = 'ACTIVE' | 'READY — WAITING FOR FIRST ACTIVITY' | 'TOOLS ONLY' | 'NEEDS REPAIR';
 export type ActivationReasonCode =
@@ -91,6 +93,13 @@ const ROWS: Array<Omit<AutomationMatrixRow, 'status' | 'notes' | 'probeCalls' | 
     promptRecall: 'UserPromptSubmit hook',
     sessionEndCapture: 'finalize / no true Stop',
     floorFallback: 'SessionStart floor sweep',
+  },
+  {
+    runtime: 'OMP',
+    sessionStartResume: 'extension session_start',
+    promptRecall: 'extension before_agent_start',
+    sessionEndCapture: 'extension session_shutdown/switch',
+    floorFallback: 'session-end capture + startup sweep',
   },
   {
     runtime: 'OpenClaw',
@@ -182,7 +191,7 @@ function latest(rows: ActivationEvidence[], predicate: (row: ActivationEvidence)
 export function deriveRuntimeActivation(
   runtime: AutomationRuntime,
   allEvidence: ActivationEvidence[],
-  options: { wiring?: RuntimeHookWiring; lifecycleWiring?: LifecycleWiringEvidence; now?: number } = {},
+  options: { wiring?: RuntimeHookWiring | OmpWiring; lifecycleWiring?: LifecycleWiringEvidence; now?: number } = {},
 ): RuntimeActivation {
   const rows = evidenceForRuntime(allEvidence, runtime);
   const lastObservedAt = latest(rows, () => true)?.observedAt;
@@ -318,31 +327,36 @@ export async function automationMatrix(
   } = {},
 ): Promise<{ rows: AutomationMatrixRow[]; metrics: ProbeMetrics; path: PathClassification; evidence: ActivationEvidence[] }> {
   const hermesHome = resolveHermesHome(options.hermesHome);
-  const [metrics, evidence, claudeWiring, codexWiring, hermesWiring]: [
+  const [metrics, evidence, ompEvidence, claudeWiring, codexWiring, ompWiring, hermesWiring]: [
     ProbeMetrics,
+    ActivationEvidence[],
     ActivationEvidence[],
     RuntimeHookWiring,
     RuntimeHookWiring,
+    OmpWiring,
     LifecycleWiringEvidence & { reason?: string },
   ] = await Promise.all([
     probeMetrics(workspace),
     readActivationEvidence(workspace).catch(() => []),
+    readActivationEvidenceForRuntime(workspace, 'omp').catch(() => []),
     verifyRuntimeHookWiring(workspace, 'claude-code', options.hookOptions),
     verifyRuntimeHookWiring(workspace, 'codex', options.hookOptions),
+    verifyOmpExtensionWiring(workspace),
     hermesHome
       ? inspectHermesInstallationWiring(hermesHome)
       : Promise.resolve<LifecycleWiringEvidence & { reason?: string }>({ state: 'missing' }),
   ]);
-  const wirings = new Map<string, RuntimeHookWiring>([
+  const wirings = new Map<string, RuntimeHookWiring | OmpWiring>([
     ['claude-code', claudeWiring],
     ['codex', codexWiring],
+    ['omp', ompWiring],
   ]);
   const pathStatus = classifyAutomationPath(spec);
   const aggregateStatus = pathStatus.status === 'BROKEN' ? 'BROKEN' : 'OK';
   const rows = ROWS.map((row) => {
     const key = runtimeKey(row.runtime);
     const wiring = wirings.get(key);
-    const activation = deriveRuntimeActivation(key as AutomationRuntime, evidence, {
+    const activation = deriveRuntimeActivation(key as AutomationRuntime, key === 'omp' ? ompEvidence : evidence, {
       wiring,
       ...(key === 'hermes' ? { lifecycleWiring: hermesWiring } : {}),
       now: options.now,

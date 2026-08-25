@@ -3,12 +3,10 @@
 //
 // Cross-runtime deterministic capture floor (automation v2.1). The Claude-Code floor lives in the
 // SessionStart hook (cli.ts runSessionStartHook): it is marker-driven and fires only for Claude Code.
-// THIS is its runtime-neutral sibling — a sweep ANY MCP-server startup can fire to floor recent
-// un-journaled sessions from EVERY runtime the engine can already read (Codex, Hermes, OpenCode,
-// WorkBuddy, OpenClaw). It exists because `connect --runtime codex|hermes|...` installs the MCP server
-// but NO capture hook, so those runtimes capture only when the agent self-invokes memory.journal /
-// write_candidate — exactly the gap real test users hit ("iHow Memory doesn't auto-record; I have to
-// remind the agent").
+// THIS is its runtime-neutral sibling — a sweep ANY MCP-server startup or verified lifecycle adapter
+// can fire for runtimes whose transcripts the engine can read (Codex, OMP, Hermes, OpenCode,
+// WorkBuddy, OpenClaw). An MCP connection alone does not guarantee session-end capture; OMP invokes
+// the same sweep at lifecycle boundaries while startup remains its crash backstop.
 //
 // SAFETY PROPERTIES (kept in lockstep with the Claude floor + the OpenClaw automation-v2 sign-off):
 //   - WRITES ONLY the low-weight journal lane — never auto-recalled, excluded from default search; a
@@ -18,11 +16,11 @@
 //   - IDEMPOTENT by a COMPOSITE (runtime, sessionId) key, enforced INSIDE the workspace lock by
 //     appendFloorJournalOnce — so two MCP servers sweeping the same memory-root concurrently cannot both
 //     write the same session. The pre-filter here is only a cheap optimization; the writer is the guarantee.
-//   - SELF-EXCLUDES the live session by a generous idle threshold (FLOOR_IDLE_MS): an actively-writing
-//     session bumps its transcript mtime within the window and is skipped. (The MCP server is not told the
-//     runtime's session id, so the idle gate, not an excludeSessionId, is the real guard.) An ENDED session
-//     is idle forever and is captured on a later sweep, so a long threshold only delays an ended session's
-//     capture — it never drops it. KNOWN v1 BOUND: a session paused longer than the threshold and THEN
+//   - SELF-EXCLUDES the live session by a generous idle threshold (FLOOR_IDLE_MS), or by an exact
+//     (runtime, sessionId) key when a lifecycle adapter supplies one. An actively-writing session bumps
+//     its transcript mtime within the window and is skipped. An ENDED session is idle forever and is
+//     captured on a later sweep, so a long threshold only delays an ended session's capture — it never
+//     drops it. KNOWN v1 BOUND: a session paused longer than the threshold and THEN
 //     resumed is floored at its partial pre-pause state, and the composite (runtime, sessionId) dedup
 //     then suppresses a re-floor of the post-pause work — partial capture, still strictly better than the
 //     zero capture these hookless runtimes had before. A content-supersede pass is left for v2.
@@ -60,7 +58,7 @@ const FLOOR_MAX_PER_SWEEP = 5;
 const FLOOR_TITLE = 'auto-capture (deterministic, cross-runtime)';
 // Runtimes this sweep covers — EVERY engine-readable runtime EXCEPT claude-code, which keeps its own
 // marker-driven SessionStart floor (covering it here too would double-write across two idempotency stores).
-const SWEEP_RUNTIMES = new Set(['codex', 'hermes', 'workbuddy', 'opencode', 'openclaw']);
+const SWEEP_RUNTIMES = new Set(['codex', 'omp', 'hermes', 'workbuddy', 'opencode', 'openclaw']);
 
 export type FloorSweepOutcome =
   | 'journaled'
@@ -95,6 +93,8 @@ export type FloorSweepOptions = {
   checkpointAnchorProvider?: (projectDir: string) => ReturnType<CheckpointMachineAnchorProvider>; // controlled override; defaults to live git anchors
   runtimes?: Set<string>;
   excludeSessionId?: string; // optional; the idle gate is the primary self-exclude
+  excludeSession?: { runtime: string; sessionId: string }; // exact composite self-exclude for lifecycle adapters
+  includeSession?: { runtime: string; sessionId: string }; // exact target for a true session-end event
 };
 
 // Composite idempotency key — sessionId alone is NOT globally unique across runtimes.
@@ -222,11 +222,21 @@ export async function runCaptureFloorSweep(
   // because an exact project binding is required before any checkpoint draft can be finalized.
   let sessions: Awaited<ReturnType<typeof listResumableSessions>>;
   try {
+    const included = options.includeSession;
+    const excluded = options.excludeSession;
     sessions = await listResumableSessions(maxPerSweep * 6 + 12, options.excludeSessionId, {
       skipAnchors: true,
       resolveProject: true,
       runtimes,
     });
+    if (included) {
+      sessions = sessions.filter((session) =>
+        session.tool === included.runtime && session.sessionId === included.sessionId);
+    }
+    if (excluded) {
+      sessions = sessions.filter((session) =>
+        session.tool !== excluded.runtime || session.sessionId !== excluded.sessionId);
+    }
   } catch {
     return result; // discovery failed — nothing to do, never crash
   }
@@ -241,6 +251,9 @@ export async function runCaptureFloorSweep(
     const sessionId = typeof session.sessionId === 'string' ? session.sessionId.trim() : '';
     if (!sessionId) continue;
     if (options.excludeSessionId && sessionId === options.excludeSessionId) continue;
+    if (options.excludeSession
+      && session.tool === options.excludeSession.runtime
+      && sessionId === options.excludeSession.sessionId) continue;
     const lastMs = Date.parse(session.modifiedAt);
     if (!Number.isFinite(lastMs)) continue;
     const ageMs = now - lastMs;
@@ -267,6 +280,9 @@ export async function runCaptureFloorSweep(
       continue;
     }
     if (options.excludeSessionId && sessionId === options.excludeSessionId) continue;
+    if (options.excludeSession
+      && session.tool === options.excludeSession.runtime
+      && sessionId === options.excludeSession.sessionId) continue;
     if (flooredKeys.has(floorKey(session.tool, sessionId))) {
       result.outcomes.push({ tool: session.tool, sessionId, outcome: 'skipped-already-floored' });
       continue;
