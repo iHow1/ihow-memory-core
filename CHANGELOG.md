@@ -7,9 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 with pre-release tags.
 
 ## [Unreleased]
+
+## [0.1.0-alpha.32] — 2026-08-25
+
+### Added
+
+- **Managed OMP lifecycle.** `setup`, `connect --runtime omp`, `install-hook --runtime omp`, and `upgrade` can install and refresh a frozen OMP extension for session-start resume context, relevant prompt recall, native PreCompact checkpoints, and exact session switch/shutdown capture. OMP transcripts under `~/.omp/agent/sessions` are normalized through the shared verify-first handoff path, while capture idempotency remains keyed by the composite `(runtime, sessionId)` identity.
+- **OMP activation and capability evidence.** `doctor`, the activation ledger, and runtime capability manifests now report OMP's managed extension wiring separately from MCP reachability. A valid extension bound to another iHow workspace is `absent` for the current workspace; a same-CLI binding mismatch is `broken`.
+
 ### Changed
 
-- **Bounded memory reads.** Core, CLI, and MCP `memory.read` now return a strict 8,000-character preview by default, report truncation metadata, and require explicit `mode: "full"` / `--full` for complete content. The existing inline truncation marker is preserved inside the declared character budget, and callers can request a bounded custom preview without accidental context expansion.
+- **Bounded memory reads.** Core, CLI, console, and MCP `memory.read` now return a strict 8,000-character preview by default, report truncation metadata, and require explicit `mode: "full"` / `--full` for complete content. Callers can request a bounded custom preview, and truncation preserves the declared character budget without splitting UTF-16 surrogate pairs.
+
+### Notes
+
+- Alpha.32 is a **public alpha prerelease candidate**. npm `next` remains the source of truth for availability; publication does not activate an already-open host or replace a frozen local runtime. Existing installations must run `upgrade` and restart OMP before the new extension can load.
+- OMP lifecycle completion is replayable by the same OS user and therefore remains `READY — WAITING FOR FIRST ACTIVITY` with `ACTIVATION_COMPLETION_UNATTESTED`; this release does not claim host authentication or `ACTIVE` status from that evidence.
+- The open-source core remains local-first with no account or required cloud. Safe Memory Gardener remains review-first and report-only; this release does not add automatic authoritative-memory rewriting, production certification, complete enterprise multi-tenant authentication/RBAC/administration, or DSH/Paseo ACP lifecycle support.
 
 ## [0.1.0-alpha.31.4] — 2026-08-18
 
