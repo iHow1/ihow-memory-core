@@ -9,6 +9,15 @@ export type RuntimeLifecycleEventName =
   | 'runtime.session_finalize'
   | 'runtime.session_end';
 
+const RUNTIME_LIFECYCLE_EVENTS = new Set<RuntimeLifecycleEventName>([
+  'runtime.session_start',
+  'runtime.session_reset',
+  'runtime.before_prompt',
+  'runtime.after_turn',
+  'runtime.session_finalize',
+  'runtime.session_end',
+]);
+
 export type RuntimeLifecycleEvent = Readonly<{
   schemaVersion: 1;
   event: RuntimeLifecycleEventName;
@@ -52,6 +61,7 @@ function validateRuntimeEvent(input: RuntimeLifecycleEvent): RuntimeLifecycleEve
   if (!input || typeof input !== 'object' || input.schemaVersion !== 1) {
     throw new Error('runtime_event_schema_invalid');
   }
+  if (!RUNTIME_LIFECYCLE_EVENTS.has(input.event)) throw new Error('runtime_event_name_invalid');
   if (typeof input.runtime !== 'string' || !input.runtime.trim()) throw new Error('runtime_event_runtime_required');
   if (input.runtime.trim().length > 64) throw new Error('runtime_event_runtime_too_large');
   if (typeof input.cwd !== 'string' || !input.cwd.trim()) throw new Error('runtime_event_cwd_required');

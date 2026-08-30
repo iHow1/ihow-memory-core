@@ -129,8 +129,11 @@ npx ihow-memory@next reset --space demo
 | VS Code (Copilot) | ✓（用户级 `mcp.json`，`servers` key） | ✗ | 只能接收——可调用 `memory.search`/`read`/`continue`，但没有可读取的本地会话存储 |
 | Gemini CLI | ✓（`~/.gemini/settings.json`） | ✓（`~/.gemini/tmp/*/logs.json`） | 被动读取 Gemini 的磁盘**用户 prompt 日志**（Gemini 不在磁盘记录助手轮）→ 会话主题 + git 锚点；需手动在 `GEMINI.md` 加提示。已对真实本地数据验证 |
 | Cline (VS Code) | —（经 Cline 自己的 MCP 设置接入） | ✓（`globalStorage` / `~/.cline/data`） | 被动读取 `tasks/<id>/api_conversation_history.json`；cwd 取自 `environment_details`。已 fixture 测试，尚未真机 smoke |
+| DeepSeek Harness（DSH） | 独立 [`dsh-ihow-memory`](https://github.com/iHow1/dsh-ihow-memory) 包 | checkpoint/MCP | 已对官方 `0.1.1-rc.2` Host 做单机 smoke：启动交接、首步召回、轮后观测、原生压缩与不完整 session-end checkpoint；适配器精确锁定 Core |
 
 MCP 工具与治理闭环与 runtime 无关。Claude Code 使用 skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks；Codex 使用原生 SessionStart / PreCompact / UserPromptSubmit hooks，并由 `~/.codex/AGENTS.md` 提供主动记忆循环。OMP 使用托管扩展接入 `session_start`、`before_agent_start`、原生 PreCompact 与会话切换/退出捕获；其可读 JSONL 会话同时供 `memory.continue` 和 crash-floor sweep 使用。Hermes 的 `connect` / `setup` 会把两类包内适配器安装到 `$HERMES_HOME/plugins`，启用 `ihow-memory`，选择 `memory.provider=ihow-memory-compaction`，并把两者绑定到该 workspace 中经过完整性校验的冻结 bridge；若已配置其他外部 MemoryProvider，会在写入前拒绝覆盖，配置/插件/MCP 任一步失败则回滚本轮变更。预压缩交接保持有界且不含 transcript 原文，但在现场锚点核验前始终明确标为 `UNVERIFIED`，不等于 `ACTIVE` 或宿主认证。Resume 提示会自动注入到配置暴露了指令文件的 runtime（Claude Code、WorkBuddy、OpenClaw、Hermes、OpenCode）。
+
+DeepSeek Harness 支持刻意不进入 `connect` 与 `setup`：独立发布的 `dsh-ihow-memory` Bundle 负责 DSH Profile 安装、MCP 工具挂载和原生 Host 事件监听；Alpha.33 只提供有界 Core 契约与能力证据。发布 Core 不会安装或激活适配器，目标 DSH Profile 必须单独安装并重启。DSH 会话启动复用 verify-first checkpoint/MCP 交接路径；当前 Core 不把 DSH 持久化格式作为原生 transcript source 解析。
 
 ## 检索引擎
 
@@ -327,9 +330,9 @@ Hosted runtime 不包含在本 npm 包与本仓库中。
 
 ## 状态
 
-Alpha.32 预发布候选 `0.1.0-alpha.32`（仅本地达到 release-ready；上方 npm 徽章显示当前已发布版本，详见 [CHANGELOG.md](./CHANGELOG.md)）。成熟度为 **alpha + 单机真机 smoke**：Claude Code 每日 dogfood，拥有最完整的原生 Hook 路径；Codex 有原生 SessionStart / PreCompact / UserPromptSubmit Hook 与主动 AGENTS 记忆循环；OMP 现有托管生命周期扩展与可读本地会话；Hermes 包含包内 lifecycle 与 compaction 适配器；其他 runtime 的较窄证据以 [Runtime 支持](#runtime-支持)为准。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 验证；原生 Windows 为**实验性**，受支持路径为 WSL。npm 包内含编译后的 CLI、stdio MCP server、只读本地 console、OMP 生命周期扩展、Hermes 包内适配器、隐私契约与 evidence-first 发布资产。Alpha 版本间可能有破坏性变更。
+Alpha.33 预发布候选 `0.1.0-alpha.33`（仅本地达到 release-ready；上方 npm 徽章显示当前已发布版本，详见 [CHANGELOG.md](./CHANGELOG.md)）。成熟度为 **alpha + 单机真机 smoke**：Claude Code 每日 dogfood，拥有最完整的原生 Hook 路径；Codex 有原生 SessionStart / PreCompact / UserPromptSubmit Hook 与主动 AGENTS 记忆循环；OMP 现有托管生命周期扩展与可读本地会话；Hermes 包含包内 lifecycle 与 compaction 适配器；独立发布的 DSH 适配器已对官方 `0.1.1-rc.2` Host 做单机 smoke；其他 runtime 的较窄证据以 [Runtime 支持](#runtime-支持)为准。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 验证；原生 Windows 为**实验性**，受支持路径为 WSL。npm 包内含编译后的 CLI、stdio MCP server、只读本地 console、OMP 生命周期扩展、Hermes 包内适配器、DSH Core 契约、隐私契约与 evidence-first 发布资产。Alpha 版本间可能有破坏性变更。
 
-**Alpha.32 工程细节：** Core、CLI、console 与 MCP 读取默认限制为 8,000 字符预览，只有显式请求才返回完整内容；同时加入 OMP 会话启动/提示召回、原生 PreCompact checkpoint、精确的会话切换/退出捕获、会话发现、托管接线验证、激活证据和 runtime capability。可重放的 managed lifecycle 完成证据仍是 `ACTIVATION_COMPLETION_UNATTESTED`，不能宣称 `ACTIVE`。npm `@next` 继续作为软件包可用性的真相源；发布本身不会更新冻结 runtime，也不会认证宿主。
+**Alpha.33 工程细节：** 新增有界 DSH Host 适配 API 与能力证据，覆盖会话启动交接注入、首步 prompt 召回、轮后观测、原生压缩 checkpoint 和不完整 session-end checkpoint。激活证据中的配置、会话、prompt 与 checkpoint 输入保持哈希化或省略。可重放的 managed lifecycle 完成证据仍是 `ACTIVATION_COMPLETION_UNATTESTED`，不能宣称 `ACTIVE`；仅发布 Core 不会安装、更新或激活 `dsh-ihow-memory`。npm `@next` 继续作为软件包可用性的真相源。
 
 **Alpha.31.2 工程细节：** 让软件包更新具备可恢复性，同时不把用户配置当成版本状态。Claude Code/Codex Hook 固定使用字节稳定的 `.runtime/cli.js` 启动器，随版本变化的实现在 `cli-runtime.js`；一次成功升级只为旧安装刷新一次激活证据，不改写正确的 Hook 文件，此后的普通实现更新不会再改变 Hook 配置或代际。runtime 替换保留两代自校验目录，新 MCP server 探活失败时恢复精确的上一代。`upgrade --runtime <name>` 可对单个过期宿主注册做有边界的修复；若冻结升级器本身已损坏，还可从新下载的软件包运行 `rescue`。Alpha.31.1 的 WorkBuddy 生效路径、Codex 最小权限/事务回滚与零运行时依赖修复继续保留。这里证明的是文档所述更新与救援合同，并不宣称所有宿主生命周期都已 `ACTIVE`；在缺少生命周期证据时，`doctor` 仍可能报告 `TOOLS ONLY`、`READY — WAITING FOR FIRST ACTIVITY` 或 `NEEDS REPAIR`。npm `@next` 是软件包可用性的真相源；发布本身不会更新已经冻结的 runtime，也不代表生产认证。Alpha.31 的 review-first 边界保持不变：持续整理仅 report-only，绝不会自动改写权威记忆；Grounded Media 只输出 `EQUAL_UNTRUSTED`；Activity Ledger 的 `COMMITTED` 不代表任务成功。
 

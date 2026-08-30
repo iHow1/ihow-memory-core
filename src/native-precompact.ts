@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 iHow Memory
-//
 // Host-specific PreCompact adapters. Inputs are normalized into an exact, bounded discriminated
 // union. Transcript/custom-instruction bytes are never read or persisted: at most an in-memory hash
 // reference is retained long enough to derive a privacy-safe dedupe key.
@@ -63,13 +62,18 @@ export type OmpPreCompactTrigger = NativePreCompactCommon & {
   trigger: 'manual' | 'auto';
 };
 
+export type DshPreCompactTrigger = NativePreCompactCommon & {
+  runtime: 'dsh';
+  trigger: 'auto';
+};
+
 export type HermesPreCompactTrigger = NativePreCompactCommon & {
   runtime: 'hermes';
   trigger: 'auto';
 };
 
 export type HostNativePreCompactTrigger = ClaudePreCompactTrigger | CodexPreCompactTrigger | OmpPreCompactTrigger;
-export type NativePreCompactTrigger = HostNativePreCompactTrigger | HermesPreCompactTrigger;
+export type NativePreCompactTrigger = HostNativePreCompactTrigger | DshPreCompactTrigger | HermesPreCompactTrigger;
 
 export type NativePreCompactResult = {
   status: 'completed';
@@ -215,6 +219,42 @@ export function normalizeNativePreCompactTrigger(
   };
 }
 
+export function normalizeDshPreCompactTrigger(input: {
+  cwd: string;
+  sessionId: string;
+  observedAt?: string;
+  turn?: number;
+  startSeq?: number;
+  endSeq?: number;
+}): DshPreCompactTrigger {
+  const cwd = boundedString(input.cwd, 'native_precompact_cwd_invalid', CWD_MAX);
+  const sessionId = boundedString(input.sessionId, 'native_precompact_session_invalid', ID_MAX);
+  const seenAt = observedAt(input.observedAt);
+  const coordinates = [input.turn, input.startSeq, input.endSeq];
+  if (coordinates.some((value) => value !== undefined && (!Number.isSafeInteger(value) || value < 0))) {
+    fail('native_precompact_dsh_coordinate_invalid');
+  }
+  const key = dedupeKey({
+    runtime: 'dsh',
+    event: 'PreCompact',
+    cwd,
+    sessionId,
+    turn: input.turn ?? null,
+    startSeq: input.startSeq ?? null,
+    endSeq: input.endSeq ?? null,
+  });
+  return {
+    runtime: 'dsh',
+    event: 'PreCompact',
+    project: { cwd },
+    session: { id: sessionId },
+    observedAt: seenAt,
+    delivery: { mode: 'best_effort', dedupeKey: key },
+    usage: { status: 'unknown' },
+    trigger: 'auto',
+  };
+}
+
 function isMinimalShadowDraft(draft: CheckpointDraftV1): boolean {
   return (
     !draft.finalization
@@ -270,7 +310,9 @@ export async function runNativePreCompact(
           ? 'Codex.PreCompact'
           : contract.runtime === 'omp'
             ? 'OMP.PreCompact'
-            : 'Hermes.MemoryProvider.on_pre_compress';
+            : contract.runtime === 'dsh'
+              ? 'DSH.SessionEvent.compaction_summary'
+              : 'Hermes.MemoryProvider.on_pre_compress';
       const replayAgeMs = Date.parse(contract.observedAt) - Date.parse(receipt.completedAt);
       // Never dedupe from recency alone. The private receipt binds the exact normalized delivery key to
       // the still-latest finalized draft/artifact, and any newly opened cooperative draft bypasses this
@@ -307,7 +349,7 @@ export async function runNativePreCompact(
   // The MemoryProvider hook has no exact durable turn-receipt binding. It may preserve bounded
   // cooperative claims, but it cannot promote their protection truth: an asserted complete draft is
   // downgraded until the existing session-end path proves every known receipt closed.
-  if (contract.runtime === 'hermes' && draft?.coverage.complete) {
+  if ((contract.runtime === 'hermes' || contract.runtime === 'dsh') && draft?.coverage.complete) {
     draft = await core.checkpoints.updateDraft(draft.draftId, {
       claims: {
         ...draft.claims,
@@ -334,7 +376,9 @@ export async function runNativePreCompact(
       ? 'Codex.PreCompact'
       : contract.runtime === 'omp'
         ? 'OMP.PreCompact'
-        : 'Hermes.MemoryProvider.on_pre_compress';
+        : contract.runtime === 'dsh'
+          ? 'DSH.SessionEvent.compaction_summary'
+          : 'Hermes.MemoryProvider.on_pre_compress';
   const result = await core.checkpoints.finalizeDraft(draft.draftId, {
     trigger: {
       kind: 'pre_compact',

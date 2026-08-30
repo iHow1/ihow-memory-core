@@ -10,7 +10,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { canonicalCheckpointJson } from '../src/checkpoint-schema.ts';
 import { locateCheckpointDrafts, resolveCheckpointProjectIdentity } from '../src/checkpoints.ts';
-import { normalizeNativePreCompactTrigger } from '../src/native-precompact.ts';
+import { normalizeDshPreCompactTrigger, normalizeNativePreCompactTrigger, runNativePreCompact } from '../src/native-precompact.ts';
 import { openCore } from '../src/core.ts';
 import { readActivationEvidence } from '../src/activation-ledger.ts';
 import { deriveRuntimeActivation } from '../src/automation-doctor.ts';
@@ -136,6 +136,50 @@ test('Claude and Codex normalize to distinct exact contracts without pseudo-symm
   assert.equal(JSON.stringify(codex).includes(secret), false);
   assert.equal('unknown_future_field' in claude, false);
   assert.equal('unknown_future_field' in codex, false);
+});
+
+test('DSH compaction normalizes to a bounded metadata-only checkpoint trigger', async (t) => {
+  const { project } = await fixture(t, 'dsh-contract');
+  const contract = normalizeDshPreCompactTrigger({
+    cwd: project,
+    sessionId: 'dsh-session-1',
+    observedAt: '2026-08-25T12:00:00.000Z',
+    turn: 4,
+    startSeq: 1,
+    endSeq: 8,
+  });
+
+  assert.equal(contract.runtime, 'dsh');
+  assert.equal(contract.trigger, 'auto');
+  assert.equal(contract.session.id, 'dsh-session-1');
+  assert.match(contract.delivery.dedupeKey, /^[a-f0-9]{64}$/);
+  assert.equal('transcriptRef' in contract, false);
+  assert.equal('model' in contract, false);
+  assert.throws(() => normalizeDshPreCompactTrigger({
+    cwd: project,
+    sessionId: 'dsh-session-1',
+    startSeq: -1,
+  }), /native_precompact_dsh_coordinate_invalid/);
+});
+
+test('DSH compaction writes a Core checkpoint with the native DSH source event', async (t) => {
+  const f = await fixture(t, 'dsh-checkpoint');
+  const contract = normalizeDshPreCompactTrigger({
+    cwd: f.project,
+    sessionId: 'dsh-session-1',
+    observedAt: '2026-08-25T12:00:00.000Z',
+    turn: 4,
+    startSeq: 1,
+    endSeq: 8,
+  });
+
+  const result = await runNativePreCompact(contract, { root: f.root, space: f.space, cwd: f.project });
+  assert.equal(result.status, 'completed');
+  const core = await openCore({ root: f.root, space: f.space, cwd: f.project });
+  const artifact = await core.checkpoints.read(result.artifactId);
+  assert.equal(artifact.trigger.sourceEvent, 'DSH.SessionEvent.compaction_summary');
+  assert.equal(artifact.trigger.signal, 'shadow');
+  assert.equal(artifact.coverage.complete, false);
 });
 
 test('normalization tolerates missing/null transcript refs but rejects wrong host fields and oversized codes', async (t) => {

@@ -77,7 +77,7 @@ export type AppendActivationEvidenceInput = {
 export const ACTIVATION_LEDGER_FILE = 'activation-ledger.ndjson';
 
 const KNOWN_RUNTIMES = new Set([
-  'claude-code', 'codex', 'omp', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw',
+  'claude-code', 'codex', 'dsh', 'omp', 'cursor', 'workbuddy', 'claude-desktop', 'opencode', 'hermes', 'openclaw',
   'vscode', 'gemini', 'no-hook', 'unknown',
 ]);
 const KNOWN_EVENTS = new Set<ActivationEvidenceEvent>([

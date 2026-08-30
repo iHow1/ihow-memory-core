@@ -140,3 +140,14 @@ test('invalid or oversized runtime event data is rejected before persistence', (
     observedAt: '2026-07-12T00:00:00.000Z',
   }), /runtime_event_cwd_too_large/);
 });
+
+test('unknown runtime lifecycle event names fail closed', () => {
+  assert.throws(() => runtimeEventToContextProbe({
+    schemaVersion: 1,
+    event: 'runtime.unknown',
+    runtime: 'dsh',
+    cwd: '/repo',
+    sessionId: 'session-1',
+    observedAt: '2026-08-25T00:00:00.000Z',
+  }), /runtime_event_name_invalid/);
+});

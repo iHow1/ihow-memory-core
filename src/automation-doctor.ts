@@ -14,7 +14,7 @@ import { verifyRuntimeHookWiring, type RuntimeHookWiring } from './hook-wiring.t
 import { inspectHermesInstallationWiring, resolveHermesHome } from './hermes-wiring.ts';
 import { verifyOmpExtensionWiring, type OmpWiring } from './omp-wiring.ts';
 
-export type AutomationRuntime = 'claude-code' | 'codex' | 'omp' | 'openclaw' | 'hermes' | 'no-hook';
+export type AutomationRuntime = 'claude-code' | 'codex' | 'dsh' | 'omp' | 'openclaw' | 'hermes' | 'no-hook';
 export type AutomationStatus = 'OK' | 'WARN' | 'BROKEN';
 export type ActivationStatus = 'ACTIVE' | 'READY — WAITING FOR FIRST ACTIVITY' | 'TOOLS ONLY' | 'NEEDS REPAIR';
 export type ActivationReasonCode =
@@ -100,6 +100,13 @@ const ROWS: Array<Omit<AutomationMatrixRow, 'status' | 'notes' | 'probeCalls' | 
     promptRecall: 'extension before_agent_start',
     sessionEndCapture: 'extension session_shutdown/switch',
     floorFallback: 'session-end capture + startup sweep',
+  },
+  {
+    runtime: 'DSH',
+    sessionStartResume: 'agent/session-start',
+    promptRecall: 'agent/pre-step',
+    sessionEndCapture: 'agent/disposed',
+    floorFallback: 'native compaction checkpoint',
   },
   {
     runtime: 'OpenClaw',
