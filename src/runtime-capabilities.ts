@@ -55,7 +55,23 @@ const OMP_LIFECYCLE: RuntimeLifecycleCapabilities = Object.freeze({
   preCompact: 'native',
 });
 
+const DSH_LIFECYCLE: RuntimeLifecycleCapabilities = Object.freeze({
+  sessionStart: true,
+  sessionReset: true,
+  beforePrompt: true,
+  afterTurn: true,
+  sessionFinalize: true,
+  sessionEnd: true,
+  preCompact: 'native',
+});
+
 const KNOWN: Readonly<Record<string, RuntimeCapabilityManifest>> = Object.freeze({
+  dsh: Object.freeze({
+    runtime: 'dsh',
+    mcpTools: true,
+    readableTranscript: true,
+    lifecycle: DSH_LIFECYCLE,
+  }),
   hermes: Object.freeze({
     runtime: 'hermes',
     mcpTools: true,

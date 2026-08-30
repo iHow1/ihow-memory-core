@@ -8,6 +8,23 @@ with pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.33] — 2026-08-26
+
+### Added
+
+- **DeepSeek Harness lifecycle contract.** Core exposes a bounded DSH host-adapter API for session-start handoff injection, first-step prompt recall, after-turn observation, native compaction checkpoints, and partial session-end checkpoints. Activation evidence keeps configuration, session, prompt, and checkpoint inputs hashed or omitted; replayable local completion remains `READY — WAITING FOR FIRST ACTIVITY` with `ACTIVATION_COMPLETION_UNATTESTED`, never authenticated `ACTIVE`.
+- **DSH capability evidence.** Runtime capability and automation reports identify the official `agent/session-start`, `agent/pre-step`, `session/event`, and `agent/disposed` surfaces without claiming that Core installs or manages a DSH profile.
+
+### Changed
+
+- **Reusable Core/adapter boundary.** DSH-only lifecycle behavior now reuses Core handoff, context-probe, checkpoint, semantic-fallback, activation-ledger, and storage contracts instead of duplicating them in the separately distributed adapter.
+
+### Notes
+
+- Alpha.33 is a **public alpha prerelease candidate** for the separately versioned `dsh-ihow-memory` adapter. Core publication alone does not install, update, or activate that adapter; the adapter pins an exact Core version, requires its own release, and must be installed and restarted in the target DSH profile.
+- DSH evidence in this release is one-machine Host smoke against the official `0.1.1-rc.2` lifecycle. The adapter remains fail-open for model execution, and session-end checkpoints intentionally report incomplete coverage rather than inventing a transcript-backed completion claim.
+- npm `next` remains the source of truth for availability. Safe Memory Gardener remains review-first and report-only; this release does not add automatic authoritative-memory rewriting, production certification, or complete enterprise multi-tenant authentication/RBAC/administration.
+
 ## [0.1.0-alpha.32] — 2026-08-25
 
 ### Added

@@ -26,7 +26,7 @@ import type { RollbackResult } from './governance.ts';
 import { readEventsAllLanes, mcpLaneWorkspace } from './store/events.ts';
 import type { MemoryEvent } from './store/events.ts';
 import { countIndexedDocuments } from './engine/fts.ts';
-import { engineStatus, indexWithEngineFallback, resolveEngineConfig, searchWithEngineFallback } from './engine/retrieval.ts';
+import { engineStatus, indexWithEngineFallback, resolveEngineConfig, searchWithEngineFallback, semanticRecallFloor } from './engine/retrieval.ts';
 import { recallReadiness } from './recall-readiness.ts';
 import { filterForgotten, forgetPath, listForgotten, rememberPath } from './forget.ts';
 import type { ForgetOutcome, RememberOutcome } from './forget.ts';
@@ -42,6 +42,27 @@ import {
   type CaptureTurnDeltaResultV1,
   type MemoryDeltaV1,
 } from './capture-intents.ts';
+import { contextProbe } from './context-probe.ts';
+import { buildHandoffPacket } from './handoff.ts';
+import { checkpointDraftFinalizationPrecondition, collectLiveCheckpointMachineAnchors } from './checkpoints.ts';
+import { runtimeEventToContextProbe, type RuntimeLifecycleEvent } from './runtime-events.ts';
+import { applySemanticEngine } from './semantic.ts';
+import { appendActivationEvidenceFailOpen } from './activation-ledger.ts';
+
+export type RuntimeEventResult = {
+  event: RuntimeLifecycleEvent['event'];
+  context?: string;
+  citations: string[];
+  checkpointId?: string;
+  checkpointSkipped?: string;
+  verdict: 'GREEN' | 'YELLOW' | 'RED' | 'NONE';
+};
+
+export type RuntimeEventOptions = {
+  source?: 'native-hook' | 'managed-hook';
+  configurationKey?: string;
+  workspace?: WorkspaceOptions;
+};
 
 export type MemoryCore = {
   workspace: Workspace;
@@ -70,6 +91,8 @@ export type MemoryCore = {
   turnReceipts: TurnReceiptService;
   captureTurnDelta(input: MemoryDeltaV1, options?: CaptureTurnDeltaOptionsV1): Promise<CaptureTurnDeltaResultV1>;
   recoverCaptureIntents(): Promise<CaptureIntentRecoveryResultV1>;
+  configure_runtime(runtime: string, options?: RuntimeEventOptions): Promise<void>;
+  runtime_event(event: RuntimeLifecycleEvent, options?: RuntimeEventOptions): Promise<RuntimeEventResult>;
 };
 
 function excerpt(content: string, max = 300): string {
@@ -99,8 +122,10 @@ function boundedContent(content: string, mode: ReadMode, maxChars: number | unde
 }
 
 export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCore> {
-  const workspace = await ensureWorkspace(resolveWorkspace(options));
-  const engineConfig = resolveEngineConfig(options);
+  const initialWorkspace = resolveWorkspace(options);
+  const effectiveOptions = applySemanticEngine(initialWorkspace, options);
+  const workspace = await ensureWorkspace(resolveWorkspace(effectiveOptions));
+  const engineConfig = resolveEngineConfig(effectiveOptions);
   const checkpoints = await createCheckpointService(workspace, options);
   const turnReceipts = createTurnReceiptService(workspace);
   const captureIntents = createCaptureIntentService(workspace, turnReceipts);
@@ -111,6 +136,130 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
     turnReceipts,
     captureTurnDelta: captureIntents.captureTurnDelta,
     recoverCaptureIntents: captureIntents.recoverCaptureIntents,
+    async configure_runtime(runtime, runtimeOptions = {}) {
+      if (runtime.trim().toLowerCase() !== 'dsh') throw new Error('runtime_adapter_unsupported');
+      if (!runtimeOptions.configurationKey) throw new Error('runtime_configuration_key_required');
+      await appendActivationEvidenceFailOpen(workspace, {
+        runtime,
+        event: 'runtime-configured',
+        source: runtimeOptions.source ?? 'managed-hook',
+        status: 'configured',
+        dedupeKey: runtimeOptions.configurationKey,
+        configurationKey: runtimeOptions.configurationKey,
+      });
+    },
+    async runtime_event(event, runtimeOptions = {}) {
+      if (runtimeOptions.workspace) {
+        const eventCore = await openCore({ ...effectiveOptions, ...runtimeOptions.workspace, cwd: event.cwd, space: runtimeOptions.workspace.space });
+        return eventCore.runtime_event(event, { ...runtimeOptions, workspace: undefined });
+      }
+      const request = runtimeEventToContextProbe(event);
+      if (event.runtime.trim().toLowerCase() !== 'dsh') throw new Error('runtime_adapter_unsupported');
+      const runtime = event.runtime.trim().toLowerCase();
+      const source = runtimeOptions.source ?? 'native-hook';
+      const eventMap = {
+        'runtime.session_start': 'hook-session-start',
+        'runtime.session_reset': 'hook-session-start',
+        'runtime.before_prompt': 'hook-user-prompt-submit',
+        'runtime.after_turn': 'hook-session-end',
+        'runtime.session_finalize': 'hook-session-end',
+        'runtime.session_end': 'hook-session-end',
+      } as const;
+      const eventDedupeKey = `${event.event}:${event.sessionId ?? ''}:${event.observedAt}`;
+      await appendActivationEvidenceFailOpen(workspace, {
+        runtime,
+        event: eventMap[event.event],
+        source,
+        status: 'observed-live-started',
+        observedAt: event.observedAt,
+        dedupeKey: `${eventDedupeKey}:started`,
+        ...(runtimeOptions.configurationKey ? { configurationKey: runtimeOptions.configurationKey } : {}),
+      });
+      try {
+        let context: string | undefined;
+        let citations: string[] = [];
+        let verdict: RuntimeEventResult['verdict'] = 'NONE';
+        if (event.event === 'runtime.session_start' || event.event === 'runtime.session_reset') {
+          const packet = await buildHandoffPacket({
+            cwd: event.cwd,
+            limit: 3,
+            excludeSessionId: event.sessionId,
+            workspace,
+          });
+          if (packet.candidates.length > 0) {
+            context = JSON.stringify(packet, null, 2);
+            citations = packet.candidates.slice(0, 3).map((candidate) => `${candidate.narrative.source}:${candidate.narrative.sessionId}`);
+            verdict = packet.candidates[0]?.verdict.state ?? 'NONE';
+          }
+        } else if (request) {
+          const output = await contextProbe(workspace, request, {
+            search: async (query, searchOptions) => {
+              const hits = (await searchWithEngineFallback(workspace, engineConfig, query, searchOptions)).hits;
+              return searchOptions?.includeForgotten === true ? hits : await filterForgotten(workspace, hits);
+            },
+            semanticFloor: semanticRecallFloor(engineConfig.vectorModel),
+          });
+          context = typeof output.injectText === 'string' && output.injectText.trim() ? output.injectText : undefined;
+          citations = output.citations ?? [];
+          verdict = output.verdict;
+        }
+        let checkpointId: string | undefined;
+        let checkpointSkipped: string | undefined;
+        if (event.event === 'runtime.session_finalize') {
+          try {
+            const draft = await checkpoints.createDraft({
+              runtime,
+              ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+              claims: { coverage: { complete: false, eventCount: 0 } },
+            });
+            const checkpoint = await checkpoints.finalizeDraft(
+              draft.draftId,
+              {
+                trigger: {
+                  kind: 'session_end',
+                  signal: 'native',
+                  sourceEvent: 'DSH.AgentRegistry.dispose',
+                  reasonCode: 'dsh_lifecycle_checkpoint_partial',
+                },
+              },
+              () => collectLiveCheckpointMachineAnchors(event.cwd),
+              checkpointDraftFinalizationPrecondition(draft),
+            );
+            checkpointId = checkpoint.artifact.id;
+          } catch (error) {
+            checkpointSkipped = error instanceof Error ? error.message.slice(0, 128) : 'checkpoint_failed';
+          }
+        }
+        await appendActivationEvidenceFailOpen(workspace, {
+          runtime,
+          event: eventMap[event.event],
+          source,
+          status: 'observed-live-completed',
+          observedAt: event.observedAt,
+          dedupeKey: `${eventDedupeKey}:completed`,
+          ...(runtimeOptions.configurationKey ? { configurationKey: runtimeOptions.configurationKey } : {}),
+        });
+        return {
+          event: event.event,
+          ...(context ? { context } : {}),
+          citations,
+          ...(checkpointId ? { checkpointId } : {}),
+          ...(checkpointSkipped ? { checkpointSkipped } : {}),
+          verdict,
+        };
+      } catch (error) {
+        await appendActivationEvidenceFailOpen(workspace, {
+          runtime,
+          event: eventMap[event.event],
+          source,
+          status: 'failed',
+          observedAt: event.observedAt,
+          dedupeKey: `${eventDedupeKey}:failed`,
+          ...(runtimeOptions.configurationKey ? { configurationKey: runtimeOptions.configurationKey } : {}),
+        });
+        throw error;
+      }
+    },
     async search(query, opts = {}) {
       if (typeof query !== 'string' || !query.trim()) return [];
       const hits = (await searchWithEngineFallback(workspace, engineConfig, query, opts)).hits;

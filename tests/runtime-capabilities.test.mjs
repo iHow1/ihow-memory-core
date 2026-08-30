@@ -42,6 +42,23 @@ test('OMP manifest exposes the managed extension lifecycle', () => {
   assert.equal(runtimeAutomationCeiling(manifest), 'lifecycle-capable');
 });
 
+test('DSH manifest exposes native session, prompt, turn, shutdown, and compaction surfaces', () => {
+  const manifest = runtimeCapabilityManifest('dsh');
+
+  assert.equal(manifest.runtime, 'dsh');
+  assert.equal(manifest.mcpTools, true);
+  assert.equal(manifest.readableTranscript, true);
+  assert.deepEqual(manifest.lifecycle, {
+    sessionStart: true,
+    sessionReset: true,
+    beforePrompt: true,
+    afterTurn: true,
+    sessionFinalize: true,
+    sessionEnd: true,
+    preCompact: 'native',
+  });
+  assert.equal(runtimeAutomationCeiling(manifest), 'lifecycle-capable');
+});
 test('capability ceilings describe host potential, never live activation', () => {
   assert.equal(runtimeAutomationCeiling(runtimeCapabilityManifest('hermes')), 'lifecycle-capable');
   assert.equal(runtimeAutomationCeiling(runtimeCapabilityManifest('workbuddy')), 'tools-only');
