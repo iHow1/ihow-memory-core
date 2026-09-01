@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const RELEASE_VERSION = '0.1.0-alpha.33';
+const RELEASE_VERSION = '0.1.0-alpha.34';
 
 function readRoot(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8');
@@ -29,7 +29,7 @@ function releaseSection(changelog, version) {
   return match[1];
 }
 
-test('alpha.33 prerelease metadata and docs stay truthful and aligned', () => {
+test('alpha.34 prerelease metadata and docs stay truthful and aligned', () => {
   const manifest = JSON.parse(readRoot('package.json'));
   const lock = JSON.parse(readRoot('package-lock.json'));
   assert.equal(manifest.version, RELEASE_VERSION);
@@ -39,7 +39,14 @@ test('alpha.33 prerelease metadata and docs stay truthful and aligned', () => {
   assert.deepEqual(lock.packages?.['']?.dependencies ?? {}, {}, 'lockfile preserves the zero-runtime-dependency contract');
 
   const changelog = readRoot('CHANGELOG.md');
-  const alpha33 = releaseSection(changelog, RELEASE_VERSION);
+  const alpha34 = releaseSection(changelog, RELEASE_VERSION);
+  assert.match(alpha34, /Project-scoped automatic handoff injection/i);
+  assert.match(alpha34, /current repository or directory/i);
+  assert.match(alpha34, /memory\.continue/i);
+  assert.match(alpha34, /cross-project discovery/i);
+  assert.match(alpha34, /npm `?next`?.*(?:source of truth|availability)/i);
+
+  const alpha33 = releaseSection(changelog, '0.1.0-alpha.33');
   assert.match(alpha33, /DeepSeek Harness lifecycle contract/i);
   assert.match(alpha33, /session-start handoff injection/i);
   assert.match(alpha33, /first-step prompt recall/i);
@@ -117,12 +124,12 @@ test('alpha.33 prerelease metadata and docs stay truthful and aligned', () => {
   assert.match(alpha31, /(?:no|not)[^\n]*(?:APPLIED|authoritative write)/i);
 
   const readmes = [
-    ['README.md', readRoot('README.md'), /Alpha\.33 prerelease/i, /npm `?@?next`?[^\n]*(?:source of truth|availability)/i],
-    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.33 预发布/i, /npm `?@?next`?[^\n]*(?:真相源|可用)/i],
+    ['README.md', readRoot('README.md'), /Alpha\.34 prerelease/i, /npm `?@?next`?.*(?:source of truth|availability)/i],
+    ['README.zh-CN.md', readRoot('README.zh-CN.md'), /Alpha\.34 预发布/i, /npm `?@?next`?.*(?:真相源|可用)/i],
   ];
   for (const [name, readme, versionLabel, registryTruth] of readmes) {
-    assert.match(readme, /0\.1\.0-alpha\.33/, `${name} states the prerelease version`);
-    assert.match(readme, versionLabel, `${name} identifies the alpha.33 surface`);
+    assert.match(readme, /0\.1\.0-alpha\.34/, `${name} states the prerelease version`);
+    assert.match(readme, versionLabel, `${name} identifies the alpha.34 surface`);
     assert.match(readme, /\.workbuddy\/\.mcp\.json/, `${name} states WorkBuddy's effective user-scope path`);
     assert.doesNotMatch(readme, /\.workbuddy\/mcp\.json/, `${name} does not advertise WorkBuddy's obsolete user-scope path`);
     assert.match(readme, /report-only/i, `${name} preserves report-only consolidation truth`);
