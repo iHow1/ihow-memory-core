@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -52,9 +53,20 @@ test('development evidence verifies legal files but is not release eligible', ()
       assert.match(manifest.legal.files[required].sha256, /^[a-f0-9]{64}$/);
     }
 
-    const checksums = fs.readFileSync(path.join(output, 'checksums.txt'), 'utf8');
-    assert.match(checksums, /release-evidence\.json/);
-    assert.match(checksums, /ihow-memory-.*\.tgz/);
+    const checksums = fs.readFileSync(path.join(output, 'checksums.txt'), 'utf8').trim().split('\n');
+    assert.equal(checksums.length, 6, 'tarball, manifest, and all four legal files are mandatory');
+    for (const line of checksums) {
+      const match = /^([a-f0-9]{64})  (.+)$/.exec(line);
+      assert.ok(match, `checksum line has canonical syntax: ${line}`);
+      const target = path.resolve(root, match[2]);
+      assert.ok(fs.existsSync(target), `checksum target exists from the release workflow cwd: ${match[2]}`);
+      const actual = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+      assert.equal(actual, match[1], `checksum verifies from the release workflow cwd: ${match[2]}`);
+    }
+
+    const releaseWorkflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
+    assert.match(releaseWorkflow, /sha256sum --check release-evidence\/checksums\.txt/);
+    assert.doesNotMatch(releaseWorkflow, /--ignore-missing/);
   } finally {
     fs.rmSync(output, { recursive: true, force: true });
   }
