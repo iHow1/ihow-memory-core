@@ -19,7 +19,7 @@ Requires Node.js >= 22.12 on macOS or Linux. WSL is supported; native Windows is
 ### Set up
 
 ```bash
-npx ihow-memory@next setup
+npx ihow-memory setup
 ```
 
 `setup` detects supported runtimes, backs up configuration before editing it, connects the local MCP server, and reports what is verified, pending, or needs a restart.
@@ -27,7 +27,7 @@ npx ihow-memory@next setup
 ### Run the proof
 
 ```bash
-npx ihow-memory@next proof
+npx ihow-memory proof
 ```
 
 The proof uses only synthetic data in a throwaway git repo and temporary memory workspace. It demonstrates an **UNVERIFIED** prior-agent narrative, matching live anchors earning **GREEN**, later repo drift forcing **RED**, and agent A's governed memory reaching agent B with a citation and audit event. It does not edit your project or runtime configuration.
@@ -44,7 +44,7 @@ Want to inspect before running? Read the [30–45 second evidence storyboard](./
 
 Git repos provide the strongest branch / HEAD / dirty anchors. Non-git workspaces still get file-fingerprint drift checks, but not commit-level GREEN/RED.
 
-**Alpha boundary:** Claude Code is the daily-dogfooded path. Other listed runtimes have narrower single-machine smoke coverage, and some are receive-only. Default retrieval is lexical FTS5, not semantic recall. Expect breaking alpha changes; check [Runtime support](#runtime-support) and [Limitations](#limitations) before production use.
+**Evidence boundary:** Claude Code is the daily-dogfooded path. Other listed runtimes have narrower single-machine smoke coverage, and some are receive-only. Default retrieval is lexical FTS5, not semantic recall. Experimental surfaces may change; check [Runtime support](#runtime-support) and [Limitations](#limitations) before production use.
 
 If agent resets have cost you real work, [star iHow Memory](https://github.com/iHow1/ihow-memory-core) so other developers can find the project—and tell us which handoff you need next.
 
@@ -53,7 +53,7 @@ If agent resets have cost you real work, [star iHow Memory](https://github.com/i
 After `/clear`, a new session, or a switch to another supported runtime:
 
 ```bash
-npx ihow-memory@next continue            # optional repo keyword: continue <name>
+npx ihow-memory continue            # optional repo keyword: continue <name>
 ```
 
 `continue` carries the previous narrative as **UNVERIFIED** and gives the receiver machine anchors to re-check before acting. GREEN is deliberately narrow; drift or conflict forces RED. If this is your first run and there is no captured session yet, the CLI says that plainly and points back to `proof` instead of printing an empty handoff envelope. In Claude Code you can simply say “continue” / “继续”.
@@ -61,9 +61,9 @@ npx ihow-memory@next continue            # optional repo keyword: continue <name
 ### Correct a wrong memory
 
 ```bash
-npx ihow-memory@next forget "text or memory/path.md"
+npx ihow-memory forget "text or memory/path.md"
 # reversible:
-npx ihow-memory@next remember "text or memory/path.md"
+npx ihow-memory remember "text or memory/path.md"
 ```
 
 `forget` tombstones one unambiguous match so it stops surfacing in search and recall; the file is untouched and the action is reversible and audited.
@@ -82,10 +82,10 @@ Claude Code is the daily-dogfooded path. Codex, OMP, OpenClaw, Hermes, OpenCode 
 To connect only one runtime, or to inspect the exact config instead of applying it:
 
 ```bash
-npx ihow-memory@next connect --runtime claude-code --dry-run
-npx ihow-memory@next connect --runtime claude-code
-npx ihow-memory@next init --runtime claude-code       # print the MCP snippet only
-npx ihow-memory@next doctor --runtime claude-code
+npx ihow-memory connect --runtime claude-code --dry-run
+npx ihow-memory connect --runtime claude-code
+npx ihow-memory init --runtime claude-code       # print the MCP snippet only
+npx ihow-memory doctor --runtime claude-code
 ```
 
 Activation is evidence-based, not inferred from installation text. The workspace-frozen CLI and exact managed Claude/Codex hook or OMP extension wiring can produce bounded local completion evidence, but the same OS user can replay that command, so it does not authenticate the host: `doctor` keeps these runtimes at **READY — WAITING FOR FIRST ACTIVITY** with reason code `ACTIVATION_COMPLETION_UNATTESTED`. **TOOLS ONLY** means cooperative MCP tools are available without a verified lifecycle hook; **NEEDS REPAIR** means managed wiring is broken or stale. Synthetic probes and started-only events never become ACTIVE. The ledger stores hashed bindings and bounded metadata, never prompts, transcripts, environment values, or error text.
@@ -95,23 +95,23 @@ Activation is evidence-based, not inferred from installation text. The workspace
 Agents use the same path over MCP. This shell version makes the review gate visible:
 
 ```bash
-npx ihow-memory@next init --space demo
-CAND=$(npx ihow-memory@next write-candidate "Decision: ship weekly release notes." --no-auto-promote --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
-PROMOTED=$(npx ihow-memory@next promote "$CAND" --scope team --title "Release notes cadence" --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
-npx ihow-memory@next search "release notes" --space demo
-npx ihow-memory@next read "$PROMOTED" --space demo
-npx ihow-memory@next reset --space demo
+npx ihow-memory init --space demo
+CAND=$(npx ihow-memory write-candidate "Decision: ship weekly release notes." --no-auto-promote --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
+PROMOTED=$(npx ihow-memory promote "$CAND" --scope team --title "Release notes cadence" --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
+npx ihow-memory search "release notes" --space demo
+npx ihow-memory read "$PROMOTED" --space demo
+npx ihow-memory reset --space demo
 ```
 
 Without `--no-auto-promote`, a clean write can auto-promote into a durable yellow tier; secrets and falsified anchors are still blocked. Search/read results cite the exact Markdown source, and promote creates an audit event.
 
 ### Updating and recovery
 
-`connect` freezes a runtime copy into the workspace. Runtime registrations keep using the stable `.runtime/mcp/server.js` path, while Claude Code and Codex hooks use a byte-stable `.runtime/cli.js` bootstrap; release CLI implementation bytes live in `.runtime/cli-runtime.js`. Because `npm update` does **not** refresh this frozen runtime by itself, run `npx ihow-memory@next upgrade` and then restart the runtime. The new generation is staged and integrity-checked before the atomic `.runtime` / `.runtime.previous` swap, then the MCP server is probed; probe failure restores the exact prior generation. Existing legacy installations refresh their activation evidence once when they first move to the stable bootstrap—without rewriting correct hook files—while later implementation-only upgrades leave both hook config and generation unchanged. If one runtime registration points at a deleted/moved workspace, pass it explicitly—for example `npx ihow-memory@next upgrade --runtime opencode`—to back up and repair only that registration. If the installed/frozen runtime is damaged, use the independent package entry `npx ihow-memory@next rescue` (optionally with `--runtime <name>`). `doctor` fails instead of silently accepting version skew or broken activation wiring.
+`connect` freezes a runtime copy into the workspace. Runtime registrations keep using the stable `.runtime/mcp/server.js` path, while Claude Code and Codex hooks use a byte-stable `.runtime/cli.js` bootstrap; release CLI implementation bytes live in `.runtime/cli-runtime.js`. Because `npm update` does **not** refresh this frozen runtime by itself, run `npx ihow-memory upgrade` and then restart the runtime. The new generation is staged and integrity-checked before the atomic `.runtime` / `.runtime.previous` swap, then the MCP server is probed; probe failure restores the exact prior generation. Existing legacy installations refresh their activation evidence once when they first move to the stable bootstrap—without rewriting correct hook files—while later implementation-only upgrades leave both hook config and generation unchanged. If one runtime registration points at a deleted/moved workspace, pass it explicitly—for example `npx ihow-memory upgrade --runtime opencode`—to back up and repair only that registration. If the installed/frozen runtime is damaged, use the independent package entry `npx ihow-memory rescue` (optionally with `--runtime <name>`). `doctor` fails instead of silently accepting version skew or broken activation wiring.
 
 ## Runtime support
 
-`connect` registers the MCP server for eleven runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted — this is alpha.
+`connect` registers the MCP server for eleven runtimes; `setup` wires every detected one in a single command and, where the runtime has an instructions file, injects a "call `memory.continue` on resume" nudge. Two sides matter: **connect** (the runtime can call the memory tools) and a **resume reader** (that runtime's own past sessions can be picked up by `memory.continue`). Verification below is single-machine real-app smoke unless noted; this is the documented evidence boundary.
 
 | Runtime | connect | resume reader | Notes |
 | --- | --- | --- | --- |
@@ -131,18 +131,18 @@ Without `--no-auto-promote`, a clean write can auto-promote into a durable yello
 
 The MCP tools and governed loop are runtime-agnostic. Claude Code uses a skill plus Stop / SessionStart / PreCompact / UserPromptSubmit hooks. Codex uses native SessionStart / PreCompact / UserPromptSubmit hooks plus an auto-injected `~/.codex/AGENTS.md` proactive memory loop (continue/search/read/write/forget discipline); the Codex SessionStart hook also triggers the existing capture-floor sweep at thread boundaries, with the normal idle gate still protecting active sessions. OMP uses a managed extension for `session_start`, `before_agent_start`, native PreCompact, and session switch/shutdown capture; its readable JSONL transcript also feeds `memory.continue` and the crash-floor sweep. For Hermes, `connect` / `setup` installs both packaged adapters under `$HERMES_HOME/plugins`, enables `ihow-memory`, selects `memory.provider=ihow-memory-compaction`, and binds both to the workspace's integrity-checked frozen bridge. It refuses to replace another configured external memory provider and rolls back partial adapter/config/MCP writes on failure. The pre-compress handoff is bounded and transcript-free, but stays explicitly `UNVERIFIED` until live anchors are checked; this is not an `ACTIVE` or host-authentication claim. Resume guidance is also auto-injected for WorkBuddy, OpenClaw, Hermes and OpenCode.
 
-DeepSeek Harness support intentionally stays outside `connect` and `setup`: the separately published `dsh-ihow-memory` bundle owns DSH Profile installation, MCP mounting, and native Host event listeners, while Alpha.34 exposes only the bounded Core contract and capability evidence. Publishing Core does not install or activate the adapter; install it separately and restart the target DSH Profile. DSH startup reuses the verify-first checkpoint/MCP handoff path; Core does not parse DSH persistence as a native transcript source.
+DeepSeek Harness support intentionally stays outside `connect` and `setup`: the separately published `dsh-ihow-memory` bundle owns DSH Profile installation, MCP mounting, and native Host event listeners, while Core `0.1.0` exposes only the bounded Core contract and capability evidence. Publishing Core does not install or activate the adapter; install it separately and restart the target DSH Profile. DSH startup reuses the verify-first checkpoint/MCP handoff path; Core does not parse DSH persistence as a native transcript source.
 
 ### Runtimes wired without an auto-injected resume nudge (Cursor · Claude Desktop · VS Code Copilot · Gemini CLI)
 
 For these, `connect` wires the shared MCP server but iHow does **not** auto-write a global rules file (their instruction surface is app- or project-managed), so add the resume nudge yourself once. Cursor, Claude Desktop and VS Code Copilot are also **receiver-only** — no readable local session store, so iHow cannot resume *their* past sessions; they instead pull a [verify-first handoff packet](./docs/handoff-schema.md) (query + GREEN/YELLOW/RED verdict + verbatim-unverified narrative) recorded by any *capture* runtime (Claude Code, Codex, …), e.g. pick up in VS Code work that Claude Code left off. Gemini CLI is now a **passive reader** (its on-disk user-prompt log — see the table above) but still needs the manual `GEMINI.md` nudge:
 
-- **Cursor** — `npx ihow-memory@next connect --runtime cursor` (merges `~/.cursor/mcp.json`, backed up; never clobbers an unparseable file). Add a User Rule like: *"On resume / when I say 继续, call the `memory.continue` MCP tool first; treat its narrative as UNVERIFIED and run its git preflight before acting."*
-- **Claude Desktop** — `npx ihow-memory@next connect --runtime claude-desktop` (writes `claude_desktop_config.json`; macOS `~/Library/Application Support/Claude/`, Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude\`). Restart the app to load the tools.
-- **VS Code (Copilot)** — `npx ihow-memory@next connect --runtime vscode` writes the **user** `mcp.json` (macOS `~/Library/Application Support/Code/User/mcp.json`, Linux `~/.config/Code/User/mcp.json`, Windows `%APPDATA%\Code\User\mcp.json`) under the `servers` key with a `type: "stdio"` entry, backed up; an unparseable file is never overwritten. Reload the window, then enable the server in Copilot agent mode. Add a line to `.github/copilot-instructions.md`: *"On resume, call the `memory.continue` MCP tool first and verify its anchors before acting."*
-- **Gemini CLI** — `npx ihow-memory@next connect --runtime gemini` adds an `mcpServers` entry to `~/.gemini/settings.json` (backed up; unparseable file left untouched). Restart `gemini`, confirm with `/mcp list`. Add the same nudge to your `GEMINI.md`.
+- **Cursor** — `npx ihow-memory connect --runtime cursor` (merges `~/.cursor/mcp.json`, backed up; never clobbers an unparseable file). Add a User Rule like: *"On resume / when I say 继续, call the `memory.continue` MCP tool first; treat its narrative as UNVERIFIED and run its git preflight before acting."*
+- **Claude Desktop** — `npx ihow-memory connect --runtime claude-desktop` (writes `claude_desktop_config.json`; macOS `~/Library/Application Support/Claude/`, Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude`). Restart the app to load the tools.
+- **VS Code (Copilot)** — `npx ihow-memory connect --runtime vscode` writes the **user** `mcp.json` (macOS `~/Library/Application Support/Code/User/mcp.json`, Linux `~/.config/Code/User/mcp.json`, Windows `%APPDATA%\Code\User\mcp.json`) under the `servers` key with a `type: "stdio"` entry, backed up; an unparseable file is never overwritten. Reload the window, then enable the server in Copilot agent mode. Add a line to `.github/copilot-instructions.md`: *"On resume, call the `memory.continue` MCP tool first and verify its anchors before acting."*
+- **Gemini CLI** — `npx ihow-memory connect --runtime gemini` adds an `mcpServers` entry to `~/.gemini/settings.json` (backed up; unparseable file left untouched). Restart `gemini`, confirm with `/mcp list`. Add the same nudge to your `GEMINI.md`.
 
-For any of these, `npx ihow-memory@next init --runtime <name>` prints the exact snippet to paste by hand instead of writing it, and `npx ihow-memory@next doctor --runtime <name>` round-trips the configured server to confirm it is reachable.
+For any of these, `npx ihow-memory init --runtime <name>` prints the exact snippet to paste by hand instead of writing it, and `npx ihow-memory doctor --runtime <name>` round-trips the configured server to confirm it is reachable.
 
 ## Retrieval engine
 
@@ -191,7 +191,7 @@ Turn it on per space with one command — it **probes your local Ollama and only
 
 ```bash
 ollama pull nomic-embed-text            # once
-npx ihow-memory@next enable-semantic    # probes Ollama; writes <space>/.runtime/semantic.json
+npx ihow-memory enable-semantic    # probes Ollama; writes <space>/.runtime/semantic.json
 # re-run `setup`/`connect` + restart your runtime to apply · reverse anytime: disable-semantic
 ```
 
@@ -256,7 +256,7 @@ ihow-memory console          read-only local web UI [--port 8788]
 ihow-memory telemetry        on | off | status — anonymous counters, OFF by default
 ```
 
-Defaults: root `~/.ihow-memory`; space derived from the current directory unless `--space` is given. Run `npx ihow-memory@next --help` for full flags.
+Defaults: root `~/.ihow-memory`; space derived from the current directory unless `--space` is given. Run `npx ihow-memory --help` for full flags.
 
 The `console` is **read-only, loopback-only, and single-user / trusted-machine by design** — there is no auth token yet, so do not run it on a shared or multi-user host.
 
@@ -265,8 +265,8 @@ The `console` is **read-only, loopback-only, and single-user / trusted-machine b
 Safe Memory Gardener adds a review-first organize/export path for local workspaces:
 
 ```bash
-npx ihow-memory@next organize --scope project --draft --json
-npx ihow-memory@next export-vault --from-draft <draft_id> --format markdown
+npx ihow-memory organize --scope project --draft --json
+npx ihow-memory export-vault --from-draft <draft_id> --format markdown
 ```
 
 `organize` scans in-scope Markdown memory, writes a deterministic JSON draft under `gardener/drafts/`, links every evidence-backed item to source files and line numbers, flags duplicate/stale-looking claims for manual review, records a `memory.organized` audit event, and never rewrites curated memory. `export-vault` renders that draft as an Obsidian-compatible Markdown digest under `gardener/exports/`, runs the redaction/secret detector on the rendered Markdown, preserves evidence links, and records a `memory.exported` audit event.
@@ -293,38 +293,38 @@ A managed space is plain files:
 You can also point iHow Memory at an existing Markdown directory without moving it:
 
 ```bash
-npx ihow-memory@next doctor --memory-root <memory-root> --state-root <state-root>
+npx ihow-memory doctor --memory-root <memory-root> --state-root <state-root>
 ```
 
 In that mode the write boundary is strict: existing durable Markdown is read-only by default; candidates go under `memory/_mcp/candidates/`, staged promotes under `memory/_mcp/promoted/`, audit events under `memory/_mcp/_events/`; SQLite state stays under `<state-root>`, outside the memory root. Durable writes into the existing tree happen only through `durable-promote`, which refuses to run without an explicit `--dry-run` (prints the full plan) or `--real-write`.
 
 ## Diagnostics, feedback, reset, uninstall
 
-**Doctor report you can share.** `npx ihow-memory@next doctor --runtime <runtime> --share-diagnostics` prints a redacted report: local paths replaced with placeholders, secret-like values removed, memory content omitted. It is printed locally and never uploaded.
+**Doctor report you can share.** `npx ihow-memory doctor --runtime <runtime> --share-diagnostics` prints a redacted report: local paths replaced with placeholders, secret-like values removed, memory content omitted. It is printed locally and never uploaded.
 
-**Feedback.** `npx ihow-memory@next feedback --runtime <runtime>` prints a prefilled GitHub issue URL, a Markdown template and a redacted doctor summary. Nothing is submitted automatically.
+**Feedback.** `npx ihow-memory feedback --runtime <runtime>` prints a prefilled GitHub issue URL, a Markdown template and a redacted doctor summary. Nothing is submitted automatically.
 
-**Reset.** `npx ihow-memory@next reset --space <name>` removes a managed space. It requires an explicit `--space`, only removes managed spaces, and refuses `--memory-root` — it cannot delete an existing shared memory root.
+**Reset.** `npx ihow-memory reset --space <name>` removes a managed space. It requires an explicit `--space`, only removes managed spaces, and refuses `--memory-root` — it cannot delete an existing shared memory root.
 
 **Uninstall.**
 
 1. Remove the `ihow-memory` entry from the runtime: `claude mcp remove ihow-memory --scope user`, `codex mcp remove ihow-memory`, or edit `~/.cursor/mcp.json` (a `*.ihow-bak-*` backup sits next to it if `connect` wrote it).
-2. Delete demo spaces with `npx ihow-memory@next reset --space <name>`.
+2. Delete demo spaces with `npx ihow-memory reset --space <name>`.
 3. If installed globally: `npm uninstall -g ihow-memory`.
 4. Delete any custom state root only after reviewing its contents.
 
 ## Troubleshooting
 
 - **A write was rejected as secret-like but isn't.** The pre-write check is deliberately conservative (it pattern-matches tokens/keys/credentials). Rephrase to drop the secret-shaped substring, or keep the value out of memory entirely. Auto-capture redacts rather than rejects, so this affects manual `write-candidate` / `promote`.
-- **`search` finds nothing you just wrote.** The FTS index rebuilds on write, but if it looks stale run `npx ihow-memory@next reindex` to rebuild from Markdown. Confirm the index status with `npx ihow-memory@next status`.
+- **`search` finds nothing you just wrote.** The FTS index rebuilds on write, but if it looks stale run `npx ihow-memory reindex` to rebuild from Markdown. Confirm the index status with `npx ihow-memory status`.
 - **`doctor` flags `node:sqlite`.** You need Node.js ≥ 22.12 (the version that ships `node:sqlite`). Check with `node -v`.
-- **Hook installed but nothing captured (Claude Code).** Restart Claude Code after `install-hook` so it loads the settings. The cooperative Stop hook depends on the agent honoring the prompt; the deterministic SessionStart floor only fires for a *previous* session that ended without a cooperative journal (so a session that already journaled is correctly skipped). Inspect outcomes with `npx ihow-memory@next audit`.
+- **Hook installed but nothing captured (Claude Code).** Restart Claude Code after `install-hook` so it loads the settings. The cooperative Stop hook depends on the agent honoring the prompt; the deterministic SessionStart floor only fires for a *previous* session that ended without a cooperative journal (so a session that already journaled is correctly skipped). Inspect outcomes with `npx ihow-memory audit`.
 - **Codex hooks installed but not firing.** Restart Codex after `connect --runtime codex --easy` / `install-hook --runtime codex`. If Codex asks you to review hooks, open `/hooks` and trust the iHow Memory command hooks; writing `hooks.json` is the installation step, while Codex still owns the trust gate.
 - **`connect --auto` across projects only backs up one.** Floor capture is single-cwd (see Limitations).
-- **Old hook points into a cleared `npx` cache.** Re-run `npx ihow-memory@next setup` (or `install-hook` for that workspace). It moves only strictly identified iHow entries into canonical hook groups, removes duplicate iHow entries, and points them at the workspace-frozen `.runtime/cli.js` without replacing third-party hooks. Hook argv are shell-escaped, including workspaces whose paths contain spaces, quotes, `$`, or backticks.
+- **Old hook points into a cleared `npx` cache.** Re-run `npx ihow-memory setup` (or `install-hook` for that workspace). It moves only strictly identified iHow entries into canonical hook groups, removes duplicate iHow entries, and points them at the workspace-frozen `.runtime/cli.js` without replacing third-party hooks. Hook argv are shell-escaped, including workspaces whose paths contain spaces, quotes, `$`, or backticks.
 - **Turn prompt recall back off after it was installed.** Re-run `install-hook --no-recall` (or `setup --no-recall`). It removes only iHow's managed `UserPromptSubmit` recall entry and preserves third-party prompt hooks.
 - **Setup refreshed the frozen runtime bundle.** The bundle is integrity-stamped, staged, and validated before an atomic `.runtime` / `.runtime.previous` generation swap; the stable `.runtime/cli.js` bootstrap and per-space `semantic.json` opt-in are preserved. Setup reports the affected registered runtime as requiring reload/restart instead of claiming no changes. If an official Claude/Codex CLI replacement add fails, setup restores the exact previous registration when possible and reports any failed rollback as a real mutation.
-- **The local frozen runtime is damaged or its updater cannot start.** Run `npx ihow-memory@next rescue` from the target workspace. Add `--runtime opencode` (or another supported runtime) only when that host's saved registration also needs repair. Rescue keeps the last self-verifying generation active when the new server probe fails.
+- **The local frozen runtime is damaged or its updater cannot start.** Run `npx ihow-memory rescue` from the target workspace. Add `--runtime opencode` (or another supported runtime) only when that host's saved registration also needs repair. Rescue keeps the last self-verifying generation active when the new server probe fails.
 - **Windows.** Use WSL; native Windows is experimental. Native installs fail closed on unsafe shell metacharacters rather than emitting an injectable hook command.
 
 ## Proactive memory
@@ -342,7 +342,7 @@ adds runtime-specific layers where the host exposes stable hooks or instruction 
   `journal` lane via `memory.journal`. It is best-effort (re-prompts as the session grows, stops once
   an entry is recorded), **project-scoped by default** (`--global-hook` for user-wide), and reversible
   (`ihow-memory audit` / `rollback`).
-- **Next-session floor (deterministic) — experimental, `next` only.** The same Claude Code `install-hook` also wires a
+- **Next-session floor (deterministic) — experimental.** The same Claude Code `install-hook` also wires a
   SessionStart hook: when a new session starts, it floors the **previous** session deterministically *iff*
   that session ended without a cooperative journal. It parses the prior transcript, composes a
   last-substantive-segment summary within a **locked scope** (assistant text + file paths + command binary
@@ -371,7 +371,7 @@ For no-hook runtimes, `session_end` means task completion or delivery, not proce
 
 > **Experimental & Claude Code-first.** Auto-capture is two layers: a cooperative Stop-hook nudge (whether
 > an entry is written depends on the agent following the prompt) and a deterministic SessionStart floor
-> backstop (`next` only) that captures the prior session when the nudge was not honored. Both write
+> backstop that captures the prior session when the nudge was not honored. Both write
 > **low-weight, unreviewed** notes — use `promote` / `durable-promote` for trusted long-term memory. The
 > floor is offline-validated as a backstop; it is not yet promoted to a primary/default-weight path, and
 > `recall` (reading memory back into a new session) is **on** by default and relevance-gated (off-topic prompts get nothing). Since alpha.19 it surfaces reviewed decisions **and** auto-captured soft facts (preferences, configs) seamlessly, while unverified status claims ("all green") and risky behavior-priors ("skip approval") are excluded from the ambient default surface — ask about status explicitly and the unverified note is shown. Output is one seamless bounded `<recalled-memory>` reference fence, not per-item trust tags. Remembered something wrong? `ihow-memory forget <what you'd say>` stops it surfacing everywhere, reversibly (`remember` undoes it). Skip hook installation with `--no-recall`, disable runtime injection with `IHOW_RECALL_OFF=1`, or restore reviewed-only with `IHOW_RECALL_AUTO_DEFAULT=0`. `IHOW_RECALL_INCLUDE_AUTO=1` additionally admits engine-anchored auto facts, but never bypasses behavior safety or status-intent gates.
@@ -392,13 +392,13 @@ A hosted runtime is not included in this npm package or this repository.
 
 ## Status
 
-Alpha.34 prerelease candidate `0.1.0-alpha.34` (local release-ready only — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Maturity is **alpha + single-machine real-app smoke**: Claude Code is dogfooded daily and has the richest native-hook path; Codex has native SessionStart / PreCompact / UserPromptSubmit hooks plus a proactive AGENTS memory loop; OMP has a managed lifecycle extension and readable local transcripts; Hermes has packaged lifecycle and compaction adapters; the separately published DSH adapter has one-machine Host smoke against official `0.1.1-rc.2`; the other runtimes have the narrower evidence recorded in [Runtime support](#runtime-support). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated on macOS and Linux; native Windows is **experimental** (supported path: WSL). The npm package contains the compiled CLI, stdio MCP server, read-only local console, OMP lifecycle extension, packaged Hermes adapters, DSH Core contract, privacy contract, and evidence-first release assets. Breaking changes may still occur between alpha releases.
+Stable release candidate `0.1.0` (local release-ready only — the npm badge above shows the latest published version; see [CHANGELOG.md](./CHANGELOG.md)). Package identity is stable, while runtime evidence remains deliberately bounded: Claude Code is dogfooded daily and has the richest native-hook path; Codex has native SessionStart / PreCompact / UserPromptSubmit hooks plus a proactive AGENTS memory loop; OMP has a managed lifecycle extension and readable local transcripts; Hermes has packaged lifecycle and compaction adapters; the separately published DSH adapter has one-machine Host smoke against official `0.1.1-rc.2`; the other runtimes have the narrower evidence recorded in [Runtime support](#runtime-support). Node >= 22.12 is a hard requirement (`node:sqlite`). Validated on macOS and Linux; native Windows is **experimental** (supported path: WSL). The npm package contains the compiled CLI, stdio MCP server, read-only local console, OMP lifecycle extension, packaged Hermes adapters, DSH Core contract, privacy contract, and evidence-first release assets. Experimental surfaces may still change.
 
-**Alpha.34 engineering detail:** narrows automatic DSH session-start and no-hook startup handoff injection to the current repository or directory after live dogfood exposed an unrelated-project handoff. Explicit `memory.continue` still supports cross-project discovery. Alpha.33's bounded DSH Host adapter API, hashed activation evidence, and `ACTIVATION_COMPLETION_UNATTESTED` boundary remain unchanged; Core publication alone does not install, update, or activate `dsh-ihow-memory`. npm `@next` remains the source of truth for package availability.
+**Stable 0.1.0 engineering detail:** promotes the verified Alpha.34 surface, including project-scoped automatic DSH session-start and no-hook startup handoff injection. Explicit `memory.continue` still supports cross-project discovery. The bounded DSH Host adapter API, hashed activation evidence, and `ACTIVATION_COMPLETION_UNATTESTED` boundary remain unchanged; Core publication alone does not install, update, or activate `dsh-ihow-memory`. npm `latest` is the source of truth for stable package availability; `next` is reserved for future prereleases.
 
-**Alpha.31.2 engineering detail:** makes package updates recoverable without turning user configuration into release state. Claude Code/Codex hooks keep a byte-stable `.runtime/cli.js` bootstrap while implementation bytes move to `cli-runtime.js`; a verified upgrade refreshes legacy activation evidence once without rewriting correct Hook files, then later implementation-only upgrades leave Hook config and activation generation unchanged. Runtime replacement uses two self-verifying generations and restores the exact previous generation if the new MCP server fails its probe. `upgrade --runtime <name>` provides bounded repair for a stale host registration, and the fresh-package `rescue` entry can recover a damaged frozen updater. Alpha.31.1's WorkBuddy effective-path, Codex least-privilege/transactional rollback, and zero-runtime-dependency fixes remain included. This proves the documented update and recovery contracts—it does not claim every host lifecycle is `ACTIVE`; `doctor` may still report `TOOLS ONLY`, `READY — WAITING FOR FIRST ACTIVITY`, or `NEEDS REPAIR` where lifecycle evidence is absent. npm `@next` is the source of truth for package availability; publication does not itself update a frozen runtime or imply production certification. The Alpha.31 review-first boundaries remain unchanged: continuous consolidation is report-only and never automatically rewrites authoritative memory; Grounded Media reports only `EQUAL_UNTRUSTED`; Activity Ledger `COMMITTED` does not imply task success.
+**Alpha.31.2 engineering detail:** makes package updates recoverable without turning user configuration into release state. Claude Code/Codex hooks keep a byte-stable `.runtime/cli.js` bootstrap while implementation bytes move to `cli-runtime.js`; a verified upgrade refreshes legacy activation evidence once without rewriting correct Hook files, then later implementation-only upgrades leave Hook config and activation generation unchanged. Runtime replacement uses two self-verifying generations and restores the exact previous generation if the new MCP server fails its probe. `upgrade --runtime <name>` provides bounded repair for a stale host registration, and the fresh-package `rescue` entry can recover a damaged frozen updater. Alpha.31.1's WorkBuddy effective-path, Codex least-privilege/transactional rollback, and zero-runtime-dependency fixes remain included. This proves the documented update and recovery contracts—it does not claim every host lifecycle is `ACTIVE`; `doctor` may still report `TOOLS ONLY`, `READY — WAITING FOR FIRST ACTIVITY`, or `NEEDS REPAIR` where lifecycle evidence is absent. npm `latest` is the source of truth for stable package availability; publication does not itself update a frozen runtime or imply production certification. The Alpha.31 review-first boundaries remain unchanged: continuous consolidation is report-only and never automatically rewrites authoritative memory; Grounded Media reports only `EQUAL_UNTRUSTED`; Activity Ledger `COMMITTED` does not imply task success.
 
-**Install and update.** Fresh installs use `npx ihow-memory@next setup`. A connected workspace keeps a frozen runtime bundle, so existing installations use `npx ihow-memory@next upgrade` and then restart the affected runtime; use `npx ihow-memory@next rescue` when the frozen updater is damaged. Publication alone does not replace an already-running frozen runtime.
+**Install and update.** Fresh installs use `npx ihow-memory setup`. A connected workspace keeps a frozen runtime bundle, so existing installations use `npx ihow-memory upgrade` and then restart the affected runtime; use `npx ihow-memory rescue` when the frozen updater is damaged. Publication alone does not replace an already-running frozen runtime.
 
 ## Limitations
 

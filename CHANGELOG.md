@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
+## [0.1.0] — 2026-09-01
+
+### Changed
+
+- **First stable Core release.** Promotes the verified Alpha.34 package surface to the stable `latest` line: verify-first cross-runtime handoffs, local governed Markdown memory, zero-dependency lexical retrieval, managed OMP and Hermes lifecycle integration, bounded DSH Core contracts, recoverable frozen-runtime upgrades, and explicit-consent metrics that remain off by default.
+- **Stable install path.** User-facing commands now use unqualified `ihow-memory`; future prereleases remain available through the `next` dist-tag.
+
+### Notes
+
+- Stable package identity does not broaden the evidence boundary: runtime support remains limited to the documented single-machine smoke and dogfood results, replayable lifecycle evidence remains `ACTIVATION_COMPLETION_UNATTESTED`, and this release does not claim production certification or complete enterprise multi-tenant administration.
+- Publishing Core does not replace an already-frozen runtime or install, update, or activate the separately versioned `dsh-ihow-memory` adapter. Each requires its own upgrade, restart, and loaded-runtime verification.
+
 ## [0.1.0-alpha.34] — 2026-09-01
 
 ### Fixed

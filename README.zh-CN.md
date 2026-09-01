@@ -21,7 +21,7 @@ iHow Memory 为 coding agent 提供一份本地、人可读的共享记忆，跨
 ### 接入
 
 ```bash
-npx ihow-memory@next setup
+npx ihow-memory setup
 ```
 
 `setup` 会检测支持的 runtime，改配置前先备份，接入本地 MCP server，并报告哪些已验证、待确认或需要重启。
@@ -29,7 +29,7 @@ npx ihow-memory@next setup
 ### 运行证明
 
 ```bash
-npx ihow-memory@next proof
+npx ihow-memory proof
 ```
 
 `proof` 只用合成数据，在一次性 git 仓库与临时记忆 workspace 中运行。它会证明：上一位 agent 的叙事保持 **UNVERIFIED**；现场锚点吻合后得到 **GREEN**；仓库发生漂移后强制 **RED**；agent A 的受治理记忆带着引用与审计事件到达 agent B。它不会修改你的项目或 runtime 配置。
@@ -46,7 +46,7 @@ npx ihow-memory@next proof
 
 Git 仓库能提供最强的 branch / HEAD / dirty 锚点。非 git workspace 仍可用文件指纹检查漂移，但没有 commit 级 GREEN/RED。
 
-**Alpha 边界：** Claude Code 是每日 dogfood 主路径；其他 runtime 只有下表所列的较窄单机 smoke 证据，部分只能接收。默认检索是词法 FTS5，不是语义召回。Alpha 版本可能破坏兼容；生产使用前请看 [Runtime 支持](#runtime-支持)与[局限](#局限limitations)。
+**证据边界：** Claude Code 是每日 dogfood 主路径；其他 runtime 只有下表所列的较窄单机 smoke 证据，部分只能接收。默认检索是词法 FTS5，不是语义召回。实验性表面仍可能变化；生产使用前请看 [Runtime 支持](#runtime-支持)与[局限](#局限limitations)。
 
 如果 agent 重置曾让你返工，欢迎 [Star iHow Memory](https://github.com/iHow1/ihow-memory-core)，让更多开发者找到它，也告诉我们你最需要哪一种交接。
 
@@ -55,7 +55,7 @@ Git 仓库能提供最强的 branch / HEAD / dirty 锚点。非 git workspace �
 在 `/clear`、新会话或切换到另一个受支持 runtime 后：
 
 ```bash
-npx ihow-memory@next continue            # 可选仓库关键词：continue <name>
+npx ihow-memory continue            # 可选仓库关键词：continue <name>
 ```
 
 `continue` 会把上一会话叙事标成 **UNVERIFIED**，并交给接收方现场重验机器锚点。GREEN 的条件刻意很窄；一旦有漂移或冲突就强制 RED。首次使用还没有历史会话时，CLI 会直接说明，并引导运行 `proof`，不会再输出一个巨大的空交接包。在 Claude Code 里可直接说“继续”。
@@ -63,9 +63,9 @@ npx ihow-memory@next continue            # 可选仓库关键词：continue <nam
 ### 纠正错误记忆
 
 ```bash
-npx ihow-memory@next forget "文字或 memory/path.md"
+npx ihow-memory forget "文字或 memory/path.md"
 # 可逆：
-npx ihow-memory@next remember "文字或 memory/path.md"
+npx ihow-memory remember "文字或 memory/path.md"
 ```
 
 `forget` 只对一个无歧义匹配做 tombstone，让它停止出现在 search 和 recall；原文件不删除，操作可逆且有审计。
@@ -84,10 +84,10 @@ Claude Code 是每日 dogfood 主路径；Codex、OMP、OpenClaw、Hermes、Open
 只接一个 runtime，或先查看配置而不直接写入：
 
 ```bash
-npx ihow-memory@next connect --runtime claude-code --dry-run
-npx ihow-memory@next connect --runtime claude-code
-npx ihow-memory@next init --runtime claude-code       # 只打印 MCP 片段
-npx ihow-memory@next doctor --runtime claude-code
+npx ihow-memory connect --runtime claude-code --dry-run
+npx ihow-memory connect --runtime claude-code
+npx ihow-memory init --runtime claude-code       # 只打印 MCP 片段
+npx ihow-memory doctor --runtime claude-code
 ```
 
 激活状态来自证据，而不是安装成功文案。当前候选中的冻结 CLI 与精确 Claude/Codex Hook 或 OMP 扩展托管接线可以形成有界的本地完成证据，但同一 OS 用户可重放该命令，因此它不是宿主认证。`doctor` 会把这类 runtime 封顶为 **READY — WAITING FOR FIRST ACTIVITY**，reason code 为 `ACTIVATION_COMPLETION_UNATTESTED`。**TOOLS ONLY** 表示只有协作式 MCP 工具，没有可核验的生命周期 Hook；**NEEDS REPAIR** 表示托管接线已经损坏或过期。synthetic probe 和 started-only 事件绝不会升级成 ACTIVE。Ledger 只保存哈希化 binding 与有界元数据，不保存 prompt、transcript、环境变量或错误正文。
@@ -97,23 +97,23 @@ npx ihow-memory@next doctor --runtime claude-code
 Agent 在 MCP 上使用的是同一路径。下面这段 shell 会把审阅门完整展示出来：
 
 ```bash
-npx ihow-memory@next init --space demo
-CAND=$(npx ihow-memory@next write-candidate "Decision: ship weekly release notes." --no-auto-promote --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
-PROMOTED=$(npx ihow-memory@next promote "$CAND" --scope team --title "Release notes cadence" --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
-npx ihow-memory@next search "release notes" --space demo
-npx ihow-memory@next read "$PROMOTED" --space demo
-npx ihow-memory@next reset --space demo
+npx ihow-memory init --space demo
+CAND=$(npx ihow-memory write-candidate "Decision: ship weekly release notes." --no-auto-promote --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
+PROMOTED=$(npx ihow-memory promote "$CAND" --scope team --title "Release notes cadence" --space demo | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
+npx ihow-memory search "release notes" --space demo
+npx ihow-memory read "$PROMOTED" --space demo
+npx ihow-memory reset --space demo
 ```
 
 不加 `--no-auto-promote` 时，干净写入可自动晋升到持久 yellow 子档；密钥和伪造锚点仍会被拦截。search/read 会引用确切 Markdown 来源，promote 会生成审计事件。
 
 ### 更新与恢复
 
-`connect` 会把运行时副本冻结进 workspace。各 Agent 的 MCP 注册持续使用固定的 `.runtime/mcp/server.js` 路径；Claude Code/Codex Hook 使用字节稳定的 `.runtime/cli.js` 启动器，真正随版本变化的 CLI 实现在 `.runtime/cli-runtime.js`。因此 `npm update` **本身不会**刷新正在运行的 MCP server，更新包后仍需执行 `npx ihow-memory@next upgrade`，然后重启 runtime。新版会先在旁路构建并校验完整性，再原子交换 `.runtime` 与 `.runtime.previous` 两代目录，随后做 MCP 探活；探活失败会恢复精确的上一代。旧安装第一次迁移到稳定启动器时只刷新一次激活证据，不会改写本来正确的 Hook 文件；此后的普通实现更新不会再改变 Hook 配置或代际。如果某一个 runtime 的注册仍指向已删除/移动的 workspace，可执行例如 `npx ihow-memory@next upgrade --runtime opencode`，只备份并修复该 runtime。若本地冻结运行时已经损坏，可从目标 workspace 执行独立救援入口 `npx ihow-memory@next rescue`，必要时再加 `--runtime <name>`。版本偏移或激活接线损坏时，`doctor` 会失败而不是静默放行。
+`connect` 会把运行时副本冻结进 workspace。各 Agent 的 MCP 注册持续使用固定的 `.runtime/mcp/server.js` 路径；Claude Code/Codex Hook 使用字节稳定的 `.runtime/cli.js` 启动器，真正随版本变化的 CLI 实现在 `.runtime/cli-runtime.js`。因此 `npm update` **本身不会**刷新正在运行的 MCP server，更新包后仍需执行 `npx ihow-memory upgrade`，然后重启 runtime。新版会先在旁路构建并校验完整性，再原子交换 `.runtime` 与 `.runtime.previous` 两代目录，随后做 MCP 探活；探活失败会恢复精确的上一代。旧安装第一次迁移到稳定启动器时只刷新一次激活证据，不会改写本来正确的 Hook 文件；此后的普通实现更新不会再改变 Hook 配置或代际。如果某一个 runtime 的注册仍指向已删除/移动的 workspace，可执行例如 `npx ihow-memory upgrade --runtime opencode`，只备份并修复该 runtime。若本地冻结运行时已经损坏，可从目标 workspace 执行独立救援入口 `npx ihow-memory rescue`，必要时再加 `--runtime <name>`。版本偏移或激活接线损坏时，`doctor` 会失败而不是静默放行。
 
 ## Runtime 支持
 
-`connect` 为十一个 runtime 生成 MCP 注册配置；`setup` 一条命令接好每个检测到的 runtime，并在 runtime 有指令文件时注入一句「resume 时调用 `memory.continue`」的提示。两个维度要分清：**connect**（runtime 能调用记忆工具）和 **resume reader**（该 runtime 自己过去的会话能被 `memory.continue` 接上）。下表除特别说明外均为单机真机 smoke——这是 alpha。
+`connect` 为十一个 runtime 生成 MCP 注册配置；`setup` 一条命令接好每个检测到的 runtime，并在 runtime 有指令文件时注入一句「resume 时调用 `memory.continue`」的提示。两个维度要分清：**connect**（runtime 能调用记忆工具）和 **resume reader**（该 runtime 自己过去的会话能被 `memory.continue` 接上）。下表除特别说明外均为单机真机 smoke；这是文档承诺的证据边界。
 
 | Runtime | connect | resume reader | 备注 |
 | --- | --- | --- | --- |
@@ -133,7 +133,7 @@ npx ihow-memory@next reset --space demo
 
 MCP 工具与治理闭环与 runtime 无关。Claude Code 使用 skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks；Codex 使用原生 SessionStart / PreCompact / UserPromptSubmit hooks，并由 `~/.codex/AGENTS.md` 提供主动记忆循环。OMP 使用托管扩展接入 `session_start`、`before_agent_start`、原生 PreCompact 与会话切换/退出捕获；其可读 JSONL 会话同时供 `memory.continue` 和 crash-floor sweep 使用。Hermes 的 `connect` / `setup` 会把两类包内适配器安装到 `$HERMES_HOME/plugins`，启用 `ihow-memory`，选择 `memory.provider=ihow-memory-compaction`，并把两者绑定到该 workspace 中经过完整性校验的冻结 bridge；若已配置其他外部 MemoryProvider，会在写入前拒绝覆盖，配置/插件/MCP 任一步失败则回滚本轮变更。预压缩交接保持有界且不含 transcript 原文，但在现场锚点核验前始终明确标为 `UNVERIFIED`，不等于 `ACTIVE` 或宿主认证。Resume 提示会自动注入到配置暴露了指令文件的 runtime（Claude Code、WorkBuddy、OpenClaw、Hermes、OpenCode）。
 
-DeepSeek Harness 支持刻意不进入 `connect` 与 `setup`：独立发布的 `dsh-ihow-memory` Bundle 负责 DSH Profile 安装、MCP 工具挂载和原生 Host 事件监听；Alpha.34 只提供有界 Core 契约与能力证据。发布 Core 不会安装或激活适配器，目标 DSH Profile 必须单独安装并重启。DSH 会话启动复用 verify-first checkpoint/MCP 交接路径；当前 Core 不把 DSH 持久化格式作为原生 transcript source 解析。
+DeepSeek Harness 支持刻意不进入 `connect` 与 `setup`：独立发布的 `dsh-ihow-memory` Bundle 负责 DSH Profile 安装、MCP 工具挂载和原生 Host 事件监听；Core `0.1.0` 只提供有界 Core 契约与能力证据。发布 Core 不会安装或激活适配器，目标 DSH Profile 必须单独安装并重启。DSH 会话启动复用 verify-first checkpoint/MCP 交接路径；当前 Core 不把 DSH 持久化格式作为原生 transcript source 解析。
 
 ## 检索引擎
 
@@ -237,21 +237,21 @@ ihow-memory console          只读本地 Web UI [--port 8788]
 ihow-memory telemetry        on | off | status——匿名计数，默认关闭
 ```
 
-默认值：root 为 `~/.ihow-memory`；space 由当前目录推导，除非显式传 `--space`。完整参数见 `npx ihow-memory@next --help`。
+默认值：root 为 `~/.ihow-memory`；space 由当前目录推导，除非显式传 `--space`。完整参数见 `npx ihow-memory --help`。
 
 `console` 在设计上是**只读、仅 loopback、单用户 / 可信机器**的——目前还没有 auth token，所以不要在共享或多用户主机上运行它。
 
 ## 排障（Troubleshooting）
 
 - **写入被判为"含密钥"但其实不是。** 写入前检查刻意保守（按 token/key/凭据模式匹配）。改写以去掉像密钥的子串，或干脆别把该值放进记忆。自动捕获是脱敏而非拒绝，所以这只影响手动 `write-candidate` / `promote`。
-- **刚写的东西 `search` 搜不到。** FTS 索引在写入时重建；若看起来过期，跑 `npx ihow-memory@next reindex` 从 Markdown 重建，用 `npx ihow-memory@next status` 确认索引状态。
+- **刚写的东西 `search` 搜不到。** FTS 索引在写入时重建；若看起来过期，跑 `npx ihow-memory reindex` 从 Markdown 重建，用 `npx ihow-memory status` 确认索引状态。
 - **`doctor` 报 `node:sqlite`。** 需要 Node.js ≥ 22.12（含 `node:sqlite` 的版本），用 `node -v` 检查。
-- **装了 hook 但没捕获（Claude Code）。** `install-hook` 后重启 Claude Code 以加载设置。协作式 Stop hook 取决于 agent 是否照提示做；确定式 SessionStart floor 只对「上一会话没有协作式 journal」时才出手（已 journal 的会话会被正确跳过）。用 `npx ihow-memory@next audit` 看结果。
+- **装了 hook 但没捕获（Claude Code）。** `install-hook` 后重启 Claude Code 以加载设置。协作式 Stop hook 取决于 agent 是否照提示做；确定式 SessionStart floor 只对「上一会话没有协作式 journal」时才出手（已 journal 的会话会被正确跳过）。用 `npx ihow-memory audit` 看结果。
 - **`connect --auto` 跨项目只兜底了一个。** Floor 捕获是单 cwd 的（见局限）。
-- **旧 hook 指向已清理的 `npx` 缓存。** 重新运行 `npx ihow-memory@next setup`（或对该 workspace 运行 `install-hook`）。它只认领结构严格匹配的 iHow entry，把它们迁到 canonical hook group、删除重复 iHow entry，并改指向 workspace 冻结的 `.runtime/cli.js`；第三方 hooks 不会被替换。Hook 参数使用真正的 shell escaping，路径里有空格、引号、`$` 或反引号也能安全执行。
+- **旧 hook 指向已清理的 `npx` 缓存。** 重新运行 `npx ihow-memory setup`（或对该 workspace 运行 `install-hook`）。它只认领结构严格匹配的 iHow entry，把它们迁到 canonical hook group、删除重复 iHow entry，并改指向 workspace 冻结的 `.runtime/cli.js`；第三方 hooks 不会被替换。Hook 参数使用真正的 shell escaping，路径里有空格、引号、`$` 或反引号也能安全执行。
 - **已经装过 prompt recall，现在想关闭。** 重新运行 `install-hook --no-recall`（或 `setup --no-recall`）；它会删除 iHow 自己管理的 `UserPromptSubmit` recall entry，同时保留第三方 prompt hooks。
 - **setup 刷新了冻结 runtime bundle。** 新 bundle 会写入完整性摘要，先在旁路目录复制和校验，再原子交换 `.runtime` / `.runtime.previous` 两代目录；稳定的 `.runtime/cli.js` 启动器与每个 space 的 `semantic.json` opt-in 会被保留。setup 会诚实要求受影响且已注册的 Runtime reload/restart。如果 Claude/Codex 官方 CLI 的替换 add 失败，会尽量恢复原注册；若回滚也失败，则明确报告真实变更。
-- **本地冻结 runtime 已损坏，或者旧升级器本身无法启动。** 在目标 workspace 执行 `npx ihow-memory@next rescue`；只有某个宿主保存的 MCP 注册也需要修复时，才额外传 `--runtime opencode` 等参数。新版 server 探活失败时，救援流程会继续保留上一代自校验 runtime。
+- **本地冻结 runtime 已损坏，或者旧升级器本身无法启动。** 在目标 workspace 执行 `npx ihow-memory rescue`；只有某个宿主保存的 MCP 注册也需要修复时，才额外传 `--runtime opencode` 等参数。新版 server 探活失败时，救援流程会继续保留上一代自校验 runtime。
 - **Windows。** 请用 WSL；原生 Windows 为实验性。原生安装遇到不安全的 shell 元字符时会 fail closed，而不是生成可能被注入的 hook command。
 
 ## 主动记忆（Claude Code，实验性）
@@ -259,17 +259,17 @@ ihow-memory telemetry        on | off | status——匿名计数，默认关闭
 自动捕获分两层：
 
 - **会话结束协作式捕获——实验性。** `connect --runtime claude-code --install-hook` 装一个 Stop hook：会话结束时请求在场 agent 通过 `memory.journal` 把一次交接记入低权重 `journal` 通道。它是**尽力而为**（随会话增长重提示、写入一条后即停）、**默认 project-local**（`--global-hook` 用户级）、**可回滚**（`ihow-memory audit` / `rollback`）。
-- **下一会话 floor 兜底（确定式）——实验性，仅 `next`。** 同一个 `install-hook` 还会装一个 SessionStart hook：新会话启动时，**若上一会话没有协作式 journal**，就确定式地把上一会话兜底——解析其 transcript，在**锁死的范围**内（assistant 文本 + 文件路径 + 命令二进制名 + 首个 prompt；绝不含工具输出、绝不含原始 shell）取"最后实质段"摘要，脱敏后写为一条低权重、可审计、可回滚的 journal 条目。它是协作式提示之下的安全网：**单 cwd**、静默（floor 只捕获、自身不注入任何内容）、永不抛错。已在 22 个真实历史 transcript 上离线评分通过 backstop 质量门；真实的自然 floor 命中仍在 dogfood 中（因为目前协作式捕获覆盖了所有观察到的会话）。
+- **下一会话 floor 兜底（确定式）——实验性。** 同一个 `install-hook` 还会装一个 SessionStart hook：新会话启动时，**若上一会话没有协作式 journal**，就确定式地把上一会话兜底——解析其 transcript，在**锁死的范围**内（assistant 文本 + 文件路径 + 命令二进制名 + 首个 prompt；绝不含工具输出、绝不含原始 shell）取“最后实质段”摘要，脱敏后写为一条低权重、可审计、可回滚的 journal 条目。它是协作式提示之下的安全网：**单 cwd**、静默（floor 只捕获、自身不注入任何内容）、永不抛错。已在 22 个真实历史 transcript 上离线评分通过 backstop 质量门；真实的自然 floor 命中仍在 dogfood 中（因为目前协作式捕获覆盖了所有观察到的会话）。
 
-> **实验性、且 Claude Code 优先。** 自动捕获 = 协作式 Stop-hook 提示（是否写入取决于 agent 是否照做）+ 确定式 SessionStart floor 兜底（仅 `next`，在提示没被照做时捕获上一会话）。两者都写**低权重、未经审阅**的笔记——可信长期记忆请用 `promote` / `durable-promote`。floor 仅作离线验证过的 backstop，尚未升为 primary/默认权重路径；`recall`（把记忆读回新会话）默认**开启**并以 reviewed 为优先，也会默认召回部分通过 machine gates 的相关 auto soft facts（偏好、配置等）。环境式 status/completion 与危险 behavior-bypass prior 被阻止；显式询问 status 时才会显示对应未验证 status note。输出是无逐条标签的 seamless `<recalled-memory>` reference fence。安装时用 `--no-recall` 跳过；运行时用 `IHOW_RECALL_OFF=1` 关闭；`IHOW_RECALL_AUTO_DEFAULT=0` 恢复 reviewed-only；`IHOW_RECALL_INCLUDE_AUTO=1` 只额外开放 engine-anchored auto，仍不能绕过 behavior gate 或 status-intent gate。完整说明以英文 README 为准。
+> **实验性、且 Claude Code 优先。** 自动捕获 = 协作式 Stop-hook 提示（是否写入取决于 agent 是否照做）+ 确定式 SessionStart floor 兜底（在提示没被照做时捕获上一会话）。两者都写**低权重、未经审阅**的笔记——可信长期记忆请用 `promote` / `durable-promote`。floor 仅作离线验证过的 backstop，尚未升为 primary/默认权重路径；`recall`（把记忆读回新会话）默认**开启**并以 reviewed 为优先，也会默认召回部分通过 machine gates 的相关 auto soft facts（偏好、配置等）。环境式 status/completion 与危险 behavior-bypass prior 被阻止；显式询问 status 时才会显示对应未验证 status note。输出是无逐条标签的 seamless `<recalled-memory>` reference fence。安装时用 `--no-recall` 跳过；运行时用 `IHOW_RECALL_OFF=1` 关闭；`IHOW_RECALL_AUTO_DEFAULT=0` 恢复 reviewed-only；`IHOW_RECALL_INCLUDE_AUTO=1` 只额外开放 engine-anchored auto，仍不能绕过 behavior gate 或 status-intent gate。完整说明以英文 README 为准。
 
 ## Safe Memory Gardener（alpha.24）
 
 Safe Memory Gardener 是一个 review-first 的本地整理/导出路径：
 
 ```bash
-npx ihow-memory@next organize --scope project --draft --json
-npx ihow-memory@next export-vault --from-draft <draft_id> --format markdown
+npx ihow-memory organize --scope project --draft --json
+npx ihow-memory export-vault --from-draft <draft_id> --format markdown
 ```
 
 `organize` 会扫描 scope 内的 Markdown memory，在 `gardener/drafts/` 下写入确定性的 JSON 草稿，为每条有证据的项目保留源文件与行号，给疑似重复/陈旧内容打“仅供 review”的非破坏性标记，记录 `memory.organized` 审计事件，并且不会改写 curated memory。`export-vault` 会把草稿渲染成 Obsidian 兼容 Markdown digest，放在 `gardener/exports/` 下，对渲染后的 Markdown 跑脱敏/密钥检测，保留证据链接，并记录 `memory.exported` 审计事件。
@@ -294,23 +294,23 @@ npx ihow-memory@next export-vault --from-draft <draft_id> --format markdown
 也可以把 iHow Memory 指向一个已有的 Markdown 目录，不必移动它：
 
 ```bash
-npx ihow-memory@next doctor --memory-root <memory-root> --state-root <state-root>
+npx ihow-memory doctor --memory-root <memory-root> --state-root <state-root>
 ```
 
 这种模式下写入边界是严格的：既有持久 Markdown 默认只读；candidate 写入 `memory/_mcp/candidates/`，staging promote 写入 `memory/_mcp/promoted/`，审计事件写入 `memory/_mcp/_events/`；SQLite 状态放在 `<state-root>` 下、memory root 之外。要向既有目录做持久写入，只能走 `durable-promote`，且必须显式传 `--dry-run`（打印完整执行计划）或 `--real-write`，否则拒绝执行。
 
 ## 诊断、反馈、重置、卸载
 
-**可分享的 doctor 报告。** `npx ihow-memory@next doctor --runtime <runtime> --share-diagnostics` 输出脱敏报告：本地路径替换为占位符、类密钥值被删除、不包含记忆内容。只在本地打印，绝不上传。
+**可分享的 doctor 报告。** `npx ihow-memory doctor --runtime <runtime> --share-diagnostics` 输出脱敏报告：本地路径替换为占位符、类密钥值被删除、不包含记忆内容。只在本地打印，绝不上传。
 
-**反馈。** `npx ihow-memory@next feedback --runtime <runtime>` 打印预填的 GitHub issue URL、Markdown 模板和脱敏 doctor 摘要。不会自动提交任何内容。
+**反馈。** `npx ihow-memory feedback --runtime <runtime>` 打印预填的 GitHub issue URL、Markdown 模板和脱敏 doctor 摘要。不会自动提交任何内容。
 
-**重置。** `npx ihow-memory@next reset --space <name>` 删除受管 space。它要求显式 `--space`，只删除受管 space，并拒绝 `--memory-root`——不可能删掉既有的共享 memory root。
+**重置。** `npx ihow-memory reset --space <name>` 删除受管 space。它要求显式 `--space`，只删除受管 space，并拒绝 `--memory-root`——不可能删掉既有的共享 memory root。
 
 **卸载。**
 
 1. 从 runtime 移除 `ihow-memory` 条目：`claude mcp remove ihow-memory --scope user`、`codex mcp remove ihow-memory`，或编辑 `~/.cursor/mcp.json`（若是 `connect` 写入的，旁边有 `*.ihow-bak-*` 备份）。
-2. 用 `npx ihow-memory@next reset --space <name>` 删除 demo space。
+2. 用 `npx ihow-memory reset --space <name>` 删除 demo space。
 3. 如曾全局安装：`npm uninstall -g ihow-memory`。
 4. 自定义 state root 请在确认内容后再手动删除。
 
@@ -330,20 +330,15 @@ Hosted runtime 不包含在本 npm 包与本仓库中。
 
 ## 状态
 
-Alpha.34 预发布候选 `0.1.0-alpha.34`（仅本地达到 release-ready；上方 npm 徽章显示当前已发布版本，详见 [CHANGELOG.md](./CHANGELOG.md)）。成熟度为 **alpha + 单机真机 smoke**：Claude Code 每日 dogfood，拥有最完整的原生 Hook 路径；Codex 有原生 SessionStart / PreCompact / UserPromptSubmit Hook 与主动 AGENTS 记忆循环；OMP 现有托管生命周期扩展与可读本地会话；Hermes 包含包内 lifecycle 与 compaction 适配器；独立发布的 DSH 适配器已对官方 `0.1.1-rc.2` Host 做单机 smoke；其他 runtime 的较窄证据以 [Runtime 支持](#runtime-支持)为准。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 验证；原生 Windows 为**实验性**，受支持路径为 WSL。npm 包内含编译后的 CLI、stdio MCP server、只读本地 console、OMP 生命周期扩展、Hermes 包内适配器、DSH Core 契约、隐私契约与 evidence-first 发布资产。Alpha 版本间可能有破坏性变更。
+稳定版候选 `0.1.0`（仅本地达到 release-ready；上方 npm 徽章显示当前已发布版本，详见 [CHANGELOG.md](./CHANGELOG.md)）。包版本身份已稳定，但 runtime 证据边界仍刻意收窄：Claude Code 每日 dogfood，拥有最完整的原生 Hook 路径；Codex 有原生 SessionStart / PreCompact / UserPromptSubmit Hook 与主动 AGENTS 记忆循环；OMP 现有托管生命周期扩展与可读本地会话；Hermes 包含包内 lifecycle 与 compaction 适配器；独立发布的 DSH 适配器已对官方 `0.1.1-rc.2` Host 做单机 smoke；其他 runtime 的较窄证据以 [Runtime 支持](#runtime-支持)为准。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 验证；原生 Windows 为**实验性**，受支持路径为 WSL。npm 包内含编译后的 CLI、stdio MCP server、只读本地 console、OMP 生命周期扩展、Hermes 包内适配器、DSH Core 契约、隐私契约与 evidence-first 发布资产。实验性表面仍可能变化。
 
-**Alpha.34 工程细节：** 在真机 dogfood 暴露跨项目误注入后，将 DSH 自动 session-start 与 no-hook 启动交接限定到当前仓库或目录；显式 `memory.continue` 仍保留跨项目发现。Alpha.33 的有界 DSH Host 适配 API、哈希化激活证据与 `ACTIVATION_COMPLETION_UNATTESTED` 边界保持不变；仅发布 Core 不会安装、更新或激活 `dsh-ihow-memory`。npm `@next` 继续作为软件包可用性的真相源。
+**稳定版 0.1.0 工程细节：** 将已验证的 Alpha.34 表面晋升为稳定包，包括限定到当前项目的 DSH 自动 session-start 与 no-hook 启动交接；显式 `memory.continue` 仍保留跨项目发现。有界 DSH Host API、哈希化激活证据与 `ACTIVATION_COMPLETION_UNATTESTED` 边界保持不变；仅发布 Core 不会安装、更新或激活 `dsh-ihow-memory`。npm `latest` 是稳定包可用性的真相源；`next` 留给未来预发布。
 
-**Alpha.31.2 工程细节：** 让软件包更新具备可恢复性，同时不把用户配置当成版本状态。Claude Code/Codex Hook 固定使用字节稳定的 `.runtime/cli.js` 启动器，随版本变化的实现在 `cli-runtime.js`；一次成功升级只为旧安装刷新一次激活证据，不改写正确的 Hook 文件，此后的普通实现更新不会再改变 Hook 配置或代际。runtime 替换保留两代自校验目录，新 MCP server 探活失败时恢复精确的上一代。`upgrade --runtime <name>` 可对单个过期宿主注册做有边界的修复；若冻结升级器本身已损坏，还可从新下载的软件包运行 `rescue`。Alpha.31.1 的 WorkBuddy 生效路径、Codex 最小权限/事务回滚与零运行时依赖修复继续保留。这里证明的是文档所述更新与救援合同，并不宣称所有宿主生命周期都已 `ACTIVE`；在缺少生命周期证据时，`doctor` 仍可能报告 `TOOLS ONLY`、`READY — WAITING FOR FIRST ACTIVITY` 或 `NEEDS REPAIR`。npm `@next` 是软件包可用性的真相源；发布本身不会更新已经冻结的 runtime，也不代表生产认证。Alpha.31 的 review-first 边界保持不变：持续整理仅 report-only，绝不会自动改写权威记忆；Grounded Media 只输出 `EQUAL_UNTRUSTED`；Activity Ledger 的 `COMMITTED` 不代表任务成功。
+**Alpha.31.2 工程细节：** 让软件包更新具备可恢复性，同时不把用户配置当成版本状态。Claude Code/Codex Hook 固定使用字节稳定的 `.runtime/cli.js` 启动器，随版本变化的实现在 `cli-runtime.js`；一次成功升级只为旧安装刷新一次激活证据，不改写正确的 Hook 文件，此后的普通实现更新不会再改变 Hook 配置或代际。runtime 替换保留两代自校验目录，新 MCP server 探活失败时恢复精确的上一代。`upgrade --runtime <name>` 可对单个过期宿主注册做有边界的修复；若冻结升级器本身已损坏，还可从新下载的软件包运行 `rescue`。Alpha.31.1 的 WorkBuddy 生效路径、Codex 最小权限/事务回滚与零运行时依赖修复继续保留。这里证明的是文档所述更新与救援合同，并不声称所有宿主生命周期都已 `ACTIVE`；在缺少生命周期证据时，`doctor` 仍可能报告 `TOOLS ONLY`、`READY — WAITING FOR FIRST ACTIVITY` 或 `NEEDS REPAIR`。npm `latest` 是稳定包可用性的真相源；发布本身不会更新已经冻结的 runtime，也不代表生产认证。Alpha.31 的 review-first 边界保持不变：持续整理仅 report-only，绝不会自动改写权威记忆；Grounded Media 只输出 `EQUAL_UNTRUSTED`；Activity Ledger 的 `COMMITTED` 不代表任务成功。
 
-**哪个版本有什么（dist-tag）。** 预发布版发布在 `next` dist-tag 下；`npm install ihow-memory` 解析到 `latest`。
+**安装与更新。** 新安装使用 `npx ihow-memory setup`。已连接的 workspace 保留冻结 runtime bundle，因此现有安装需运行 `npx ihow-memory upgrade`，然后重启受影响 runtime；冻结升级器损坏时使用 `npx ihow-memory rescue`。发布本身不会替换正在运行的冻结 runtime。
 
-| dist-tag | 自动捕获 |
-| --- | --- |
-| `latest` | 仅协作式 Stop-hook 提示（取决于 agent 是否照做） |
-| `next` | 增加**确定式 SessionStart floor** 兜底（单 cwd、低权重、离线验证过）+ **recall 开启**（reviewed 优先 + 受门控的相关 auto soft facts；ambient status / behavior-bypass 受阻；seamless fenced reference） |
-
-想试 floor 兜底：`npm install ihow-memory@next`。普通 `npm install ihow-memory` 留在保守的 `latest`。
+**dist-tag。** `npm install ihow-memory` 解析到稳定 `latest`；未来预发布使用 `next`。稳定 `0.1.0` 已包含确定式 SessionStart floor（单 cwd、低权重、离线验证过）与默认相关召回（reviewed 优先 + 受门控的 auto soft facts；ambient status / behavior-bypass 受阻；seamless fenced reference）。
 
 ## 局限（Limitations）
 
