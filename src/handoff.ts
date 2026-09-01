@@ -1010,6 +1010,16 @@ function projectIdFor(p?: string): string {
   return crypto.createHash('sha256').update(path.resolve(p)).digest('hex').slice(0, 12);
 }
 
+function projectScope(dir: string | undefined): string | undefined {
+  if (!dir?.trim()) return undefined;
+  const resolved = path.resolve(dir);
+  return repoRoot(resolved) ?? resolved;
+}
+
+function sameProjectPath(projectDir: string | undefined, receiverScope: string | undefined): boolean {
+  return projectScope(projectDir) === receiverScope && receiverScope !== undefined;
+}
+
 function redactLiveAnchors(projectDir: string): GitAnchors {
   const anchors = gitAnchors(projectDir);
   if (anchors.headSubject) anchors.headSubject = redactSecretLikeContent(anchors.headSubject);
@@ -1253,13 +1263,17 @@ export async function buildHandoffPacket(opts: {
   excludeSessionId?: string;
   workspace?: Workspace;
   now?: number;
+  sameProjectOnly?: boolean;
 }): Promise<HandoffPacket> {
   const limit = Number.isFinite(opts.limit) && (opts.limit as number) > 0 ? Math.min(Math.floor(opts.limit as number), 20) : 5;
   const needle = opts.projectHint?.trim().toLowerCase();
-  // With a hint, scan a wider window before filtering so a match further back isn't missed; without one,
-  // a small over-fetch is enough (we only return `limit`).
-  let sessions = await listResumableSessions(needle ? 100 : limit * 3, opts.excludeSessionId);
-  if (needle) sessions = sessions.filter((s) => `${s.projectDir ?? ''}\n${s.body}`.toLowerCase().includes(needle));
+  const receiverScope = opts.sameProjectOnly ? projectScope(opts.cwd) : undefined;
+  // Automatic lifecycle injection must stay scoped to the receiver's current project. Manual
+  // `memory.continue` keeps cross-project discovery so users can explicitly choose another thread.
+  const discoveryLimit = needle || opts.sameProjectOnly ? 100 : limit * 3;
+  let sessions = await listResumableSessions(discoveryLimit, opts.excludeSessionId);
+  if (needle) sessions = sessions.filter((session) => `${session.projectDir ?? ''}\n${session.body}`.toLowerCase().includes(needle));
+  if (opts.sameProjectOnly) sessions = sessions.filter((session) => sameProjectPath(session.projectDir, receiverScope));
   const now = opts.now ?? Date.now();
   const transcriptCandidates: HandoffCandidate[] = sessions.map((s) => {
     const ageMs = now - Date.parse(s.modifiedAt);
@@ -1382,7 +1396,7 @@ export async function buildHandoffPacket(opts: {
       ));
     }
   }
-  const floorCandidates = await floorJournalCandidates(opts.workspace, sessions, needle, now);
+  const floorCandidates = opts.sameProjectOnly ? [] : await floorJournalCandidates(opts.workspace, sessions, needle, now);
   for (const candidate of [...transcriptCandidates, ...floorCandidates]) {
     const activationDegradation = degradation.get(candidate.tool);
     if (activationDegradation) candidate.activationDegradation = activationDegradation;

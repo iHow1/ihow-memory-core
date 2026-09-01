@@ -96,3 +96,35 @@ test('buildHandoffPacket: projectHint filters candidates', async (t) => {
   const pkt = await buildHandoffPacket({ cwd, projectHint: 'alpha', limit: 5 });
   assert.ok(pkt.candidates.every((c) => c.project.basename === 'alpha'), 'hint narrows to the matching project');
 });
+
+test('buildHandoffPacket: automatic startup scope excludes other projects without narrowing manual continue', async (t) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-home-'));
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-base-'));
+  const origHome = process.env.HOME;
+  t.after(async () => {
+    process.env.HOME = origHome;
+    await fs.rm(home, { recursive: true, force: true });
+    await fs.rm(base, { recursive: true, force: true });
+  });
+  const repoA = path.join(base, 'current-project');
+  const repoB = path.join(base, 'other-project');
+  await makeRepo(repoA);
+  await makeRepo(repoB);
+  const currentDir = path.join(home, '.claude', 'projects', '-current-session');
+  const otherDir = path.join(home, '.claude', 'projects', '-other-session');
+  await fs.mkdir(currentDir, { recursive: true });
+  await fs.mkdir(otherDir, { recursive: true });
+  await fs.writeFile(path.join(currentDir, 'current.jsonl'), editedTranscript(repoA, 'CURRENT-PROJECT', 'cafe123'), 'utf8');
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await fs.writeFile(path.join(otherDir, 'other.jsonl'), editedTranscript(repoB, 'OTHER-PROJECT', 'beef456'), 'utf8');
+
+  process.env.HOME = home;
+  const manual = await buildHandoffPacket({ cwd: repoA, limit: 5 });
+  assert.ok(manual.candidates.some((candidate) => candidate.project.basename === 'other-project'), 'manual continue keeps cross-project discovery');
+
+  const automatic = await buildHandoffPacket({ cwd: repoA, limit: 5, sameProjectOnly: true });
+  assert.ok(automatic.candidates.length >= 1, 'current-project handoff remains available');
+  assert.ok(automatic.candidates.every((candidate) => candidate.project.basename === 'current-project'), 'automatic startup excludes other projects');
+  assert.match(JSON.stringify(automatic), /CURRENT-PROJECT/);
+  assert.doesNotMatch(JSON.stringify(automatic), /OTHER-PROJECT/);
+});

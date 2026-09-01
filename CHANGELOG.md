@@ -8,6 +8,10 @@ with pre-release tags.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Project-scoped automatic handoff injection.** Native DSH session starts and no-hook `context_probe(session_start)` now inject only handoffs bound to the current repository or directory. Explicit `memory.continue` keeps cross-project discovery, while automatic startup excludes unrelated and project-undetermined transcript or floor candidates.
+
 ## [0.1.0-alpha.33] — 2026-08-26
 
 ### Added

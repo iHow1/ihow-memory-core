@@ -192,7 +192,7 @@ async function contextProbeInner(
   let output: ContextProbeOutput;
 
   if (input.eventHint === 'session_start') {
-    const packet = await buildHandoffPacket({ cwd: input.cwd, limit: 3, excludeSessionId: input.sessionHint });
+    const packet = await buildHandoffPacket({ cwd: input.cwd, limit: 3, excludeSessionId: input.sessionHint, sameProjectOnly: true });
     const verdict = staleMarker ? 'YELLOW' : handoffVerdict(packet);
     const staleNote = 'Previous context_probe marker is stale. No summary was fabricated; verify live project state and anchors before continuing.';
     output = {
