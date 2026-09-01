@@ -26,6 +26,25 @@ function runMcp(root, lines, env = {}) {
   return out.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
+async function makeRepo(dir) {
+  await fs.mkdir(dir, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 't@example.com'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'T'], { cwd: dir });
+  await fs.writeFile(path.join(dir, 'seed.txt'), 'x\n', 'utf8');
+  execFileSync('git', ['add', '-A'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'seed'], { cwd: dir });
+}
+
+function editedTranscript(repo, marker) {
+  return [
+    JSON.stringify({ type: 'user', message: { content: 'continue' } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(repo, 'seed.txt') } }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: `handoff ${marker} `.repeat(12) }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: `next ${marker} `.repeat(12) }] } }),
+  ].join('\n') + '\n';
+}
+
 test('MCP tools/list includes memory.context_probe', async (t) => {
   const root = await mkdtemp('ihow-cp-root-');
   const home = await mkdtemp('ihow-cp-home-');
@@ -163,6 +182,38 @@ test('context_probe(session_start) is safe without prior marker', async (t) => {
   assert.ok(['NONE', 'YELLOW', 'GREEN', 'RED'].includes(payload.verdict));
   assert.notEqual(payload.action, 'floor_journaled');
   assert.equal(payload.diagnostics.staleMarker, false);
+});
+
+test('context_probe(session_start) does not inject a different project handoff', async (t) => {
+  const root = await mkdtemp('ihow-cp-root-');
+  const cwd = await mkdtemp('ihow-cp-cwd-');
+  const foreign = await mkdtemp('ihow-cp-foreign-');
+  const home = await mkdtemp('ihow-cp-home-');
+  t.after(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(cwd, { recursive: true, force: true });
+    await fs.rm(foreign, { recursive: true, force: true });
+    await fs.rm(home, { recursive: true, force: true });
+  });
+  await makeRepo(foreign);
+  const sessionDir = path.join(home, '.claude', 'projects', '-foreign-session');
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(path.join(sessionDir, 'foreign.jsonl'), editedTranscript(foreign, 'FOREIGN-STARTUP-CONTEXT'), 'utf8');
+  const manual = runMcp(root, [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory.continue', arguments: { cwd } } },
+  ], { HOME: home });
+  assert.match(JSON.stringify(manual.find((message) => message.id === 2)), /FOREIGN-STARTUP-CONTEXT/, 'fixture is visible to manual continue');
+
+
+  const msgs = runMcp(root, [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory.context_probe', arguments: { cwd, runtime: 'workbuddy', eventHint: 'session_start' } } },
+  ], { HOME: home });
+  const payload = msgs.find((message) => message.id === 2).result.structuredContent;
+  assert.equal(payload.action, 'none');
+  assert.equal(payload.verdict, 'NONE');
+  assert.doesNotMatch(payload.injectText, /FOREIGN-STARTUP-CONTEXT/);
 });
 
 test('stale marker returns YELLOW diagnostics without fabricating summary', async (t) => {

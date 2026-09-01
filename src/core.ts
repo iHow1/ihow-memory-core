@@ -185,6 +185,7 @@ export async function openCore(options: WorkspaceOptions = {}): Promise<MemoryCo
             limit: 3,
             excludeSessionId: event.sessionId,
             workspace,
+            sameProjectOnly: true,
           });
           if (packet.candidates.length > 0) {
             context = JSON.stringify(packet, null, 2);
