@@ -6,11 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
-## [Unreleased]
+## [0.1.0-alpha.34] — 2026-09-01
 
 ### Fixed
 
 - **Project-scoped automatic handoff injection.** Native DSH session starts and no-hook `context_probe(session_start)` now inject only handoffs bound to the current repository or directory. Explicit `memory.continue` keeps cross-project discovery, while automatic startup excludes unrelated and project-undetermined transcript or floor candidates.
+
+### Notes
+
+- Alpha.34 supersedes Alpha.33 for runtime dogfood after a live DSH Alpha4 session-start loaded an unrelated project handoff. This release narrows automatic startup injection only; explicit cross-project resume remains available through `memory.continue`.
+- npm `next` remains the source of truth for prerelease availability. Existing frozen runtimes and the separately versioned DSH adapter require their own upgrade, restart, and live verification.
 
 ## [0.1.0-alpha.33] — 2026-08-26
 
