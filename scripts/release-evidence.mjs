@@ -39,6 +39,9 @@ function sha256(input) {
 function fileSha256(file) {
   return sha256(fs.readFileSync(file));
 }
+function checksumPath(file) {
+  return path.relative(root, file) || path.basename(file);
+}
 
 function outputArgument(argv) {
   const index = argv.indexOf('--output');
@@ -129,8 +132,8 @@ try {
   const manifestPath = path.join(outputDir, 'release-evidence.json');
   fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   fs.writeFileSync(path.join(outputDir, 'checksums.txt'), [
-    `${manifest.package.sha256}  ${packed.filename}`,
-    `${fileSha256(manifestPath)}  release-evidence.json`,
+    `${manifest.package.sha256}  ${checksumPath(tarballPath)}`,
+    `${fileSha256(manifestPath)}  ${checksumPath(manifestPath)}`,
     ...requiredPackageFiles.map((file) => `${legalFiles[file].sha256}  ${file}`),
     '',
   ].join('\n'));
