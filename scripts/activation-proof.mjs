@@ -15,8 +15,8 @@ function assert(condition, message) {
 function run(args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cli, ...args], {
-      cwd: options.cwd || packageDir,
-      env: { ...process.env, ...(options.env || {}) },
+      cwd: options.cwd || isolatedCwd,
+      env: { ...isolatedEnv, ...(options.env || {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -33,12 +33,42 @@ function run(args, options = {}) {
 }
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ihow-memory-activation-proof-'));
+const isolatedHome = path.join(root, 'home');
+const isolatedCwd = path.join(root, 'cwd');
+await Promise.all([
+  fs.mkdir(isolatedHome, { recursive: true }),
+  fs.mkdir(isolatedCwd, { recursive: true }),
+]);
+const isolatedEnv = { ...process.env };
+for (const name of [
+  'CLAUDE_CODE_SESSION_ID',
+  'IHOW_MEMORY_API_KEY',
+  'IHOW_MEMORY_ROOT',
+  'IHOW_MEMORY_STATE_ROOT',
+  'IHOW_MEMORY_TEST_NODE_VERSION',
+  'IHOW_MEMORY_VECTOR_MODEL',
+  'IHOW_MEMORY_VECTOR_PROVIDER_COMMAND',
+  'MEMORY_ROOT',
+]) delete isolatedEnv[name];
+Object.assign(isolatedEnv, {
+  HOME: isolatedHome,
+  USERPROFILE: isolatedHome,
+  APPDATA: path.join(isolatedHome, 'AppData', 'Roaming'),
+  XDG_CONFIG_HOME: path.join(isolatedHome, '.config'),
+  CLAUDE_CONFIG_DIR: path.join(isolatedHome, '.claude'),
+  CODEX_HOME: path.join(isolatedHome, '.codex'),
+  HERMES_HOME: path.join(isolatedHome, '.hermes'),
+  PI_CODING_AGENT_DIR: path.join(isolatedHome, '.omp', 'agent'),
+  CLINE_DATA_DIR: path.join(isolatedHome, '.cline', 'data'),
+  IHOW_HANDOFF_METRICS: '0',
+});
 
 try {
   const lowNode = await run(['doctor', '--root', root, '--space', 'low-node'], {
     env: { IHOW_MEMORY_TEST_NODE_VERSION: '20.11.1' },
   });
   assert(lowNode.code === 1, 'low Node doctor must exit with a failed check');
+  assert(lowNode.combined.includes('- fail node: v20.11.1'), 'low Node proof must fail specifically at the Node gate');
   assert(lowNode.combined.includes('Install Node >= 22.12'), 'low Node doctor must give an upgrade action');
   assert(!lowNode.combined.includes('stack'), 'low Node doctor must not print a stack trace');
 
@@ -59,17 +89,33 @@ try {
     IHOW_MEMORY_API_KEY: ['sk', fakeSecret, '123456'].join('-'),
     IHOW_MEMORY_VECTOR_PROVIDER_COMMAND: `/private/provider --${['to', 'ken'].join('')}=${fakeSecret}`,
   };
+  const diagnosticsSpace = 'diagnostics';
+  const connected = await run([
+    'connect', '--root', root, '--space', diagnosticsSpace, '--runtime', 'cursor', '--json',
+  ]);
+  assert(connected.code === 0, 'Cursor connect must complete its package-internal MCP roundtrip');
+  const connection = JSON.parse(connected.stdout);
+  assert(connection.method === 'direct-json', 'Cursor connect must use the package direct-JSON connector');
+  assert(connection.target === path.join(isolatedHome, '.cursor', 'mcp.json'), 'Cursor connect must stay inside the isolated HOME');
+  assert(connection.reachable === true, 'Cursor connect must prove the packaged MCP server is reachable');
+  assert(connection.detail.includes('server ok'), 'Cursor connect must report a successful memory.status roundtrip');
+  assert(connection.verified === false, 'Cursor connect must not claim the Cursor UI loaded the MCP server');
+
   const diagnostics = await run(
-    ['doctor', '--root', root, '--space', 'diagnostics', '--runtime', 'cursor', '--share-diagnostics'],
+    ['doctor', '--root', root, '--space', diagnosticsSpace, '--runtime', 'cursor', '--share-diagnostics'],
     { env: secretEnv },
   );
-  assert(diagnostics.code === 0, 'share diagnostics must succeed');
+  assert(diagnostics.code === 0, 'share diagnostics must succeed after connect prepares a reachable MCP server');
+  const diagnosticReport = JSON.parse(diagnostics.stdout);
+  const runtimeCheck = diagnosticReport.checks.find((check) => check.name === 'runtime');
+  assert(runtimeCheck?.ok === true, 'share diagnostics must include a successful MCP reachability check');
+  assert(runtimeCheck.detail.includes('registration unconfirmed'), 'share diagnostics must not claim real Cursor UI activation');
   assert(diagnostics.stdout.includes('"paths": "redacted"'), 'share diagnostics must declare path redaction');
   assert(!diagnostics.stdout.includes(root), 'share diagnostics must not include the temporary root');
   assert(!diagnostics.stdout.includes('/private/provider'), 'share diagnostics must not include provider paths');
   assert(!diagnostics.stdout.includes(fakeSecret), 'share diagnostics must not include secrets');
 
-  const feedback = await run(['feedback', '--root', root, '--space', 'feedback', '--runtime', 'codex'], {
+  const feedback = await run(['feedback', '--root', root, '--space', diagnosticsSpace, '--runtime', 'cursor'], {
     env: secretEnv,
   });
   assert(feedback.code === 0, 'feedback must succeed');
@@ -95,7 +141,7 @@ try {
   assert(!readme.includes('/home/'), 'README must not include Linux user absolute paths');
   assert(!readme.includes('C:\\Users\\'), 'README must not include Windows user absolute paths');
 
-  console.log('PASS activation proof: low Node guidance, runtime snippets, redacted diagnostics/feedback, reset, README path hygiene');
+  console.log('PASS activation proof: low Node guidance, runtime snippets, isolated Cursor MCP roundtrip, redacted diagnostics/feedback, reset, README path hygiene');
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }
