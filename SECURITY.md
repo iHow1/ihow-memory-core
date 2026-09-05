@@ -1,13 +1,14 @@
 # Security Policy
 
-iHow Memory is a local-first memory layer for AI agents. Its security promises are concrete: governed writes (candidate → explicit promote), strict write boundaries around existing memory roots, redacted diagnostics, and no default network surface. Reports that break any of those promises are exactly what we want to hear about.
+iHow Memory is a local-first memory layer for AI agents. Its security promises are concrete: engine-governed writes and recall eligibility, strict write boundaries around existing memory roots, redacted diagnostics, and no default network surface. Reports that break any of those promises are exactly what we want to hear about.
 
 ## Supported versions
 
 | Version | Supported |
 | --- | --- |
-| Latest published `0.1.x` alpha | Yes |
-| Older pre-releases | No — please reproduce on the latest version |
+| Latest published stable `0.1.x` release (`latest`) | Yes |
+| Latest published prerelease (`next`) | Yes — prerelease evidence boundaries apply |
+| Older releases and prereleases | No — please reproduce on the latest version in the affected channel |
 
 ## How to report a vulnerability
 
@@ -19,13 +20,26 @@ Report privately via GitHub Security Advisories:
 2. Include: affected version (`npx ihow-memory --version`), OS, Node version, reproduction steps, and impact.
 3. If diagnostics help, attach the output of `npx ihow-memory doctor --share-diagnostics` — it is redacted by design. Never attach real memory content, real paths you consider sensitive, or secrets.
 
-We aim to acknowledge reports within 7 days. This is an alpha project maintained on a best-effort basis; we will keep you updated on triage and coordinate disclosure with you before any public detail is released. Please give us reasonable time to ship a fix before publishing.
+We aim to acknowledge reports within 7 days. This project is maintained on a best-effort basis; we will keep you updated on triage and coordinate disclosure with you before any public detail is released. Please give us reasonable time to ship a fix before publishing. A stable `0.1.x` package is not a `1.0` API compatibility guarantee or production security certification.
 
 There is currently no bug bounty program.
 
+## Governed persistence and recall
+
+`memory.write_candidate` enables automatic promotion by default. Persistence is not a claim that the content is true, human-reviewed, or eligible for automatic recall:
+
+- Detected secret-like content and claimed anchors that conflict with an explicitly identified live repository are rejected by the automatic promotion gate. Secret detection is pattern-based, not a guarantee of detecting every possible credential.
+- Non-directive content with qualifying provenance becomes durable `verified` memory. A live Git anchor is checked against the repository; a `command` + `exitCode` pair is structured, self-reported evidence, not a command the engine re-executes or proof that the prose is true.
+- Content without qualifying provenance becomes durable `unverified` memory, never `verified` merely because the caller supplied `verified: true`. Relevant soft facts may be recalled under the prompt-recall policy; unreviewed status or bypass claims remain excluded.
+- Governance, access, identity, and destructive statements become durable `flagged` memory. They are excluded from default search and automatic prompt recall pending review. Explicit `includeFlagged` search or a direct read can inspect them without granting recall eligibility.
+
+Use `autoPromote: false` to stage an inbox candidate for explicit promotion. `memory.promote` is the explicit review path. The separate `memory.durable_promote` operation requires an explicit preview or real-write choice; `realWrite: true` / `--real-write` is required for its real writes, not for every ordinary memory write. The automatic journal lane also persists bounded, low-weight entries without a manual promotion step.
+
+Filesystem containment, secret handling, tier assignment, recall eligibility, and audit records remain enforced on their respective paths. Human confirmation for review actions is a host/operator responsibility, not cryptographic proof of a human decision; a caller running as the same OS user is within the local trust boundary.
+
 ## In scope (examples we care about most)
 
-- Write-guard bypass: any way to create or modify durable memory without an explicit `promote`, or a durable write without `--real-write` / `realWrite: true`.
+- Write-guard or recall-policy bypass: writes escaping the applicable containment, secret-handling, tier, or audit controls; automatic recall of quarantined `flagged` content; or real writes through `memory.durable_promote` without its explicit real-write option. Engine-governed automatic promotion and low-weight journaling are intentional, not bypasses solely because no manual `promote` occurred.
 - Path traversal: reads or writes escaping the configured memory root or state root (CLI args, MCP tool inputs, candidate paths).
 - Redaction failures: secrets, local paths, or memory content leaking through `doctor --share-diagnostics` or `feedback` output.
 - `connect` damaging runtime configuration: clobbering or corrupting config files without a backup, or writing outside the documented targets.
@@ -42,6 +56,6 @@ There is currently no bug bounty program.
 
 ## Hardening notes for users
 
-- Keep Node at or above 22.12 and update `ihow-memory` to the latest alpha before reporting.
+- Keep Node at or above 22.12 and update `ihow-memory` to the latest supported version in the affected channel before reporting.
 - Use `connect --dry-run` to preview configuration changes; backups (`*.ihow-bak-*`) are written before direct config edits.
 - Point agents at a demo space first; `reset` only removes managed spaces and refuses `--memory-root`.
