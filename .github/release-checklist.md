@@ -19,25 +19,32 @@ The workflow derives the dist-tag from the version automatically — no manual `
    workflow's tag↔version check fails if `package.json` doesn't match the tag).
    - Verify: `node -p "[require('./package.json').version, require('./package-lock.json').version]"` —
      both equal, and equal the version you intend to tag.
-2. **Sanity-build + test locally.**
-   - `npm run build` (strips types into `dist/`).
-   - `node --test "tests/**/*.test.mjs"` — all green.
-   - `node bin/ihow-memory.mjs --version` — prints the new version.
-3. **Run the release gates locally** (the workflow runs them too; catching failures here is faster):
+2. **Prepare and freeze the candidate.** Update `CHANGELOG.md`, bilingual release identity, bundled
+   plugin versions and affected release assertions; run affected checks and commit with DCO sign-off.
+   Select that clean commit/tree as the integrated RC. Do not tag before its required review/gates pass.
+3. **Run the release gates against the frozen RC** (the workflow runs them too):
+   - `npm run build && npm run typecheck`, then `node bin/ihow-memory.mjs --version`.
+   - `node scripts/release-evidence.mjs --output release-evidence` retains one exact tarball before the expensive gate. Do not rebuild this artifact later.
+   - `npm test` uses the repository's parallel and deadline-sensitive phases; do not launch competing full-suite runs.
    - Governed-loop proof: `node scripts/proof.mjs`.
    - Secret scan: `npm run secret-scan` (the same repository policy used by CI).
-   - License and release evidence: from the committed release-candidate tree, run `npm run release:evidence:check`. It rejects dirty trees, requires `package.json` / `package-lock.json` version parity and a matching changelog section, verifies Apache-2.0 legal files in the package, and binds source/package hashes to the candidate commit and tree.
-   - To retain a local evidence bundle before tagging, run `npm run release:evidence`; it writes the ignored `release-evidence/` directory containing the tarball, `release-evidence.json`, and `checksums.txt`. `--allow-dirty` is development diagnostics only and produces `DEVELOPMENT_ONLY`, never release evidence.
-4. **Update `CHANGELOG.md`** with the new version's notes.
-5. **Commit** the version bump + changelog.
+   - `node scripts/verify-release-artifact.mjs release-evidence/release-evidence.json` verifies commit/tree and tarball hash, performs an offline fresh install, compares all installed file bytes, and exercises CLI version and MCP write/search/read, isolation, empty-lock recovery and restart persistence. It uses synthetic data in a temporary HOME and requires Node, npm and tar on macOS/Linux.
+   - Evidence rejects dirty trees, requires package/lockfile version parity and a changelog section, and records legal/source/package hashes. `--allow-dirty` remains development diagnostics only, never release evidence.
+4. **Close compatibility and platform gates.** Check exact Core pins in separately versioned adapters,
+   and read authoritative CI results for the frozen composition. Local macOS success is not Linux or Windows CI evidence.
+5. **Verify the final object.** If product bytes change, invalidate the candidate, fix with affected
+   checks, freeze a new object and run one replacement final gate. Keep the accepted artifact immutable.
 6. **Push the branch**, then **tag and push the tag**:
    ```bash
    git push origin <branch>
    git tag -a v<new-version> -m "iHow Memory <new-version>"
    git push origin v<new-version>
    ```
-   The tag push triggers the release workflow → annotated-tag/version verification → build/typecheck/tests/proof/secret-scan → clean-tree source/legal evidence + one retained tarball/SHA-256 bundle →
-   checksum verification → `npm publish <that-tarball> --tag <next|latest> --provenance`.
+   The tag push triggers the release workflow → tag/version verification → build/typecheck → one retained
+   tarball/source/legal evidence bundle → tests/proof/secret-scan → exact-artifact offline install/MCP
+   verification → checksum verification → `npm publish <that-tarball> --tag <next|latest> --provenance`.
+   Compare the workflow artifact hash with the accepted RC artifact; publication or a rebuild never
+   substitutes for validation of the actual published bytes.
 7. **Verify the publish**: `npm view ihow-memory dist-tags` shows the new version under the expected tag;
    `npm install ihow-memory@<tag>` resolves it.
 

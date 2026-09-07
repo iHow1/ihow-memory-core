@@ -1,6 +1,6 @@
 # Workspace and activation-ledger lock recovery
 
-This is an unpublished correctness candidate. It does not upgrade an installed or running client.
+This document describes the 0.1.1 lock protocol. Package publication does not upgrade an installed or running client.
 
 ## Owner publication and exclusion
 

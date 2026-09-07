@@ -1,5 +1,5 @@
 name: ihow-memory
-version: "0.1.0"
+version: "0.1.1"
 description: Fail-open Hermes lifecycle adapter for iHow Memory recall and checkpoint signals.
 provides_tools:
   - ihow_memory_delta

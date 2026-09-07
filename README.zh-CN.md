@@ -133,7 +133,7 @@ npx ihow-memory reset --space demo
 
 MCP 工具与治理闭环与 runtime 无关。Claude Code 使用 skill + Stop / SessionStart / PreCompact / UserPromptSubmit hooks；Codex 使用原生 SessionStart / PreCompact / UserPromptSubmit hooks，并由 `~/.codex/AGENTS.md` 提供主动记忆循环。OMP 使用托管扩展接入 `session_start`、`before_agent_start`、原生 PreCompact 与会话切换/退出捕获；其可读 JSONL 会话同时供 `memory.continue` 和 crash-floor sweep 使用。Hermes 的 `connect` / `setup` 会把两类包内适配器安装到 `$HERMES_HOME/plugins`，启用 `ihow-memory`，选择 `memory.provider=ihow-memory-compaction`，并把两者绑定到该 workspace 中经过完整性校验的冻结 bridge；若已配置其他外部 MemoryProvider，会在写入前拒绝覆盖，配置/插件/MCP 任一步失败则回滚本轮变更。预压缩交接保持有界且不含 transcript 原文，但在现场锚点核验前始终明确标为 `UNVERIFIED`，不等于 `ACTIVE` 或宿主认证。Resume 提示会自动注入到配置暴露了指令文件的 runtime（Claude Code、WorkBuddy、OpenClaw、Hermes、OpenCode）。
 
-DeepSeek Harness 支持刻意不进入 `connect` 与 `setup`：独立发布的 `dsh-ihow-memory` Bundle 负责 DSH Profile 安装、MCP 工具挂载和原生 Host 事件监听；Core `0.1.0` 只提供有界 Core 契约与能力证据。发布 Core 不会安装或激活适配器，目标 DSH Profile 必须单独安装并重启。DSH 会话启动复用 verify-first checkpoint/MCP 交接路径；当前 Core 不把 DSH 持久化格式作为原生 transcript source 解析。
+DeepSeek Harness 支持刻意不进入 `connect` 与 `setup`：独立发布的 `dsh-ihow-memory` Bundle 负责 DSH Profile 安装、MCP 工具挂载和原生 Host 事件监听；Core `0.1.1` 只提供有界 Core 契约与能力证据。发布 Core 不会安装或激活适配器，目标 DSH Profile 必须单独安装并重启。DSH 会话启动复用 verify-first checkpoint/MCP 交接路径；当前 Core 不把 DSH 持久化格式作为原生 transcript source 解析。
 
 ## 检索引擎
 
@@ -330,7 +330,9 @@ Hosted runtime 不包含在本 npm 包与本仓库中。
 
 ## 状态
 
-稳定版候选 `0.1.0`（仅本地达到 release-ready；上方 npm 徽章显示当前已发布版本，详见 [CHANGELOG.md](./CHANGELOG.md)）。包版本身份已稳定，但 runtime 证据边界仍刻意收窄：Claude Code 每日 dogfood，拥有最完整的原生 Hook 路径；Codex 有原生 SessionStart / PreCompact / UserPromptSubmit Hook 与主动 AGENTS 记忆循环；OMP 现有托管生命周期扩展与可读本地会话；Hermes 包含包内 lifecycle 与 compaction 适配器；独立发布的 DSH 适配器已对官方 `0.1.1-rc.2` Host 做单机 smoke；其他 runtime 的较窄证据以 [Runtime 支持](#runtime-支持)为准。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 验证；原生 Windows 为**实验性**，受支持路径为 WSL。npm 包内含编译后的 CLI、stdio MCP server、只读本地 console、OMP 生命周期扩展、Hermes 包内适配器、DSH Core 契约、隐私契约与 evidence-first 发布资产。实验性表面仍可能变化。
+稳定版候选 `0.1.1`（本地集成候选，完整门禁结果单独记录；上方 npm 徽章显示当前已发布版本，详见 [CHANGELOG.md](./CHANGELOG.md)）。包版本身份已稳定，但 runtime 证据边界仍刻意收窄：Claude Code 每日 dogfood，拥有最完整的原生 Hook 路径；Codex 有原生 SessionStart / PreCompact / UserPromptSubmit Hook 与主动 AGENTS 记忆循环；OMP 现有托管生命周期扩展与可读本地会话；Hermes 包含包内 lifecycle 与 compaction 适配器；独立发布的 DSH 适配器已对官方 `0.1.1-rc.2` Host 做单机 smoke；其他 runtime 的较窄证据以 [Runtime 支持](#runtime-支持)为准。Node >= 22.12 是硬性要求（`node:sqlite`）。已在 macOS 与 Linux 验证；原生 Windows 为**实验性**，受支持路径为 WSL。npm 包内含编译后的 CLI、stdio MCP server、只读本地 console、OMP 生命周期扩展、Hermes 包内适配器、DSH Core 契约、隐私契约与 evidence-first 发布资产。实验性表面仍可能变化。
+
+**0.1.1 正确性修复：** 自动生成的运行元数据不再影响词法排序；事务性索引迁移保留原始 Markdown、业务日期和治理过滤。工作区与激活回执台账可恢复老旧空锁，新锁以完整 PID 记录原子公开。详见[锁恢复与升级限制](./docs/workspace-locking.md)。这些改动不扩大 runtime 激活信任。
 
 **稳定版 0.1.0 工程细节：** 将已验证的 Alpha.34 表面晋升为稳定包，包括限定到当前项目的 DSH 自动 session-start 与 no-hook 启动交接；显式 `memory.continue` 仍保留跨项目发现。有界 DSH Host API、哈希化激活证据与 `ACTIVATION_COMPLETION_UNATTESTED` 边界保持不变；仅发布 Core 不会安装、更新或激活 `dsh-ihow-memory`。npm `latest` 是稳定包可用性的真相源；`next` 留给未来预发布。
 

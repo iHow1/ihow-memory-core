@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const RELEASE_VERSION = '0.1.0';
+const RELEASE_VERSION = '0.1.1';
 
 function readRoot(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8');
@@ -29,7 +29,7 @@ function releaseSection(changelog, version) {
   return match[1];
 }
 
-test('stable 0.1.0 metadata and docs stay truthful and aligned', () => {
+test('stable 0.1.1 candidate metadata and docs stay truthful and aligned', () => {
   const manifest = JSON.parse(readRoot('package.json'));
   const lock = JSON.parse(readRoot('package-lock.json'));
   assert.equal(manifest.version, RELEASE_VERSION);
@@ -39,7 +39,16 @@ test('stable 0.1.0 metadata and docs stay truthful and aligned', () => {
   assert.deepEqual(lock.packages?.['']?.dependencies ?? {}, {}, 'lockfile preserves the zero-runtime-dependency contract');
 
   const changelog = readRoot('CHANGELOG.md');
-  const stable = releaseSection(changelog, RELEASE_VERSION);
+  const patch = releaseSection(changelog, RELEASE_VERSION);
+  assert.match(patch, /operational metadata.*lexical indexing/i);
+  assert.match(patch, /original Markdown.*business dates.*governance filtering/i);
+  assert.match(patch, /transactional legacy-index migration/i);
+  assert.match(patch, /empty or malformed workspace and activation-ledger locks/i);
+  assert.match(patch, /atomic publication/i);
+  assert.match(patch, /recovery interrupted.*operator recovery/i);
+  assert.match(patch, /publication does not upgrade a frozen or running client/i);
+  assert.match(patch, /pinned adapters require their own compatibility check/i);
+  const stable = releaseSection(changelog, '0.1.0');
   assert.match(stable, /First stable Core release/i);
   assert.match(stable, /stable `?latest`? line/i);
   assert.match(stable, /Stable install path/i);
@@ -137,7 +146,7 @@ test('stable 0.1.0 metadata and docs stay truthful and aligned', () => {
     ['README.zh-CN.md', readRoot('README.zh-CN.md'), /稳定版候选/i, /npm `?latest`?.*(?:真相源|可用)/i],
   ];
   for (const [name, readme, versionLabel, registryTruth] of readmes) {
-    assert.match(readme, /0\.1\.0/, `${name} states the stable version`);
+    assert.match(readme, /0\.1\.1/, `${name} states the candidate version`);
     assert.match(readme, versionLabel, `${name} identifies the stable surface`);
     assert.match(readme, registryTruth, `${name} identifies npm latest as the stable availability source`);
     assert.doesNotMatch(readme, /npx ihow-memory@next/, `${name} uses the stable CLI path in commands`);
