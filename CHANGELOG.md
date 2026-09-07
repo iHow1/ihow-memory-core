@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
-## [Unreleased]
+## [0.1.1] — 2026-09-07
 
 ### Fixed
 
@@ -15,6 +15,7 @@ with pre-release tags.
 
 ### Notes
 
+- This patch is an integrated release candidate until its gates pass and registry publication is verified. Package publication does not upgrade a frozen or running client, and separately pinned adapters require their own compatibility check.
 - Activation-ledger contention retains its short fail-open budget. Atomic lock publication requires same-directory hard-link support; unsupported filesystems fail explicitly.
 - A process crash while holding the recovery guard is reported as recovery interrupted and requires owner-verified operator recovery. Old clients do not participate in the new recovery guard; coordinate writer upgrades. See [workspace lock recovery](docs/workspace-locking.md).
 

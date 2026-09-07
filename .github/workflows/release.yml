@@ -39,6 +39,8 @@ jobs:
         run: npm run build && npm run typecheck
       - name: CLI smoke
         run: node bin/ihow-memory.mjs --version
+      - name: Freeze exact release artifact and evidence
+        run: node scripts/release-evidence.mjs --output release-evidence
       - name: Tests
         run: |
           if [ -d tests ]; then npm test; else echo "no tests/"; fi
@@ -48,8 +50,8 @@ jobs:
         run: npm run secret-scan
         env:
           IHOW_PUBLIC_BOUNDARY_DENYLIST: ${{ secrets.IHOW_PUBLIC_BOUNDARY_DENYLIST }}
-      - name: Build exact release artifact and evidence
-        run: npm run release:evidence
+      - name: Verify retained artifact with offline fresh install and MCP
+        run: node scripts/verify-release-artifact.mjs release-evidence/release-evidence.json
       - uses: actions/upload-artifact@v4
         with:
           name: npm-release-${{ github.ref_name }}
