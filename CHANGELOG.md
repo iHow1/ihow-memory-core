@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with pre-release tags.
 
+## [Unreleased]
+
+### Fixed
+
+- Exclude recognized Core-generated operational metadata from lexical indexing while retaining original Markdown, business dates, governance filtering and transactional legacy-index migration; stabilize tied lexical scores by path.
+- Recover aged empty or malformed workspace and activation-ledger locks. Initialize owner records before atomic publication so an interrupted initialization cannot expose an empty lock, protect live owners including callers in the same process, and serialize stale-lock recovery with generation revalidation.
+
+### Notes
+
+- Activation-ledger contention retains its short fail-open budget. Atomic lock publication requires same-directory hard-link support; unsupported filesystems fail explicitly.
+- A process crash while holding the recovery guard is reported as recovery interrupted and requires owner-verified operator recovery. Old clients do not participate in the new recovery guard; coordinate writer upgrades. See [workspace lock recovery](docs/workspace-locking.md).
+
 ## [0.1.0] — 2026-09-01
 
 ### Changed

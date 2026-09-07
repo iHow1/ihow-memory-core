@@ -96,6 +96,18 @@ async function evidence(workspace, runtime, status, observedAt, dedupeKey, extra
   });
 }
 
+test('activation ledger recovers an old empty lock without losing existing evidence', async (t) => {
+  const { workspace } = await fixture(t, 'empty-lock');
+  await evidence(workspace, 'codex', 'configured', '2026-07-11T20:00:00.000Z', 'first');
+  const lock = `${activationLedgerPath(workspace)}.lock`;
+  await fs.writeFile(lock, '');
+  const old = new Date(Date.now() - 10_000);
+  await fs.utimes(lock, old, old);
+  await evidence(workspace, 'codex', 'configured', '2026-07-11T20:00:01.000Z', 'second');
+  assert.equal((await readActivationEvidence(workspace)).length, 2);
+  await assert.rejects(fs.access(lock), { code: 'ENOENT' });
+});
+
 test('configured wiring without live activity is READY with a stable reason code', async (t) => {
   const { workspace } = await fixture(t, 'configured');
   await evidence(workspace, 'claude-code', 'configured', '2026-07-11T20:00:00.000Z', 'install-1');

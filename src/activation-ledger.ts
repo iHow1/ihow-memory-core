@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Workspace } from './types.ts';
+import { withPathLock } from './store/lock.ts';
 
 export type ActivationEvidenceStatus =
   | 'configured'
@@ -194,66 +195,14 @@ export function activationLedgerLockPath(workspace: Workspace): string {
   return `${activationLedgerPath(workspace)}.lock`;
 }
 
-const ACTIVATION_LOCK_RETRY_MS = 5;
-const ACTIVATION_LOCK_TIMEOUT_MS = 40;
-const ACTIVATION_LOCK_STALE_MS = 5_000;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function activationLockIsStale(file: string): Promise<boolean> {
-  try {
-    const raw = await fs.readFile(file, 'utf8');
-    const [pidLine, atLine] = raw.split('\n');
-    const pid = Number.parseInt(pidLine || '', 10);
-    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
-      try {
-        process.kill(pid, 0);
-        return false;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
-        if ((error as NodeJS.ErrnoException).code === 'EPERM') return false;
-      }
-    }
-    const at = Date.parse(atLine || '');
-    return Number.isFinite(at) && Date.now() - at > ACTIVATION_LOCK_STALE_MS;
-  } catch {
-    return false;
-  }
-}
-
 async function withActivationLedgerLock<T>(workspace: Workspace, fn: () => Promise<T>): Promise<T> {
-  const lock = activationLedgerLockPath(workspace);
-  await fs.mkdir(path.dirname(lock), { recursive: true });
-  const started = Date.now();
-  let handle: fs.FileHandle | undefined;
-  while (!handle) {
-    try {
-      handle = await fs.open(lock, 'wx', 0o600);
-      await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (await activationLockIsStale(lock)) {
-        const stale = `${lock}.stale-${process.pid}-${crypto.randomUUID()}`;
-        try {
-          await fs.rename(lock, stale);
-          await fs.rm(stale, { force: true });
-        } catch {
-          // Another contender reclaimed or released it first.
-        }
-        continue;
-      }
-      if (Date.now() - started >= ACTIVATION_LOCK_TIMEOUT_MS) throw new Error('activation_ledger_lock_busy');
-      await sleep(ACTIVATION_LOCK_RETRY_MS);
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    await handle.close().catch(() => {});
-    await fs.rm(lock, { force: true }).catch(() => {});
-  }
+  return await withPathLock(activationLedgerLockPath(workspace), fn, {
+    retryMs: 5,
+    timeoutMs: 40,
+    staleMs: 5_000,
+    timeoutError: 'activation_ledger_lock_busy',
+    recoveryError: 'activation_ledger_lock_recovery_interrupted',
+  });
 }
 
 export async function appendActivationEvidence(

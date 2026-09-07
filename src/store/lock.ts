@@ -1,64 +1,162 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 iHow Memory
 import fs from 'node:fs/promises';
+import type { Stats } from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import type { Workspace } from '../types.ts';
 
-const LOCK_RETRY_MS = 25;
-const LOCK_TIMEOUT_MS = 5000;
-// A lock held longer than this is treated as orphaned. Legitimate locked operations are sub-second;
-// even the longest holder (an index rebuild) is far under this, so a lock older than the TTL almost
-// certainly belongs to a process that crashed mid-write. The dead-PID probe below catches most crashes
-// immediately; the TTL is the backstop for when the PID can't be determined.
-const LOCK_STALE_MS = 60_000;
-
-// File locks coordinate separate processes. Within one process, let callers wait on a per-path queue
-// before starting the file-lock acquisition budget; otherwise a large local burst can spend the entire
-// timeout polling a lock held by an earlier caller from this same process.
+type LockSnapshot = { stat: Stats; raw: string; pid: number | null };
+type PreparedOwner = { path: string; stat: Stats };
+type LockOptions = { retryMs?: number; timeoutMs?: number; staleMs?: number; timeoutError?: string; recoveryError?: string };
 const localLockTails = new Map<string, Promise<void>>();
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const code = (error: unknown): string | undefined => (error as NodeJS.ErrnoException).code;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sameFile(a: Stats, b: Stats): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
 }
 
-// Liveness probe: is the process that wrote this lock still running? signal 0 doesn't actually signal,
-// it just checks existence/permission. true = alive, false = definitely gone, null = can't tell.
-function pidAlive(pid: number): boolean | null {
+function unchanged(a: LockSnapshot, b: LockSnapshot): boolean {
+  return sameFile(a.stat, b.stat) && a.stat.size === b.stat.size && a.stat.mtimeMs === b.stat.mtimeMs
+    && a.stat.ctimeMs === b.stat.ctimeMs && a.raw === b.raw;
+}
+
+// Read metadata and contents from one descriptor, then check that the pathname still names it.
+async function snapshot(file: string): Promise<LockSnapshot | null> {
+  let handle: fs.FileHandle | undefined;
   try {
-    process.kill(pid, 0);
+    const named = await fs.lstat(file);
+    if (!named.isFile() || named.size > 4096) return null;
+    handle = await fs.open(file, 'r');
+    const before = await handle.stat();
+    const raw = await handle.readFile('utf8');
+    const stat = await handle.stat();
+    const after = await fs.lstat(file);
+    if (!sameFile(named, stat) || !sameFile(stat, after) || before.size !== stat.size
+      || before.mtimeMs !== stat.mtimeMs || before.ctimeMs !== stat.ctimeMs) return null;
+    const line = (raw.split('\n')[0] || '').trim();
+    const number = /^[1-9]\d*$/.test(line) ? Number(line) : NaN;
+    return { stat, raw, pid: Number.isSafeInteger(number) && number <= 0x7fffffff ? number : null };
+  } catch (error) {
+    if (code(error) === 'ENOENT') return null;
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function isStale(lock: LockSnapshot, staleMs: number): boolean {
+  if (lock.pid !== null) {
+    try {
+      process.kill(lock.pid, 0);
+      return false; // Includes our own PID: separate module instances can share one process.
+    } catch (error) {
+      if (code(error) === 'ESRCH') return true;
+      return false; // EPERM or unknown liveness never grants permission to steal a lock.
+    }
+  }
+  // A legacy writer may be between exclusive creation and writing its owner record. Filesystem age
+  // supplies the missing timestamp, but a fresh/clock-skewed malformed record remains protected.
+  return Date.now() - lock.stat.mtimeMs > staleMs;
+}
+
+// Initialize privately, then link atomically with no replacement. Contenders never see a new empty
+// lock, and an initialization failure cannot leak the public lock or its descriptor. Same-directory
+// hard links preserve the existing regular-file PID format used by older clients.
+async function prepareOwner(file: string): Promise<PreparedOwner> {
+  const temporary = `${file}.owner-${process.pid}-${crypto.randomUUID()}`;
+  let handle: fs.FileHandle | undefined;
+  let created = false;
+  try {
+    handle = await fs.open(temporary, 'wx', 0o600);
+    created = true;
+    await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, 'utf8');
+    const stat = await handle.stat();
+    await handle.close();
+    handle = undefined;
+    return { path: temporary, stat };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (created) await fs.rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+async function unlinkOwned(file: string, owner: PreparedOwner): Promise<boolean> {
+  try {
+    const stat = await fs.lstat(file);
+    if (!sameFile(stat, owner.stat)) return false;
+    await fs.unlink(file);
     return true;
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ESRCH') return false; // no such process — the writer is gone
-    if (code === 'EPERM') return true; // exists but owned by another user — alive
-    return null;
+    if (code(error) === 'ENOENT') return false;
+    throw error;
   }
 }
 
-// Decide whether an existing lock file is orphaned (safe to steal): either the process that wrote it is
-// gone, or it has been held past the TTL. The file content is "<pid>\n<iso>\n" written right after the
-// exclusive open — a holder may have created the file but not yet written it, so an unreadable/empty/
-// unparseable lock is treated as NOT-yet-stale (let the normal retry handle a just-created lock).
-async function lockIsStale(lockPath: string): Promise<boolean> {
-  let raw: string;
+async function reclaim(file: string, observed: LockSnapshot, staleMs: number, recoveryError: string): Promise<boolean> {
+  // Serialize reapers and revalidate after acquiring the guard. A stale observer must never rename
+  // a replacement live lock. Normal publishers can still acquire after the stale lock is removed.
+  const guard = `${file}.reclaim`;
+  const owner = await prepareOwner(guard);
+  let acquired = false;
   try {
-    raw = await fs.readFile(lockPath, 'utf8');
-  } catch {
-    return false;
+    try {
+      await fs.link(owner.path, guard);
+      acquired = true;
+    } catch (error) {
+      if (code(error) !== 'EEXIST') throw error;
+      const held = await snapshot(guard);
+      // Do not recursively steal a recovery guard: racing recovery-of-recovery would recreate the
+      // same unlink race. A crash during this tiny section fails explicitly for operator recovery.
+      if (held && isStale(held, staleMs)) throw new Error(recoveryError);
+      return false;
+    }
+    const current = await snapshot(file);
+    if (!current || !unchanged(observed, current) || !isStale(current, staleMs)) return false;
+    await fs.unlink(file);
+    return true;
+  } finally {
+    try {
+      if (acquired) await unlinkOwned(guard, owner);
+    } finally {
+      await fs.rm(owner.path, { force: true });
+    }
   }
-  const [pidLine, atLine] = raw.split('\n');
-  const pid = Number.parseInt((pidLine || '').trim(), 10);
-  if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
-    const alive = pidAlive(pid);
-    if (alive === false) return true; // the writer process is gone — orphaned, safe to steal
-    if (alive === true) return false; // the writer is ALIVE — never steal, even past the TTL (it may be a
-    // legitimately slow critical section: a big index rebuild, slow disk, a debugger pause). Stealing here
-    // would put two processes in the critical section. alive === null (can't tell) falls through to the TTL.
+}
+
+// Path-level lock also serves short-budget ledgers; it does not add a same-process queue.
+export async function withPathLock<T>(file: string, fn: () => Promise<T>, options: LockOptions = {}): Promise<T> {
+  const { retryMs = 25, timeoutMs = 5000, staleMs = 60_000,
+    timeoutError = 'workspace_lock_timeout', recoveryError = 'workspace_lock_recovery_interrupted' } = options;
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const started = Date.now();
+  const owner = await prepareOwner(file);
+  let acquired = false;
+  try {
+    while (!acquired) {
+      try {
+        await fs.link(owner.path, file);
+        acquired = true;
+      } catch (error) {
+        if (code(error) !== 'EEXIST') throw error;
+        if (Date.now() - started >= timeoutMs) throw new Error(timeoutError);
+        const observed = await snapshot(file);
+        if (observed && isStale(observed, staleMs)
+          && await reclaim(file, observed, staleMs, recoveryError)) continue;
+        await sleep(retryMs);
+      }
+    }
+    await fs.rm(owner.path, { force: true });
+    return await fn();
+  } finally {
+    try {
+      if (acquired && !await unlinkOwned(file, owner)) throw new Error('workspace_lock_ownership_lost');
+    } finally {
+      await fs.rm(owner.path, { force: true });
+    }
   }
-  const at = Date.parse((atLine || '').trim());
-  // TTL backstop — only reached when the lock has no parseable foreign PID or liveness is unknowable.
-  if (!Number.isNaN(at) && Date.now() - at > LOCK_STALE_MS) return true;
-  return false;
 }
 
 async function waitForLocalLockTurn(lockPath: string): Promise<() => void> {
@@ -67,7 +165,6 @@ async function waitForLocalLockTurn(lockPath: string): Promise<() => void> {
   const turn = new Promise<void>((resolve) => { releaseTurn = resolve; });
   localLockTails.set(lockPath, turn);
   if (previous) await previous;
-
   let released = false;
   return () => {
     if (released) return;
@@ -77,49 +174,10 @@ async function waitForLocalLockTurn(lockPath: string): Promise<() => void> {
   };
 }
 
-async function withFileLock<T>(workspace: Workspace, fn: () => Promise<T>): Promise<T> {
-  await fs.mkdir(path.dirname(workspace.lockPath), { recursive: true });
-  const started = Date.now();
-  let handle: fs.FileHandle | undefined;
-  while (!handle) {
-    try {
-      handle = await fs.open(workspace.lockPath, 'wx');
-      await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      // Someone holds it. If it's orphaned (dead writer or held past the TTL), reclaim it; otherwise wait.
-      if (await lockIsStale(workspace.lockPath)) {
-        // Steal atomically via rename so two racers can't both "steal" the same lock and end up both
-        // holding it: only one rename wins; the loser's rename throws and falls through to retry.
-        const stealPath = `${workspace.lockPath}.stale-${process.pid}`;
-        try {
-          await fs.rename(workspace.lockPath, stealPath);
-          await fs.rm(stealPath, { force: true });
-        } catch {
-          // another writer won the steal, or the lock was released meanwhile — just retry
-        }
-        continue;
-      }
-      if (Date.now() - started > LOCK_TIMEOUT_MS) throw new Error('workspace_lock_timeout');
-      await sleep(LOCK_RETRY_MS);
-    }
-  }
-
-  try {
-    return await fn();
-  } finally {
-    try {
-      await handle.close();
-    } finally {
-      await fs.rm(workspace.lockPath, { force: true });
-    }
-  }
-}
-
 export async function withWorkspaceLock<T>(workspace: Workspace, fn: () => Promise<T>): Promise<T> {
   const releaseLocalTurn = await waitForLocalLockTurn(workspace.lockPath);
   try {
-    return await withFileLock(workspace, fn);
+    return await withPathLock(workspace.lockPath, fn);
   } finally {
     releaseLocalTurn();
   }
