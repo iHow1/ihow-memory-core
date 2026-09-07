@@ -29,6 +29,7 @@ export const CANDIDATE_IDENTITY_FILES=Object.freeze([
   'src/checkpoints.ts',
   'src/decay.ts',
   'src/engine/fts.ts',
+  'src/engine/source-projection.ts',
   'src/engine/manifest.ts',
   'src/engine/retrieval.ts',
   'src/evaluation.ts',
