@@ -47,6 +47,7 @@
     "docs/handoff-schema.md",
     "docs/launch-asset-checklist.md",
     "docs/release-governance.md",
+    "docs/workspace-locking.md",
     "docs/telemetry-privacy.md",
     "docs/safe-memory-gardener.md"
   ],

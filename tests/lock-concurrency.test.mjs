@@ -65,18 +65,19 @@ test('stale lock with a dead PID is reclaimed (not a permanent wedge)', async (t
   await assert.rejects(fs.access(ws.lockPath), 'lock is released after the critical section');
 });
 
-test('stale lock held past the TTL is reclaimed even if the PID looks alive', async (t) => {
+test('old malformed owner records recover by filesystem age', async (t) => {
   const memoryRoot = await mkdtempReal('ihow-lock-ttl-');
   t.after(async () => { await fs.rm(memoryRoot, { recursive: true, force: true }); });
   const ws = resolveWorkspace({ memoryRoot, cwd: memoryRoot });
 
   await fs.mkdir(path.dirname(ws.lockPath), { recursive: true });
-  // Our own (live) PID, but a timestamp far past the staleness TTL → reclaim via the TTL backstop.
-  await fs.writeFile(ws.lockPath, `${process.pid}\n2000-01-01T00:00:00.000Z\n`, 'utf8');
+  await fs.writeFile(ws.lockPath, `unknown\n2000-01-01T00:00:00.000Z\n`, 'utf8');
+  const old = new Date(Date.now() - 120_000);
+  await fs.utimes(ws.lockPath, old, old);
 
   let ran = false;
   await withWorkspaceLock(ws, async () => { ran = true; });
-  assert.ok(ran, 'a lock held past the TTL must be reclaimable');
+  assert.ok(ran, 'an old lock without a valid owner must be reclaimable');
 });
 
 test('a lock held by a LIVE foreign process is NOT stolen even past the TTL (no double critical section)', async (t) => {
