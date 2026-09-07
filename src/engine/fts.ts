@@ -10,6 +10,7 @@ import { withWorkspaceLock } from '../store/lock.ts';
 import { relativeToSpace } from '../workspace.ts';
 import { defaultFtsManifest, writeProviderManifest } from './manifest.ts';
 import { containsSecretLikeContent } from '../governance.ts';
+import { FTS_SOURCE_TEXT_COLUMN, projectFtsSourceText } from './source-projection.ts';
 
 type IndexDocument = {
   path: string;
@@ -188,18 +189,19 @@ async function collectDocuments(workspace: Workspace): Promise<IndexDocument[]> 
   return documents;
 }
 
-async function rebuildFtsIndexUnlocked(workspace: Workspace): Promise<number> {
+async function rebuildFtsIndexUnlocked(workspace: Workspace, publishManifest = true): Promise<number> {
   const documents = await collectDocuments(workspace);
   const db = openDatabase(workspace);
   try {
-    // DROP+CREATE (not just DELETE) so an old-schema index (pre-bigram/pre-`reviewed`) migrates cleanly.
-    db.exec('DROP TABLE IF EXISTS memory_fts');
-    db.exec("CREATE VIRTUAL TABLE memory_fts USING fts5(path UNINDEXED, content, orig UNINDEXED, flagged UNINDEXED, reviewed UNINDEXED, tokenize = 'unicode61')");
+    // Keep schema, projected rows and generation atomic. A failed migration
+    // must retain the previous table, not leave an empty current-generation index.
     db.exec('BEGIN');
-    const insert = db.prepare('INSERT INTO memory_fts(path, content, orig, flagged, reviewed) VALUES (?, ?, ?, ?, ?)');
+    db.exec('DROP TABLE IF EXISTS memory_fts');
+    db.exec(`CREATE VIRTUAL TABLE memory_fts USING fts5(path UNINDEXED, content, orig UNINDEXED, flagged UNINDEXED, reviewed UNINDEXED, ${FTS_SOURCE_TEXT_COLUMN} UNINDEXED, tokenize = 'unicode61')`);
+    const insert = db.prepare(`INSERT INTO memory_fts(path, content, orig, flagged, reviewed, ${FTS_SOURCE_TEXT_COLUMN}) VALUES (?, ?, ?, ?, ?, 1)`);
     for (const document of documents) {
       // reviewed=1 when human-reviewed/plain; reviewed=0 when machine auto-promoted (down-weighted at rank time).
-      insert.run(document.path, cjkIndexSegment(document.content), document.content, document.flagged ? 1 : 0, document.unreviewed ? 0 : 1);
+      insert.run(document.path, cjkIndexSegment(projectFtsSourceText(document.content)), document.content, document.flagged ? 1 : 0, document.unreviewed ? 0 : 1);
     }
     db.exec('COMMIT');
   } catch (error) {
@@ -212,7 +214,8 @@ async function rebuildFtsIndexUnlocked(workspace: Workspace): Promise<number> {
   } finally {
     db.close();
   }
-  await writeProviderManifest(workspace, defaultFtsManifest('ready'));
+  // Lazy local schema repair is not a successful vector-provider reindex.
+  if (publishManifest) await writeProviderManifest(workspace, defaultFtsManifest('ready'));
   return documents.length;
 }
 
@@ -220,9 +223,9 @@ async function hasUsableIndex(workspace: Workspace): Promise<boolean> {
   if (!fs.existsSync(workspace.indexPath)) return false;
   const db = openDatabase(workspace, { initialize: false });
   try {
-    // selecting `orig`+`reviewed` also verifies the current schema — a pre-bigram / pre-reviewed index
-    // lacks one of these columns, fails here, and is rebuilt with the current schema.
-    db.prepare('SELECT orig, flagged, reviewed FROM memory_fts LIMIT 1').all();
+    // A schema-bound generation also detects an older process rebuilding this
+    // same database. A standalone version table could survive that old writer.
+    db.prepare(`SELECT orig, flagged, reviewed, ${FTS_SOURCE_TEXT_COLUMN} FROM memory_fts LIMIT 1`).all();
     return true;
   } catch {
     return false;
@@ -235,7 +238,7 @@ async function ensureFtsIndex(workspace: Workspace): Promise<void> {
   if (await hasUsableIndex(workspace)) return;
   await withWorkspaceLock(workspace, async () => {
     if (await hasUsableIndex(workspace)) return;
-    await rebuildFtsIndexUnlocked(workspace);
+    await rebuildFtsIndexUnlocked(workspace, false);
   });
 }
 
@@ -261,6 +264,7 @@ export async function searchFts(
         SELECT
           path,
           orig,
+          ${FTS_SOURCE_TEXT_COLUMN} AS projection_generation,
           bm25(memory_fts) AS rank,
           (CASE WHEN path LIKE 'memory/journal/%' OR path LIKE 'memory/_mcp/journal/%' THEN 1 ELSE 0 END) AS is_journal,
           -- RED-TEAM-NEEDED (governance.ts:839): bm25 is NEGATIVE (more-negative = better). Adding a small
@@ -279,7 +283,7 @@ export async function searchFts(
                 THEN substr(path, length(path) - 12, 10) ELSE '' END) AS journal_day
         FROM memory_fts
         WHERE memory_fts MATCH ? AND (? = 1 OR flagged != 1)
-        ORDER BY is_journal ASC, (rank + rank_penalty), journal_day DESC
+        ORDER BY is_journal ASC, (rank + rank_penalty), journal_day DESC, path ASC
         LIMIT ?
       `)
       .all(queryToFts(query), opts.includeFlagged === true ? 1 : 0, limit) as Array<{ path: string; orig: string; rank: number; is_journal: number; rank_penalty: number; journal_day: string }>;
